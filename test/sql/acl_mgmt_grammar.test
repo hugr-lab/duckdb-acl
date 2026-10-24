@@ -15,18 +15,24 @@ SELECT acl_use_db('aclcat', 'acl', true);
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
 # --- a family not moved yet: as its own text, as before ------------------------------------------------------------
 
 statement ok
-ACL ADMIN CREATE ROLE grammar_one;
+ACL ADMIN CREATE VIRTUAL CATALOG grammar_one;
 
 statement ok
-ACL ADMIN CREATE ROLE grammar_two; CREATE ROLE grammar_three;
+ACL ADMIN CREATE VIRTUAL CATALOG grammar_two; CREATE VIRTUAL CATALOG grammar_three;
 
 query I
-SELECT count(*) FROM aclcat.acl.roles WHERE role LIKE 'grammar_%';
+SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat LIKE 'grammar_%';
 ----
 3
+
+statement ok
+ACL ADMIN CREATE ROLE grammar_one;
 
 # --- the operations of a node: rules, the same calls ---------------------------------------------------------------
 
@@ -92,10 +98,10 @@ true
 
 # a batch of a rule's statement and a compiler's
 statement ok
-ACL ADMIN CREATE ROLE grammar_four; DRAIN NODE; RESUME NODE;
+ACL ADMIN CREATE VIRTUAL CATALOG grammar_four; DRAIN NODE; RESUME NODE;
 
 query I
-SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_four';
+SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'grammar_four';
 ----
 1
 
@@ -187,7 +193,19 @@ SELECT count(*) FROM aclcat.acl.roles WHERE role = 'never_made';
 # a statement the tokenizer refuses is the compiler's to judge, in its own words; the rest of the batch is read by its
 # rules as before
 statement ok
-ACL ADMIN ALTER ROLE grammar_one SET COMMENT ""; RESUME NODE;
+ACL ADMIN CREATE VIRTUAL CATALOG grammar_cat;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL CATALOG grammar_cat SET COMMENT ""; RESUME NODE;
+
+# a moved form's `""` is the tokenizer's zero-length identifier (`''` is the empty text)
+statement error
+ACL ADMIN ALTER ROLE grammar_one SET COMMENT "";
+----
+zero-length delimited identifier
+
+statement ok
+ACL ADMIN ALTER ROLE grammar_one SET COMMENT '';
 
 # a batch the tokenizer refuses never runs without what it refused - an unterminated comment the split would drop
 statement error
@@ -235,3 +253,249 @@ statement error
 DRAIN NODE;
 ----
 syntax error
+
+# --- roles, administration, view-as (stage 3b): rules, the same calls -----------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE tenant_reader CLAIMS (tenant = 'acme', region = 'eu, west');
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'tenant_reader' ORDER BY claim;
+----
+region	eu, west
+tenant	acme
+
+statement ok
+ACL ADMIN CREATE OR REPLACE ROLE tenant_reader CLAIMS 'tenant=''globex''';
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'tenant_reader' ORDER BY claim;
+----
+tenant	globex
+
+statement ok
+ACL ADMIN CREATE ROLE IF NOT EXISTS tenant_reader;
+
+statement ok
+ACL ADMIN ALTER ROLE tenant_reader SET CLAIMS (tenant = 'initech');
+
+query I
+SELECT value FROM aclcat.acl.role_claims WHERE role = 'tenant_reader';
+----
+initech
+
+statement ok
+ACL ADMIN ALTER ROLE tenant_reader SET COMMENT 'reads one tenant';
+
+query I
+SELECT comment FROM aclcat.acl.roles WHERE role = 'tenant_reader';
+----
+reads one tenant
+
+# a role named like a keyword, bare or quoted; a quoted name keeps its case and its dot
+statement ok
+ACL ADMIN CREATE ROLE select; CREATE ROLE "Mixed.Case";
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role IN ('select', 'Mixed.Case');
+----
+2
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE tenant_reader;
+
+query I
+SELECT scope FROM aclcat.acl.admins WHERE role = 'tenant_reader';
+----
+observe
+
+statement ok
+ACL ADMIN REVOKE ADMIN observe FROM ROLE tenant_reader;
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE tenant_reader; REVOKE ADMIN FROM ROLE tenant_reader;
+
+query I
+SELECT count(*) FROM aclcat.acl.admins WHERE role = 'tenant_reader';
+----
+0
+
+statement ok
+ACL ADMIN DROP ROLE IF EXISTS no_such_role;
+
+statement error
+ACL ADMIN DROP ROLE no_such_role;
+----
+no_such_role
+
+statement ok
+ACL ADMIN DROP ROLE "Mixed.Case";
+
+# a comment inside a form past its first two words (the compiler's scanner read none; before the second word the text
+# check that tells management from native SQL still misses it - 3g makes that a rule)
+statement ok
+ACL ADMIN CREATE ROLE /* the note */ commented_role -- and after
+;
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'commented_role';
+----
+1
+
+# a comment inside a claims list is no part of it: the list is its tokens, never its text as written
+statement ok
+ACL ADMIN CREATE ROLE commented_claims CLAIMS (region = 'eu' -- , tenant = 'globex'
+);
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'commented_claims';
+----
+region	eu
+
+statement ok
+ACL ADMIN ALTER ROLE commented_claims SET CLAIMS (region = /* a ) and a ' */ 'us');
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'commented_claims';
+----
+region	us
+
+# ... and the list is otherwise as written: a name or an unquoted value keeps what touches in it
+statement ok
+ACL ADMIN CREATE ROLE punctuated CLAIMS (custom:tenant = 'acme', cost-center = '42', level = -1, region = eu-west);
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'punctuated' ORDER BY claim;
+----
+cost-center	42
+custom:tenant	acme
+level	-1
+region	eu-west
+
+# a literal the compiler's reader would split otherwise than duckdb's tokenizer reads it is refused in a list (stage
+# 4 makes the list a rule): `$$a, tenant = 'globex', b = $$` is one value to the tokenizer, three claims to the reader
+statement error
+ACL ADMIN CREATE ROLE split_list CLAIMS (region = $$a, tenant = 'globex', b = $$);
+----
+a claims list is written as name = 'value' items
+
+statement error
+ACL ADMIN CREATE ROLE split_list CLAIMS (region = E'a\'b', tenant = 'x');
+----
+a claims list is written as name = 'value' items
+
+statement error
+ACL ADMIN CREATE ROLE split_list CLAIMS (region = `a, tenant = 'globex', z = `);
+----
+a backtick name
+
+# ... and a text the tokens do not tile (after a lone `$` the tokenizer places the next token at the `$`)
+statement error
+ACL ADMIN CREATE ROLE split_list CLAIMS (region = $, tenant = 'x');
+----
+a claims list is written as name = 'value' items
+
+statement error
+ACL ADMIN CREATE ROLE split_list CLAIMS (region = 'x', tenant = $);
+----
+a claims list is written as name = 'value' items
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'split_list';
+----
+0
+
+# a name with a leading digit is one word, as the scanner read it - the tokenizer splits it (`9abc` is `9` `abc`)
+statement ok
+ACL ADMIN CREATE ROLE 9abc; CREATE ROLE 0x1F;
+
+query I
+SELECT role FROM aclcat.acl.roles WHERE role IN ('9abc', '0x1F') ORDER BY role;
+----
+0x1F
+9abc
+
+statement ok
+ACL ADMIN DROP ROLE 9abc;
+
+# ... and a word apart is another word
+statement error
+ACL ADMIN CREATE ROLE 9 abc;
+----
+write CREATE [OR REPLACE] ROLE
+
+# a role mapping, both ways; an issuer's name of words joined by dots, `.2` too
+statement ok
+ACL ADMIN CREATE ISSUER "v1.2" URL 'test/idp/two';
+
+statement ok
+ACL ADMIN MAP GROUP 'g-read' FROM ISSUER v1.2 TO ROLE tenant_reader; MAP CLAIM "ops" FROM ISSUER v1 . 2 TO ROLE 0x1F;
+
+query IIIII
+SELECT scope_kind, scope_name, source, external_value, role FROM aclcat.acl.role_mappings ORDER BY role;
+----
+issuer	v1.2	claim-value	ops	0x1F
+issuer	v1.2	group	g-read	tenant_reader
+
+# a dotted name the tokenizer reads as numbers is the name as written (`v2.0.1` is `v2` `.0.1`): the mapping reaches
+# the issuer's own check, every part a word
+statement error
+ACL ADMIN MAP GROUP 'g' FROM ISSUER v2.0.1 TO ROLE tenant_reader;
+----
+issuer "v2.0.1" does not exist
+
+statement error
+ACL ADMIN MAP GROUP 'g' FROM ISSUER 9.x TO ROLE tenant_reader;
+----
+issuer "9.x" does not exist
+
+statement error
+ACL ADMIN MAP GROUP 'g' FROM ISSUER a..b TO ROLE tenant_reader;
+----
+write MAP GROUP | CLAIM
+
+statement ok
+ACL ADMIN DROP MAP GROUP 'g-read' FROM ISSUER v1.2 TO ROLE tenant_reader;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_mappings;
+----
+1
+
+# view-as needs a session of the client's own: the call answers so, from the rule
+statement error
+ACL ADMIN SET SESSION VIEW AS ROLE tenant_reader;
+----
+view
+
+statement error
+ACL ADMIN RESET SESSION VIEW AS;
+----
+view
+
+# --- a role form that does not read as its rule says how it is written ---------------------------------------------
+
+statement error
+ACL ADMIN CREATE ROLE;
+----
+write CREATE [OR REPLACE] ROLE
+
+statement error
+ACL ADMIN CREATE ROLE "";
+----
+zero-length delimited identifier
+
+statement error
+ACL ADMIN GRANT ADMIN observe TO tenant_reader;
+----
+write GRANT ADMIN <scope> TO ROLE <role>
+
+statement error
+ACL ADMIN ALTER ROLE tenant_reader SET CLAIMS (tenant 'x');
+----
+a claim is written as name = 'value'
+
+statement error
+ACL ADMIN MAP GROUP admins FROM ISSUER corp TO ROLE tenant_reader;
+----
+expected external value, quoted

@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -154,7 +154,28 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   `RESUME NODE`, `MIGRATE POLICY CATALOG <db>[.<schema>]`. Newly accepted: comments inside these forms; a quoted
   level stays refused, as it was; a SQL keyword as a database name must be quoted now (the refusal says so); an inline body's trailing comment is no longer part of a legacy statement's text. A rule's checks run over
   the batch before the compiler's statements, so a later statement's error may be the one reported.
-- 3b: roles, admin scopes, role mappings, view-as (names as values, spec 116's `NameValue`).
+- 3b (built): roles, admin scopes, role mappings, view-as - `CREATE [OR REPLACE] ROLE [IF NOT EXISTS] r [CLAIMS
+  (…) | '…']`, `ALTER ROLE r SET COMMENT | CLAIMS`, `DROP ROLE [IF EXISTS] r`, `GRANT ADMIN s TO ROLE r`, `REVOKE ADMIN
+  [s] FROM ROLE r`, `[DROP] MAP GROUP | CLAIM '<v>' FROM CLIENT | ISSUER n TO ROLE r`, `SET SESSION VIEW AS ROLE r`,
+  `RESET SESSION VIEW AS`. The compiler's values on duckdb's tokens: a matcher of ours (`AclTokenMatcher`) reads a word
+  (ASCII letters, digits, `_` - a keyword too: `CREATE ROLE select` works as it did; the tokenizer splits a word at a
+  leading digit, `9abc` is `9` `abc`, so a word is the run of word tokens with nothing between them, as the scanner
+  read it), a double-quoted name, or a list's item; `Ident` is `AclName`, `NameValue` `AclNameValue` (quoted either
+  way, or words joined by `.` - the tokenizer reads a number through its dots, `v2.0.1` is `v2` `.0.1`, so one matcher
+  takes the tokens of word characters and dots that touch or meet at a dot and judges the name whole, every part a
+  word), a parenthesised claims list is passed to the compiler's `ClaimsListToCsv` as written with each comment a
+  space (the span as is read `(a = 'x' -- , b = 'y'⏎)` as two claims; the tokens joined by a space would have split
+  `custom:tenant` and `-1`, which the reader keeps as written). A claim's value is not yet checked to
+  be a plain literal (`(a = 'x' ACL ROLE 'boss')` stores what the compiler made of it, as before): stage 4's rule for
+  the list does. Changed: a moved form's `""` is the tokenizer's zero-length identifier (`ALTER ROLE r SET COMMENT ""`
+  cleared the comment, `SET SESSION VIEW AS ROLE ""` reset the mode; `''` / `RESET` do), `REVOKE ADMIN`'s scope and
+  `FROM` are told apart by the rule, never by peeking (`REVOKE ADMIN from FROM ROLE r` is an unknown scope); newly
+  accepted: a comment anywhere inside these forms, spaces or a comment around a name's dot (`kc . x` is `kc.x`), `if`
+  as a role name (`DROP ROLE if`), a comment inside a claims list (read as a space). Refused inside a claims list: a
+  value written `E'…'` or `$$…$$` and a backtick name - the compiler's reader knows `'…'` and `"…"` only, so it split
+  `(region = $$a, tenant = 'globex', b = $$)` into three claims where the tokenizer reads one value (the scanner's
+  `Parens` accepted that too) - and a text the tokens do not tile (after a lone `$` duckdb's tokenizer places the next
+  token at the `$`).
 - 3c: the virtual catalog's objects (`CREATE | ALTER | DROP VIRTUAL …`, `ADD …`, `CHECK`, `REPAIR`, comments) -
   spec 116's paths and the bodies (still their text until stage 4).
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).

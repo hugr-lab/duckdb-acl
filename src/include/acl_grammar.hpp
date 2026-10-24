@@ -55,6 +55,9 @@ struct MgmtParsed {
 	vector<Value> args;
 	//! the first argument is the session the batch runs under (`PROFILE SESSION CURRENT`)
 	bool current_session = false;
+	//! arguments written as a parenthesised claims list - the text inside, which the compiler's ClaimsListToCsv reads
+	//! as it always did (a list becomes a rule in stage 4)
+	vector<pair<idx_t, string>> claims_lists;
 };
 
 //! A marker's words as a client writes them: `TRACE`, `LINEAGE JOB`, ...

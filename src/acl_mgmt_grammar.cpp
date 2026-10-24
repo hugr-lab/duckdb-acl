@@ -13,6 +13,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
+#include "duckdb/parser/peg/matcher.hpp"
 #include "duckdb/parser/peg/passthrough_dialect.hpp"
 #include "duckdb/parser/peg/tokenizer/parser_tokenizer.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
@@ -46,6 +47,13 @@ struct MgmtParseData : ParserExtensionParseData {
 	vector<QuotedValue> quoted;
 	//! words that must be written bare (a level is a word, never a quoted name)
 	vector<QuotedValue> bare;
+	//! arguments written as a parenthesised list: the argument's index and the list's span, inside the parentheses
+	struct Span {
+		idx_t arg;
+		idx_t start;
+		idx_t end;
+	};
+	vector<Span> claims_lists;
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
 		return make_uniq<MgmtParseData>(*this);
@@ -93,6 +101,208 @@ string LevelWord(PEGTransformer &transformer, ParseResult &result, const char *w
 	entry.what = what;
 	data.bare.push_back(entry);
 	return StringUtil::Lower(transformer.Transform<string>(base));
+}
+
+// --- the values a management statement holds ---------------------------------------------------------------------
+
+//! One token of a kind the management compiler's scanner read: a word (ASCII letters, digits, `_` - a keyword too),
+//! a double-quoted name, either, words joined by `.` - or, inside a parenthesised list, any token but a parenthesis.
+//! The scanner read a word whole where duckdb's tokenizer splits it at a leading digit (`9abc` is `9` `abc`, `0x1F` is
+//! `0` `x1F`): a word is the run of word tokens with nothing between them. The tokenizer also reads a number through
+//! its dots (`v2.0.1` is `v2` `.0.1`, `9.x` is `9.` `x`): a dotted name is the run of tokens of word characters and
+//! dots that touch or meet at a dot (`a . b`, `a /* c */ .b` too), then judged whole - every part a word
+class AclTokenMatcher final : public AtomicMatcher {
+public:
+	enum class Kind : uint8_t { WORD, NAME, DOTTED, LIST_ITEM };
+
+	explicit AclTokenMatcher(Kind kind_p) : AtomicMatcher(MatcherType::CUSTOM), kind(kind_p) {
+	}
+
+	MatcherResult MatchAtomic(MatchState &state) const override {
+		auto current = state.token_iterator.Current();
+		if (!current || !Accepts(*current)) {
+			return MatcherResult::Failure();
+		}
+		if (kind == Kind::DOTTED) {
+			return MatchDotted(state);
+		}
+		auto text = current->text;
+		auto offset = current->offset;
+		auto length = current->length;
+		bool joins = kind != Kind::LIST_ITEM && current->type != TokenType::STRING_LITERAL && text[0] != '"';
+		state.token_iterator.Advance();
+		state.UpdateMaxTokenIndex();
+		while (joins) {
+			auto next = state.token_iterator.Current();
+			if (!next || next->offset != offset + length || next->type == TokenType::STRING_LITERAL ||
+			    !IsWord(next->text)) {
+				break;
+			}
+			text += next->text;
+			length += next->length;
+			state.token_iterator.Advance();
+			state.UpdateMaxTokenIndex();
+		}
+		return state.AllocateParseResult<TokenParseResult>(std::move(text), offset, length);
+	}
+
+	SuggestionType AddSuggestionInternal(MatchState &state) const override {
+		return SuggestionType::MANDATORY; // a name: nothing to offer
+	}
+
+	string ToString() const override {
+		return "AclToken";
+	}
+
+private:
+	static bool IsDottedText(const MatcherToken &token) {
+		if (token.type == TokenType::STRING_LITERAL || token.text.empty()) {
+			return false;
+		}
+		for (auto c : token.text) {
+			if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_' && c != '.') {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	MatcherResult MatchDotted(MatchState &state) const {
+		auto &tokens = state.token_iterator;
+		auto first = tokens.Position();
+		auto &head = tokens.GetToken(first);
+		string text = head.text;
+		auto end = head.offset + head.length;
+		idx_t count = 1;
+		while (first + count < tokens.Size()) {
+			auto &next = tokens.GetToken(first + count);
+			bool touches = next.offset == end;
+			if (!IsDottedText(next) || (!touches && text.back() != '.' && next.text[0] != '.')) {
+				break;
+			}
+			text += next.text;
+			end = next.offset + next.length;
+			count++;
+		}
+		// every part a word: no dot first, last or twice
+		idx_t part_start = 0;
+		for (idx_t i = 0; i <= text.size(); i++) {
+			if (i == text.size() || text[i] == '.') {
+				if (!IsWord(text.substr(part_start, i - part_start))) {
+					return MatcherResult::Failure();
+				}
+				part_start = i + 1;
+			}
+		}
+		tokens.Advance(count);
+		state.UpdateMaxTokenIndex();
+		return state.AllocateParseResult<TokenParseResult>(std::move(text), head.offset, end - head.offset);
+	}
+
+	static bool IsWord(const string &text) {
+		if (text.empty()) {
+			return false;
+		}
+		for (auto c : text) {
+			if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_') {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool Accepts(const MatcherToken &token) const {
+		if (token.type == TokenType::TERMINATOR || token.type == TokenType::END_OF_INPUT ||
+		    token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+			return false;
+		}
+		bool quoted_name = !token.text.empty() && token.text[0] == '"';
+		switch (kind) {
+		case Kind::WORD:
+			return token.type != TokenType::STRING_LITERAL && IsWord(token.text);
+		case Kind::NAME:
+			return quoted_name || (token.type != TokenType::STRING_LITERAL && IsWord(token.text));
+		case Kind::DOTTED:
+			return IsDottedText(token);
+		case Kind::LIST_ITEM:
+			return token.text != "(" && token.text != ")";
+		}
+		return false;
+	}
+
+	Kind kind;
+};
+
+//! A token's text under a rule part (our token rules have no transform: the token is read here)
+const TokenParseResult &TokenOf(ParseResult &result) {
+	reference<ParseResult> node = result;
+	while (node.get().type != ParseResultType::TOKEN) {
+		if (node.get().type == ParseResultType::CHOICE) {
+			node = node.get().Cast<ChoiceParseResult>().GetResult();
+		} else if (node.get().type == ParseResultType::LIST &&
+		           node.get().Cast<ListParseResult>().GetChildren().size() == 1) {
+			node = node.get().Cast<ListParseResult>().GetChild(0);
+		} else {
+			throw ParserException("acl admin: a name's token is not where its rule says");
+		}
+	}
+	return node.get().Cast<TokenParseResult>();
+}
+
+//! A double-quoted name's text, `""` a quote - what the compiler's scanner took
+string UnquoteName(const string &text) {
+	return StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"");
+}
+
+//! `AclName <- AclNameToken`: one SQL identifier as the compiler's `Ident` read it - a word, or a double-quoted
+//! name with `""` for a quote; never empty
+string NameOf(ParseResult &result, const char *what) {
+	auto &token = TokenOf(result);
+	if (token.text.empty() || token.text[0] != '"') {
+		return token.text;
+	}
+	auto name = UnquoteName(token.text);
+	if (name.empty()) {
+		throw BinderException("acl admin: an empty quoted identifier - %s cannot be empty", what);
+	}
+	return name;
+}
+
+//! `AclNameValue <- StringLiteral / AclDottedToken / Identifier`: a name that is a value (spec 116 §3) as `NameValue`
+//! read it - quoted either way, as written, or words joined by `.`
+string NameValueOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
+	auto &node = Strip(result);
+	if (node.Name() == "AclDottedToken") {
+		// the matcher joined the name's tokens, its dots kept
+		return TokenOf(node).text;
+	}
+	QuotedValue entry;
+	entry.value = ValueOf(transformer, node, entry.offset);
+	entry.what = what;
+	data.quoted.push_back(entry);
+	return entry.value;
+}
+
+//! `AclClaims <- AclParenList / AclQuotedValue` into argument `arg`: a list keeps its span for the compiler's reader
+void ClaimsInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, MgmtParseData &data) {
+	auto &node = Strip(result);
+	if (node.Name() == "AclParenList") {
+		// AclParenList <- '(' AclListItem* ')': the text between the parentheses
+		auto &list = node.Cast<ListParseResult>();
+		auto &open = list.GetChild(0);
+		auto &close = list.GetChild(list.GetChildren().size() - 1);
+		if (!open.offset.IsValid() || !close.offset.IsValid()) {
+			throw ParserException("acl admin: a list has no position");
+		}
+		data.claims_lists.push_back(MgmtParseData::Span {arg, open.offset.GetIndex() + 1, close.offset.GetIndex()});
+		data.args[arg] = Value(string());
+		return;
+	}
+	QuotedValue entry;
+	entry.value = ValueOf(transformer, node, entry.offset);
+	entry.what = "claims list";
+	data.quoted.push_back(entry);
+	data.args[arg] = Value(entry.value);
 }
 
 // --- the operations of a node (spec 118) ----------------------------------------------------------------------------
@@ -160,6 +370,129 @@ arena_ptr<TransformResultValue> FinalizeMigrate(PEGTransformer &transformer, Par
 	return MgmtResult(transformer, std::move(data));
 }
 
+// --- roles, administration, mappings, view-as (specs 009, 095, 117, 120) ---------------------------------------------
+
+//! The keyword a rule's optional part holds, '' when absent
+string OptionalKeyword(ListParseResult &list, idx_t index) {
+	auto &part = list.Child<OptionalParseResult>(index);
+	return part.HasResult() ? KeywordOf(part.GetResult()) : string();
+}
+
+// AclCreateRole <- 'CREATE' AclOrReplace? 'ROLE' AclIfNotExists? AclName AclRoleClaims?
+arena_ptr<TransformResultValue> FinalizeCreateRole(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_define_role");
+	string mode = OptionalKeyword(list, 1) == "or" ? "replace" : "create";
+	if (OptionalKeyword(list, 3) == "if" && mode == "create") {
+		mode = "skip";
+	}
+	data->args.emplace_back(NameOf(list.GetChild(4), "a role name"));
+	data->args.emplace_back(string());
+	auto &claims = list.Child<OptionalParseResult>(5);
+	if (claims.HasResult()) {
+		// AclRoleClaims <- 'CLAIMS' AclClaims
+		ClaimsInto(transformer, Strip(claims.GetResult()).Cast<ListParseResult>().GetChild(1), 1, *data);
+	}
+	data->args.emplace_back(mode);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterRoleComment <- 'ALTER' 'ROLE' AclName 'SET' 'COMMENT' AclQuotedValue (spec 120)
+arena_ptr<TransformResultValue> FinalizeAlterRoleComment(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_comment_role");
+	data->args.emplace_back(NameOf(list.GetChild(2), "a role name"));
+	data->args.emplace_back(Quoted(transformer, list, 5, "comment", *data));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterRoleClaims <- 'ALTER' 'ROLE' AclName 'SET' 'CLAIMS' AclClaims
+arena_ptr<TransformResultValue> FinalizeAlterRoleClaims(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_alter_role");
+	data->args.emplace_back(NameOf(list.GetChild(2), "a role name"));
+	data->args.emplace_back(string());
+	ClaimsInto(transformer, list.GetChild(5), 1, *data);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclDropRole <- 'DROP' 'ROLE' AclIfExists? AclName - `IF EXISTS` says nothing-to-drop is not an error (spec 010)
+arena_ptr<TransformResultValue> FinalizeDropRole(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_drop_role");
+	data->args.emplace_back(NameOf(list.GetChild(3), "a role name"));
+	data->args.emplace_back(OptionalKeyword(list, 2) == "if" ? "skip" : "");
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantAdmin <- 'GRANT' 'ADMIN' AclWordToken 'TO' 'ROLE' AclName - the GLOBAL scope (a catalog's manage is a
+// catalog grant's capability)
+arena_ptr<TransformResultValue> FinalizeGrantAdmin(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_grant_admin");
+	data->args.emplace_back(NameOf(list.GetChild(5), "a role name"));
+	data->args.emplace_back(TokenOf(list.GetChild(2)).text);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeAdmin <- 'REVOKE' 'ADMIN' 'FROM' 'ROLE' AclName: every administration of the role
+arena_ptr<TransformResultValue> FinalizeRevokeAdmin(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_admin");
+	data->args.emplace_back(NameOf(list.GetChild(4), "a role name"));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeAdminScope <- 'REVOKE' 'ADMIN' AclWordToken 'FROM' 'ROLE' AclName: one bundle (spec 117)
+arena_ptr<TransformResultValue> FinalizeRevokeAdminScope(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_admin");
+	data->args.emplace_back(NameOf(list.GetChild(5), "a role name"));
+	data->args.emplace_back(TokenOf(list.GetChild(2)).text);
+	return MgmtResult(transformer, std::move(data));
+}
+
+//! AclMapping <- AclMapKind AclQuotedValue 'FROM' AclMapScope AclNameValue 'TO' 'ROLE' AclName (spec 095)
+void MappingInto(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
+	auto &list = Strip(result).Cast<ListParseResult>();
+	auto is_group = KeywordOf(list.GetChild(0)) == "group";
+	auto external = Quoted(transformer, list, 1, "external value", data);
+	auto kind = KeywordOf(list.GetChild(3));
+	auto scope =
+	    NameValueOf(transformer, list.GetChild(4), kind == "client" ? "a client name" : "an issuer name", data);
+	auto role = NameOf(list.GetChild(7), "a role name");
+	data.args = {Value(kind), Value(scope), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)};
+}
+
+// AclMapRole <- 'MAP' AclMapping
+arena_ptr<TransformResultValue> FinalizeMapRole(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto data = Call("acl_map_role");
+	MappingInto(transformer, parse_result.Cast<ListParseResult>().GetChild(1), *data);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclDropMap <- 'DROP' 'MAP' AclMapping
+arena_ptr<TransformResultValue> FinalizeDropMap(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto data = Call("acl_drop_role_mapping");
+	MappingInto(transformer, parse_result.Cast<ListParseResult>().GetChild(2), *data);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclViewAs <- 'SET' 'SESSION' 'VIEW' 'AS' 'ROLE' AclNameValue (spec 120.3): this session, as role r, metadata only
+arena_ptr<TransformResultValue> FinalizeViewAs(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_session_view_as");
+	data->args.emplace_back(NameValueOf(transformer, list.GetChild(5), "a role", *data));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclResetViewAs <- 'RESET' 'SESSION' 'VIEW' 'AS': back to the session's own principal
+arena_ptr<TransformResultValue> FinalizeResetViewAs(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto data = Call("acl_session_view_as");
+	data->args.emplace_back(string());
+	return MgmtResult(transformer, std::move(data));
+}
+
 // --- a statement no rule reads yet ------------------------------------------------------------------------------
 
 // AclMgmtLegacy <- AclTailToken+ : its span, for the management compiler
@@ -224,6 +557,65 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclSchemaPart <- '.' Identifier"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclMigrateCatalog <- 'MIGRATE' 'POLICY' 'CATALOG' Identifier AclSchemaPart?", Start<FinalizeMigrate>));
+		// the values the compiler's scanner read, on duckdb's tokens: a word, a double-quoted name, either; a list's
+		// items
+		changes.push_back(GrammarChange::AddRule("AclWordToken <- Identifier"));
+		changes.push_back(
+		    GrammarChange::AddTerminalRuleOverride("AclWordToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::WORD);
+		    }));
+		changes.push_back(GrammarChange::AddRule("AclNameToken <- Identifier"));
+		changes.push_back(
+		    GrammarChange::AddTerminalRuleOverride("AclNameToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::NAME);
+		    }));
+		changes.push_back(GrammarChange::AddRule("AclDottedToken <- Identifier"));
+		changes.push_back(GrammarChange::AddTerminalRuleOverride(
+		    "AclDottedToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::DOTTED);
+		    }));
+		changes.push_back(GrammarChange::AddRule("AclListToken <- Identifier"));
+		changes.push_back(
+		    GrammarChange::AddTerminalRuleOverride("AclListToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::LIST_ITEM);
+		    }));
+		changes.push_back(GrammarChange::AddRule("AclName <- AclNameToken"));
+		changes.push_back(GrammarChange::AddRule("AclNameValue <- StringLiteral / AclDottedToken / Identifier"));
+		changes.push_back(GrammarChange::AddRule("AclListItem <- AclParenList / AclListToken"));
+		changes.push_back(GrammarChange::AddRule("AclParenList <- '(' AclListItem* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclClaims <- AclParenList / AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclOrReplace <- 'OR' 'REPLACE'"));
+		changes.push_back(GrammarChange::AddRule("AclIfNotExists <- 'IF' 'NOT' 'EXISTS'"));
+		changes.push_back(GrammarChange::AddRule("AclIfExists <- 'IF' 'EXISTS'"));
+		// roles, administration, mappings, view-as
+		changes.push_back(GrammarChange::AddRule("AclRoleClaims <- 'CLAIMS' AclClaims"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclCreateRole <- 'CREATE' AclOrReplace? 'ROLE' AclIfNotExists? AclName AclRoleClaims?",
+		    Start<FinalizeCreateRole>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclAlterRoleComment <- 'ALTER' 'ROLE' AclName 'SET' 'COMMENT' AclQuotedValue",
+		                           Start<FinalizeAlterRoleComment>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclAlterRoleClaims <- 'ALTER' 'ROLE' AclName 'SET' 'CLAIMS' AclClaims", Start<FinalizeAlterRoleClaims>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclDropRole <- 'DROP' 'ROLE' AclIfExists? AclName", Start<FinalizeDropRole>));
+		changes.push_back(GrammarChange::AddRule("AclGrantAdmin <- 'GRANT' 'ADMIN' AclWordToken 'TO' 'ROLE' AclName",
+		                                         Start<FinalizeGrantAdmin>));
+		changes.push_back(GrammarChange::AddRule("AclRevokeAdmin <- 'REVOKE' 'ADMIN' 'FROM' 'ROLE' AclName",
+		                                         Start<FinalizeRevokeAdmin>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclRevokeAdminScope <- 'REVOKE' 'ADMIN' AclWordToken 'FROM' 'ROLE' AclName",
+		                           Start<FinalizeRevokeAdminScope>));
+		changes.push_back(GrammarChange::AddRule("AclMapKind <- 'GROUP' / 'CLAIM'"));
+		changes.push_back(GrammarChange::AddRule("AclMapScope <- 'CLIENT' / 'ISSUER'"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclMapping <- AclMapKind AclQuotedValue 'FROM' AclMapScope AclNameValue 'TO' 'ROLE' AclName"));
+		changes.push_back(GrammarChange::AddRule("AclMapRole <- 'MAP' AclMapping", Start<FinalizeMapRole>));
+		changes.push_back(GrammarChange::AddRule("AclDropMap <- 'DROP' 'MAP' AclMapping", Start<FinalizeDropMap>));
+		changes.push_back(GrammarChange::AddRule("AclViewAs <- 'SET' 'SESSION' 'VIEW' 'AS' 'ROLE' AclNameValue",
+		                                         Start<FinalizeViewAs>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclResetViewAs <- 'RESET' 'SESSION' 'VIEW' 'AS'", Start<FinalizeResetViewAs>));
 		// a statement no rule reads yet: its tokens, to the management compiler
 		changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
 		changes.push_back(
@@ -233,12 +625,62 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclMgmtLegacy <- AclTailToken+", Start<FinalizeLegacy>));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclMgmtStatement <- AclKillSession / AclSessionAuditLevel / AclProfileSession / AclNodeOperation / "
-		    "AclMigrateCatalog / AclMgmtLegacy"));
+		    "AclMigrateCatalog / AclCreateRole / AclAlterRoleComment / AclAlterRoleClaims / AclDropRole / "
+		    "AclGrantAdmin / AclRevokeAdmin / AclRevokeAdminScope / AclMapRole / AclDropMap / AclViewAs / "
+		    "AclResetViewAs / AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
 	}
 };
+
+//! A claims list's text between its parentheses for the compiler's `ClaimsListToCsv`: as written with each comment a
+//! space - that reader keeps a name and an unquoted value as written (`custom:tenant`, `-1`), and a comment would be
+//! read as part of the list (`(region = 'eu' -- , tenant = 'x'` set tenant). That reader knows `'…'` and `"…"` only:
+//! a literal the tokenizer reads otherwise (`E'…'`, `$$…$$`, a backtick name) would split into other claims than
+//! written, so it is refused until the list is a rule (stage 4), as is a text the tokens do not tile
+string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
+	auto refuse = [](const char *why) {
+		throw BinderException("acl admin: a claims list is written as name = 'value' items - %s", why);
+	};
+	if (start == 0 || text[start - 1] != '(' || end >= text.size() || text[end] != ')') {
+		refuse("its text does not read as written"); // a parenthesis placed at another token's offset
+	}
+	auto first = grammar::TokenIndexAt(tokens, start - 1); // the list's `(`
+	string inside;
+	optional_idx previous_end;
+	for (idx_t index = first.IsValid() ? first.GetIndex() : 0; index < tokens.Size(); index++) {
+		auto &token = tokens.GetToken(index);
+		if (token.offset < start) {
+			continue;
+		}
+		if (token.offset >= end || token.type == TokenType::END_OF_INPUT) {
+			break;
+		}
+		if (token.type == TokenType::STRING_LITERAL && (token.text.empty() || token.text[0] != '\'')) {
+			refuse("a value is in single quotes (E'...' and $$...$$ are not read as one value here yet)");
+		}
+		if (!token.text.empty() && token.text[0] == '`') {
+			refuse("a backtick name is not read as one name here");
+		}
+		if (previous_end.IsValid()) {
+			auto gap_start = previous_end.GetIndex();
+			if (token.offset < gap_start) {
+				refuse("its text does not read as written");
+			}
+			auto gap = text.substr(gap_start, token.offset - gap_start);
+			auto blank = gap;
+			StringUtil::Trim(blank);
+			if (!blank.empty() && !StringUtil::StartsWith(blank, "--") && !StringUtil::StartsWith(blank, "/*")) {
+				refuse("its text does not read as written");
+			}
+			inside += blank.empty() ? gap : " ";
+		}
+		inside += text.substr(token.offset, token.length);
+		previous_end = token.offset + token.length;
+	}
+	return inside;
+}
 
 } // namespace
 
@@ -311,6 +753,9 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			parsed.function = data.function;
 			parsed.args = data.args;
 			parsed.current_session = data.current_session;
+			for (auto &span : data.claims_lists) {
+				parsed.claims_lists.emplace_back(span.arg, ClaimsListText(text, tokens, span.start, span.end));
+			}
 		}
 		result.push_back(std::move(parsed));
 	}
