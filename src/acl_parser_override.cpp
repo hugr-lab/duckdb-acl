@@ -10,6 +10,7 @@
 #include "acl_rewriter.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -97,7 +98,7 @@ AclPrefix ReadAclPrefix(AclGrammarCache &grammar, const string &query, ParserOpt
 	}
 	using MarkerKind = GrammarPrefix::MarkerKind;
 	// a marker is written once whatever its value - an empty one included
-	bool written[static_cast<uint8_t>(MarkerKind::LINEAGE_JOB) + 1] = {};
+	bool written[GrammarPrefix::MARKER_KINDS] = {};
 	for (auto &marker : head.markers) {
 		auto &seen = written[static_cast<uint8_t>(marker.kind)];
 		if (seen) {
@@ -222,13 +223,15 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 //! A parse error of the rest carries the offset of what was parsed, and duckdb draws it under the whole text - the
 //! prefix, a token or a session handle included, the caret in the wrong place (the 2026-10-24 review). Drawn here
 //! against the text that was parsed, or - a compiler's own segment - not drawn at all.
+//! With errors as JSON the position is left as it is: duckdb sends it unrendered, and it counts in the client's
+//! own text - the rest.
 template <class FUNC>
-void ParseOfRest(const string *parsed, FUNC &&parse) {
+void ParseOfRest(const string *parsed, bool errors_as_json, FUNC &&parse) {
 	try {
 		parse();
 	} catch (ParserException &ex) {
 		ErrorData error(ex);
-		if (error.ExtraInfo().find("position") == error.ExtraInfo().end()) {
+		if (errors_as_json || error.ExtraInfo().find("position") == error.ExtraInfo().end()) {
 			throw;
 		}
 		if (parsed) {
@@ -240,6 +243,24 @@ void ParseOfRest(const string *parsed, FUNC &&parse) {
 		info.erase("location");
 		throw ParserException(info, error.RawMessage());
 	}
+}
+
+bool ErrorsAsJson(const ParserOptions &options) {
+	return options.context && Settings::Get<ErrorsAsJSONSetting>(*options.context);
+}
+
+//! Whatever else leaves the override carrying a position of some text of its own is drawn by duckdb under the whole
+//! text - the prefix included: the position is dropped (a parse of the rest drew its own, ParseOfRest). Called from a
+//! handler, it rethrows what that handler holds.
+[[noreturn]] void RethrowUnlocated(std::exception &ex, bool errors_as_json) {
+	ErrorData error(ex);
+	auto info = error.ExtraInfo();
+	if (errors_as_json || (info.find("position") == info.end() && info.find("location") == info.end())) {
+		throw;
+	}
+	info.erase("position");
+	info.erase("location");
+	throw Exception(info, error.Type(), error.RawMessage());
 }
 
 //! spec 120.3: the one refusal of a view-as session outside the rewriter
@@ -749,7 +770,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// manages only for a principal it knows as an administrator (tresor spec 009)
 		audit.phase = Reason::PARSE;
 		vector<unique_ptr<SQLStatement>> statements;
-		ParseOfRest(nullptr, [&]() { statements = ParseSecretsBatch(prefix.rest, store); });
+		ParseOfRest(nullptr, ErrorsAsJson(options), [&]() { statements = ParseSecretsBatch(prefix.rest, store); });
 		for (auto &stmt : statements) {
 			// the execution must find its decision (spec 074's note, matched by the text the statement
 			// carries): that note is what puts the session on the connection while the service's call
@@ -766,7 +787,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
 		audit.phase = Reason::PARSE;
 		vector<unique_ptr<SQLStatement>> statements;
-		ParseOfRest(nullptr, [&]() { statements = ParseMgmtBatch(prefix.rest, audit.proto.session); }); // CURRENT: ours
+		ParseOfRest(nullptr, ErrorsAsJson(options), // CURRENT is this session
+		            [&]() { statements = ParseMgmtBatch(prefix.rest, audit.proto.session); });
 		if (!viewing.empty() && !OnlyViewAsCalls(statements)) {
 			RefuseInViewAs();
 		}
@@ -808,14 +830,15 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	vector<unique_ptr<SQLStatement>> statements;
 	bool attach_lineage = false;
 	if (mode == AclPrefix::Mode::NATIVE) {
-		ParseOfRest(nullptr, [&]() { attach_lineage = ParseAttachLineage(prefix.rest, inner, statements); });
+		ParseOfRest(nullptr, ErrorsAsJson(options),
+		            [&]() { attach_lineage = ParseAttachLineage(prefix.rest, inner, statements); });
 	}
 	if (!attach_lineage) {
 		AclParseGuard guard;
 		Parser parser(inner);
 		// spec 114: `USE SCHEMA s` - a form duckdb's grammar lacks - is the session's default schema
 		auto rest = mode == AclPrefix::Mode::QUERY ? UseSchemaAsSet(prefix.rest) : prefix.rest;
-		ParseOfRest(&rest, [&]() { parser.ParseQuery(rest); });
+		ParseOfRest(&rest, ErrorsAsJson(options), [&]() { parser.ParseQuery(rest); });
 		statements = std::move(parser.statements);
 	}
 
@@ -980,7 +1003,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		// counted as one: nobody is known yet, so it is the gateway's, and a parse
 		StatementAudit audit(store.audit.get());
 		audit.Denied(ex);
-		throw;
+		RethrowUnlocated(ex, ErrorsAsJson(options));
 	}
 	if (prefix.kind == AclPrefix::Kind::NONE) {
 		// The one thing we do to a statement nobody prefixed - and only while a door of ours is open.
@@ -1022,7 +1045,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		return result;
 	} catch (std::exception &ex) {
 		audit.Denied(ex);
-		throw;
+		RethrowUnlocated(ex, ErrorsAsJson(options));
 	}
 }
 

@@ -797,6 +797,10 @@ Before a node serves anyone:
       unprefixed statement is unrestricted; this is the perimeter.
 - [ ] `allow_parser_override_extension` is `STRICT` (set on load; verify nobody set it before
       loading, and nobody runs `SET GLOBAL … = 'DEFAULT'`).
+- [ ] A gateway validates a client's text as UTF-8 before it composes the prefix: DuckDB checks the
+      whole text before any extension sees it and draws that error under the whole text, the
+      prefix - a token - included (spec 150). The doors are not exposed: Flight and quack refuse
+      such bytes before they compose.
 - [ ] A policy catalog is configured (`acl_use_db`); memory mode is the dev stub.
 - [ ] `acl_allow_anonymous_admin` is **off** once the first `passthrough` admin exists; the doors
       refuse to open while it is on.

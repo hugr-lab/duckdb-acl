@@ -24,6 +24,8 @@ namespace acl {
 struct GrammarPrefix {
 	enum class Kind : uint8_t { ROLE, TOKEN, SESSION, INGEST, ADMIN };
 	enum class MarkerKind : uint8_t { TRACE, PARENT, LINEAGE_PARENT, LINEAGE_ROOT, LINEAGE_JOB };
+	//! how many marker kinds there are - LINEAGE_JOB is the last
+	static constexpr uint8_t MARKER_KINDS = static_cast<uint8_t>(MarkerKind::LINEAGE_JOB) + 1;
 	//! a marker, in the order written
 	struct Marker {
 		MarkerKind kind;

@@ -118,7 +118,11 @@ loses its position instead; the head's own syntax error never quotes the text. A
 statements 1.04-1.06 s (the scanner's 1.02-1.12 s): the text is tokenized for the head and again for the rest. The
 management statements and the batch's checks (`SplitBatchText`, `StartsWithMgmt`, `RefuseRepeatedPrefix`) stay read by
 hand until stage 3; `ACL ROLE "r" ; ACL ROLE "x" …` ends as a syntax error, not as "one ACL prefix per batch".
-A client's `ROOT` / `PARENT` right after a door's `LINEAGE JOB` joins that LINEAGE marker, as it did. The scanner, the
+A client's `ROOT` / `PARENT` right after a door's `LINEAGE JOB` joins that LINEAGE marker, as it did. Any other error
+leaving the override drops a position of its own (it would be drawn under the whole text); with `errors_as_json` the
+positions stay, unrendered, counted in the client's own text. One error is not ours to draw: duckdb validates the
+whole text as UTF-8 before any override runs, and draws a failure under it, the prefix included - a gateway validates
+before it composes (security.md's checklist); the doors refuse such bytes before they compose. The scanner, the
 stage 1 path and `acl_peg_prefix` are gone. The registered `acl` grammar (completion) has
 `AclTail <- Statement`, so the CLI offers the statements after the prefix. A prefix in a position where duckdb's
 grammar takes a `Statement` - `PREPARE p AS ACL ROLE …`, a CTE body, a CTAS - parses to our statement (on a connection

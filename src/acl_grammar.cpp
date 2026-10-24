@@ -449,7 +449,7 @@ bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &optio
 		auto word = first.IsValid() ? StringUtil::Lower(tokens.GetToken(first.GetIndex()).text) : string();
 		bool after_lineage = !data.markers.empty() && data.markers.back().kind != GrammarPrefix::MarkerKind::TRACE &&
 		                     data.markers.back().kind != GrammarPrefix::MarkerKind::PARENT;
-		if (word == "trace" || word == "parent") {
+		if (word == "trace" || (word == "parent" && !after_lineage)) {
 			throw ParserException("acl_rewrite: ACL %s requires a quoted value", StringUtil::Upper(word));
 		}
 		if (word == "lineage") {
@@ -461,7 +461,7 @@ bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &optio
 			}
 			throw ParserException("acl_rewrite: ACL LINEAGE needs PARENT, ROOT or JOB");
 		}
-		if (after_lineage && (word == "root" || word == "job")) {
+		if (after_lineage && (word == "parent" || word == "root" || word == "job")) {
 			throw ParserException("acl_rewrite: ACL LINEAGE %s requires a quoted value", StringUtil::Upper(word));
 		}
 	}

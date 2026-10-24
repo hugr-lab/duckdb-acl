@@ -185,6 +185,11 @@ ACL ROLE "analyst" LINEAGE JOB 'j' ROOT SELECT 1;
 ACL LINEAGE ROOT requires a quoted value
 
 statement error
+ACL ROLE "analyst" LINEAGE JOB 'j' PARENT SELECT 1;
+----
+ACL LINEAGE PARENT requires a quoted value
+
+statement error
 ACL ROLE "analyst" TRACE 'a'
 'b' SELECT 1;
 ----
@@ -247,6 +252,13 @@ statement error
 ACL ROLE "analyst" SELECT , FROM sales;
 ----
 <!REGEX>:.*ACL ROLE.*
+
+# the same through a compiler's own segments: ATTACH … LINEAGE under ACL NATIVE parses each piece on its own, and its
+# error loses its position rather than being drawn under the prefix
+statement error
+ACL ADMIN ACL NATIVE ATTACH ':memory:' AS lineage_x LINEAGE 'pg://h/db'; SELECT , 1;
+----
+<!REGEX>:.*ACL ADMIN.*
 
 # a prefix with no statement of its own, a separator right after it, the batch under one prefix
 statement ok
