@@ -226,8 +226,16 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   whose scanner knows `'…'`, `"…"` and whitespace only: once it compiles, a comment inside it, a `$$…$$` string, an
   `E'…'` one with a backslash or a backtick name refuses it (`MgmtParsed::unreadable`, `LegacyUnreadable`) -
   `GRANT CATALOG c TO ROLE r WITH (select, /*, manage, */ insert)` stored `manage` (found in review; a statement
-  that does not compile keeps its own refusal; comments before, between and after statements are untouched). A
-  body whose parentheses do not balance was cut by a `;` inside them and is refused (`AS SELECT (1; …`).
+  that does not compile keeps its own refusal; comments before, between and after statements are untouched). A body
+  is read as what it is before anything of the batch runs (`JudgeBody`: a view's SQL and a table function's template
+  one statement, a scalar's template an expression list, duckdb's parser): a body a `;` cut (`AS SELECT [1; …`,
+  `CASE … ; … END`) does not parse and is refused, and an unparseable body is never stored (it used to be, under an
+  operator, and failed at its first read).
+  Found in the same review and left to the family that moves the form (each a fix with its test there): 3d - the WITH
+  list's JSON is built without escaping (`\u006danage` stores manage), `ParseCaps` reads a key up to a NUL and counts
+  a duplicate key true if any is; 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside quotes; 3b's
+  `ClaimsListToCsv` splits at an `=` inside a quoted name (stage 4's rule); 3g - `UseSchemaAsSet`'s own comment
+  reader (`--` ends at `\n` only, `/* */` not nested).
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.

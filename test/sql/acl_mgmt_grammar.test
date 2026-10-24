@@ -1176,13 +1176,31 @@ GADGET
 statement ok
 ACL ADMIN GRANT CATALOG hidden TO ROLE hider WITH (select) MAIN;
 
-# a body whose parentheses do not balance was cut by a `;` inside them - never stored as the body
+# a body is read as what it is - one statement, one expression - before anything of the batch runs: a `;` ends a
+# statement wherever it stands outside a literal, so a body cut by one does not parse and is never stored, and the
+# statements after it never run
 statement error
 ACL ADMIN CREATE VIRTUAL VIEW hidden.v AS SELECT (1; CREATE VIRTUAL VIEW hidden.w AS SELECT 2);
 ----
-a body's parentheses do not balance
+view SQL does not parse
 
-query I
-SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'hidden';
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW hidden.v AS SELECT [1; DROP VIRTUAL CATALOG hidden CASCADE; CREATE VIRTUAL VIEW hidden.w AS SELECT 2];
 ----
-0
+view SQL does not parse
+
+statement error
+ACL ADMIN ADD SCALAR hidden.s(x INTEGER) MACRO CASE WHEN acl_arg(1) > 0 THEN 1; DROP VIRTUAL CATALOG hidden CASCADE;
+----
+expression template does not parse
+
+statement error
+ACL ADMIN ALTER VIRTUAL VIEW hidden.nothing SET AS SELECT 1; SELECT 2;
+----
+a batch mixing management statements and queries
+
+query II
+SELECT (SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'hidden'),
+       (SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'hidden');
+----
+0	1

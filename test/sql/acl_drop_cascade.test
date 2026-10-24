@@ -39,7 +39,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.report AS phys.main.report_fn;
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.report AS SELECT 1 AS x;
 
 statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE c.by_customer FROM customers TO orders ON (id = cust);
@@ -147,7 +147,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE g MAIN;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.solo AS phys.main.solo_fn;
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.solo AS SELECT 1 AS x;
 
 statement ok
 ACL ADMIN GRANT OBJECT c.solo TO ROLE g WITH (select);
@@ -170,7 +170,7 @@ statement ok
 ACL ADMIN GRANT TABLE c.orders TO ROLE g WITH (select);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders AS phys.main.report_fn;
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders AS SELECT 1 AS x;
 
 statement ok
 ACL ADMIN DROP VIRTUAL TABLE FUNCTION c.orders;
@@ -189,7 +189,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.vs.inner AS phys.lake.events;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.vs.fn AS phys.lake.fn;
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.vs.fn AS SELECT 1 AS x;
 
 statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE c.crosses FROM c.vs.inner TO orders ON (id = id);

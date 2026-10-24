@@ -8,6 +8,7 @@
 #include "acl_grammar_util.hpp"
 #include "acl_name_path.hpp"
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/grammar_change.hpp"
 #include "duckdb/parser/grammar_extension.hpp"
@@ -65,6 +66,8 @@ struct MgmtParseData : ParserExtensionParseData {
 		bool resolved = false;
 		string text;
 		string what;
+		//! a body that is an expression (a scalar's template), not a statement
+		bool expression = false;
 	};
 	vector<Span> spans;
 
@@ -458,7 +461,7 @@ void ClaimsInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, Mgm
 
 //! `AclBody <- AclTailToken+` into argument `arg`: a body written either way - inline to the end of the statement
 //! (what a human writes) or as one quoted string (what a gateway generates), read once the tokens are known
-void BodyInto(ParseResult &result, idx_t arg, const char *what, MgmtParseData &data) {
+void BodyInto(ParseResult &result, idx_t arg, const char *what, bool expression, MgmtParseData &data) {
 	MgmtParseData::Span span;
 	span.arg = arg;
 	span.kind = MgmtParsed::TextKind::TEXT;
@@ -466,6 +469,7 @@ void BodyInto(ParseResult &result, idx_t arg, const char *what, MgmtParseData &d
 	span.sql = true;
 	RepeatSpan(result, span.start, span.end, "a body");
 	span.what = what;
+	span.expression = expression;
 	data.spans.push_back(std::move(span));
 }
 
@@ -816,7 +820,7 @@ arena_ptr<TransformResultValue> FinalizeCreateView(PEGTransformer &transformer, 
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(5)), vcat, vname);
 	data->args = {Value(vcat), Value(vname)};
-	BodyInto(list.GetChild(9), AddArg(*data), "view SQL", *data);
+	BodyInto(list.GetChild(9), AddArg(*data), "view SQL", false, *data);
 	OptionalParensInto(list, 6, AddArg(*data), *data);
 	auto comment = AddArg(*data);
 	data->args.emplace_back(CreateMode(list, 1, 4));
@@ -899,7 +903,7 @@ arena_ptr<TransformResultValue> FinalizeCreateFunction(PEGTransformer &transform
 	// AclAsBody <- 'AS' AclBody
 	data->function = scalar ? "acl_add_scalar" : "acl_add_table_function";
 	data->args = {Value(vcat), Value(vname)};
-	BodyInto(definition.GetChild(1), AddArg(*data), scalar ? "expression template" : "SQL template", *data);
+	BodyInto(definition.GetChild(1), AddArg(*data), scalar ? "expression template" : "SQL template", scalar, *data);
 	OptionalParensInto(list, 6, AddArg(*data), *data);
 	ReturnsInto(list, 7, scalar, AddArg(*data), *data);
 	data->args.emplace_back(comment);
@@ -954,7 +958,7 @@ arena_ptr<TransformResultValue> FinalizeAddView(PEGTransformer &transformer, Par
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
 	data->args = {Value(vcat), Value(vname)};
-	BodyInto(list.GetChild(5), AddArg(*data), "view SQL", *data);
+	BodyInto(list.GetChild(5), AddArg(*data), "view SQL", false, *data);
 	OptionalParensInto(list, 3, AddArg(*data), *data);
 	return MgmtResult(transformer, std::move(data));
 }
@@ -989,7 +993,7 @@ arena_ptr<TransformResultValue> FinalizeAddFunction(PEGTransformer &transformer,
 	}
 	// AclAddMacro <- 'MACRO' AclBody
 	data->function = scalar ? "acl_add_scalar" : "acl_add_table_function";
-	BodyInto(definition.GetChild(1), AddArg(*data), scalar ? "expression template" : "SQL template", *data);
+	BodyInto(definition.GetChild(1), AddArg(*data), scalar ? "expression template" : "SQL template", scalar, *data);
 	OptionalParensInto(list, 3, AddArg(*data), *data);
 	ReturnsInto(list, 4, scalar, AddArg(*data), *data);
 	return MgmtResult(transformer, std::move(data));
@@ -1080,7 +1084,8 @@ void ObjectChangeInto(PEGTransformer &transformer, ParseResult &result, const ch
 		bool macro = name == "AclSetMacro";
 		data.args.emplace_back(macro ? "macro" : "alias");
 		if (macro) {
-			BodyInto(parts.GetChild(2), AddArg(data), "definition", data);
+			BodyInto(parts.GetChild(2), AddArg(data), "definition", StringUtil::CIEquals(function_kind, "scalar"),
+			         data);
 		} else {
 			data.args.emplace_back(PathNameOf(transformer, parts.GetChild(3), "a target function", data));
 		}
@@ -1090,7 +1095,7 @@ void ObjectChangeInto(PEGTransformer &transformer, ParseResult &result, const ch
 	if (name == "AclSetBody") {
 		// AclSetBody <- 'SET' 'AS' AclBody
 		data.args.emplace_back("view");
-		BodyInto(parts.GetChild(2), AddArg(data), "view SQL", data);
+		BodyInto(parts.GetChild(2), AddArg(data), "view SQL", false, data);
 	} else if (name == "AclSetPhys") {
 		// AclSetPhys <- 'SET' 'PHYS' AclPathName
 		data.args.emplace_back("phys");
@@ -1759,20 +1764,31 @@ string BodyText(const string &text, const TokenIterator &tokens, idx_t start, id
 			return value;
 		}
 	}
-	// a `;` ends a statement wherever it stands outside a literal: a body whose parentheses do not balance was cut by
-	// one (`AS SELECT (1; …`) - never stored as the body
-	int64_t depth = 0;
-	auto body = TokensText(text, tokens, start, end, false, true, TILING_REFUSAL, [&depth](const MatcherToken &token) {
-		if (token.text == "(") {
-			depth++;
-		} else if (token.text == ")" && --depth < 0) {
-			throw BinderException("acl admin: a body's parentheses do not balance");
+	return TokensText(text, tokens, start, end, false, true, TILING_REFUSAL, [](const MatcherToken &) {});
+}
+
+//! A body read as what it is - one statement (a view's SQL, a table function's template) or one expression list (a
+//! scalar's template, spec 148 judges the rest where it is written) - before anything of the batch runs: a `;` ends a
+//! statement wherever it stands outside a literal, so a body cut by one (`AS SELECT [1; …`, `CASE … ; … END`) does
+//! not parse, and a broken body is never stored
+void JudgeBody(const string &body, const string &what, bool expression, const ParserOptions &options) {
+	ParserOptions inner = options;
+	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+	Parser parser(inner);
+	idx_t statements = 1;
+	try {
+		if (expression) {
+			parser.ParseExpressionList(body);
+		} else {
+			parser.ParseQuery(body);
+			statements = parser.statements.size();
 		}
-	});
-	if (depth != 0) {
-		throw BinderException("acl admin: a body's parentheses do not balance - a `;` inside them ends the statement");
+	} catch (ParserException &error) {
+		throw BinderException("acl admin: %s does not parse - %s", what, ErrorData(error).RawMessage());
 	}
-	return body;
+	if (statements != 1) {
+		throw BinderException("acl admin: %s is one statement, not %llu", what, statements);
+	}
 }
 
 } // namespace
@@ -1897,6 +1913,8 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			parsed.legacy = true;
 			parsed.text =
 			    text.substr(tokens.GetToken(start).offset, last.offset + last.length - tokens.GetToken(start).offset);
+			parsed.unreadable =
+			    LegacyUnreadable(text, tokens, tokens.GetToken(start).offset, last.offset + last.length);
 			result.push_back(std::move(parsed));
 			cursor.SetPosition(end);
 			while (cursor.Current() && cursor.Current()->type == TokenType::TERMINATOR) {
@@ -1938,6 +1956,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 					value = span.text;
 				} else if (span.body) {
 					value = BodyText(text, tokens, span.start, span.end, span.what);
+					JudgeBody(value, span.what, span.expression, options);
 				} else if (span.kind == MgmtParsed::TextKind::CLAIMS) {
 					value = ClaimsListText(text, tokens, span.start, span.end);
 				} else {

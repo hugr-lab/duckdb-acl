@@ -56,11 +56,18 @@ same one as spec 082) and are named by it; the policy keeps the secret's name. W
 
 ```sql
 ACL ADMIN CREATE ISSUER 'https://kc/realms/x'
-    AUDIENCES ('account')                       -- required: the token's aud must be one of them
-    ROLE CLAIM 'realm_access.roles'             -- where the role values are (default 'roles')
-    CLAIM MAP (tid => tenant)                   -- jwt path => acl_claim name
-    CLIENT ID 'acl-desktop';                    -- optional: what drivers log in as
+    AUDIENCES ('account')
+    ROLE CLAIM 'realm_access.roles'
+    CLAIM MAP (tid => tenant)
+    CLIENT ID 'acl-desktop';
 ```
+
+- `AUDIENCES` - required: the token's `aud` must be one of them.
+- `ROLE CLAIM` - where the role values are (default `'roles'`).
+- `CLAIM MAP` - JWT path `=>` the name `acl_claim` reads.
+- `CLIENT ID` - optional: what drivers log in as.
+
+A comment inside this statement is refused for now - put notes before or after it.
 
 A quoted URL in place of a name is the short form. It creates the issuer, named by its URL, and its
 **implicit client** of the same name: the audiences, the role claim, the claim map, the client id -
