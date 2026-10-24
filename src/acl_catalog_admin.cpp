@@ -1982,7 +1982,7 @@ void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, con
                                      const string &caps_json, const string &comment, const string &into,
                                      bool virtual_only) {
 	RequireCatalog(catalog, "acl_grant_schema");
-	if (acl_detail::ParseCaps(caps_json).count("manage")) {
+	if (acl_detail::ParseCaps(caps_json, true).count("manage")) {
 		throw BinderException("acl admin: `manage` is granted per catalog, not per schema - administering the ACL is "
 		                      "catalog-scoped (spec 009)");
 	}
@@ -2417,8 +2417,8 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 	if (vcat.empty()) {
 		throw BinderException("acl admin: a grant needs a catalog name");
 	}
-	acl_detail::ParseCaps(caps_json); // validate before persisting
-	if (judge_columns) {              // only where the list itself is being written - never re-judging a stored one
+	acl_detail::ParseCaps(caps_json, true); // validate before persisting
+	if (judge_columns) { // only where the list itself is being written - never re-judging a stored one
 		ValidateGrantColumns(*catalog, vcat, columns, "");
 	}
 	// the verdict is read on the connection that writes it (spec 027), so what it judges the predicate
@@ -3751,7 +3751,7 @@ void PolicyStore::CatalogCheckObjectCaps(const string &vcat, const string &vname
 	// spec 032: a capability that cannot apply to what it names is a misunderstanding, not a no-op, and
 	// the refusal belongs here rather than in the pre-check - the legacy wrappers write a grant without
 	// passing through that one.
-	auto caps = acl_detail::ParseCaps(caps_json);
+	auto caps = acl_detail::ParseCaps(caps_json, true);
 	if (caps.count("manage")) {
 		throw BinderException("acl admin: `manage` is granted per catalog, not per object - administering the ACL is "
 		                      "catalog-scoped (spec 009)");
@@ -3915,7 +3915,7 @@ vector<PolicyStore::GrantCheckRow> PolicyStore::CatalogCheckGrant(const string &
 		    if (object) {
 			    CatalogCheckObjectCaps(vcat, vname, caps_json);
 		    } else {
-			    acl_detail::ParseCaps(caps_json);
+			    acl_detail::ParseCaps(caps_json, true);
 		    }
 	    })) {
 		return out;

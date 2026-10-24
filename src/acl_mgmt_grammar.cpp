@@ -4,9 +4,11 @@
 // to the management compiler (acl_admin_sql.cpp) - one family moves per PR. Never registered: a connection cannot
 // switch it on.
 
+#include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
 #include "acl_grammar_util.hpp"
 #include "acl_name_path.hpp"
+#include "acl_platform.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -1296,6 +1298,216 @@ arena_ptr<TransformResultValue> FinalizeDropObject(PEGTransformer &transformer, 
 	return MgmtResult(transformer, std::move(data));
 }
 
+// --- grants (specs 011, 012, 015, 120) ------------------------------------------------------------------------------
+
+//! A grant's policy clauses, in any order, the last of a kind winning: `WITH (select, insert)` (the list form of
+//! CAPS), `CAPS '<json>'`, `RLS <list>`, `COLUMNS <list>`, and - a catalog grant's - `MAIN`
+struct GrantClauses {
+	optional_idx caps;
+	optional_idx rls;
+	optional_idx columns;
+	bool main = false;
+	//! a clause that is present and not empty (a schema grant carries capabilities only)
+	bool rls_written = false;
+	bool columns_written = false;
+};
+
+//! Whether a list clause's value (`AclList`) is empty as written - `()` or `''`
+bool ListIsEmpty(PEGTransformer &transformer, ParseResult &result) {
+	auto &node = Strip(result);
+	if (node.Name() == "AclParenList") {
+		vector<reference<ParseResult>> items;
+		grammar::Collect(node.Cast<ListParseResult>().GetChild(1), items);
+		return items.empty();
+	}
+	optional_idx offset;
+	return ValueOf(transformer, node, offset).empty();
+}
+
+//! `AclCapsList <- '(' AclCapsEntry AclCapsMore* ')'` (AclCapsEntry <- AclName?): the capabilities named, as the
+//! stored JSON - the list form is what a person writes, JSON the storage format and the admin functions' input. Each
+//! a word or a double-quoted name, lower-cased, quoted as JSON (the compiler pasted the text between the commas into
+//! the JSON, so `\u006danage` stored manage). An unknown capability is kept as written rather than refused - the
+//! vocabulary grows, and a grant authored against a newer version must not fail - but enforces nothing until some
+//! spec reads it (design 004)
+string CapsListJson(ParseResult &result) {
+	vector<reference<ParseResult>> names;
+	auto &list = Strip(result).Cast<ListParseResult>();
+	auto collect = [&names](ParseResult &entry) {
+		auto &part = Strip(entry);
+		if (part.type != ParseResultType::OPTIONAL) {
+			names.push_back(part);
+		}
+	};
+	collect(list.GetChild(1));
+	vector<reference<ParseResult>> more;
+	grammar::Collect(list.GetChild(2), more);
+	for (auto &next : more) {
+		collect(next.get().Cast<ListParseResult>().GetChild(1));
+	}
+	vector<string> entries;
+	for (auto &name : names) {
+		entries.push_back(JsonQuote(StringUtil::Lower(NameOf(name, "a capability"))) + ": true");
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
+//! The clauses of a repetition at part `index` into the call's arguments `clauses` names
+void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t index, GrantClauses &clauses,
+                      MgmtParseData &data) {
+	for (auto &clause : Clauses(list, index)) {
+		auto keyword = KeywordOf(clause);
+		if (keyword == "main") {
+			clauses.main = true;
+			continue;
+		}
+		auto &parts = ClauseList(clause);
+		if (keyword == "with") {
+			data.args[clauses.caps.GetIndex()] = Value(CapsListJson(parts.GetChild(1)));
+		} else if (keyword == "caps") {
+			data.args[clauses.caps.GetIndex()] = Value(Quoted(transformer, parts, 1, "caps JSON", data));
+		} else if (keyword == "rls") {
+			clauses.rls_written = !ListIsEmpty(transformer, parts.GetChild(1));
+			ListInto(transformer, parts.GetChild(1), clauses.rls, MgmtParsed::TextKind::TEXT, true, "an RLS predicate",
+			         data);
+		} else {
+			clauses.columns_written = !ListIsEmpty(transformer, parts.GetChild(1));
+			ListInto(transformer, parts.GetChild(1), clauses.columns, MgmtParsed::TextKind::COLUMNS, false,
+			         "a column list", data);
+		}
+	}
+}
+
+//! A grant's object kind when it names the platform catalog's view: that grant is a point grant on the system
+//! catalog (spec 117), the compiler's for now - the statement goes to it as its text
+void DivertPlatformView(ListParseResult &list, idx_t kind, const string &vcat) {
+	if (KeywordOf(list.GetChild(kind)) == "view" && IsPlatformCatalog(vcat)) {
+		throw ParserException("acl admin: a grant on a platform view is read by the management compiler");
+	}
+}
+
+// AclGrantCatalog <- 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName AclGrantClause* - the catalog level (spec 011):
+// no capability clause = unspecified, which resolves to every data capability; `WITH ()` / `CAPS '{}'` none
+arena_ptr<TransformResultValue> FinalizeGrantCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_grant_catalog");
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(CatalogKeyOf(list.GetChild(2)))};
+	GrantClauses clauses;
+	clauses.caps = AddArg(*data);
+	auto main = AddArg(*data);
+	clauses.rls = AddArg(*data);
+	clauses.columns = AddArg(*data);
+	GrantClausesInto(transformer, list, 6, clauses, *data);
+	data->args[main] = Value::BOOLEAN(clauses.main);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantSchema <- 'GRANT' 'SCHEMA' AclPath 'TO' 'ROLE' AclName AclObjectClause* AclSchemaHome? AclComment? - the
+// middle level (spec 015): capabilities only; INTO <phys> is where this role creates, VIRTUAL ONLY nowhere
+arena_ptr<TransformResultValue> FinalizeGrantSchema(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_grant_schema");
+	string vcat, path;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, path);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(path)};
+	// RLS and COLUMNS are judged, not kept: present and not empty, they are refused
+	GrantClauses clauses;
+	clauses.caps = AddArg(*data);
+	auto comment = AddArg(*data);
+	auto into = AddArg(*data);
+	auto virtual_only = AddArg(*data, Value::BOOLEAN(false));
+	GrantClausesInto(transformer, list, 6, clauses, *data);
+	if (clauses.rls_written || clauses.columns_written) {
+		throw BinderException("acl admin: a schema grant carries capabilities only - RLS and COLUMNS belong to the "
+		                      "catalog or to the object (spec 015)");
+	}
+	auto &home = list.Child<OptionalParseResult>(7);
+	if (home.HasResult()) {
+		auto &where = Strip(home.GetResult()).Cast<ListParseResult>();
+		if (KeywordOf(where) == "into") {
+			// AclInto <- 'INTO' AclPathName
+			data->args[into] = Value(PathNameOf(transformer, where.GetChild(1), "a physical schema path", *data));
+		} else {
+			data->args[virtual_only] = Value::BOOLEAN(true); // AclVirtualOnly <- 'VIRTUAL' 'ONLY'
+		}
+	}
+	data->args[comment] = Value(OptionalComment(transformer, list, 8, *data));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' 'ROLE' AclName AclObjectClause* - the object's own grant (spec
+// 011): it narrows the object for this role, it never widens it
+arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_grant_object");
+	string vcat, vname;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
+	DivertPlatformView(list, 1, vcat);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
+	GrantClauses clauses;
+	clauses.caps = AddArg(*data);
+	clauses.rls = AddArg(*data);
+	clauses.columns = AddArg(*data);
+	GrantClausesInto(transformer, list, 6, clauses, *data);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeCatalog <- 'REVOKE' 'CATALOG' AclName 'FROM' 'ROLE' AclName
+arena_ptr<TransformResultValue> FinalizeRevokeCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_catalog");
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(CatalogKeyOf(list.GetChild(2)))};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeSchema <- 'REVOKE' 'SCHEMA' AclPath 'FROM' 'ROLE' AclName
+arena_ptr<TransformResultValue> FinalizeRevokeSchema(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_schema");
+	string vcat, path;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, path);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(path)};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' 'ROLE' AclName (spec 120): the object's own grant - the
+// catalog's stays
+arena_ptr<TransformResultValue> FinalizeRevokeObject(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_object");
+	string vcat, vname;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
+	DivertPlatformView(list, 1, vcat);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterGrant <- 'ALTER' 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName 'SET' AclGrantSet - one property of a
+// catalog grant, the rest kept; its values are quoted strings (AclGrantSet <- AclCapsClause / AclSetRlsValue /
+// AclSetColumnsValue / AclSetMainValue)
+arena_ptr<TransformResultValue> FinalizeAlterGrant(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_alter_grant");
+	data->args = {Value(NameOf(list.GetChild(6), "a role name")), Value(CatalogKeyOf(list.GetChild(3)))};
+	auto &change = ClauseList(list.GetChild(8));
+	auto field = KeywordOf(change);
+	data->args.emplace_back(field);
+	if (field == "main") {
+		data->args.emplace_back(TokenOf(change.GetChild(1)).text);
+	} else if (field == "columns") {
+		MgmtParseData::Span span;
+		span.arg = AddArg(*data);
+		span.kind = MgmtParsed::TextKind::COLUMNS;
+		span.resolved = true;
+		span.text = Quoted(transformer, change, 1, "a column list", *data);
+		data->spans.push_back(std::move(span));
+	} else {
+		data->args.emplace_back(
+		    Quoted(transformer, change, 1, field == "caps" ? "caps JSON" : "an RLS predicate", *data));
+	}
+	return MgmtResult(transformer, std::move(data));
+}
+
 // --- a statement no rule reads yet ------------------------------------------------------------------------------
 
 // AclMgmtLegacy <- AclTailToken+ : its span, for the management compiler
@@ -1563,6 +1775,43 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclDropObjectKind <- 'TABLE' / 'VIEW'"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclDropObject <- 'DROP' 'VIRTUAL' AclDropObjectKind AclIfExists? AclPath", Start<FinalizeDropObject>));
+		// grants
+		changes.push_back(GrammarChange::AddRule("AclCapsEntry <- AclName?"));
+		changes.push_back(GrammarChange::AddRule("AclCapsMore <- ',' AclCapsEntry"));
+		changes.push_back(GrammarChange::AddRule("AclCapsList <- '(' AclCapsEntry AclCapsMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclWithCaps <- 'WITH' AclCapsList"));
+		changes.push_back(GrammarChange::AddRule("AclCapsClause <- 'CAPS' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclMainClause <- 'MAIN'"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / AclColumnsClause"));
+		changes.push_back(GrammarChange::AddRule("AclGrantClause <- AclObjectClause / AclMainClause"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclGrantCatalog <- 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName AclGrantClause*",
+		                           Start<FinalizeGrantCatalog>));
+		changes.push_back(GrammarChange::AddRule("AclInto <- 'INTO' AclPathName"));
+		changes.push_back(GrammarChange::AddRule("AclVirtualOnly <- 'VIRTUAL' 'ONLY'"));
+		changes.push_back(GrammarChange::AddRule("AclSchemaHome <- AclInto / AclVirtualOnly"));
+		changes.push_back(GrammarChange::AddRule("AclGrantSchema <- 'GRANT' 'SCHEMA' AclPath 'TO' 'ROLE' AclName "
+		                                         "AclObjectClause* AclSchemaHome? AclComment?",
+		                                         Start<FinalizeGrantSchema>));
+		changes.push_back(GrammarChange::AddRule("AclObjectKind <- 'TABLE' / 'VIEW' / 'OBJECT'"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' 'ROLE' AclName AclObjectClause*",
+		    Start<FinalizeGrantObject>));
+		changes.push_back(GrammarChange::AddRule("AclRevokeCatalog <- 'REVOKE' 'CATALOG' AclName 'FROM' 'ROLE' AclName",
+		                                         Start<FinalizeRevokeCatalog>));
+		changes.push_back(GrammarChange::AddRule("AclRevokeSchema <- 'REVOKE' 'SCHEMA' AclPath 'FROM' 'ROLE' AclName",
+		                                         Start<FinalizeRevokeSchema>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' 'ROLE' AclName", Start<FinalizeRevokeObject>));
+		changes.push_back(GrammarChange::AddRule("AclSetRlsValue <- 'RLS' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclSetColumnsValue <- 'COLUMNS' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclSetMainValue <- 'MAIN' AclWordToken"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGrantSet <- AclCapsClause / AclSetRlsValue / AclSetColumnsValue / AclSetMainValue"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclAlterGrant <- 'ALTER' 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName 'SET' AclGrantSet",
+		    Start<FinalizeAlterGrant>));
 		// a statement no rule reads yet: its tokens, to the management compiler
 		changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
 		changes.push_back(
@@ -1580,7 +1829,8 @@ public:
 		    "AclCommentReference / AclCommentFunction / AclCommentObject / AclCheckCatalog / AclRepairTable / "
 		    "AclAnalyzeCatalog / "
 		    "AclAnalyzeObject / AclDropRelation / AclDropReference / AclDropCatalog / AclDropSchema / "
-		    "AclDropFunction / AclDropObject / AclMgmtLegacy"));
+		    "AclDropFunction / AclDropObject / AclGrantCatalog / AclGrantSchema / AclGrantObject / AclRevokeCatalog / "
+		    "AclRevokeSchema / AclRevokeObject / AclAlterGrant / AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;

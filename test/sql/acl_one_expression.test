@@ -91,10 +91,11 @@ SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id > 0 FROM range(
 ----
 spec 148
 
-statement error
+# spec 150, stage 3d: the grant is a rule, whose list reads a comment as a space - the predicate stored is one
+# expression, as written without the comment (the compiler kept the comment, and spec 148 refused it)
+statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN RLS (id > 0 -- x
 );
-----
 
 # what is one expression stays allowed: a string holding the comment marks, a subquery, CASE, a lambda, a cast
 statement ok

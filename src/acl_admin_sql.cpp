@@ -36,21 +36,6 @@ void SplitVirtual(const string &path, string &vcat, string &vname) {
 	}
 }
 
-//! `(select, insert)` -> `{"select": true, "insert": true}`. The list form is what a person writes;
-//! JSON stays the storage format and the admin functions' input. An unknown capability is kept as
-//! written rather than refused - the vocabulary grows, and a grant authored against a newer version
-//! must not fail - but it enforces nothing until some spec starts reading it (design 004).
-string CapsListToJson(const string &list) {
-	vector<string> entries;
-	for (auto &item : SplitTopLevel(list, ',')) {
-		if (item.empty()) {
-			continue;
-		}
-		entries.push_back("\"" + StringUtil::Replace(StringUtil::Lower(item), "\"", "") + "\": true");
-	}
-	return "{" + StringUtil::Join(entries, ", ") + "}";
-}
-
 } // namespace
 
 //! Strip one layer of quotes from a list element written as a literal
@@ -177,34 +162,6 @@ string UnquoteColumnsList(const string &raw) {
 		}
 	}
 	return StringUtil::Join(items, ", ");
-}
-
-//! The clauses a grant is written with, in any order: CAPS '<json>' RLS '<predicate>'
-//! COLUMNS '<name[=expr], …>' - the grant's own policy (spec 011) - plus MAIN for a catalog grant
-void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &columns, bool *main = nullptr) {
-	for (bool more = true; more;) {
-		more = false;
-		if (s.Accept("with")) { // WITH (select, insert) - the list form of CAPS
-			caps = CapsListToJson(s.Parens());
-			more = true;
-		}
-		if (s.Accept("caps")) {
-			caps = s.Quoted("caps JSON");
-			more = true;
-		}
-		if (s.Accept("rls")) {
-			rls = s.List("an RLS predicate");
-			more = true;
-		}
-		if (s.Accept("columns")) {
-			columns = UnquoteColumnsList(s.List("a column list"));
-			more = true;
-		}
-		if (main && s.Accept("main")) {
-			*main = true;
-			more = true;
-		}
-	}
 }
 
 } // namespace
@@ -535,6 +492,34 @@ public:
 	}
 	RefuseMovedForm("write ANALYZE VIRTUAL CATALOG <catalog>, or ANALYZE VIRTUAL [TABLE | VIEW | SCALAR | TABLE "
 	                "FUNCTION] <catalog>.<name>");
+}
+
+//! spec 150, stage 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT are rules - one that reaches here did
+//! not read as its rule, said in the form's own words (`s` stands after GRANT / REVOKE)
+[[noreturn]] void RefuseGrantForm(AdminScanner &s, const string &verb) {
+	auto kind = StringUtil::Lower(s.PeekWord());
+	bool grant = verb == "grant";
+	if (kind == "catalog") {
+		RefuseMovedForm(grant ? "write GRANT CATALOG <catalog> TO ROLE <role> [WITH (<capability>, ...) | CAPS "
+		                        "'<json>'] [RLS (<predicate>)] [COLUMNS (<list>)] [MAIN]"
+		                      : "write REVOKE CATALOG <catalog> FROM ROLE <role>");
+	}
+	if (kind == "schema") {
+		RefuseMovedForm(grant ? "write GRANT SCHEMA <catalog>.<path> TO ROLE <role> [WITH (<capability>, ...) | CAPS "
+		                        "'<json>'] [INTO <physical schema> | VIRTUAL ONLY] [COMMENT '<text>']"
+		                      : "write REVOKE SCHEMA <catalog>.<path> FROM ROLE <role>");
+	}
+	if (kind == "table" || kind == "view" || kind == "object") {
+		RefuseMovedForm(grant
+		                    ? "write GRANT TABLE | VIEW | OBJECT <catalog>.<name> TO ROLE <role> [WITH (<capability>, "
+		                      "...) | CAPS '<json>'] [RLS (<predicate>)] [COLUMNS (<list>)]"
+		                    : "write REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>");
+	}
+	RefuseMovedForm(grant
+	                    ? "write GRANT CATALOG | SCHEMA | TABLE | VIEW | OBJECT | ADMIN | FUNCTION | SOURCE | RESOURCE "
+	                      "GROUP ... TO ROLE <role>"
+	                    : "write REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT | ADMIN | FUNCTION | SOURCE | "
+	                      "RESOURCE GROUP ... FROM ROLE <role>");
 }
 
 //! spec 072: a function as a grant or a member names it - `read_parquet`, `lake.main.peek`, a
@@ -1154,36 +1139,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			auto role = RoleOrAllRoles(s, "to");
 			return MakeAdminCall("acl_grant_function", {Value(role), Value(spec), Value("true")});
 		}
-		// GRANT SCHEMA v.path TO ROLE r WITH (…) [COMMENT '…'] - the middle level (spec 015)
-		if (s.Accept("schema")) {
-			string vcat, path;
-			SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
-			s.Expect("to");
-			s.Expect("role");
-			auto role = s.Ident("a role name");
-			string caps, rls, columns, comment, into;
-			bool virtual_only = false;
-			GrantPolicyClauses(s, caps, rls, columns);
-			if (s.Accept("into")) { // where this role creates - the grant decides, not the schema
-				into = s.PathName("a physical schema path");
-			} else if (s.Accept("virtual")) {
-				s.Expect("only");
-				virtual_only = true;
-			}
-			if (!rls.empty() || !columns.empty()) {
-				throw BinderException("acl admin: a schema grant carries capabilities only - RLS and COLUMNS belong "
-				                      "to the catalog or to the object (spec 015)");
-			}
-			if (s.Accept("comment")) {
-				comment = s.Quoted("comment");
-			}
-			return MakeAdminCall("acl_grant_schema", {Value(role), Value(vcat), Value(path), Value(caps),
-			                                          Value(comment), Value(into), Value::BOOLEAN(virtual_only)});
-		}
-		// GRANT TABLE|VIEW|OBJECT v.n TO ROLE r [CAPS '…'] [RLS '…'] [COLUMNS '…'] - the grant's own
-		// policy (spec 011): it narrows the object for this role, it never widens it
+		// spec 117: GRANT VIEW platform.<v> TO ROLE r - a view of the system catalog (the grant rule hands it here)
 		{
-			// spec 117: GRANT VIEW platform.<v> TO ROLE r - a view of the system catalog
 			auto saved = s.pos;
 			string object;
 			if (s.Accept("view") && PlatformTarget(s, object)) {
@@ -1191,29 +1148,9 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			}
 			s.pos = saved;
 		}
-		if (s.Accept("table") || s.Accept("view") || s.Accept("object")) {
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			s.Expect("to");
-			s.Expect("role");
-			auto role = s.Ident("a role name");
-			// no CAPS clause = unspecified, which resolves to the read-only default; an explicit
-			// CAPS '{}' still means "no capabilities" (spec 012)
-			string caps, rls, columns;
-			GrantPolicyClauses(s, caps, rls, columns);
-			return MakeAdminCall("acl_grant_object",
-			                     {Value(role), Value(vcat), Value(vname), Value(caps), Value(rls), Value(columns)});
-		}
-		s.Expect("catalog");
-		auto vcat = s.IdentKey("a catalog name");
-		s.Expect("to"); // GRANT CATALOG c TO ROLE r
-		s.Expect("role");
-		auto role = s.Ident("a role name");
-		string caps, rls, columns;
-		bool main = false;
-		GrantPolicyClauses(s, caps, rls, columns, &main);
-		return MakeAdminCall("acl_grant_catalog",
-		                     {Value(role), Value(vcat), Value(caps), Value::BOOLEAN(main), Value(rls), Value(columns)});
+		// spec 150, stage 3d: GRANT CATALOG | SCHEMA | TABLE | VIEW | OBJECT are rules - one that reaches here did not
+		// read as its rule
+		RefuseGrantForm(s, "grant");
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
 		if (s.Accept("source")) {
@@ -1240,14 +1177,6 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			}
 			s.pos = saved;
 		}
-		if (s.Accept("table") || s.Accept("view") || s.Accept("object")) {
-			// REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r (spec 120): the object's own grant - the catalog's stays
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			s.Expect("from");
-			s.Expect("role");
-			return MakeAdminCall("acl_revoke_object", {Value(s.Ident("a role name")), Value(vcat), Value(vname)});
-		}
 		if (s.Accept("resource")) {
 			// REVOKE RESOURCE GROUP g FROM ROLE r (spec 085)
 			s.Expect("group");
@@ -1255,13 +1184,6 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("from");
 			s.Expect("role");
 			return MakeAdminCall("acl_revoke_resource_group", {Value(s.Ident("a role name")), Value(group)});
-		}
-		if (s.Accept("schema")) { // REVOKE SCHEMA v.path FROM ROLE r
-			string vcat, path;
-			SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
-			s.Expect("from");
-			s.Expect("role");
-			return MakeAdminCall("acl_revoke_schema", {Value(s.Ident("a role name")), Value(vcat), Value(path)});
 		}
 		if (s.Accept("function")) {
 			// REVOKE FUNCTION CATEGORY c FROM ROLE r | ALL ROLES; REVOKE FUNCTION f [TABLE] FROM ROLE r |
@@ -1275,12 +1197,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			auto role = RoleOrAllRoles(s, "from");
 			return MakeAdminCall("acl_revoke_function", {Value(role), Value(spec)});
 		}
-		s.Expect("catalog");
-		auto vcat = s.IdentKey("a catalog name");
-		s.Expect("from");
-		s.Expect("role");
-		auto role = s.Ident("a role name");
-		return MakeAdminCall("acl_revoke_catalog", {Value(role), Value(vcat)});
+		RefuseGrantForm(s, "revoke");
 	}
 	if (StringUtil::CIEquals(keyword, "map")) {
 		RefuseMovedForm("write MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
@@ -1337,29 +1254,9 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		if (s.Accept("client")) { // spec 095: ALTER CLIENT c SET … | DROP FROM SECRET
 			return ParseAlterClient(s);
 		}
-		// ALTER GRANT CATALOG c TO ROLE r SET CAPS '…' | SET RLS '…' | SET COLUMNS '…' | SET MAIN t|f
 		if (s.Accept("grant")) {
-			s.Expect("catalog");
-			auto vcat = s.IdentKey("a catalog name");
-			s.Expect("to");
-			s.Expect("role");
-			auto role = s.Ident("a role name");
-			s.Expect("set");
-			if (s.Accept("caps")) {
-				return MakeAdminCall("acl_alter_grant",
-				                     {Value(role), Value(vcat), Value("caps"), Value(s.Quoted("caps JSON"))});
-			}
-			if (s.Accept("rls")) {
-				return MakeAdminCall("acl_alter_grant",
-				                     {Value(role), Value(vcat), Value("rls"), Value(s.Quoted("an RLS predicate"))});
-			}
-			if (s.Accept("columns")) {
-				return MakeAdminCall("acl_alter_grant", {Value(role), Value(vcat), Value("columns"),
-				                                         Value(UnquoteColumnsList(s.Quoted("a column list")))});
-			}
-			s.Expect("main");
-			auto flag = s.Word("true or false");
-			return MakeAdminCall("acl_alter_grant", {Value(role), Value(vcat), Value("main"), Value(flag)});
+			RefuseMovedForm("write ALTER GRANT CATALOG <catalog> TO ROLE <role> SET CAPS '<json>' | SET RLS "
+			                "'<predicate>' | SET COLUMNS '<list>' | SET MAIN true | false");
 		}
 		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
 		s.Expect("virtual");

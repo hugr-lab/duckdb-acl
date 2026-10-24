@@ -509,7 +509,9 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
   secrets service, see below) on the main catalog grant, and `lineage` (the catalog's definition lineage,
   `acl_lineage_definitions` - [lineage](lineage.md#a-catalogs-definitions-on-demand)) on any catalog grant,
   each held only when named.
-  An unknown name is stored as written and enforces nothing.
+  An unknown name is stored as written and enforces nothing. Each item of `WITH (…)` is a name - a word
+  or a double-quoted name, lower-cased; `CAPS` JSON that names a capability twice (names compare
+  case-insensitively) or holds a NUL in a name is refused where it is written.
 - **`MAIN`** marks the catalog whose objects the role addresses unqualified. A principal with more than
   one main catalog across its roles resolves only qualified names.
 - **`RLS`** is the grant's own predicate, AND-ed onto every object of the catalog for this role (and

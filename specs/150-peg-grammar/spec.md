@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -233,10 +233,24 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   operator, and failed at its first read).
   Found in the same review and left to the family that moves the form (each a fix with its test there): 3d - the WITH
   list's JSON is built without escaping (`\u006danage` stores manage), `ParseCaps` reads a key up to a NUL and counts
-  a duplicate key true if any is; 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside quotes; 3b's
+  a duplicate key true if any is (both fixed in 3d); 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside
+  quotes; 3b's
   `ClaimsListToCsv` splits at an `=` inside a quoted name (stage 4's rule); 3g - `UseSchemaAsSet`'s own comment
   reader (`--` ends at `\n` only, `/* */` not nested).
-- 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
+- 3d (built): grants - `GRANT CATALOG c TO ROLE r` / `GRANT SCHEMA c.p …` / `GRANT TABLE | VIEW | OBJECT c.n …` with
+  their clauses in any order, the last of a kind winning (`WITH (…)`, `CAPS '<json>'`, `RLS`, `COLUMNS`, a catalog's
+  `MAIN`; a schema's `INTO <phys>` | `VIRTUAL ONLY` and `COMMENT` after them, its `RLS` / `COLUMNS` refused unless
+  empty), `REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT … FROM ROLE r`, `ALTER GRANT CATALOG c TO ROLE r SET CAPS |
+  RLS | COLUMNS '<text>' | MAIN <word>`. A grant on a platform view (`GRANT | REVOKE VIEW platform.x`, spec 117) is a
+  point grant the compiler still reads: its transform throws a ParserException, which hands the statement to it as
+  text (`DivertPlatformView`). Fixed with the move (stage 3c's review): `WITH (…)` is a list of names (`AclCapsList`:
+  a word or a double-quoted name, lower-cased, `JsonQuote`d - `CapsListToJson` pasted the text between the commas, so
+  `\u006danage` stored manage) and `ParseCaps(json, strict)` where caps are written refuses a name twice (names
+  compare case-insensitively; it counts any true, a JSON reader takes the last) and a NUL in a name (it read up to
+  it); a stored row keeps its reading, and an `ALTER GRANT` that rewrites such a row is refused until its caps are
+  restated. Changed: a comment in an RLS / COLUMNS list reads as a space (spec 148 refused the open comment), a
+  `WITH` item that is no name (`'insert'`, `select insert`) is refused, the catalog / schema / object refusals are the
+  form's usage.
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
