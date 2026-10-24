@@ -97,6 +97,11 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN RLS (id > 0 -- x
 );
 
+query I
+SELECT rls FROM store.acl.role_catalogs WHERE role = 'r' AND vcat = 'c';
+----
+id > 0
+
 # what is one expression stays allowed: a string holding the comment marks, a subquery, CASE, a lambda, a cast
 statement ok
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'note <> ''x--y''', 'id, note = CASE WHEN id > 1 THEN ''--'' ELSE upper(note) END');

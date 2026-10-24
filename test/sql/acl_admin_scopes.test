@@ -511,7 +511,12 @@ ACL ROLE "scoped" ACL CREATE ROLE scoped_role;
 statement error
 ACL ADMIN GRANT CATALOG '' TO ROLE scoped CAPS '{"manage": true}';
 ----
-<REGEX>:.*(expected a catalog name|needs a catalog name|write GRANT CATALOG).*
+<REGEX>:.*write GRANT CATALOG.*
+
+statement error
+SELECT acl_grant_catalog('scoped', '', '{"manage": true}', false);
+----
+<REGEX>:.*needs a catalog name.*
 
 # 5. catalog names compare case-insensitively, as duckdb's catalog does (spec 116): "Sales" is the
 # catalog sales - declaring it again is refused, a grant on "SALES" lands on sales, and manage on it is

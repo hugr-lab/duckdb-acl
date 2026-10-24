@@ -694,8 +694,10 @@ struct PolicyStore {
 	                         const string &cardinality, bool optional, const string &join_method,
 	                         const string &comment);
 	void CatalogDropReference(const string &vcat, const string &name);
+	//! `judge_columns` / `judge_caps`: only where that part itself is being written - never re-judging a stored one
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
-	                  const string &rls = "", const string &columns = "", bool judge_columns = true);
+	                  const string &rls = "", const string &columns = "", bool judge_columns = true,
+	                  bool judge_caps = true);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
 	//! spec 107: after a virtual object's definition was written (or dropped), the static lineage event
@@ -863,9 +865,10 @@ struct PolicyStore {
 	void CatalogEditIdentity(const std::function<void(IdentityModel &)> &apply);
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
-	                          const string &rls = "", const string &columns = "");
-	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function)
-	void CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json);
+	                          const string &rls = "", const string &columns = "", bool judge_caps = true);
+	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function);
+	//! `strict` where they are written (spec 150 stage 3d: a name twice, a NUL in a name)
+	void CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json, bool strict = true);
 	//! spec 122: one finding of platform.check_grant - item rls | columns | column | caps | object, status ok |
 	//! refused | unchecked
 	struct GrantCheckRow {

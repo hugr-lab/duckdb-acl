@@ -719,6 +719,14 @@ vector<reference<ParseResult>> Clauses(ListParseResult &list, idx_t index) {
 	return clauses;
 }
 
+//! A clause kind written once: a repeated one (`RLS (tenant = 'x') … RLS ()`) would leave a reader of the statement
+//! the first while the last took effect - refused
+void ClauseOnce(case_insensitive_set_t &seen, const string &kind) {
+	if (!seen.insert(kind).second) {
+		throw BinderException("acl admin: %s is written twice - write each clause once", StringUtil::Upper(kind));
+	}
+}
+
 //! A clause `'<KEYWORD>' … <value>`'s list (its value the last part)
 ListParseResult &ClauseList(ParseResult &clause) {
 	return Strip(clause).Cast<ListParseResult>();
@@ -778,8 +786,10 @@ arena_ptr<TransformResultValue> FinalizeCreateReference(PEGTransformer &transfor
 	}
 	string cardinality, join_method, comment;
 	bool optional = false;
+	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 11)) {
 		auto keyword = KeywordOf(clause);
+		ClauseOnce(seen, keyword);
 		if (keyword == "optional") {
 			optional = true;
 		} else if (keyword == "comment") {
@@ -827,7 +837,9 @@ arena_ptr<TransformResultValue> FinalizeCreateView(PEGTransformer &transformer, 
 	auto comment = AddArg(*data);
 	data->args.emplace_back(CreateMode(list, 1, 4));
 	auto pk = AddArg(*data);
+	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 7)) {
+		ClauseOnce(seen, KeywordOf(clause));
 		if (KeywordOf(clause) == "comment") {
 			data->args[comment] = Value(Quoted(transformer, ClauseList(clause), 1, "comment", *data));
 		} else {
@@ -935,8 +947,10 @@ arena_ptr<TransformResultValue> FinalizeCreateTable(PEGTransformer &transformer,
 	auto comment = AddArg(*data);
 	data->args.emplace_back(CreateMode(list, 1, 4));
 	auto pk = AddArg(*data);
+	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 8)) {
 		auto keyword = KeywordOf(clause);
+		ClauseOnce(seen, keyword);
 		auto &value = ClauseList(clause);
 		if (keyword == "columns") {
 			ListInto(transformer, value.GetChild(1), columns, MgmtParsed::TextKind::COLUMNS, false, "columns list",
@@ -1316,12 +1330,25 @@ struct GrantClauses {
 bool ListIsEmpty(PEGTransformer &transformer, ParseResult &result) {
 	auto &node = Strip(result);
 	if (node.Name() == "AclParenList") {
+		// separators only read as no item (the compiler's reader drops empty items)
 		vector<reference<ParseResult>> items;
 		grammar::Collect(node.Cast<ListParseResult>().GetChild(1), items);
-		return items.empty();
+		for (auto &item : items) {
+			auto &token = Strip(item.get());
+			if (token.type != ParseResultType::TOKEN || token.Cast<TokenParseResult>().text != ",") {
+				return false;
+			}
+		}
+		return true;
 	}
 	optional_idx offset;
-	return ValueOf(transformer, node, offset).empty();
+	auto value = ValueOf(transformer, node, offset);
+	for (auto c : value) {
+		if (c != ',' && !StringUtil::CharacterIsSpace(c)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 //! `AclCapsList <- '(' AclCapsEntry AclCapsMore* ')'` (AclCapsEntry <- AclName?): the capabilities named, as the
@@ -1346,8 +1373,12 @@ string CapsListJson(ParseResult &result) {
 		collect(next.get().Cast<ListParseResult>().GetChild(1));
 	}
 	vector<string> entries;
+	case_insensitive_set_t named;
 	for (auto &name : names) {
-		entries.push_back(JsonQuote(StringUtil::Lower(NameOf(name, "a capability"))) + ": true");
+		auto capability = StringUtil::Lower(NameOf(name, "a capability"));
+		if (named.insert(capability).second) { // the same capability twice is one
+			entries.push_back(JsonQuote(capability) + ": true");
+		}
 	}
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
@@ -1355,8 +1386,10 @@ string CapsListJson(ParseResult &result) {
 //! The clauses of a repetition at part `index` into the call's arguments `clauses` names
 void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t index, GrantClauses &clauses,
                       MgmtParseData &data) {
+	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, index)) {
 		auto keyword = KeywordOf(clause);
+		ClauseOnce(seen, keyword == "with" ? "caps" : keyword); // WITH is the list form of CAPS
 		if (keyword == "main") {
 			clauses.main = true;
 			continue;
@@ -1378,12 +1411,23 @@ void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t 
 	}
 }
 
-//! A grant's object kind when it names the platform catalog's view: that grant is a point grant on the system
-//! catalog (spec 117), the compiler's for now - the statement goes to it as its text
-void DivertPlatformView(ListParseResult &list, idx_t kind, const string &vcat) {
-	if (KeywordOf(list.GetChild(kind)) == "view" && IsPlatformCatalog(vcat)) {
-		throw ParserException("acl admin: a grant on a platform view is read by the management compiler");
+//! A grant on a view of the platform catalog (`GRANT | REVOKE VIEW platform.x`): a point grant on the system catalog
+//! (spec 117), the compiler's for now - the statement goes to it as its text (legacy data, its span). Any other name
+//! of platform's stays an object grant, which refuses the reserved catalog in its own words
+unique_ptr<MgmtParseData> PlatformViewGrant(ParseResult &parse_result, idx_t kind, const string &path_key) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	string leaf;
+	if (KeywordOf(list.GetChild(kind)) != "view" || !PlatformObjectName(NamePath::FromKey(path_key).Parts(), leaf)) {
+		return nullptr;
 	}
+	if (!parse_result.offset.IsValid() || !parse_result.length.IsValid()) {
+		throw ParserException("acl admin: a grant has no position");
+	}
+	auto data = make_uniq<MgmtParseData>();
+	data->legacy = true;
+	data->start = parse_result.offset.GetIndex();
+	data->end = data->start + parse_result.length.GetIndex();
+	return data;
 }
 
 // AclGrantCatalog <- 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName AclGrantClause* - the catalog level (spec 011):
@@ -1439,10 +1483,12 @@ arena_ptr<TransformResultValue> FinalizeGrantSchema(PEGTransformer &transformer,
 // 011): it narrows the object for this role, it never widens it
 arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
+	if (auto platform = PlatformViewGrant(parse_result, 1, PathOf(list.GetChild(2)))) {
+		return MgmtResult(transformer, std::move(platform));
+	}
 	auto data = Call("acl_grant_object");
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
-	DivertPlatformView(list, 1, vcat);
 	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
 	GrantClauses clauses;
 	clauses.caps = AddArg(*data);
@@ -1474,10 +1520,12 @@ arena_ptr<TransformResultValue> FinalizeRevokeSchema(PEGTransformer &transformer
 // catalog's stays
 arena_ptr<TransformResultValue> FinalizeRevokeObject(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
+	if (auto platform = PlatformViewGrant(parse_result, 1, PathOf(list.GetChild(2)))) {
+		return MgmtResult(transformer, std::move(platform));
+	}
 	auto data = Call("acl_revoke_object");
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
-	DivertPlatformView(list, 1, vcat);
 	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
 	return MgmtResult(transformer, std::move(data));
 }
@@ -2117,7 +2165,22 @@ string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text)
 	SplitTokenizerBehavior behavior(text, owned);
 	compiled->GetTokenizer().TokenizeInput(behavior);
 	TokenIterator tokens(owned);
-	return LegacyUnreadable(text, tokens, 0, text.size());
+	auto why = LegacyUnreadable(text, tokens, 0, text.size());
+	if (!why.empty()) {
+		return why;
+	}
+	// the whole text: what stands before its first token or after its last is a comment too
+	idx_t first = text.size();
+	idx_t last = 0;
+	for (auto &token : owned) {
+		if (token.type != TokenType::END_OF_INPUT && token.type != TokenType::TERMINATOR) {
+			first = MinValue(first, token.offset);
+			last = MaxValue(last, token.offset + token.length);
+		}
+	}
+	auto outside = first <= last ? text.substr(0, first) + text.substr(last) : text;
+	StringUtil::Trim(outside);
+	return outside.empty() ? string() : "a comment";
 }
 
 shared_ptr<GrammarExtension> MakeMgmtGrammar() {
@@ -2204,6 +2267,15 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				string value;
 				if (span.resolved) {
 					value = span.text;
+					if (span.kind == MgmtParsed::TextKind::COLUMNS) {
+						// a quoted columns list is split by the compiler's reader, which knows no comment
+						auto why = JudgeLegacyText(compiled, value);
+						if (!why.empty()) {
+							throw BinderException("acl admin: %s in a quoted columns list - its reader would read it "
+							                      "otherwise than written; write the list in parentheses",
+							                      why);
+						}
+					}
 				} else if (span.body) {
 					value = BodyText(text, tokens, span.start, span.end, span.what);
 					JudgeBody(value, span.what, span.expression, options);

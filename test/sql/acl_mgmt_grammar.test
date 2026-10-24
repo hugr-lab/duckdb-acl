@@ -1211,24 +1211,43 @@ SELECT caps, is_main FROM aclcat.acl.role_catalogs WHERE role = 'grantee';
 ----
 {"select": true, "insert": true}	true
 
-# each item a word or a double-quoted name, quoted as JSON: an escape is no capability (the compiler pasted the text
-# into the JSON, so `manage` stored manage; the runner turns `m` into `m` itself, so these write two
-# backslashes - a backslash is no name, and a quoted name keeps them as text)
+# each item a word or a double-quoted name, quoted as JSON, and a capability's name is a word: an escape is no
+# capability (the compiler pasted the text between the commas into the JSON, so `\u006danage` stored manage)
 statement error
-ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH (select, \\u006danage);
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH (select, \u006danage);
 ----
 write GRANT CATALOG
 
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH (select, "\u006danage");
+----
+a capability's name is a word
+
+# the same capability twice is one
 statement ok
-ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH (select, "\\u006danage", "Insert");
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH (select, "Insert", SELECT, insert);
 
 query I
 SELECT caps FROM aclcat.acl.role_catalogs WHERE role = 'grantee';
 ----
-{"select": true, "\\\\u006danage": true, "insert": true}
+{"select": true, "insert": true}
 
-# CAPS JSON is read as a JSON reader reads it: a name twice (names compare case-insensitively) or a NUL in a name is
-# refused where it is written
+# a stored name a pasted rebuild would turn into another: REVOKE ADMIN rewrites the caps as JSON, so a name written
+# `\u006danage` (planted directly - no write path takes it now) stays that name, never manage
+statement ok
+UPDATE aclcat.acl.role_catalogs SET caps = '{"select": true, "manage": true, "' || chr(92) || chr(92) || 'u006danage": true}'
+WHERE role = 'grantee';
+
+statement ok
+ACL ADMIN REVOKE ADMIN FROM ROLE grantee;
+
+query II
+SELECT acl_platform_caps(caps).manage, acl_platform_caps(caps)."select" FROM aclcat.acl.role_catalogs WHERE role = 'grantee';
+----
+false	true
+
+# CAPS JSON is read as a JSON reader reads it: a name twice (names compare case-insensitively) or a name that is no
+# word (a NUL this reader reads up to, a quote a rewrite would paste) is refused where it is written
 statement error
 ACL ADMIN GRANT CATALOG granted TO ROLE grantee CAPS '{"select": true, "manage": true, "manage": false}';
 ----
@@ -1242,11 +1261,21 @@ caps name "Select" twice
 statement error
 ACL ADMIN GRANT CATALOG granted TO ROLE grantee CAPS '{"select": true, "manage\u0000x": true}';
 ----
-a capability's name holds a NUL
+a capability's name is a word
 
-# the clauses in any order, the last of a kind winning
+# the clauses in any order, each once: a repeated one would leave a reader the first while the last took effect
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH (select) RLS (tenant = 'x') MAIN RLS ();
+----
+RLS is written twice
+
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee CAPS '{"manage": true}' WITH (select);
+----
+CAPS is written twice
+
 statement ok
-ACL ADMIN GRANT CATALOG granted TO ROLE grantee MAIN COLUMNS (a, "b") RLS (tenant = 'a') WITH (select) RLS (a > 0);
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee MAIN COLUMNS (a, "b") WITH (select) RLS (a > 0);
 
 query IIII
 SELECT caps, rls, columns, is_main FROM aclcat.acl.role_catalogs WHERE role = 'grantee';
@@ -1270,9 +1299,64 @@ ACL ADMIN GRANT SCHEMA granted.s TO ROLE grantee WITH (create) RLS (a > 0);
 ----
 a schema grant carries capabilities only
 
-# an object's own grant
+# an object's own grant - and a grant on a view of ours is one too
 statement ok
 ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) RLS (a > 1) COLUMNS (a);
+CREATE VIRTUAL VIEW granted.v AS SELECT a FROM phys.main.t; GRANT VIEW granted.v TO ROLE grantee WITH (select);
+
+query IIII
+SELECT vname, caps, coalesce(rls, ''), coalesce("columns", '') FROM aclcat.acl.role_object_caps
+WHERE role = 'grantee' ORDER BY vname;
+----
+t	{"select": true}	a > 1	a
+v	{"select": true}	(empty)	(empty)
+
+statement ok
+ACL ADMIN REVOKE VIEW granted.v FROM ROLE grantee;
+
+query I
+SELECT string_agg(vname, ',') FROM aclcat.acl.role_object_caps WHERE role = 'grantee';
+----
+t
+
+# a WITH item that is no name, MAIN on an object, a quoted columns list with a comment in it
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH ('insert');
+----
+write GRANT CATALOG
+
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH (select insert);
+----
+write GRANT CATALOG
+
+statement error
+ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) MAIN;
+----
+write GRANT TABLE | VIEW | OBJECT
+
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE grantee COLUMNS 'a /*, tenant, */';
+----
+a comment in a quoted columns list
+
+# a schema grant's capabilities are judged before anything is written: a refused one leaves no catalog grant behind
+statement ok
+ACL ADMIN CREATE ROLE schema_only;
+
+statement error
+ACL ADMIN GRANT SCHEMA granted.s TO ROLE schema_only CAPS '{"create": true, "CREATE": true}';
+----
+caps name "CREATE" twice
+
+query I
+SELECT count(*) FROM aclcat.acl.role_catalogs WHERE role = 'schema_only';
+----
+0
+
+# a schema grant's list of separators only is empty, as the reader read it
+statement ok
+ACL ADMIN GRANT SCHEMA granted.s TO ROLE schema_only WITH (select) COLUMNS (,);
 
 # one property of a catalog grant at a time, the rest kept
 statement ok
@@ -1285,9 +1369,10 @@ SELECT caps, rls, columns, is_main FROM aclcat.acl.role_catalogs WHERE role = 'g
 ----
 {"select": true, "insert": true}	a > 2	a, b	false
 
-# a grant on a platform view stays the management compiler's point grant (spec 117) - never an object grant
+# a grant on a platform view stays the management compiler's point grant (spec 117) - never an object grant, also in
+# a batch with a rule after it; another name of platform's is an object grant, refused in its own words
 statement ok
-ACL ADMIN GRANT VIEW platform.sessions TO ROLE grantee;
+ACL ADMIN GRANT VIEW platform.sessions TO ROLE grantee; GRANT CATALOG granted TO ROLE grantee WITH (select);
 
 query II
 SELECT kind, object FROM aclcat.acl.platform_grants WHERE role = 'grantee';
@@ -1297,9 +1382,38 @@ view	sessions
 statement ok
 ACL ADMIN REVOKE VIEW platform.sessions FROM ROLE grantee;
 
+query I
+SELECT count(*) FROM aclcat.acl.platform_grants WHERE role = 'grantee';
+----
+0
+
+statement error
+ACL ADMIN GRANT VIEW platform.a.b TO ROLE grantee;
+----
+reserved
+
+# a stored row whose caps a write would now refuse keeps working: only a change of the caps judges them
 statement ok
-ACL ADMIN REVOKE TABLE granted.t FROM ROLE grantee; REVOKE SCHEMA granted.s FROM ROLE grantee;
-REVOKE CATALOG granted FROM ROLE grantee;
+UPDATE aclcat.acl.role_catalogs SET caps = '{"select": true, "SELECT": true}' WHERE role = 'grantee';
+
+statement ok
+ACL ADMIN ALTER GRANT CATALOG granted TO ROLE grantee SET RLS 'a > 3';
+
+query II
+SELECT caps, rls FROM aclcat.acl.role_catalogs WHERE role = 'grantee';
+----
+{"select": true, "SELECT": true}	a > 3
+
+statement ok
+ACL ADMIN REVOKE TABLE granted.t FROM ROLE grantee;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE role = 'grantee';
+----
+0
+
+statement ok
+ACL ADMIN REVOKE SCHEMA granted.s FROM ROLE grantee; REVOKE CATALOG granted FROM ROLE grantee;
 
 query II
 SELECT (SELECT count(*) FROM aclcat.acl.role_catalogs WHERE role = 'grantee'),

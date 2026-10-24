@@ -238,19 +238,28 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   `ClaimsListToCsv` splits at an `=` inside a quoted name (stage 4's rule); 3g - `UseSchemaAsSet`'s own comment
   reader (`--` ends at `\n` only, `/* */` not nested).
 - 3d (built): grants - `GRANT CATALOG c TO ROLE r` / `GRANT SCHEMA c.p …` / `GRANT TABLE | VIEW | OBJECT c.n …` with
-  their clauses in any order, the last of a kind winning (`WITH (…)`, `CAPS '<json>'`, `RLS`, `COLUMNS`, a catalog's
-  `MAIN`; a schema's `INTO <phys>` | `VIRTUAL ONLY` and `COMMENT` after them, its `RLS` / `COLUMNS` refused unless
-  empty), `REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT … FROM ROLE r`, `ALTER GRANT CATALOG c TO ROLE r SET CAPS |
-  RLS | COLUMNS '<text>' | MAIN <word>`. A grant on a platform view (`GRANT | REVOKE VIEW platform.x`, spec 117) is a
-  point grant the compiler still reads: its transform throws a ParserException, which hands the statement to it as
-  text (`DivertPlatformView`). Fixed with the move (stage 3c's review): `WITH (…)` is a list of names (`AclCapsList`:
-  a word or a double-quoted name, lower-cased, `JsonQuote`d - `CapsListToJson` pasted the text between the commas, so
-  `\u006danage` stored manage) and `ParseCaps(json, strict)` where caps are written refuses a name twice (names
-  compare case-insensitively; it counts any true, a JSON reader takes the last) and a NUL in a name (it read up to
-  it); a stored row keeps its reading, and an `ALTER GRANT` that rewrites such a row is refused until its caps are
-  restated. Changed: a comment in an RLS / COLUMNS list reads as a space (spec 148 refused the open comment), a
-  `WITH` item that is no name (`'insert'`, `select insert`) is refused, the catalog / schema / object refusals are the
-  form's usage.
+  their clauses in any order, each once (`WITH (…)` / `CAPS '<json>'` one kind, `RLS`, `COLUMNS`, a catalog's `MAIN`;
+  a schema's `INTO <phys>` | `VIRTUAL ONLY` and `COMMENT` after them, its `RLS` / `COLUMNS` refused unless empty -
+  separators only are empty), `REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT … FROM ROLE r`, `ALTER GRANT CATALOG c
+  TO ROLE r SET CAPS | RLS | COLUMNS '<text>' | MAIN <word>`. A grant on a view of the platform catalog (`GRANT |
+  REVOKE VIEW platform.x`, spec 117, `PlatformObjectName`) is a point grant the compiler still reads: its transform
+  answers legacy data with the statement's span (`PlatformViewGrant`); another name of platform's stays an object
+  grant, refused as the reserved catalog. Fixed with the move (3c's review, 3d's): `WITH (…)` is a list of names
+  (`AclCapsList`: a word or a double-quoted name, lower-cased, the same twice one, `JsonQuote`d - `CapsListToJson`
+  pasted the text between the commas, so `\u006danage` stored manage); `ParseCaps(json, strict)` where caps are WRITTEN
+  (a grant, `ALTER GRANT SET CAPS`, `check_grant`, the function forms - judged before the implicit catalog grant is
+  ensured, so a refusal leaves none) refuses a name that is not a word (ASCII letters, digits, `_`: a NUL it read up
+  to, a `"` a rewrite pasted, a character the listings' regex folded) and a name written twice (names compare
+  case-insensitively; it counts any true, a JSON reader takes the last); `REVOKE ADMIN` rebuilds the caps as JSON
+  (`JsonQuote` - it pasted each name, so a stored `\u006danage` came back as manage and the role stayed an administrator;
+  found in 3d's review) and so does the legacy csv wrapper (`CapsCsvToJson`, each name once, as `CapsJson` the
+  platform call's list); a quoted COLUMNS list holding a comment, a `$$…$$` string, an `E'…'` one with a backslash or
+  a backtick name is refused (its reader would split it otherwise than written: `'a /*, tenant, */'` read only
+  `tenant`). A stored row keeps its reading and its rewrites stay unjudged (`ALTER GRANT SET RLS`, `REPAIR … AND
+  MASKS`): nothing is taken back by itself. Changed: a comment in an RLS / COLUMNS list reads as a space (spec 148
+  refused the open comment), a clause written twice is refused (the last won, so `RLS (tenant = 'x') … RLS ()` read
+  as a filter and granted every row), a `WITH` item that is no word (`'insert'`, `select insert`) is refused, the
+  catalog / schema / object refusals are the form's usage, `""` is the tokenizer's (`''` the empty text).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;

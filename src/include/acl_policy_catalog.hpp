@@ -383,9 +383,10 @@ void RequireColumnName(const char *what, const string &name);
 
 //! Parse a caps JSON object ({"select": true, "insert": false, ...}) into the set of enabled
 //! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused. `strict` (where
-//! caps are written, spec 150 stage 3d) also refuses what a reader would read otherwise than this one does: a key
-//! named twice (names compare case-insensitively; this one counts any true, a JSON reader takes the last) and a key
-//! holding a NUL (this one reads up to it). A stored row keeps its reading - nothing is taken back by itself.
+//! caps are written, spec 150 stage 3d) also refuses what another reader would read otherwise than this one does: a
+//! name that is not a word (ASCII letters, digits, `_` - a NUL this one reads up to, a `"` a rewrite pastes, a
+//! character the listings' regex folds) and a name written twice (names compare case-insensitively; this one counts
+//! any true, a JSON reader takes the last). A stored row keeps its reading - nothing is taken back by itself.
 inline case_insensitive_set_t ParseCaps(const string &json, bool strict = false) {
 	case_insensitive_set_t caps;
 	auto trimmed = json;
@@ -414,8 +415,12 @@ inline case_insensitive_set_t ParseCaps(const string &json, bool strict = false)
 			}
 			if (strict) {
 				string name(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
-				if (name.find('\0') != string::npos) {
-					error = "a capability's name holds a NUL";
+				bool word = !name.empty() && !StringUtil::CharacterIsDigit(name[0]);
+				for (auto c : name) {
+					word = word && (StringUtil::CharacterIsAlpha(c) || StringUtil::CharacterIsDigit(c) || c == '_');
+				}
+				if (!word) {
+					error = "a capability's name is a word (letters, digits, _)";
 					break;
 				}
 				if (!named.insert(name).second) {

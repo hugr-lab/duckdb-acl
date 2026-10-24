@@ -27,17 +27,6 @@
 
 namespace duckdb {
 namespace acl {
-namespace {
-
-//! vcat.vname (a key): the first part is the catalog, the rest the in-catalog path - both as keys
-void SplitVirtual(const string &path, string &vcat, string &vname) {
-	if (!NamePath::SplitHeadKey(path, vcat, vname)) {
-		throw BinderException("acl admin: \"%s\" must be written as <catalog>.<name>", path);
-	}
-}
-
-} // namespace
-
 //! Strip one layer of quotes from a list element written as a literal
 string Unquoted(string value) {
 	StringUtil::Trim(value);

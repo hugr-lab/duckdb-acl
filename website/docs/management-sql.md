@@ -509,9 +509,10 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
   secrets service, see below) on the main catalog grant, and `lineage` (the catalog's definition lineage,
   `acl_lineage_definitions` - [lineage](lineage.md#a-catalogs-definitions-on-demand)) on any catalog grant,
   each held only when named.
-  An unknown name is stored as written and enforces nothing. Each item of `WITH (…)` is a name - a word
-  or a double-quoted name, lower-cased; `CAPS` JSON that names a capability twice (names compare
-  case-insensitively) or holds a NUL in a name is refused where it is written.
+  An unknown name is stored as written and enforces nothing. A capability's name is a word (ASCII
+  letters, digits, `_`): each item of `WITH (…)` is one - bare or double-quoted, lower-cased, the same
+  one twice counting once - and `CAPS` JSON naming anything else, or a capability twice (names compare
+  case-insensitively), is refused where it is written. Each clause of a grant is written once.
 - **`MAIN`** marks the catalog whose objects the role addresses unqualified. A principal with more than
   one main catalog across its roles resolves only qualified names.
 - **`RLS`** is the grant's own predicate, AND-ed onto every object of the catalog for this role (and
@@ -554,8 +555,8 @@ REVOKE SCHEMA <catalog>.<path> FROM ROLE <role>
 ```
 
 The middle level of the grant chain: capabilities for everything under a schema path, including
-objects that appear in it later. It carries capabilities only - `RLS` and `COLUMNS` parse but are
-refused, and `manage` is refused at this level. Capabilities resolve by the longest granted prefix of
+objects that appear in it later. It carries capabilities only - `RLS` and `COLUMNS` are refused
+unless empty, and `manage` is refused at this level. Capabilities resolve by the longest granted prefix of
 a name (`object -> schema -> catalog`); a level that states none inherits from the nearest ancestor
 that does, and the inheritance is materialised when a grant or a schema changes. `REVOKE` re-points
 the subtree at the next ancestor. A schema grant does not make names resolve - the role still needs
