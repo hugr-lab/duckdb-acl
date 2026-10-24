@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
-// acl_scan_util.hpp — the four text-scanning helpers the ACL prefix scanner and the
-// management grammar share (a word, whitespace, a quoted literal with the doubled-quote
-// escape). Private to the two TUs that scan ACL text; nothing here parses SQL.
+// acl_scan_util.hpp — the text-scanning helpers the management grammar and the batch checks still
+// use until spec 150's stage 3 makes them rules (a word, whitespace, a quoted literal with the
+// doubled-quote escape); the override's one-word ACL gate too. Nothing here parses SQL.
 //===----------------------------------------------------------------------===//
 #pragma once
 
@@ -45,7 +45,7 @@ inline string ReadQuoted(const string &query, idx_t &pos) {
 		}
 		value += query[pos++];
 	}
-	throw ParserException("acl_rewrite: unterminated quoted value after ACL prefix");
+	throw ParserException("acl_rewrite: unterminated quoted value");
 }
 
 } // namespace acl

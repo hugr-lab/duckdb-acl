@@ -26,6 +26,7 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/peg/dialect_extension.hpp"
 #include "duckdb/parser/peg/parsed_grammar.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -184,6 +185,13 @@ public:
 	}
 };
 
+//! spec 150: a dialect of the default grammar, so a connection can choose one
+class ToyDialect final : public DialectExtension {
+public:
+	ToyDialect() : DialectExtension("toy") {
+	}
+};
+
 std::string OpenSession(Connection &con) {
 	auto result = con.Query("SELECT acl_session_open('tok')");
 	if (result->HasError() || result->RowCount() == 0) {
@@ -202,6 +210,7 @@ void Run() {
 	DBConfig config;
 	// the toy is registered the way any co-loaded extension would register itself
 	ParserExtension::Register(config, HonkExtension());
+	DialectExtension::Register(config, make_shared_ptr<ToyDialect>());
 	DuckDB db(nullptr, &config);
 	Connection con(db);
 	// statically linked: the generated extension loader publishes 'acl' on the config
@@ -284,6 +293,11 @@ void Run() {
 		// a dialect (DialectExtension) is chosen the same way, per connection - refused alike (spec 067's concern)
 		auto dialect = con.Query("ACL TOKEN 'tok' SET current_dialect = 'duckdb'");
 		Refused(*dialect, "SET \"current_dialect\" is not permitted under ACL", "SET current_dialect under ACL TOKEN");
+		// spec 150: the owner's dialect is the owner's - a prefix under one is refused, nothing of ours added to it
+		Exec(con, "SET current_dialect = 'toy'");
+		auto under_dialect = con.Query("ACL TOKEN 'tok' SELECT 1");
+		Refused(*under_dialect, "refused on a CONNECT-ed connection or under a dialect", "a prefix under a dialect");
+		Exec(con, "RESET current_dialect");
 		auto handle = OpenSession(con);
 		if (Check(!handle.empty(), "a session opens for the token")) {
 			// a session of the client's own may set TimeZone (spec 068) - and nothing else

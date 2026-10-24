@@ -246,6 +246,20 @@ int main(int argc, char *argv[]) {
 			Exec(con, "DETACH remote");
 		});
 
+		Scenario("a batch through the door answers as native quack: its first statement with rows (spec 150)", [&] {
+			Exec(con, "ATTACH 'quack:localhost:31975' AS batch (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			// one PREPARE carries the whole text, under the session's one prefix
+			auto rows = con.Query("FROM batch.query('SELECT 42::BIGINT AS a; SELECT count(*)::BIGINT FROM orders')");
+			if (CheckOk(*rows, "the batch answers")) {
+				Check(rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 42,
+				      "...with its first statement's rows, as a native quack server does");
+			}
+			// every statement of it is decided before any runs: one the principal may not run refuses the batch
+			auto refused = con.Query("FROM batch.query('SELECT 1; SELECT acl_session_count()')");
+			Check(refused->HasError(), "a statement the principal may not run refuses the whole batch");
+			Exec(con, "DETACH batch");
+		});
+
 		Scenario("GET /metrics is opt-in and renders what acl_metrics() answers (spec 069)", [&] {
 			auto off = GetObserved("/metrics", OBSERVER_TOKEN);
 			Check(off.status == 404,

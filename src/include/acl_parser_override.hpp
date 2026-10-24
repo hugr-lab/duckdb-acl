@@ -1,7 +1,7 @@
-// The `ACL` prefix scanner and parser_override entry (specs/001): recognizes `ACL ROLE "<role>"` /
-// `ACL TOKEN '<token>'` / `ACL ADMIN`, strips exactly one prefix, verifies the principal offline,
-// re-parses the remainder natively and rewrites it. FALLBACK semantics: anything unrecognized falls
-// through to the native parser; a recognized prefix that fails enforcement throws (a non-success
+// The `ACL` prefix's parser_override entry (specs/001): reads `ACL ROLE "<role>"` / `ACL TOKEN '<token>'` /
+// `ACL SESSION` / `ACL ADMIN` with a grammar rule (spec 150, acl_grammar.hpp), takes exactly one prefix, verifies
+// the principal offline, parses the remainder as its own text and rewrites it. FALLBACK semantics: anything
+// unrecognized falls through to the native parser; a recognized prefix that fails enforcement throws (a non-success
 // result would be silently re-parsed natively - an enforcement bypass).
 
 #pragma once

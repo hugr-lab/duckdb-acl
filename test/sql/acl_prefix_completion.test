@@ -1,4 +1,4 @@
-# name: test/sql/acl_peg_completion.test
+# name: test/sql/acl_prefix_completion.test
 # description: spec 150 - the prefix rules registered as the grammar extension `acl`: a connection that switches
 #   them on parses as before and completes `ACL …`; and a prefixed text that reaches duckdb's own parser (the
 #   override off) is refused at bind, never run
@@ -63,3 +63,9 @@ query I
 SELECT count(*) FROM sql_auto_complete('ACL ') WHERE suggestion ILIKE 'role%';
 ----
 1
+
+# after the prefix, the statements
+query I
+SELECT count(*) > 0 FROM sql_auto_complete('ACL ROLE ''r'' SEL') WHERE suggestion ILIKE 'select%';
+----
+true
