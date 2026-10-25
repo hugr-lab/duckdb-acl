@@ -452,6 +452,11 @@ void ApplyClientSpec(IdentityClient &client, const string &spec_json, case_insen
 			client.roles_from = StringArray(value, "roles_from");
 		} else if (key == "roles_constant") {
 			client.roles_constant = StringArray(value, "roles_constant");
+			for (auto &role : client.roles_constant) {
+				if (role.empty()) {
+					Bad("ROLES CONSTANT names a role - '' is none"); // spec 152: a role is never ''
+				}
+			}
 		} else if (key == "unmapped") {
 			auto unmapped = StringUtil::Lower(StringOf(value, "unmapped"));
 			if (unmapped == "as_role" || unmapped == "as role") {
@@ -491,10 +496,10 @@ void ApplyClientSpec(IdentityClient &client, const string &spec_json, case_insen
 			}
 			client.flows = std::move(flows);
 		} else if (key == "secret") {
-			// a secret named anew lives where its own IN says (a "service" key after it), else in the one
-			// service attached - never silently in the previous secret's
+			// a secret named anew lives where its own IN says (a "service" key beside it, in any order), else in
+			// the one service attached - never silently in the previous secret's
 			client.secret = StringOf(value, "secret");
-			client.secret_service.clear();
+			client.secret_service = keys.count("service") ? client.secret_service : string();
 		} else if (key == "service") {
 			client.secret_service = StringOf(value, "service");
 		} else {
@@ -525,7 +530,7 @@ void ApplyIssuerSpec(IdentityIssuer &issuer, const string &spec_json, string &cl
 			issuer.url = StringOf(value, "url");
 		} else if (key == "secret") {
 			issuer.secret = StringOf(value, "secret");
-			issuer.secret_service.clear();
+			issuer.secret_service = keys.count("service") ? issuer.secret_service : string(); // as a client's
 		} else if (key == "service") {
 			issuer.secret_service = StringOf(value, "service");
 		} else if (key == "client") {

@@ -47,7 +47,7 @@ shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state);
 //! in the refusal of a NULL; an optional argument past the last column answers its fallback.
 string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what);
 //! spec 152: a role argument - required and never '' (every role is '' for a function grant alone, spec 072: a grant,
-//! a mapping or a scope stored for '' would be a role nobody defined, which the authorizer cannot judge)
+//! a mapping or a scope stored for '' would name no role)
 string RoleArg(DataChunk &args, idx_t col, idx_t row, const char *fn);
 string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback);
 //! spec 116: a virtual or physical name argument, read with the key rules and returned as its

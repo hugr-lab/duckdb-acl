@@ -388,7 +388,7 @@ ACL ROLE "pol" MAP CLAIM 'n' FROM CLIENT pc TO ROLE r_map; GRANT CATALOG sales T
 
 # the calls' batch is judged the same
 statement error
-ACL ROLE "pol" SELECT platform.map_role('client', 'pc', 'groups', 'c1', 'r_both'); SELECT platform.grant_catalog('r_both', 'sales', '{"manage": true}');
+ACL ROLE "pol" SELECT platform.map_role('client', 'pc', 'group', 'c1', 'r_both'); SELECT platform.grant_catalog('r_both', 'sales', '{"manage": true}');
 ----
 <REGEX>:.*"r_both" is given a catalog's manage by this batch.*
 
@@ -454,6 +454,17 @@ statement error
 SELECT acl_alter_issuer('plain', '{"url": "test/idp/a", "url": "test/idp/c"}');
 ----
 <REGEX>:.*an issuer spec names "url" twice.*
+
+statement error
+SELECT acl_define_client('dup', 'plain', '{"audiences": ["api://a"], "roles_constant": ""}');
+----
+<REGEX>:.*ROLES CONSTANT names a role - '' is none.*
+
+# a secret and its service in either order (the service read after the secret used to be dropped)
+statement error
+SELECT acl_define_client('svcorder', 'plain', '{"audiences": ["api://a"], "service": "nosuch", "secret": "s"}');
+----
+<REGEX>:.*nosuch.*
 
 # --- D3: the policy store under every reading of its name ---------------------------------------------------
 

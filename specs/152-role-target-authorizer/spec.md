@@ -42,12 +42,15 @@ client specs as strict as their grammar.
 - `RoleArg` (acl_door_common): every role argument of the admin functions - grants, revokes, `ALTER GRANT`, mappings,
   `GRANT | REVOKE ADMIN`, resource groups, the role's own definition - is required and never `''`. A function grant
   keeps `''` for every role. No stored row is rewritten.
-- `ApplyClientSpec` / `ApplyIssuerSpec` (only writers call them) refuse a property named twice and a client spec
-  naming both `attributes` and `claim_map`.
+- `ApplyClientSpec` / `ApplyIssuerSpec` (only writers call them) refuse a property named twice, a client spec naming
+  both `attributes` and `claim_map`, and a `ROLES CONSTANT` of `''`; a `service` beside its `secret` is kept in either
+  order (one read before the secret was dropped).
 
 ## Enforcement & security
 
-Fail closed: each change only widens what is refused. Passthrough is untouched; roles still compare exactly (spec 095).
+Fail closed: each change widens what is refused, but the URL comparison's removal, which refused only innocent names
+(a client under an issuer named like another issuer's URL). Passthrough is untouched; roles still compare exactly
+(spec 095). A drop (`DROP MAP`, `DROP CLIENT`) hands nothing out and stays the policy bundle's.
 The at-use rules (a privileged role reached by an issuer-scope mapping, `AS ROLE` or a constant does not count) are
 unchanged.
 
