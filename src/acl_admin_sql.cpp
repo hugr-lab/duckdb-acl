@@ -524,75 +524,6 @@ public:
 	                      "RESOURCE GROUP ... FROM ROLE <role>");
 }
 
-//! spec 072: a function as a grant or a member names it - `read_parquet`, `lake.main.peek`, a
-//! double-quoted operator (`"+"`, `"IS DISTINCT FROM"`) - optionally followed by TABLE (or SCALAR,
-//! the default); the text goes to the admin function as one spec, which parses it once more with
-//! the same rules the function form takes
-string FunctionSpecText(AdminScanner &s) {
-	string spec;
-	s.Skip();
-	if (s.pos < s.text.size() && s.text[s.pos] == '"') {
-		spec = "\"" + s.Quoted("a function name") + "\"";
-	} else {
-		spec = s.Dotted("a function name");
-	}
-	if (s.Accept("table")) {
-		spec += " TABLE";
-	} else if (s.Accept("scalar")) {
-		spec += " SCALAR";
-	}
-	return spec;
-}
-
-//! `TO|FROM ROLE r` names the role, `TO|FROM ALL ROLES` is the role '' - every role's
-string RoleOrAllRoles(AdminScanner &s, const char *preposition) {
-	s.Expect(preposition);
-	if (s.Accept("all")) {
-		s.Expect("roles");
-		return string();
-	}
-	s.Expect("role");
-	return s.Ident("a role name");
-}
-
-//! spec 117: `platform.<object>` / `platform.main.<object>` next - a view or a function of the system
-//! catalog, whose grants are its own (platform_grants), never a catalog's or spec 072's. Consumed only
-//! when it is one; `object` is the leaf.
-bool PlatformTarget(AdminScanner &s, string &object) {
-	auto saved = s.pos;
-	s.Skip();
-	if (s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"')) {
-		// a quoted function spec (an operator) is never platform's
-		if (s.text[s.pos] == '\'') {
-			s.pos = saved;
-			return false;
-		}
-	}
-	NamePath path;
-	try {
-		path = s.Path("a name");
-	} catch (std::exception &) {
-		s.pos = saved;
-		return false;
-	}
-	if (!PlatformObjectName(path.Parts(), object)) {
-		s.pos = saved;
-		return false;
-	}
-	return true;
-}
-
-//! GRANT | DENY | REVOKE VIEW|FUNCTION platform.<x> TO|FROM ROLE r (spec 117)
-unique_ptr<SQLStatement> PlatformGrant(AdminScanner &s, const char *kind, const string &object, const char *verb) {
-	auto grant = string(verb) != "revoke";
-	auto role = RoleOrAllRoles(s, grant ? "to" : "from");
-	if (grant) {
-		return MakeAdminCall("acl_grant_platform", {Value(role), Value(kind), Value(object),
-		                                            Value(string(verb) == "deny" ? "false" : "true")});
-	}
-	return MakeAdminCall("acl_revoke_platform", {Value(role), Value(kind), Value(object)});
-}
-
 // --- spec 095: the readers of an issuer's and a client's lists ---------------------------------------
 
 string JsonList(const vector<string> &values) {
@@ -786,28 +717,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		RefuseMovedForm("write MIGRATE POLICY CATALOG <database>[.<schema>] - a name that is an SQL keyword in double "
 		                "quotes");
 	}
+	// spec 150, stage 3f: function grants and categories, platform's point grants, sources and resource groups are
+	// rules - one that reaches here did not read as its rule
 	if (StringUtil::CIEquals(keyword, "deny")) {
-		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES
-		// (spec 072): a grant row with allowed = false, which wins over every grant
-		string object;
-		if (s.Accept("view")) { // spec 117: DENY VIEW platform.<v> TO ROLE r
-			if (!PlatformTarget(s, object)) {
-				throw BinderException("acl admin: DENY VIEW names a view of the platform catalog (platform.<view>)");
-			}
-			return PlatformGrant(s, "view", object, "deny");
-		}
-		s.Expect("function");
-		if (PlatformTarget(s, object)) {
-			return PlatformGrant(s, "function", object, "deny");
-		}
-		if (s.Accept("category")) {
-			auto category = s.Ident("a category name");
-			auto role = RoleOrAllRoles(s, "to");
-			return MakeAdminCall("acl_grant_function_category", {Value(role), Value(category), Value("false")});
-		}
-		auto spec = FunctionSpecText(s);
-		auto role = RoleOrAllRoles(s, "to");
-		return MakeAdminCall("acl_grant_function", {Value(role), Value(spec), Value("false")});
+		RefuseMovedForm(
+		    "write DENY FUNCTION [CATEGORY] <name> [TABLE] | DENY VIEW platform.<view> TO ROLE <role> | ALL "
+		    "ROLES");
 	}
 	if (StringUtil::CIEquals(keyword, "create")) {
 		if (s.Accept("or")) {
@@ -820,39 +735,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			RefuseMovedForm("write CREATE [OR REPLACE] ROLE [IF NOT EXISTS] <role> [CLAIMS (name = 'value', ...)]");
 		}
 		if (s.Accept("resource")) {
-			// CREATE [OR REPLACE] RESOURCE GROUP g [WITH] (window_max 64, batch_bytes '32MiB', …)
-			// [COMMENT '…'] (spec 085): a re-create replaces the limits; the roles bound to it stay
-			s.Expect("group");
-			auto group = s.Ident("a group name");
-			s.Accept("with");
-			string limits = "{}";
-			if (s.AtParen()) {
-				limits = ResourceLimitsJson(s.Parens());
-			}
-			// DEFAULT (spec 096): principals bound to no group are its members; before or after COMMENT
-			string comment, is_default;
-			bool commented = false;
-			for (int clause = 0; clause < 2; clause++) {
-				if (is_default.empty() && s.Accept("default")) {
-					is_default = "true";
-				} else if (!commented && s.Accept("comment")) {
-					comment = s.Quoted("comment");
-					commented = true;
-				}
-			}
-			return MakeAdminCall("acl_create_resource_group",
-			                     {Value(group), Value(limits), Value(comment), Value(is_default)});
+			RefuseMovedForm(
+			    "write CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] [(<limit> <value>, ...)] [DEFAULT] "
+			    "[COMMENT '<text>']");
 		}
 		if (s.Accept("function")) {
-			// CREATE FUNCTION CATEGORY c [COMMENT '…'] (spec 072): the operator's own category; a
-			// re-create keeps the members and grants and takes the new comment
-			s.Expect("category");
-			auto category = s.Ident("a category name");
-			string comment;
-			if (s.Accept("comment")) {
-				comment = s.Quoted("comment");
-			}
-			return MakeAdminCall("acl_create_function_category", {Value(category), Value(comment)});
+			RefuseMovedForm("write CREATE FUNCTION CATEGORY <category> [COMMENT '<text>']");
 		}
 		// spec 150, stage 3e: CREATE ISSUER | CLIENT are rules - one that reaches here did not read as its rule
 		if (s.Accept("client")) {
@@ -869,48 +757,16 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
 		if (s.Accept("source")) {
-			// GRANT SOURCE <database>[.<schema>] TO ROLE r (spec 118.3): the physical tree a catalog admin
-			// sees under platform.attached, and the only sources it builds over
-			auto source = s.Dotted("a source (<database>[.<schema>])");
-			s.Expect("to");
-			s.Expect("role");
-			return MakeAdminCall("acl_grant_source", {Value(s.Ident("a role name")), Value(source)});
+			RefuseMovedForm("write GRANT SOURCE <database>[.<schema>] TO ROLE <role>");
 		}
 		if (s.Accept("resource")) {
-			// GRANT RESOURCE GROUP g TO ROLE r (spec 085)
-			s.Expect("group");
-			auto group = s.Ident("a group name");
-			s.Expect("to");
-			s.Expect("role");
-			return MakeAdminCall("acl_grant_resource_group", {Value(s.Ident("a role name")), Value(group)});
+			RefuseMovedForm("write GRANT RESOURCE GROUP <group> TO ROLE <role>");
 		}
 		if (s.Accept("admin")) {
 			RefuseMovedForm("write GRANT ADMIN <scope> TO ROLE <role>");
 		}
 		if (s.Accept("function")) {
-			// GRANT FUNCTION CATEGORY c TO ROLE r | ALL ROLES; GRANT FUNCTION f [TABLE] TO ROLE r | ALL
-			// ROLES (spec 072) - a grant by name admits the key whatever its categories
-			string object;
-			if (PlatformTarget(s, object)) { // spec 117: a function of the platform catalog
-				return PlatformGrant(s, "function", object, "grant");
-			}
-			if (s.Accept("category")) {
-				auto category = s.Ident("a category name");
-				auto role = RoleOrAllRoles(s, "to");
-				return MakeAdminCall("acl_grant_function_category", {Value(role), Value(category), Value("true")});
-			}
-			auto spec = FunctionSpecText(s);
-			auto role = RoleOrAllRoles(s, "to");
-			return MakeAdminCall("acl_grant_function", {Value(role), Value(spec), Value("true")});
-		}
-		// spec 117: GRANT VIEW platform.<v> TO ROLE r - a view of the system catalog (the grant rule hands it here)
-		{
-			auto saved = s.pos;
-			string object;
-			if (s.Accept("view") && PlatformTarget(s, object)) {
-				return PlatformGrant(s, "view", object, "grant");
-			}
-			s.pos = saved;
+			RefuseMovedForm("write GRANT FUNCTION [CATEGORY] <name> [TABLE] TO ROLE <role> | ALL ROLES");
 		}
 		// spec 150, stage 3d: GRANT CATALOG | SCHEMA | TABLE | VIEW | OBJECT are rules - one that reaches here did not
 		// read as its rule
@@ -918,48 +774,16 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
 		if (s.Accept("source")) {
-			// REVOKE SOURCE <database>[.<schema>] FROM ROLE r (spec 118.3): what the role declared over it
-			// keeps working - an explicit DROP removes it
-			auto source = s.Dotted("a source (<database>[.<schema>])");
-			s.Expect("from");
-			s.Expect("role");
-			return MakeAdminCall("acl_revoke_source", {Value(s.Ident("a role name")), Value(source)});
+			RefuseMovedForm("write REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>");
 		}
 		if (s.Accept("admin")) {
 			RefuseMovedForm("write REVOKE ADMIN [<scope>] FROM ROLE <role>");
 		}
-		{
-			// spec 117: REVOKE VIEW|FUNCTION platform.<x> FROM ROLE r
-			auto saved = s.pos;
-			string object;
-			if (s.Accept("view") && PlatformTarget(s, object)) {
-				return PlatformGrant(s, "view", object, "revoke");
-			}
-			s.pos = saved;
-			if (s.Accept("function") && PlatformTarget(s, object)) {
-				return PlatformGrant(s, "function", object, "revoke");
-			}
-			s.pos = saved;
-		}
 		if (s.Accept("resource")) {
-			// REVOKE RESOURCE GROUP g FROM ROLE r (spec 085)
-			s.Expect("group");
-			auto group = s.Ident("a group name");
-			s.Expect("from");
-			s.Expect("role");
-			return MakeAdminCall("acl_revoke_resource_group", {Value(s.Ident("a role name")), Value(group)});
+			RefuseMovedForm("write REVOKE RESOURCE GROUP <group> FROM ROLE <role>");
 		}
 		if (s.Accept("function")) {
-			// REVOKE FUNCTION CATEGORY c FROM ROLE r | ALL ROLES; REVOKE FUNCTION f [TABLE] FROM ROLE r |
-			// ALL ROLES (spec 072): the row goes, grant or deny alike
-			if (s.Accept("category")) {
-				auto category = s.Ident("a category name");
-				auto role = RoleOrAllRoles(s, "from");
-				return MakeAdminCall("acl_revoke_function_category", {Value(role), Value(category)});
-			}
-			auto spec = FunctionSpecText(s);
-			auto role = RoleOrAllRoles(s, "from");
-			return MakeAdminCall("acl_revoke_function", {Value(role), Value(spec)});
+			RefuseMovedForm("write REVOKE FUNCTION [CATEGORY] <name> [TABLE] FROM ROLE <role> | ALL ROLES");
 		}
 		RefuseGrantForm(s, "revoke");
 	}
@@ -968,46 +792,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	}
 	if (StringUtil::CIEquals(keyword, "alter")) {
 		if (s.Accept("function")) {
-			// ALTER FUNCTION CATEGORY c ADD (f [TABLE], db.schema.f TABLE, "+") | DROP (…) (spec 072):
-			// the list goes to the admin function as written, which parses each spec
-			s.Expect("category");
-			auto category = s.Ident("a category name");
-			if (s.Accept("set")) { // spec 120: ALTER FUNCTION CATEGORY c SET COMMENT '…' - the category must exist; its
-				                   // members stay
-				s.Expect("comment");
-				return MakeAdminCall("acl_comment_function_category", {Value(category), Value(s.Quoted("comment"))});
-			}
-			bool add = s.Accept("add");
-			if (!add) {
-				s.Expect("drop");
-			}
-			auto members = s.Parens();
-			if (members.empty()) {
-				throw BinderException("acl admin: ALTER FUNCTION CATEGORY %s the members in parentheses",
-				                      add ? "ADD takes" : "DROP takes");
-			}
-			return MakeAdminCall(add ? "acl_function_category_add" : "acl_function_category_remove",
-			                     {Value(category), Value(members)});
+			RefuseMovedForm(
+			    "write ALTER FUNCTION CATEGORY <category> ADD | DROP (<function> [TABLE], ...) | SET COMMENT "
+			    "'<text>'");
 		}
-		if (s.Accept(
-		        "resource")) { // spec 096 / 120: ALTER RESOURCE GROUP g SET (limits) | SET COMMENT | SET|DROP DEFAULT
-			s.Expect("group");
-			auto group = s.Ident("a group name");
-			bool set = s.Accept("set");
-			if (set && s.AtParen()) {
-				return MakeAdminCall("acl_alter_resource_group",
-				                     {Value(group), Value("limits"), Value(ResourceLimitsJson(s.Parens()))});
-			}
-			if (set && s.Accept("comment")) {
-				return MakeAdminCall("acl_alter_resource_group",
-				                     {Value(group), Value("comment"), Value(s.Quoted("comment"))});
-			}
-			if (!set) {
-				s.Expect("drop");
-			}
-			s.Expect("default");
-			return MakeAdminCall("acl_alter_resource_group",
-			                     {Value(group), Value("default"), Value(set ? "true" : "false")});
+		if (s.Accept("resource")) {
+			RefuseMovedForm(
+			    "write ALTER RESOURCE GROUP <group> SET (<limit> <value>, ...) | SET COMMENT '<text>' | SET "
+			    "DEFAULT | DROP DEFAULT");
 		}
 		if (s.Accept("role")) {
 			RefuseMovedForm("write ALTER ROLE <role> SET COMMENT '<text>' | SET CLAIMS (name = 'value', ...)");
@@ -1036,29 +828,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		RefuseObjectChange(s, StringUtil::Lower(keyword));
 	}
 	if (StringUtil::CIEquals(keyword, "drop")) {
-		// `IF EXISTS` says nothing-to-drop is not an error; without it a missing target is reported,
-		// which is what makes a typo visible (spec 010)
-		string mode;
-		auto if_exists = [&mode](AdminScanner &scanner) {
-			if (scanner.Accept("if")) {
-				scanner.Expect("exists");
-				mode = "skip";
-			}
-		};
 		if (s.Accept("relation")) {
 			RefuseMovedForm("write DROP RELATION [IF EXISTS] <catalog>.<name>");
 		}
 		if (s.Accept("resource")) {
-			// DROP RESOURCE GROUP [IF EXISTS] g (spec 085): its role bindings go too
-			s.Expect("group");
-			if_exists(s);
-			return MakeAdminCall("acl_drop_resource_group", {Value(s.Ident("a group name")), Value(mode)});
+			RefuseMovedForm("write DROP RESOURCE GROUP [IF EXISTS] <group>");
 		}
 		if (s.Accept("function")) {
-			// DROP FUNCTION CATEGORY [IF EXISTS] c (spec 072): the members and every grant on it go too
-			s.Expect("category");
-			if_exists(s);
-			return MakeAdminCall("acl_drop_function_category", {Value(s.Ident("a category name")), Value(mode)});
+			RefuseMovedForm("write DROP FUNCTION CATEGORY [IF EXISTS] <category>");
 		}
 		if (s.Accept("reference")) {
 			RefuseMovedForm("write DROP [VIRTUAL] REFERENCE [IF EXISTS] <catalog>.<name>");
@@ -1326,6 +1103,9 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				break;
 			case MgmtParsed::TextKind::CLAIM_MAP:
 				read = JsonQuote(ClaimMapToJson(list.text)); // kept as a JSON string, which the spec parses
+				break;
+			case MgmtParsed::TextKind::LIMITS:
+				read = ResourceLimitsJson(list.text);
 				break;
 			}
 			if (list.splice.empty()) {

@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d, 3e built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d, 3e, 3f built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -289,7 +289,20 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   wins), never read by an authorizer. 3e's review also found two
   holes of spec 117's authorizer (a name written in another case, a batch mapping and granting manage together) -
   spec 152's.
-- 3f: function categories and grants, platform grants, sources, resource groups.
+- 3f (built): function categories and grants (spec 072: `CREATE | ALTER … ADD | DROP (…) | SET COMMENT | DROP
+  [IF EXISTS] FUNCTION CATEGORY`, `GRANT | DENY | REVOKE FUNCTION [CATEGORY] … TO | FROM ROLE r | ALL ROLES`), the
+  platform catalog's point grants (spec 117: `GRANT | DENY | REVOKE FUNCTION platform.<f>`, `DENY VIEW platform.<v>`,
+  and `GRANT | REVOKE VIEW platform.<v>` through the object grant's rule, which now takes `ALL ROLES` too - its call
+  refuses `''`), sources (spec 118.3: `GRANT | REVOKE SOURCE <db>[.<schema>]`), resource groups (spec 085: `CREATE
+  [OR REPLACE] RESOURCE GROUP g [WITH] [(limits)] [DEFAULT] [COMMENT '…']`, `ALTER … SET (limits) | SET COMMENT | SET
+  DEFAULT | DROP DEFAULT`, `DROP [IF EXISTS]`, `GRANT | REVOKE RESOURCE GROUP g TO | FROM ROLE r`). A function spec is
+  its path's key, a one-part name no bare word could be (`"||"`, `"IS DISTINCT FROM"`) in double quotes, then `TABLE`
+  / `SCALAR` as written - what `ParseFunctionSpec` reads, as the compiler's `FunctionSpecText` wrote it; a platform
+  function takes no kind (refused). The limits are `TextKind::LIMITS`, read by the compiler's `ResourceLimitsJson`,
+  and a value list: a string continued on the next line refused. Changed: DEFAULT / COMMENT each once; comments inside
+  the forms; `""` the tokenizer's; a grant on a platform view with an object grant's clause refused in its words.
+  After 3f no family of this repository is the compiler's - the legacy path (`AclMgmtLegacy`, `CompileMgmtText`,
+  `LegacyUnreadable`) serves hugr-node's registered forms until 3g.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
   `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
 
