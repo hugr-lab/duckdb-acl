@@ -854,7 +854,23 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 		key.schema = "main";
 		key.name = spec.substr(1, spec.size() - 2);
 	} else {
-		auto parts = SplitTopLevel(spec, '.');
+		// a name written in parts reads plain parts only: a quote, an apostrophe or a parenthesis would be kept in a
+		// part or end the split, and a space at a part's edge trimmed away - each a name other than written
+		if (spec.find_first_of("\"'()") != string::npos) {
+			throw BinderException("%s: \"%s\" - a function written in parts names plain parts (a one-part name may be "
+			                      "double-quoted: \"IS DISTINCT FROM\")",
+			                      fn, spec_p);
+		}
+		auto parts = StringUtil::Split(spec, '.');
+		for (auto &part : parts) {
+			auto trimmed = part;
+			StringUtil::Trim(trimmed);
+			if (trimmed.empty() || trimmed.size() != part.size()) {
+				throw BinderException("%s: \"%s\" - a part of a function's name is never empty nor starts or ends "
+				                      "with a space",
+				                      fn, spec_p);
+			}
+		}
 		if (parts.size() == 1) {
 			key.database = "system";
 			key.schema = "main";
@@ -2230,6 +2246,12 @@ void AclDefineRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 }
 
 } // namespace
+
+FunctionKey ReadFunctionSpec(const string &spec, const char *fn, bool &kind_written) {
+	auto parsed = ParseFunctionSpec(spec, fn);
+	kind_written = parsed.kind_explicit;
+	return parsed.key;
+}
 
 void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	// register an admin setup function, attaching the shared store via its function_info

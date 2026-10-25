@@ -4,6 +4,7 @@
 // linked module registers - hugr-node's, until 3g) goes, as its own text, to the management compiler
 // (acl_admin_sql.cpp). Never registered: a connection cannot switch it on.
 
+#include "acl_admin_functions.hpp"
 #include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
 #include "acl_grammar_util.hpp"
@@ -1882,19 +1883,6 @@ string FunctionSpecOf(ParseResult &result, string &key, bool &kind_written) {
 	auto &spec = Strip(result).Cast<ListParseResult>();
 	key = PathOf(spec.GetChild(0));
 	auto parts = NamePath::FromKey(key).Parts();
-	// ParseFunctionSpec reads the text, not parts: a quote is kept, a dot of a qualified name's part splits it, a space
-	// in its last part ends the name at a kind word (`main."read_csv TABLE"` read as read_csv TABLE) - refused, never
-	// stored as another function than written
-	for (idx_t index = 0; index < parts.size(); index++) {
-		auto &part = parts[index];
-		bool last = index + 1 == parts.size();
-		if (StringUtil::Contains(part, "\"") || (parts.size() > 1 && StringUtil::Contains(part, ".")) ||
-		    (parts.size() > 1 && last && part.find_first_of(" \t\r\n") != string::npos)) {
-			throw BinderException("acl admin: function \"%s\" would be read as another - no part of its name holds a "
-			                      "quote, a qualified one's parts no dot, its last part no space",
-			                      key);
-		}
-	}
 	if (parts.size() == 1 && StringUtil::CIEquals(parts[0], "category")) {
 		throw BinderException("acl admin: FUNCTION CATEGORY names a category - write FUNCTION CATEGORY <name>, or a "
 		                      "function named category as system.main.category");
@@ -1914,6 +1902,27 @@ string FunctionSpecOf(ParseResult &result, string &key, bool &kind_written) {
 		text += KeywordOf(kind.GetResult()) == "table" ? " TABLE" : " SCALAR";
 	}
 	return text;
+}
+
+//! The spec read back as the admin function will read it must name the function written: it reads text, not parts (a
+//! space in a qualified name's last part ends the name at a kind word - `main."read_csv TABLE"` was the table function
+//! read_csv), so a name it would read as another is refused here, never stored
+void RequireReadAsWritten(const string &spec, const string &key, bool kind_written, bool table) {
+	auto parts = NamePath::FromKey(key).Parts();
+	FunctionKey written;
+	written.database = parts.size() == 3 ? parts[0] : "system";
+	written.schema = parts.size() == 3 ? parts[1] : parts.size() == 2 ? parts[0] : "main";
+	written.name = parts.back();
+	bool read_kind = false;
+	auto read = ReadFunctionSpec(spec, "acl admin", read_kind);
+	bool same = parts.size() <= 3 && read.name == StringUtil::Lower(written.name) &&
+	            read.schema == StringUtil::Lower(written.schema) &&
+	            read.database == StringUtil::Lower(written.database) && read_kind == kind_written &&
+	            (!kind_written || (read.kind == FunctionKind::TABLE) == table);
+	if (!same) {
+		throw BinderException("acl admin: function \"%s\" would be read as %s - write its name in plain parts", key,
+		                      read.ToString());
+	}
 }
 
 // AclGrantFunctionCategory <- AclFunctionGrantVerb 'FUNCTION' 'CATEGORY' AclName 'TO' AclRoleTarget - a deny wins
@@ -1948,6 +1957,7 @@ arena_ptr<TransformResultValue> FunctionGrant(PEGTransformer &transformer, Parse
 		}
 		return MgmtResult(transformer, std::move(platform));
 	}
+	RequireReadAsWritten(spec, key, kind_written, StringUtil::EndsWith(spec, " TABLE"));
 	auto data = Call(verb == "revoke" ? "acl_revoke_function" : "acl_grant_function");
 	data->args = {Value(role), Value(spec)};
 	if (verb != "revoke") {

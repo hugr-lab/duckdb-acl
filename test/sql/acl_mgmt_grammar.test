@@ -1,7 +1,7 @@
 # name: test/sql/acl_mgmt_grammar.test
 # description: spec 150, stage 3 - the management statements read by rules of duckdb's parser: each family compiles
 #   to the acl_* call it always compiled to (a form a linked module registers - hugr-node's - still goes as its own
-#   text to the management compiler, until 3g). Families in order: 3a the operations of a node, then 3b-3f.
+#   text to the management compiler, until 3g). A resource group first (the first family the tests used), then 3a-3f.
 # group: [sql]
 
 require acl
@@ -1852,41 +1852,65 @@ ACL ADMIN DENY FUNCTION lower;
 ----
 write DENY FUNCTION [CATEGORY]
 
-# a function spec the admin function would read as another is refused, never stored: a quote in a part, a dot in a
-# qualified one's part, a space in its last part (`main."read_csv TABLE"` was read as the table function read_csv)
+# a function spec the admin function would read as another is refused, never stored: it reads text, not parts -
+# `main."read_csv TABLE"` was the table function read_csv, a part's edge space was trimmed, a quote, an apostrophe or
+# a parenthesis kept in a part or ended the split
 statement error
 ACL ADMIN GRANT FUNCTION system.main."read_csv TABLE" TO ROLE fgrantee;
 ----
-would be read as another
+would be read as system.main.read_csv
+
+statement error
+ACL ADMIN GRANT FUNCTION "system ".main.lower TO ROLE fgrantee;
+----
+never empty nor starts or ends with a space
+
+statement error
+ACL ADMIN GRANT FUNCTION " system".main.lower TO ROLE fgrantee;
+----
+would be read as system.main.lower
 
 statement error
 ACL ADMIN DENY FUNCTION "sys.tem".main.query TABLE TO ROLE fgrantee;
 ----
-would be read as another
+a function written in parts names plain parts
 
 statement error
 ACL ADMIN DENY FUNCTION lake."a.b".f TABLE TO ROLE fgrantee;
 ----
-would be read as another
+a function written in parts names plain parts
+
+statement error
+ACL ADMIN DENY FUNCTION a."it's".f TABLE TO ROLE fgrantee;
+----
+a function written in parts names plain parts
 
 statement error
 ACL ADMIN DENY FUNCTION "a""b" TABLE TO ROLE fgrantee;
 ----
-would be read as another
+a function written in parts names plain parts
+
+# ... and a category's members are read by the same reader (a quoted part dropped nothing, silently)
+statement error
+ACL ADMIN CREATE FUNCTION CATEGORY quoted; ALTER FUNCTION CATEGORY quoted DROP (system.main."lower");
+----
+a function written in parts names plain parts
 
 query I
 SELECT count(*) FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND name NOT IN ('lower', '||');
 ----
 0
 
-# ... while a part with a space that is not the last one reads as written, and SCALAR is a kind
+# ... while a name with a space that reads as written is kept, and SCALAR is a kind
 statement ok
-ACL ADMIN DENY FUNCTION lake."my schema".peek SCALAR TO ROLE fgrantee;
+ACL ADMIN DENY FUNCTION lake."my schema".peek SCALAR TO ROLE fgrantee; DENY FUNCTION lake.main."my func" SCALAR
+TO ROLE fgrantee; DENY FUNCTION system.main."IS DISTINCT FROM" TO ROLE fgrantee;
 
-query III
-SELECT database, schema, kind FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND name = 'peek';
+query T
+SELECT string_agg(database || '|' || schema || '|' || name || '|' || kind, ',' ORDER BY name)
+FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND NOT allowed;
 ----
-lake	my schema	scalar
+system|main|is distinct from|scalar,lake|main|my func|scalar,lake|my schema|peek|scalar
 
 # CATEGORY alone is no function's name: a category's name forgotten is refused, never a grant of `category`
 statement error
@@ -1908,6 +1932,21 @@ an object grant names one role
 
 statement error
 ACL ADMIN CREATE ROLE never_seated; REVOKE VIEW platform.sessions FROM ALL ROLES;
+----
+a grant on the platform catalog names one role
+
+statement error
+ACL ADMIN CREATE ROLE never_seated; REVOKE TABLE granted.t FROM ALL ROLES;
+----
+an object grant names one role
+
+statement error
+ACL ADMIN CREATE ROLE never_seated; GRANT FUNCTION platform.drain TO ALL ROLES;
+----
+a grant on the platform catalog names one role
+
+statement error
+ACL ADMIN CREATE ROLE never_seated; DENY VIEW platform.sessions TO ALL ROLES;
 ----
 a grant on the platform catalog names one role
 
@@ -1943,6 +1982,11 @@ statement error
 ACL ADMIN ALTER RESOURCE GROUP bare SET (window_max 1, window_max 7);
 ----
 limit "window_max" is written twice
+
+statement error
+ACL ADMIN CREATE OR REPLACE RESOURCE GROUP bare (window_max 1, WINDOW_MAX = 7);
+----
+limit "WINDOW_MAX" is written twice
 
 statement ok
 ACL ADMIN DROP RESOURCE GROUP bare;

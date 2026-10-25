@@ -1,9 +1,8 @@
-// The ACL management grammar (spec 008) and its authorization gate (spec 009). Moved out of
-// acl_parser_override.cpp on 2026-09-03 (release plan 4.1): AuthorizeMgmt is the gate every
-// management statement passes, and it was invisible inside a file named after prefix scanning.
-// Since spec 150's stage 3 the management statements are rules (acl_mgmt_grammar.cpp); what is left here compiles a
-// form a linked module registers (hugr-node's, until 3g) and refuses a moved form's text in its own words. The parser
-// override is its only caller.
+// The ACL management grammar (spec 008). Since spec 150's stage 3 the management statements are rules
+// (acl_mgmt_grammar.cpp); what is left here reads the lists a rule hands over (ParseMgmtBatch's readers), compiles a
+// form a linked module registers (hugr-node's) and `ACL GRANT | REVOKE SECRET` until 3g, and refuses a moved form's
+// text in its own words. The authorizer every management statement passes is acl_platform.cpp's (spec 117). The
+// parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
 #include "acl_grammar.hpp"
@@ -669,7 +668,7 @@ string AttributesJson(const string &list) {
 //! (spec 085; ALTER RESOURCE GROUP … SET (…), spec 120)
 string ResourceLimitsJson(const string &inside) {
 	vector<string> entries;
-	unordered_set<string> named;
+	case_insensitive_set_t named;
 	for (auto &item : SplitTopLevel(inside, ',')) {
 		auto text = item;
 		StringUtil::Trim(text);
@@ -687,7 +686,7 @@ string ResourceLimitsJson(const string &inside) {
 			value = value.substr(1);
 		}
 		value = Unquoted(value);
-		if (!named.insert(StringUtil::Lower(name)).second) {
+		if (!named.insert(name).second) {
 			throw BinderException("acl admin: limit \"%s\" is written twice - write each limit once", name);
 		}
 		entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));

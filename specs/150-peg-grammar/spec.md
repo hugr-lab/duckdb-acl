@@ -292,17 +292,20 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
 - 3f (built): function categories and grants (spec 072: `CREATE | ALTER … ADD | DROP (…) | SET COMMENT | DROP
   [IF EXISTS] FUNCTION CATEGORY`, `GRANT | DENY | REVOKE FUNCTION [CATEGORY] … TO | FROM ROLE r | ALL ROLES`), the
   platform catalog's point grants (spec 117: `GRANT | DENY | REVOKE FUNCTION platform.<f>`, `DENY VIEW platform.<v>`,
-  and `GRANT | REVOKE VIEW platform.<v>` through the object grant's rule, which now takes `ALL ROLES` too - its call
-  refuses `''`), sources (spec 118.3: `GRANT | REVOKE SOURCE <db>[.<schema>]`), resource groups (spec 085: `CREATE
+  and `GRANT | REVOKE VIEW platform.<v>` through the object grant's rule, whose role is now `ROLE r | ALL ROLES` -
+  ALL ROLES refused where read), sources (spec 118.3: `GRANT | REVOKE SOURCE <db>[.<schema>]`), resource groups (spec 085: `CREATE
   [OR REPLACE] RESOURCE GROUP g [WITH] [(limits)] [DEFAULT] [COMMENT '…']`, `ALTER … SET (limits) | SET COMMENT | SET
   DEFAULT | DROP DEFAULT`, `DROP [IF EXISTS]`, `GRANT | REVOKE RESOURCE GROUP g TO | FROM ROLE r`). A function spec is
   its path's key, a one-part name no bare word could be (`"||"`, `"IS DISTINCT FROM"`) in double quotes, then `TABLE`
   / `SCALAR` as written - what `ParseFunctionSpec` reads, as the compiler's `FunctionSpecText` wrote it; a platform
   function takes no kind (refused). The limits are `TextKind::LIMITS`, read by the compiler's `ResourceLimitsJson`,
   and a value list: a string continued on the next line refused. Fixed with the move (3f's reviews): a function spec
-  the admin function would read as another is refused (`ParseFunctionSpec` reads text, not parts - a quote in a part
-  is kept, a dot of a qualified name's part splits it, a space in its last part ends the name at a kind word:
-  `system.main."read_csv TABLE"` stored the table function read_csv, as the compiler's `Dotted` did); `category`
+  the admin function would read as another is refused (`ParseFunctionSpec` reads text, not parts: a space in a
+  qualified name's last part ended the name at a kind word - `system.main."read_csv TABLE"` stored the table function
+  read_csv, as the compiler's `Dotted` did - an edge space was trimmed, a quote, an apostrophe or a parenthesis kept in
+  a part or ended the split; `RequireReadAsWritten` reads the spec back through `ReadFunctionSpec` and compares the
+  key, and `ParseFunctionSpec` refuses a name in parts that is not plain - members of a category too, whose quoted part
+  dropped nothing, silently); `category`
   alone is refused (a category's forgotten name read as a grant of a function `category`); `ALL ROLES` on an object
   grant and a platform grant refused where read (the call refused it after the batch's earlier statements ran); a
   limit written twice refused (the last won). Changed: comments inside the forms after their first words (one after
