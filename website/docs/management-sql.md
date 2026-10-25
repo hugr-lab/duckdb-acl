@@ -723,11 +723,12 @@ REVOKE FUNCTION <function> FROM ROLE <role> | FROM ALL ROLES
 ```
 
 A `<function>` is `name`, `schema.name` or `database.schema.name` - a bare name is `system.main`,
-where every builtin lives - optionally followed by `TABLE` (or `SCALAR`, the default); an operator is
-double-quoted (`"+"`, `"IS DISTINCT FROM"`). A name written in parts names plain parts - no quote,
-apostrophe or parenthesis, no space at a part's edge - and a grant whose name would read as another
-is refused (`main."read_csv TABLE"` reads as the table function `read_csv`); `category` alone names
-a category (`system.main.category` is the function). A member or an admitting grant must name a function this node has, unless the
+where every builtin lives - optionally followed by `TABLE` (or `SCALAR`, the default). Each part is a
+word or a double-quoted name, read as duckdb reads a qualified name (`""` a quote): an operator is
+double-quoted (`"+"`, `"IS DISTINCT FROM"`, `system.main."||"`), and a kind is read only outside
+quotes (`main."read_csv TABLE"` is a function of that name). A part never starts or ends with a
+space; `category` alone names a category (`system.main.category` is the function). The members of a
+category are written the same way. A member or an admitting grant must name a function this node has, unless the
 kind was written explicitly: that is how a fleet-shared catalog records a function of an extension
 the writing node does not carry. The never set - `acl_*`, `ducklake_*`, `quack_*`, `arrow_scan*`,
 `query`, `query_table`, `json_execute_serialized_sql`, a scanner's `*_query` / `*_execute` /

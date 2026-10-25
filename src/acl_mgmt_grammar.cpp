@@ -4,7 +4,6 @@
 // linked module registers - hugr-node's, until 3g) goes, as its own text, to the management compiler
 // (acl_admin_sql.cpp). Never registered: a connection cannot switch it on.
 
-#include "acl_admin_functions.hpp"
 #include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
 #include "acl_grammar_util.hpp"
@@ -1876,9 +1875,9 @@ arena_ptr<TransformResultValue> FinalizeDropIdentity(PEGTransformer &transformer
 // --- function grants and categories (spec 072), platform's point grants (spec 117), sources (spec 118.3), resource
 // groups (spec 085) ---------------------------------------------------------------------------------------------
 
-//! `AclFunctionSpec <- AclPath AclGrantFunctionKind?` as the spec the admin functions parse (ParseFunctionSpec): the
-//! path's key, a one-part name no bare word could be (`"+"`, `"IS DISTINCT FROM"`) in double quotes, then the kind
-//! written; `key` the path's key
+//! `AclFunctionSpec <- AclPath AclGrantFunctionKind?` as the spec the admin functions parse (ParseFunctionSpec): each
+//! part of the path double-quoted (`""` a quote) - the reader takes a quoted part as written and a kind only outside
+//! quotes - then the kind written; `key` the path's key
 string FunctionSpecOf(ParseResult &result, string &key, bool &kind_written) {
 	auto &spec = Strip(result).Cast<ListParseResult>();
 	key = PathOf(spec.GetChild(0));
@@ -1887,42 +1886,17 @@ string FunctionSpecOf(ParseResult &result, string &key, bool &kind_written) {
 		throw BinderException("acl admin: FUNCTION CATEGORY names a category - write FUNCTION CATEGORY <name>, or a "
 		                      "function named category as system.main.category");
 	}
-	auto text = key;
-	if (parts.size() == 1) {
-		for (auto c : parts[0]) {
-			if (!StringUtil::CharacterIsAlphaNumeric(c) && c != '_') {
-				text = "\"" + parts[0] + "\"";
-				break;
-			}
-		}
+	vector<string> quoted;
+	for (auto &part : parts) {
+		quoted.push_back("\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"");
 	}
+	auto text = StringUtil::Join(quoted, ".");
 	auto &kind = spec.Child<OptionalParseResult>(1);
 	kind_written = kind.HasResult();
 	if (kind_written) {
 		text += KeywordOf(kind.GetResult()) == "table" ? " TABLE" : " SCALAR";
 	}
 	return text;
-}
-
-//! The spec read back as the admin function will read it must name the function written: it reads text, not parts (a
-//! space in a qualified name's last part ends the name at a kind word - `main."read_csv TABLE"` was the table function
-//! read_csv), so a name it would read as another is refused here, never stored
-void RequireReadAsWritten(const string &spec, const string &key, bool kind_written, bool table) {
-	auto parts = NamePath::FromKey(key).Parts();
-	FunctionKey written;
-	written.database = parts.size() == 3 ? parts[0] : "system";
-	written.schema = parts.size() == 3 ? parts[1] : parts.size() == 2 ? parts[0] : "main";
-	written.name = parts.back();
-	bool read_kind = false;
-	auto read = ReadFunctionSpec(spec, "acl admin", read_kind);
-	bool same = parts.size() <= 3 && read.name == StringUtil::Lower(written.name) &&
-	            read.schema == StringUtil::Lower(written.schema) &&
-	            read.database == StringUtil::Lower(written.database) && read_kind == kind_written &&
-	            (!kind_written || (read.kind == FunctionKind::TABLE) == table);
-	if (!same) {
-		throw BinderException("acl admin: function \"%s\" would be read as %s - write its name in plain parts", key,
-		                      read.ToString());
-	}
 }
 
 // AclGrantFunctionCategory <- AclFunctionGrantVerb 'FUNCTION' 'CATEGORY' AclName 'TO' AclRoleTarget - a deny wins
@@ -1957,7 +1931,6 @@ arena_ptr<TransformResultValue> FunctionGrant(PEGTransformer &transformer, Parse
 		}
 		return MgmtResult(transformer, std::move(platform));
 	}
-	RequireReadAsWritten(spec, key, kind_written, StringUtil::EndsWith(spec, " TABLE"));
 	auto data = Call(verb == "revoke" ? "acl_revoke_function" : "acl_grant_function");
 	data->args = {Value(role), Value(spec)};
 	if (verb != "revoke") {

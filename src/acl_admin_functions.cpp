@@ -829,65 +829,64 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 	FunctionSpec out;
 	auto &key = out.key;
 	key.kind = FunctionKind::SCALAR;
-	auto space = spec.find_last_of(" \t");
-	if (space != string::npos && spec.front() != '"') {
-		auto suffix = spec.substr(space + 1);
-		if (ParseFunctionKind(suffix, key.kind)) {
-			out.kind_explicit = true;
-			spec = spec.substr(0, space);
-			StringUtil::Trim(spec);
-		}
-	} else if (space != string::npos) {
-		// a quoted name: the kind, if any, follows the closing quote
-		auto close = spec.find('"', 1);
-		if (close != string::npos && close + 1 < spec.size()) {
-			auto suffix = spec.substr(close + 1);
-			StringUtil::Trim(suffix);
-			if (ParseFunctionKind(suffix, key.kind)) {
-				out.kind_explicit = true;
-				spec = spec.substr(0, close + 1);
-			}
+	// the kind: a last word after a space outside double quotes (`"read_csv TABLE"` is a name)
+	bool quoted = false;
+	optional_idx space;
+	for (idx_t i = 0; i < spec.size(); i++) {
+		if (spec[i] == '"') {
+			quoted = !quoted; // a doubled quote toggles twice
+		} else if (!quoted && (spec[i] == ' ' || spec[i] == '\t')) {
+			space = i;
 		}
 	}
-	if (spec.size() >= 2 && spec.front() == '"' && spec.back() == '"') {
+	if (space.IsValid() && ParseFunctionKind(spec.substr(space.GetIndex() + 1), key.kind)) {
+		out.kind_explicit = true;
+		spec = spec.substr(0, space.GetIndex());
+		StringUtil::Trim(spec);
+	}
+	// the name: up to three parts, each a word or a double-quoted name with `""` for a quote - read as duckdb reads a
+	// qualified name (spec 152's review: a quote kept in a part, a part's edge space trimmed, a trailing dot dropped
+	// each named another function than written)
+	vector<Identifier> parts;
+	string error;
+	if (!spec.empty() && spec.back() != '.') {
+		try {
+			parts = QualifiedName::ParseComponents(spec);
+		} catch (std::exception &ex) {
+			error = ErrorData(ex).RawMessage();
+		}
+	}
+	if (parts.empty() || !error.empty()) {
+		throw BinderException("%s: \"%s\" is no function name - up to three parts, each a word or a double-quoted name "
+		                      "(\"IS DISTINCT FROM\"), optionally followed by TABLE or SCALAR%s",
+		                      fn, spec_p, error.empty() ? "" : " (" + error + ")");
+	}
+	for (auto &part : parts) {
+		auto text = part.GetIdentifierName();
+		auto trimmed = text;
+		StringUtil::Trim(trimmed);
+		if (text.empty() || trimmed.size() != text.size()) {
+			throw BinderException("%s: \"%s\" - a part of a function's name is never empty nor starts or ends with a "
+			                      "space",
+			                      fn, spec_p);
+		}
+	}
+	if (parts.size() == 1) {
 		key.database = "system";
 		key.schema = "main";
-		key.name = spec.substr(1, spec.size() - 2);
+		key.name = parts[0].GetIdentifierName();
+	} else if (parts.size() == 2) {
+		key.database = "system";
+		key.schema = parts[0].GetIdentifierName();
+		key.name = parts[1].GetIdentifierName();
+	} else if (parts.size() == 3) {
+		key.database = parts[0].GetIdentifierName();
+		key.schema = parts[1].GetIdentifierName();
+		key.name = parts[2].GetIdentifierName();
 	} else {
-		// a name written in parts reads plain parts only: a quote, an apostrophe or a parenthesis would be kept in a
-		// part or end the split, and a space at a part's edge trimmed away - each a name other than written
-		if (spec.find_first_of("\"'()") != string::npos) {
-			throw BinderException("%s: \"%s\" - a function written in parts names plain parts (a one-part name may be "
-			                      "double-quoted: \"IS DISTINCT FROM\")",
-			                      fn, spec_p);
-		}
-		auto parts = StringUtil::Split(spec, '.');
-		for (auto &part : parts) {
-			auto trimmed = part;
-			StringUtil::Trim(trimmed);
-			if (trimmed.empty() || trimmed.size() != part.size()) {
-				throw BinderException("%s: \"%s\" - a part of a function's name is never empty nor starts or ends "
-				                      "with a space",
-				                      fn, spec_p);
-			}
-		}
-		if (parts.size() == 1) {
-			key.database = "system";
-			key.schema = "main";
-			key.name = parts[0];
-		} else if (parts.size() == 2) {
-			key.database = "system";
-			key.schema = parts[0];
-			key.name = parts[1];
-		} else if (parts.size() == 3) {
-			key.database = parts[0];
-			key.schema = parts[1];
-			key.name = parts[2];
-		} else {
-			throw BinderException("%s: a function is written as name, schema.name or database.schema.name, "
-			                      "optionally followed by TABLE: \"%s\"",
-			                      fn, spec_p);
-		}
+		throw BinderException("%s: a function is written as name, schema.name or database.schema.name, "
+		                      "optionally followed by TABLE: \"%s\"",
+		                      fn, spec_p);
 	}
 	if (key.name.empty()) {
 		throw BinderException("%s: a function name is required", fn);
@@ -2246,12 +2245,6 @@ void AclDefineRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 }
 
 } // namespace
-
-FunctionKey ReadFunctionSpec(const string &spec, const char *fn, bool &kind_written) {
-	auto parsed = ParseFunctionSpec(spec, fn);
-	kind_written = parsed.kind_explicit;
-	return parsed.key;
-}
 
 void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	// register an admin setup function, attaching the shared store via its function_info
