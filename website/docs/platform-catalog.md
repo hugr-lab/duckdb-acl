@@ -101,8 +101,8 @@ may call itself - its roles' categories and grants by name, a deny winning, the 
 body is a constant (never a `?`). No definition may name the policy catalog's own tables. Changing an
 issuer or a client that carries a mapping to an administering role, mapping to such a role, and granting
 a catalog's `manage` to a role a mapping reaches are `passthrough`'s - an issuer or a client named in any
-case is the same one, and a batch is judged with what it maps and grants itself (`MAP … TO ROLE r; GRANT CATALOG c
-TO ROLE r WITH (manage)` is refused in either order). `REVOKE ADMIN <bundle>` of a
+case is the same one, and a batch is judged with what it maps and grants itself (`MAP … TO ROLE r;
+GRANT CATALOG c TO ROLE r WITH (manage)` is refused in either order). `REVOKE ADMIN <bundle>` of a
 bundle the role does not hold - or holds only through `manage` / `passthrough` - is refused, naming
 what to revoke.
 

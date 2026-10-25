@@ -427,9 +427,18 @@ void ApplyClientSpec(IdentityClient &client, const string &spec_json, case_insen
 	}
 	duckdb_yyjson::yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(json.Root(), &iter);
+	case_insensitive_set_t keys;
 	while (auto key_value = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
 		auto key = StringUtil::Lower(Text(key_value));
 		auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key_value);
+		// spec 152: a property once, and the attributes from one of their two spellings - the last of two would take
+		// effect while a reader of the spec saw the first (the grammar refuses the same, spec 150's 3e)
+		if (!keys.insert(key).second) {
+			Bad("a client spec names \"" + key + "\" twice");
+		}
+		if ((key == "attributes" && keys.count("claim_map")) || (key == "claim_map" && keys.count("attributes"))) {
+			Bad("a client spec names both \"attributes\" and \"claim_map\" - both write the attributes; name one");
+		}
 		if (written) {
 			written->insert(key);
 		}
@@ -505,9 +514,13 @@ void ApplyIssuerSpec(IdentityIssuer &issuer, const string &spec_json, string &cl
 	}
 	duckdb_yyjson::yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(json.Root(), &iter);
+	case_insensitive_set_t keys;
 	while (auto key_value = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
 		auto key = StringUtil::Lower(Text(key_value));
 		auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key_value);
+		if (!keys.insert(key).second) {
+			Bad("an issuer spec names \"" + key + "\" twice"); // spec 152, as a client spec
+		}
 		if (key == "url") {
 			issuer.url = StringOf(value, "url");
 		} else if (key == "secret") {

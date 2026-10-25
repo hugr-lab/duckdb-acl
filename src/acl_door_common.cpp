@@ -75,6 +75,14 @@ string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const 
 	return value.ToString();
 }
 
+string RoleArg(DataChunk &args, idx_t col, idx_t row, const char *fn) {
+	auto role = RequiredArg(args, col, row, fn, "role");
+	if (role.empty()) {
+		throw InvalidInputException("%s: a role is named - '' is a role only for a function grant (every role)", fn);
+	}
+	return role;
+}
+
 string NameKey(const string &text, const char *fn, const char *what) {
 	if (text.empty()) {
 		return text;
