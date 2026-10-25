@@ -68,9 +68,9 @@ catalog forms refuse.
   a nested schema answers its path, and a schema part with a dot is shown quoted (`"a.b"`, `a."b.c"`)
   so it never reads as two levels. Lineage names a dataset by the same key rules
   (`Sales Mart.main.Order Items`, `c."a.b".Sink`).
-- Quoted values take `'…'` or `"…"`; a doubled quote is a literal one. The empty text is `''` - every
-  management form is read by duckdb's tokenizer, to which `""` is an empty identifier, which it
-  refuses.
+- Quoted values take `'…'` or `"…"`; a doubled quote is a literal one. The empty text is `''` - the
+  management forms are read by duckdb's tokenizer (but `ACL GRANT | REVOKE SECRET`), to which `""` is
+  an empty identifier, which it refuses.
 - A body (after `AS` or `MACRO`) is either one quoted string - the whole body, nothing after it - or
   written inline to the end of the statement: a `;` inside a literal does not end it, one outside
   does. In the forms of the virtual catalog's objects (`CREATE | ALTER VIRTUAL …`, `ADD …`) a `$$…$$`
@@ -708,7 +708,7 @@ session's `USE` a short name is read in its catalog first), and `acl_function_co
 schema[, function]]])` lists their parameters, result columns and a scalar's return type.
 
 ```sql
-CREATE FUNCTION CATEGORY <name> [COMMENT '<text>']
+CREATE [OR REPLACE] FUNCTION CATEGORY <name> [COMMENT '<text>']
 ALTER FUNCTION CATEGORY <name> ADD (<function> [, …]) | DROP (<function> [, …])
 ALTER FUNCTION CATEGORY <name> SET COMMENT '<text>'      -- it must exist; the members stay (spec 120)
 DROP FUNCTION CATEGORY [IF EXISTS] <name>
@@ -723,8 +723,10 @@ REVOKE FUNCTION <function> FROM ROLE <role> | FROM ALL ROLES
 ```
 
 A `<function>` is `name`, `schema.name` or `database.schema.name` - a bare name is `system.main`,
-where every builtin lives - optionally followed by `TABLE`; an operator is double-quoted (`"+"`,
-`"IS DISTINCT FROM"`). A member or an admitting grant must name a function this node has, unless the
+where every builtin lives - optionally followed by `TABLE` (or `SCALAR`, the default); an operator is
+double-quoted (`"+"`, `"IS DISTINCT FROM"`). A name that would read as another is refused: a quote
+in a part, a dot in a part of a qualified name, a space in its last part; `category` alone names a
+category (`system.main.category` is the function). A member or an admitting grant must name a function this node has, unless the
 kind was written explicitly: that is how a fleet-shared catalog records a function of an extension
 the writing node does not carry. The never set - `acl_*`, `ducklake_*`, `quack_*`, `arrow_scan*`,
 `query`, `query_table`, `json_execute_serialized_sql`, a scanner's `*_query` / `*_execute` /

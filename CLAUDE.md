@@ -486,8 +486,8 @@ a space). 3c: the virtual catalog's objects - CREATE / ALTER / COMMENT ON / ANAL
 [VIRTUAL] REFERENCE, CHECK, REPAIR, the ADD forms - `AclPathToken` (a path judged whole into its canonical key),
 `AclPathName`, `AclList` (a list as written, each comment a space), `AclBody` (one plain quoted token its value, else
 its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT, ALTER GRANT (`WITH (…)` a
-list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant handed to the
-compiler). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the transform, a list inside it a marker
+list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant a point grant,
+`PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the transform, a list inside it a marker
 its reading replaces (`TextArg::splice`). 3f: function categories and grants, platform's point grants, sources,
 resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's registered forms. Stage 4 the
 policy texts. Tests `acl_prefix_grammar.test`,

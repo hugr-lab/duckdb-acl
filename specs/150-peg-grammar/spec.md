@@ -243,8 +243,8 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   separators only are empty), `REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT … FROM ROLE r`, `ALTER GRANT CATALOG c
   TO ROLE r SET CAPS | RLS | COLUMNS '<text>' | MAIN <word>`. A grant on a view of the platform catalog (`GRANT |
   REVOKE VIEW platform.x`, spec 117, `PlatformObjectName`) is a point grant the compiler still reads: its transform
-  answers legacy data with the statement's span (`PlatformViewGrant`); another name of platform's stays an object
-  grant, refused as the reserved catalog. Fixed with the move (3c's review, 3d's): `WITH (…)` is a list of names
+  answers legacy data with the statement's span (`PlatformViewGrant`; a call since 3f); another name of platform's
+  stays an object grant, refused as the reserved catalog. Fixed with the move (3c's review, 3d's): `WITH (…)` is a list of names
   (`AclCapsList`: a word or a double-quoted name, lower-cased, the same twice one, `JsonQuote`d - `CapsListToJson`
   pasted the text between the commas, so `\u006danage` stored manage); `ParseCaps(json, strict)` where caps are WRITTEN
   (a grant, `ALTER GRANT SET CAPS`, `check_grant`, the function forms) refuses an escape in the JSON (a name is a word
@@ -299,10 +299,18 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   its path's key, a one-part name no bare word could be (`"||"`, `"IS DISTINCT FROM"`) in double quotes, then `TABLE`
   / `SCALAR` as written - what `ParseFunctionSpec` reads, as the compiler's `FunctionSpecText` wrote it; a platform
   function takes no kind (refused). The limits are `TextKind::LIMITS`, read by the compiler's `ResourceLimitsJson`,
-  and a value list: a string continued on the next line refused. Changed: DEFAULT / COMMENT each once; comments inside
-  the forms; `""` the tokenizer's; a grant on a platform view with an object grant's clause refused in its words.
-  After 3f no family of this repository is the compiler's - the legacy path (`AclMgmtLegacy`, `CompileMgmtText`,
-  `LegacyUnreadable`) serves hugr-node's registered forms until 3g.
+  and a value list: a string continued on the next line refused. Fixed with the move (3f's reviews): a function spec
+  the admin function would read as another is refused (`ParseFunctionSpec` reads text, not parts - a quote in a part
+  is kept, a dot of a qualified name's part splits it, a space in its last part ends the name at a kind word:
+  `system.main."read_csv TABLE"` stored the table function read_csv, as the compiler's `Dotted` did); `category`
+  alone is refused (a category's forgotten name read as a grant of a function `category`); `ALL ROLES` on an object
+  grant and a platform grant refused where read (the call refused it after the batch's earlier statements ran); a
+  limit written twice refused (the last won). Changed: comments inside the forms after their first words (one after
+  `DENY` / `CREATE` / `ALTER` / `DROP` is 3g's classification); `""` the tokenizer's; a quoted part touching the
+  next word (`"lower"TABLE`) refused; DEFAULT / COMMENT each once and the platform grant's clause or kind refusals
+  are the old refusals in new words. After 3f no family of this repository is the compiler's - the legacy path
+  (`AclMgmtLegacy`, `CompileMgmtText`, `LegacyUnreadable`) serves hugr-node's registered forms until 3g, and its
+  tests are hugr-node's.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
   `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
 

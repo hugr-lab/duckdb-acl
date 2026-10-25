@@ -1,7 +1,9 @@
 // The ACL management grammar (spec 008) and its authorization gate (spec 009). Moved out of
 // acl_parser_override.cpp on 2026-09-03 (release plan 4.1): AuthorizeMgmt is the gate every
 // management statement passes, and it was invisible inside a file named after prefix scanning.
-// The grammar compiles text into acl_* admin-function calls; the parser override is its only caller.
+// Since spec 150's stage 3 the management statements are rules (acl_mgmt_grammar.cpp); what is left here compiles a
+// form a linked module registers (hugr-node's, until 3g) and refuses a moved form's text in its own words. The parser
+// override is its only caller.
 
 #include "acl_admin_sql.hpp"
 #include "acl_grammar.hpp"
@@ -9,7 +11,6 @@
 #include "acl_platform.hpp"
 
 #include "acl_door_common.hpp"
-#include "acl_name_path.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -668,6 +669,7 @@ string AttributesJson(const string &list) {
 //! (spec 085; ALTER RESOURCE GROUP … SET (…), spec 120)
 string ResourceLimitsJson(const string &inside) {
 	vector<string> entries;
+	unordered_set<string> named;
 	for (auto &item : SplitTopLevel(inside, ',')) {
 		auto text = item;
 		StringUtil::Trim(text);
@@ -685,6 +687,9 @@ string ResourceLimitsJson(const string &inside) {
 			value = value.substr(1);
 		}
 		value = Unquoted(value);
+		if (!named.insert(StringUtil::Lower(name)).second) {
+			throw BinderException("acl admin: limit \"%s\" is written twice - write each limit once", name);
+		}
 		entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));
 	}
 	return "{" + StringUtil::Join(entries, ", ") + "}";
@@ -720,9 +725,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	// spec 150, stage 3f: function grants and categories, platform's point grants, sources and resource groups are
 	// rules - one that reaches here did not read as its rule
 	if (StringUtil::CIEquals(keyword, "deny")) {
-		RefuseMovedForm(
-		    "write DENY FUNCTION [CATEGORY] <name> [TABLE] | DENY VIEW platform.<view> TO ROLE <role> | ALL "
-		    "ROLES");
+		RefuseMovedForm("write DENY FUNCTION [CATEGORY] <name> [TABLE | SCALAR] TO ROLE <role> | ALL ROLES, or DENY "
+		                "VIEW platform.<view> TO ROLE <role>");
 	}
 	if (StringUtil::CIEquals(keyword, "create")) {
 		if (s.Accept("or")) {
@@ -740,7 +744,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			    "[COMMENT '<text>']");
 		}
 		if (s.Accept("function")) {
-			RefuseMovedForm("write CREATE FUNCTION CATEGORY <category> [COMMENT '<text>']");
+			RefuseMovedForm("write CREATE [OR REPLACE] FUNCTION CATEGORY <category> [COMMENT '<text>']");
 		}
 		// spec 150, stage 3e: CREATE ISSUER | CLIENT are rules - one that reaches here did not read as its rule
 		if (s.Accept("client")) {
@@ -766,7 +770,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			RefuseMovedForm("write GRANT ADMIN <scope> TO ROLE <role>");
 		}
 		if (s.Accept("function")) {
-			RefuseMovedForm("write GRANT FUNCTION [CATEGORY] <name> [TABLE] TO ROLE <role> | ALL ROLES");
+			RefuseMovedForm("write GRANT FUNCTION [CATEGORY] <name> [TABLE | SCALAR] TO ROLE <role> | ALL ROLES");
 		}
 		// spec 150, stage 3d: GRANT CATALOG | SCHEMA | TABLE | VIEW | OBJECT are rules - one that reaches here did not
 		// read as its rule
@@ -783,7 +787,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			RefuseMovedForm("write REVOKE RESOURCE GROUP <group> FROM ROLE <role>");
 		}
 		if (s.Accept("function")) {
-			RefuseMovedForm("write REVOKE FUNCTION [CATEGORY] <name> [TABLE] FROM ROLE <role> | ALL ROLES");
+			RefuseMovedForm("write REVOKE FUNCTION [CATEGORY] <name> [TABLE | SCALAR] FROM ROLE <role> | ALL ROLES");
 		}
 		RefuseGrantForm(s, "revoke");
 	}
@@ -793,7 +797,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	if (StringUtil::CIEquals(keyword, "alter")) {
 		if (s.Accept("function")) {
 			RefuseMovedForm(
-			    "write ALTER FUNCTION CATEGORY <category> ADD | DROP (<function> [TABLE], ...) | SET COMMENT "
+			    "write ALTER FUNCTION CATEGORY <category> ADD | DROP (<function> [TABLE | SCALAR], ...) | SET COMMENT "
 			    "'<text>'");
 		}
 		if (s.Accept("resource")) {
@@ -993,7 +997,7 @@ bool BatchIsAllMgmt(const string &text) {
 	return !statements.empty();
 }
 
-//! One management statement written as text, compiled by the management compiler (a family no rule reads yet)
+//! One management statement written as text, compiled by the management compiler (a form no rule reads)
 unique_ptr<SQLStatement> CompileMgmtText(const string &text) {
 	AdminScanner scanner(text);
 	auto statement = ParseMgmtStatement(scanner);
@@ -1064,8 +1068,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				if (!entry.unreadable.empty()) {
 					// it compiled - from text its scanner reads otherwise than duckdb does
 					throw BinderException("acl admin: %s in a statement no rule reads yet - its compiler would read it "
-					                      "otherwise than written; write it without (its family becomes a rule in "
-					                      "stage 3)",
+					                      "otherwise than written; write it without (a linked module's form becomes a "
+					                      "rule in stage 3g)",
 					                      entry.unreadable);
 				}
 			} catch (MovedFormRefusal &) {

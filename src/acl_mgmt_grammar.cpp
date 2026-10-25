@@ -1,8 +1,8 @@
 // Spec 150, stage 3: the management statements as rules of duckdb's PEG parser. A management batch (the rest after
 // `ACL <prefix> ACL`, or after `ACL ADMIN`) is parsed with a grammar whose Statement is ours: each family that moved
-// to rules compiles to the acl_* call it always compiled to, and a statement no rule reads yet goes, as its own text,
-// to the management compiler (acl_admin_sql.cpp) - one family moves per PR. Never registered: a connection cannot
-// switch it on.
+// to rules compiles to the acl_* call it always compiled to, and a statement no rule reads (since 3f only a form a
+// linked module registers - hugr-node's, until 3g) goes, as its own text, to the management compiler
+// (acl_admin_sql.cpp). Never registered: a connection cannot switch it on.
 
 #include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
@@ -1438,6 +1438,11 @@ unique_ptr<MgmtParseData> PlatformGrantCall(const char *kind, const string &path
 	if (!PlatformObjectName(NamePath::FromKey(path_key).Parts(), leaf)) {
 		return nullptr;
 	}
+	if (role.empty()) {
+		// refused where read, so a batch holding it runs nothing (the call refuses it too)
+		throw BinderException("acl admin: a grant on the platform catalog names one role - never every role (ALL "
+		                      "ROLES)");
+	}
 	if (verb == "revoke") {
 		auto data = Call("acl_revoke_platform");
 		data->args = {Value(role), Value(kind), Value(leaf)};
@@ -1511,6 +1516,14 @@ arena_ptr<TransformResultValue> FinalizeGrantSchema(PEGTransformer &transformer,
 	return MgmtResult(transformer, std::move(data));
 }
 
+//! An object grant's role (`AclRoleTarget`): one role - ALL ROLES is a function grant's and platform's (which refuses
+//! it), refused where read so a batch holding it runs nothing
+void ObjectGrantRole(ParseResult &target) {
+	if (RoleTargetOf(target).empty()) {
+		throw BinderException("acl admin: an object grant names one role - TO | FROM ROLE <role>, never ALL ROLES");
+	}
+}
+
 // AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' AclRoleTarget AclObjectClause* - the object's own grant (spec
 // 011): it narrows the object for this role, it never widens it
 arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer, ParseResult &parse_result) {
@@ -1519,6 +1532,7 @@ arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer,
 		return MgmtResult(transformer, std::move(platform));
 	}
 	auto data = Call("acl_grant_object");
+	ObjectGrantRole(list.GetChild(4));
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
 	data->args = {Value(RoleTargetOf(list.GetChild(4))), Value(vcat), Value(vname)};
@@ -1556,6 +1570,7 @@ arena_ptr<TransformResultValue> FinalizeRevokeObject(PEGTransformer &transformer
 		return MgmtResult(transformer, std::move(platform));
 	}
 	auto data = Call("acl_revoke_object");
+	ObjectGrantRole(list.GetChild(4));
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
 	data->args = {Value(RoleTargetOf(list.GetChild(4))), Value(vcat), Value(vname)};
@@ -1867,6 +1882,23 @@ string FunctionSpecOf(ParseResult &result, string &key, bool &kind_written) {
 	auto &spec = Strip(result).Cast<ListParseResult>();
 	key = PathOf(spec.GetChild(0));
 	auto parts = NamePath::FromKey(key).Parts();
+	// ParseFunctionSpec reads the text, not parts: a quote is kept, a dot of a qualified name's part splits it, a space
+	// in its last part ends the name at a kind word (`main."read_csv TABLE"` read as read_csv TABLE) - refused, never
+	// stored as another function than written
+	for (idx_t index = 0; index < parts.size(); index++) {
+		auto &part = parts[index];
+		bool last = index + 1 == parts.size();
+		if (StringUtil::Contains(part, "\"") || (parts.size() > 1 && StringUtil::Contains(part, ".")) ||
+		    (parts.size() > 1 && last && part.find_first_of(" \t\r\n") != string::npos)) {
+			throw BinderException("acl admin: function \"%s\" would be read as another - no part of its name holds a "
+			                      "quote, a qualified one's parts no dot, its last part no space",
+			                      key);
+		}
+	}
+	if (parts.size() == 1 && StringUtil::CIEquals(parts[0], "category")) {
+		throw BinderException("acl admin: FUNCTION CATEGORY names a category - write FUNCTION CATEGORY <name>, or a "
+		                      "function named category as system.main.category");
+	}
 	auto text = key;
 	if (parts.size() == 1) {
 		for (auto c : parts[0]) {
@@ -1953,8 +1985,8 @@ arena_ptr<TransformResultValue> FinalizeDenyView(PEGTransformer &transformer, Pa
 arena_ptr<TransformResultValue> FinalizeCreateFunctionCategory(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_create_function_category");
-	data->args = {Value(NameOf(list.GetChild(4), "a category name")), Value(string())};
-	data->args[1] = Value(OptionalComment(transformer, list, 5, *data));
+	auto name = NameOf(list.GetChild(4), "a category name");
+	data->args = {Value(name), Value(OptionalComment(transformer, list, 5, *data))};
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -2002,12 +2034,6 @@ arena_ptr<TransformResultValue> FinalizeSourceGrant(PEGTransformer &transformer,
 	return MgmtResult(transformer, std::move(data));
 }
 
-//! A resource group's limits `(window_max 64, batch_bytes '32MiB', …)` into argument `arg`, read once the tokens are
-//! known (the compiler's ResourceLimitsJson)
-void LimitsInto(ParseResult &paren_list, idx_t arg, MgmtParseData &data) {
-	ParensInto(paren_list, arg, MgmtParsed::TextKind::LIMITS, false, data);
-}
-
 // AclCreateResourceGroup <- 'CREATE' AclOrReplace? 'RESOURCE' 'GROUP' AclName 'WITH'? AclParenList? AclGroupClause*
 // (spec 085) - a re-create replaces the limits, the roles bound to it stay; DEFAULT (spec 096: the principals bound to
 // no group are its members) and COMMENT in any order, each once
@@ -2017,7 +2043,8 @@ arena_ptr<TransformResultValue> FinalizeCreateResourceGroup(PEGTransformer &tran
 	data->args = {Value(NameOf(list.GetChild(4), "a group name")), Value("{}"), Value(string()), Value(string())};
 	auto &limits = list.Child<OptionalParseResult>(6);
 	if (limits.HasResult()) {
-		LimitsInto(limits.GetResult(), 1, *data);
+		// the limits `(window_max 64, batch_bytes '32MiB', …)`, read once the tokens are known (ResourceLimitsJson)
+		ParensInto(limits.GetResult(), 1, MgmtParsed::TextKind::LIMITS, false, *data);
 	}
 	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 7)) {
@@ -2043,7 +2070,7 @@ arena_ptr<TransformResultValue> FinalizeAlterResourceGroup(PEGTransformer &trans
 	auto name = change.Name();
 	if (name == "AclGroupSetLimits") {
 		data->args[1] = Value("limits"); // AclGroupSetLimits <- 'SET' AclParenList
-		LimitsInto(change.GetChild(1), 2, *data);
+		ParensInto(change.GetChild(1), 2, MgmtParsed::TextKind::LIMITS, false, *data);
 	} else if (name == "AclGroupSetComment") {
 		data->args[1] = Value("comment"); // AclGroupSetComment <- 'SET' AclComment
 		data->args[2] = Value(Quoted(transformer, ClauseList(change.GetChild(1)), 1, "comment", *data));
