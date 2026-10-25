@@ -1351,16 +1351,6 @@ bool PlatformAccess::Any() const {
 
 namespace {
 
-//! An issuer's URL by its name ('' when none) - a short-form issuer is named by its URL
-string IssuerUrlOf(const IdentityModel &model, const string &name) {
-	for (auto &issuer : model.issuers) {
-		if (issuer.name == name) {
-			return issuer.url;
-		}
-	}
-	return string();
-}
-
 //! The call a compiled management statement makes: `SELECT acl_<fn>(…)` or `SELECT * FROM acl_<fn>(…)`
 FunctionExpression &CompiledCall(SQLStatement &statement) {
 	if (statement.type != StatementType::SELECT_STATEMENT) {
@@ -1911,22 +1901,22 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 		return;
 	}
 	auto identity = store.Identity();
-	// the issuer / client a mapping to an administering role hangs on: what repoints that trust is privileged
+	// the issuer / client a mapping to an administering role hangs on: what repoints that trust is privileged. Names
+	// compare as the store resolves them, in any case (spec 152: `ALTER ISSUER KC` is issuer kc)
 	auto privileged_behind = [&](const string &issuer, const string &client) {
 		for (auto &mapping : identity->mappings) {
 			bool scoped = false;
 			if (StringUtil::CIEquals(mapping.scope_kind, "client")) {
-				if (!client.empty() && mapping.scope_name == client) {
+				if (!client.empty() && StringUtil::CIEquals(mapping.scope_name, client)) {
 					scoped = true;
 				}
 				for (auto &each : identity->clients) {
-					if (each.name == mapping.scope_name && !issuer.empty() &&
-					    (each.issuer == issuer || IssuerUrlOf(*identity, each.issuer) == issuer)) {
+					if (!issuer.empty() && StringUtil::CIEquals(each.name, mapping.scope_name) &&
+					    StringUtil::CIEquals(each.issuer, issuer)) {
 						scoped = true;
 					}
 				}
-			} else if (!issuer.empty() &&
-			           (mapping.scope_name == issuer || IssuerUrlOf(*identity, mapping.scope_name) == issuer)) {
+			} else if (!issuer.empty() && StringUtil::CIEquals(mapping.scope_name, issuer)) {
 				scoped = true;
 			}
 			if (scoped && store.RolePrivileged(mapping.role)) {
@@ -1935,10 +1925,42 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 		}
 		return string();
 	};
+	// each statement's grant of a catalog's manage (the role it goes to), and the batch's own effects, whatever their
+	// order (spec 152): sent one after the other a mapping and a manage grant to one role refuse the second, so one
+	// batch holding both refuses too
+	struct Target {
+		string function;
+		bool manage = false;
+		string manage_role;
+	};
+	vector<Target> targets;
+	unordered_set<string> mapped_here, managed_here;
 	for (auto &statement : statements) {
 		auto &call = CompiledCall(*statement);
-		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
-		if (target == "acl_session_view_as") {
+		Target entry;
+		entry.function = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		if (entry.function == "acl_grant_catalog") {
+			auto caps = ConstantArgument(call, 2, "grant_catalog");
+			entry.manage = !caps.empty() && acl_detail::ParseCaps(caps).count("manage");
+		} else if (entry.function == "acl_alter_grant") {
+			auto field = StringUtil::Lower(ConstantArgument(call, 2, "alter_grant"));
+			auto value = ConstantArgument(call, 3, "alter_grant");
+			entry.manage = field == "caps" && !value.empty() && acl_detail::ParseCaps(value).count("manage");
+		}
+		if (entry.manage) {
+			entry.manage_role =
+			    ConstantArgument(call, 0, entry.function == "acl_grant_catalog" ? "grant_catalog" : "alter_grant");
+			managed_here.insert(entry.manage_role);
+		}
+		if (entry.function == "acl_map_role") {
+			mapped_here.insert(ConstantArgument(call, 4, "map_role"));
+		}
+		targets.push_back(std::move(entry));
+	}
+	for (idx_t index = 0; index < statements.size(); index++) {
+		auto &call = CompiledCall(*statements[index]);
+		auto &target = targets[index];
+		if (target.function == "acl_session_view_as") {
 			// spec 120.3: the policy bundle's (a point grant on platform.view_as does not reach it), and a view never
 			// shows more than the viewer may read: a role holding administration is viewed by passthrough only
 			auto why = store.ViewAsRefusal(rights, ConstantArgument(call, 0, "view_as"));
@@ -1947,11 +1969,11 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 			}
 		}
 		string issuer, client;
-		if (target == "acl_alter_issuer" || target == "acl_define_issuer") {
+		if (target.function == "acl_alter_issuer" || target.function == "acl_define_issuer") {
 			issuer = ConstantArgument(call, 0, "alter_issuer");
-		} else if (target == "acl_alter_client") {
+		} else if (target.function == "acl_alter_client") {
 			client = ConstantArgument(call, 0, "alter_client");
-		} else if (target == "acl_define_client") {
+		} else if (target.function == "acl_define_client") {
 			client = ConstantArgument(call, 0, "define_client");
 			issuer = ConstantArgument(call, 1, "define_client");
 		}
@@ -1966,33 +1988,28 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 		}
 		// a grant that makes a mapped role administer a catalog hands it to whoever holds the claim: the
 		// order (map first, grant after) must not reach what mapping it afterwards could not
-		if (target == "acl_grant_catalog" || target == "acl_alter_grant") {
-			auto role = ConstantArgument(call, 0, "grant_catalog");
-			bool manage = false;
-			if (target == "acl_grant_catalog") {
-				auto caps = ConstantArgument(call, 2, "grant_catalog");
-				manage = !caps.empty() && acl_detail::ParseCaps(caps).count("manage");
-			} else {
-				auto field = StringUtil::Lower(ConstantArgument(call, 2, "alter_grant"));
-				auto value = ConstantArgument(call, 3, "alter_grant");
-				manage = field == "caps" && !value.empty() && acl_detail::ParseCaps(value).count("manage");
+		if (target.manage) {
+			bool mapped = mapped_here.count(target.manage_role) > 0;
+			for (auto &mapping : identity->mappings) {
+				mapped = mapped || mapping.role == target.manage_role;
 			}
-			if (manage) {
-				for (auto &mapping : identity->mappings) {
-					if (mapping.role == role) {
-						throw BinderException("acl admin: \"%s\" is reached by a role mapping, so granting it a "
-						                      "catalog's manage hands administration to whoever holds the claim - it "
-						                      "requires a passthrough scope, as mapping to an administering role does",
-						                      role);
-					}
-				}
+			if (mapped) {
+				throw BinderException("acl admin: \"%s\" is reached by a role mapping, so granting it a "
+				                      "catalog's manage hands administration to whoever holds the claim - it "
+				                      "requires a passthrough scope, as mapping to an administering role does",
+				                      target.manage_role);
 			}
 		}
-		if (target != "acl_map_role") {
+		if (target.function != "acl_map_role") {
 			continue;
 		}
 		auto role = ConstantArgument(call, 4, "map_role");
-		if (!role.empty() && store.RolePrivileged(role)) {
+		if (managed_here.count(role)) {
+			throw BinderException("acl admin: \"%s\" is given a catalog's manage by this batch, so mapping a claim to "
+			                      "it hands that administration out - it requires a passthrough scope",
+			                      role);
+		}
+		if (store.RolePrivileged(role)) {
 			throw BinderException("acl admin: \"%s\" holds administration, so mapping a claim to it hands that "
 			                      "administration out - it requires a passthrough scope, as granting the bundle does",
 			                      role);

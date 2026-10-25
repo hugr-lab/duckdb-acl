@@ -679,7 +679,7 @@ every write first takes the stored spelling (`PolicyStore::SpellCatalog` / `Spel
 at each admin-function name argument, read by `KeyArg` / `CatalogArg`), and a NEW name differing only by
 case from any stored name of its catalog is refused - so joins between policy tables stay exact. Grammar:
 `Ident` / `Path` (a `"…"` is ONE identifier), `PathName` (`'…'` = the legacy whole path), `NameValue`
-for issuers/clients/groups/secrets. Roles/groups/issuers/clients compare exactly. Listings compute in key
+for issuers/clients/groups/secrets. Roles/groups compare exactly, issuers/clients in any case (spec 152). Listings compute in key
 space and show names unquoted at the end (`named(...)`; a one-part schema holding a dot shows as its key
 `"a.b"`, `NamePath::Display` / `FromDisplay`). Schema v20, `min_reader` 20; the step refuses case
 collisions and unreadable keys. Tests: `test_acl_name_path.cpp`, `acl_quoted_names.test` (memory mode:
@@ -739,6 +739,14 @@ quack door (`SessionDoorOf`). Flight: a management statement / call is a command
 a retained result is read from the handle. The view comment and the stored catalog / schema comments
 reach the listings. Tests: `platform_{views,calls,rights,markerless,reserved,memory}.test`,
 `test_acl_session.cpp` / `test_acl_params_passthrough.cpp`, `test/e2e/flight/admin.sh`, the door e2e.
+
+**Spec 152 — the role-target authorizer reads as the store does**: `AuthorizeRoleTargets` compares issuer / client
+names case-insensitively (`ALTER ISSUER KC` is kc - it compared exactly, so a `policy` admin repointed an issuer behind
+a passthrough mapping and became passthrough), and judges a batch with its own `acl_map_role` targets and catalog
+`manage` grants, in either order (`MAP … TO ROLE r; GRANT … manage TO r` passed together). A role argument is never
+`''` (`RoleArg`, every writer and revoke; only a function grant's `''` = every role), and an issuer / client spec JSON
+names a property once and the attributes in one spelling. Judged when decided (a prepared statement executes as
+decided - a known limit). Test `platform_review.test`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a

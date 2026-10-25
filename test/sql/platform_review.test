@@ -316,6 +316,156 @@ ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET CAPS '{"manage": tru
 ----
 <REGEX>:.*"reader" is reached by a role mapping.*
 
+# spec 152: a name in another case is the same issuer / client to the store, and to the authorizer
+statement error
+ACL ROLE "pol" ALTER ISSUER KC SET URL 'test/idp/a';
+----
+<REGEX>:.*issuer "KC" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" SELECT platform.alter_issuer('Kc', '{"url": "test/idp/a"}');
+----
+<REGEX>:.*issuer "Kc" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" ALTER CLIENT CATCHALL SET AUDIENCES ('api://other');
+----
+<REGEX>:.*client "CATCHALL" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" CREATE OR REPLACE CLIENT Catchall ISSUER KC AUDIENCES ('api://acl-test') ROLES FROM ('groups');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" CREATE CLIENT sneaky2 ISSUER kC AUDIENCES ('api://acl-test') AZP ('y') ROLES FROM ('groups');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+# ... and a short form, named by its URL
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/d' AUDIENCES ('api://d') ROLE CLAIM 'roles';
+
+statement ok
+ACL ADMIN MAP CLAIM 'd-root' FROM CLIENT 'test/idp/d' TO ROLE root;
+
+statement error
+ACL ROLE "pol" ALTER ISSUER 'TEST/IDP/D' SET AUDIENCES ('api://any');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+# spec 152: a batch is judged with what it maps and grants itself - map then grant, grant then map
+statement ok
+ACL ADMIN CREATE ROLE r_both; CREATE ROLE r_rev; CREATE ROLE r_map; CREATE ROLE r_grant;
+
+statement error
+ACL ROLE "pol" MAP CLAIM 'x' FROM CLIENT pc TO ROLE r_both; GRANT CATALOG sales TO ROLE r_both WITH (select, manage);
+----
+<REGEX>:.*"r_both" is given a catalog's manage by this batch, so mapping a claim to it.*
+
+statement error
+ACL ROLE "pol" GRANT CATALOG sales TO ROLE r_rev WITH (select, manage); MAP CLAIM 'y' FROM CLIENT pc TO ROLE r_rev;
+----
+<REGEX>:.*"r_rev" is reached by a role mapping.*
+
+statement error
+ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET CAPS '{"select": true}'; MAP CLAIM 'z' FROM CLIENT pc TO ROLE r_rev; ALTER GRANT CATALOG sales TO ROLE r_rev SET CAPS '{"manage": true}';
+----
+<REGEX>:.*"r_rev" is given a catalog's manage by this batch.*
+
+query I
+SELECT count(*) FROM acl_role_mappings() WHERE role IN ('r_both', 'r_rev');
+----
+0
+
+# a mapping and a manage grant to different roles stay one batch
+statement ok
+ACL ROLE "pol" MAP CLAIM 'm' FROM CLIENT pc TO ROLE r_map; GRANT CATALOG sales TO ROLE r_grant WITH (select, manage);
+
+# ... and a mapping with a grant that is no manage, to one role
+statement ok
+ACL ROLE "pol" MAP CLAIM 'n' FROM CLIENT pc TO ROLE r_map; GRANT CATALOG sales TO ROLE r_map WITH (select);
+
+# the calls' batch is judged the same
+statement error
+ACL ROLE "pol" SELECT platform.map_role('client', 'pc', 'group', 'c1', 'r_both'); SELECT platform.grant_catalog('r_both', 'sales', '{"manage": true}');
+----
+<REGEX>:.*"r_both" is given a catalog's manage by this batch.*
+
+# a name in another case with nothing privileged behind it is changed as before
+statement ok
+ACL ROLE "pol" ALTER ISSUER PLAIN SET URL 'test/idp/c';
+
+# a client re-created under another spelling keeps its mappings (they resolve in any case): still behind root
+statement ok
+ACL ROLE "root" CREATE OR REPLACE CLIENT Catchall ISSUER kc AUDIENCES ('api://acl-test') ROLES FROM ('groups');
+
+statement error
+ACL ROLE "pol" ALTER ISSUER kc SET URL 'test/idp/a';
+----
+<REGEX>:.*issuer "kc" carries a mapping to "root".*
+
+statement ok
+ACL ROLE "root" CREATE OR REPLACE CLIENT catchall ISSUER kc AUDIENCES ('api://acl-test') ROLES FROM ('groups');
+
+# spec 152: '' is a role only for a function grant (every role) - never a grant's, a mapping's or a scope's
+statement error
+ACL ROLE "pol" SELECT platform.map_role('client', 'pc', 'groups', 'g-empty', '');
+----
+<REGEX>:.*acl_map_role: a role is named.*
+
+statement error
+ACL ROLE "pol" SELECT platform.grant_catalog('', 'sales', '{"select": true, "manage": true}');
+----
+<REGEX>:.*acl_grant_catalog: a role is named.*
+
+statement error
+ACL ROLE "pol" SELECT platform.alter_grant('', 'sales', 'caps', '{"manage": true}');
+----
+<REGEX>:.*acl_alter_grant: a role is named.*
+
+statement error
+SELECT acl_revoke_catalog('', 'sales');
+----
+<REGEX>:.*acl_revoke_catalog: a role is named.*
+
+statement error
+SELECT acl_grant_admin('', 'observe');
+----
+<REGEX>:.*acl_grant_admin: a role is named.*
+
+query I
+SELECT count(*) FROM acl_role_mappings() WHERE role = '';
+----
+0
+
+# spec 152: a spec names a property once, the attributes in one spelling - the last of two took effect
+statement error
+SELECT acl_define_client('dup', 'plain', '{"audiences": ["api://a"], "audiences": ["api://b"]}');
+----
+<REGEX>:.*a client spec names "audiences" twice.*
+
+statement error
+SELECT acl_define_client('dup', 'plain', '{"audiences": ["api://a"], "attributes": [{"name": "tenant", "constant": "acme"}], "claim_map": "{\"tid\": \"tenant\"}"}');
+----
+<REGEX>:.*names both "attributes" and "claim_map".*
+
+statement error
+SELECT acl_alter_issuer('plain', '{"url": "test/idp/a", "url": "test/idp/c"}');
+----
+<REGEX>:.*an issuer spec names "url" twice.*
+
+statement error
+SELECT acl_define_client('dup', 'plain', '{"audiences": ["api://a"], "roles_constant": ""}');
+----
+<REGEX>:.*ROLES CONSTANT names a role - '' is none.*
+
+# a secret and its service in either order (the service read after the secret used to be dropped)
+statement error
+SELECT acl_define_client('svcorder', 'plain', '{"audiences": ["api://a"], "service": "nosuch", "secret": "s"}');
+----
+<REGEX>:.*nosuch.*
+
 # --- D3: the policy store under every reading of its name ---------------------------------------------------
 
 statement ok

@@ -479,7 +479,7 @@ void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &re
 //! the middle level of the grant chain (spec 015) - capabilities only, materialised down the subtree
 void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_grant_schema", "role");
+		auto role = RoleArg(args, 0, row, "acl_grant_schema");
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_grant_schema", "catalog"));
 		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_grant_schema", "schema path"));
 		auto &store = StoreOf(state);
@@ -499,7 +499,7 @@ void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 void AclRevokeSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_revoke_schema", "role");
+		auto role = RoleArg(args, 0, row, "acl_revoke_schema");
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_revoke_schema", "catalog"));
 		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_revoke_schema", "schema path"));
 		StoreOf(state).CatalogRevokeSchema(role, vcat, path);
@@ -614,7 +614,7 @@ void AclAddScalarAliasCatalogFunc(DataChunk &args, ExpressionState &state, Vecto
 //! for this role - the predicate is AND-ed onto the objects', the column list intersects theirs.
 void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_grant_catalog", "role");
+		auto role = RoleArg(args, 0, row, "acl_grant_catalog");
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_grant_catalog", "catalog"));
 		// an omitted caps argument is "unspecified", which the resolver reads as the read-only
 		// default; an explicit '{}' is "no capabilities" (spec 012)
@@ -634,7 +634,7 @@ void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result
 //! with the capabilities and the policy this role gets on it (spec 011)
 void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_grant_object", "role");
+		auto role = RoleArg(args, 0, row, "acl_grant_object");
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_grant_object", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_grant_object", "name"));
 		auto caps = OptionalArg(args, 3, row, "");
@@ -651,7 +651,7 @@ void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 void AclRevokeCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_revoke_catalog", "role");
+		auto role = RoleArg(args, 0, row, "acl_revoke_catalog");
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_revoke_catalog", "catalog"));
 		StoreOf(state).CatalogRevoke(role, vcat);
 	}
@@ -680,7 +680,7 @@ void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result
 //! are simply omitted. caps_csv is a comma list of {select,insert,update,delete,merge}.
 void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_grant_table", "role");
+		auto role = RoleArg(args, 0, row, "acl_grant_table");
 		auto vname = StoreOf(state).SpellName("default", KeyArg(args, 1, row, "acl_grant_table", "name"));
 		auto phys = StoreOf(state).SpellRelationPhysical(KeyArg(args, 2, row, "acl_grant_table", "phys"));
 		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
@@ -727,7 +727,7 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 //! The SQL may contain acl_claim('<name>') markers; they are baked to constants at rewrite time.
 void AclGrantViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_grant_view", "role");
+		auto role = RoleArg(args, 0, row, "acl_grant_view");
 		auto vname = StoreOf(state).SpellName("default", KeyArg(args, 1, row, "acl_grant_view", "name"));
 		auto sql = RequiredArg(args, 2, row, "acl_grant_view", "SQL");
 		auto &store = StoreOf(state);
@@ -751,7 +751,7 @@ void GrantFunctionWrapper(DataChunk &args, ExpressionState &state, Vector &resul
                           bool is_alias,
                           case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> PolicyStore::*space) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, what, "role");
+		auto role = RoleArg(args, 0, row, what);
 		auto vname = StoreOf(state).SpellName("default", KeyArg(args, 1, row, what, "name"));
 		auto definition =
 		    is_alias ? KeyArg(args, 2, row, what, "target") : RequiredArg(args, 2, row, what, "definition");
@@ -1282,7 +1282,7 @@ void AclDropResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &r
 
 void BindResourceGroup(DataChunk &args, ExpressionState &state, Vector &result, const char *fn, bool remove) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, fn, "role");
+		auto role = RoleArg(args, 0, row, fn);
 		auto group = RequiredArg(args, 1, row, fn, "group");
 		StoreOf(state).CatalogBindResourceGroup(role, group, remove);
 	}
@@ -1388,7 +1388,7 @@ void AclAlterCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result
 
 void AclAlterRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_alter_role", "role");
+		auto role = RoleArg(args, 0, row, "acl_alter_role");
 		StoreOf(state).CatalogAlterRole(role, ParseClaims(OptionalArg(args, 1, row, "")));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -1397,8 +1397,7 @@ void AclAlterRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! acl_comment_role(role, comment) (spec 120): a role's comment - what the console shows of it
 void AclCommentRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		StoreOf(state).CatalogCommentRole(RequiredArg(args, 0, row, "acl_comment_role", "role"),
-		                                  OptionalArg(args, 1, row, ""));
+		StoreOf(state).CatalogCommentRole(RoleArg(args, 0, row, "acl_comment_role"), OptionalArg(args, 1, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -1417,7 +1416,7 @@ void AclCommentFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vec
 void AclRevokeObjectFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto &store = StoreOf(state);
-		auto role = RequiredArg(args, 0, row, "acl_revoke_object", "role");
+		auto role = RoleArg(args, 0, row, "acl_revoke_object");
 		auto vcat = store.SpellCatalog(CatalogArg(args, 1, row, "acl_revoke_object", "catalog"));
 		auto vname = store.SpellName(vcat, KeyArg(args, 2, row, "acl_revoke_object", "name"));
 		store.CatalogRevokeObject(role, vcat, vname);
@@ -1442,7 +1441,7 @@ void AclAlterReferenceFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! acl_alter_grant(role, vcat, field, value): field is caps | main
 void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_alter_grant", "role");
+		auto role = RoleArg(args, 0, row, "acl_alter_grant");
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_alter_grant", "catalog"));
 		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_grant", "property"));
 		auto value = OptionalArg(args, 3, row, "");
@@ -1532,7 +1531,7 @@ void AclDropFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result
 
 void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_drop_role", "role");
+		auto role = RoleArg(args, 0, row, "acl_drop_role");
 		auto &store = StoreOf(state);
 		if (AllowDrop(store, "", role, "role", OptionalArg(args, 1, row, ""))) {
 			store.CatalogDropRole(role);
@@ -1549,7 +1548,7 @@ void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! '{"manage": true}')`.
 void AclGrantAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_grant_admin", "role");
+		auto role = RoleArg(args, 0, row, "acl_grant_admin");
 		auto scope = RequiredArg(args, 1, row, "acl_grant_admin", "scope");
 		StoreOf(state).GrantAdmin(role, ParseAdminScope(scope));
 	}
@@ -1564,7 +1563,7 @@ void AclRevokeAdminFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		if (!scope.empty()) {
 			ParseAdminScope(scope); // a bundle this build does not know is refused by name
 		}
-		StoreOf(state).RevokeAdmin(RequiredArg(args, 0, row, "acl_revoke_admin", "role"), StringUtil::Lower(scope));
+		StoreOf(state).RevokeAdmin(RoleArg(args, 0, row, "acl_revoke_admin"), StringUtil::Lower(scope));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -1947,7 +1946,7 @@ void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		auto scope = RequiredArg(args, 1, row, "acl_map_role", "scope");
 		auto source = RequiredArg(args, 2, row, "acl_map_role", "source");
 		auto external = RequiredArg(args, 3, row, "acl_map_role", "external value");
-		auto role = RequiredArg(args, 4, row, "acl_map_role", "role");
+		auto role = RoleArg(args, 4, row, "acl_map_role");
 		StoreOf(state).EditIdentity("acl_map_role", [&](IdentityModel &model) {
 			IdentityMapping mapping;
 			MappingScope(model, kind, scope, mapping.scope_kind, mapping.scope_name);
@@ -1974,7 +1973,7 @@ void AclDropRoleMappingFunc(DataChunk &args, ExpressionState &state, Vector &res
 		auto scope = RequiredArg(args, 1, row, "acl_drop_role_mapping", "scope");
 		auto source = RequiredArg(args, 2, row, "acl_drop_role_mapping", "source");
 		auto external = RequiredArg(args, 3, row, "acl_drop_role_mapping", "external value");
-		auto role = RequiredArg(args, 4, row, "acl_drop_role_mapping", "role");
+		auto role = RoleArg(args, 4, row, "acl_drop_role_mapping");
 		StoreOf(state).EditIdentity("acl_drop_role_mapping", [&](IdentityModel &model) {
 			string scope_kind, scope_name;
 			MappingScope(model, kind, scope, scope_kind, scope_name);
@@ -2200,7 +2199,7 @@ void AclSessionCloseFunc(DataChunk &args, ExpressionState &state, Vector &result
 void AclDefineTokenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto token = RequiredArg(args, 0, row, "acl_define_token", "token");
-		auto role = RequiredArg(args, 1, row, "acl_define_token", "role");
+		auto role = RoleArg(args, 1, row, "acl_define_token");
 		Principal principal;
 		principal.roles = {role};
 		principal.claims = ParseClaims(OptionalArg(args, 2, row, ""));
@@ -2214,7 +2213,7 @@ void AclDefineTokenFunc(DataChunk &args, ExpressionState &state, Vector &result)
 //! acl_define_role(role, claims_csv): default claims carried by the bare ROLE form
 void AclDefineRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, "acl_define_role", "role");
+		auto role = RoleArg(args, 0, row, "acl_define_role");
 		auto claims = ParseClaims(OptionalArg(args, 1, row, ""));
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {

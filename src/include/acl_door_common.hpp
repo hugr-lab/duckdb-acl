@@ -46,6 +46,9 @@ shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state);
 //! The argument readers every acl_* scalar uses. `fn` and `what` name the function and the argument
 //! in the refusal of a NULL; an optional argument past the last column answers its fallback.
 string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what);
+//! spec 152: a role argument - required and never '' (every role is '' for a function grant alone, spec 072: a grant,
+//! a mapping or a scope stored for '' would name no role)
+string RoleArg(DataChunk &args, idx_t col, idx_t row, const char *fn);
 string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback);
 //! spec 116: a virtual or physical name argument, read with the key rules and returned as its
 //! canonical key (`'sales."Order Items"'` -> `sales.Order Items`); a malformed name is refused

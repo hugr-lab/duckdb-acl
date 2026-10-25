@@ -427,9 +427,18 @@ void ApplyClientSpec(IdentityClient &client, const string &spec_json, case_insen
 	}
 	duckdb_yyjson::yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(json.Root(), &iter);
+	case_insensitive_set_t keys;
 	while (auto key_value = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
 		auto key = StringUtil::Lower(Text(key_value));
 		auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key_value);
+		// spec 152: a property once, and the attributes from one of their two spellings - the last of two would take
+		// effect while a reader of the spec saw the first (the grammar refuses the same, spec 150's 3e)
+		if (!keys.insert(key).second) {
+			Bad("a client spec names \"" + key + "\" twice");
+		}
+		if ((key == "attributes" && keys.count("claim_map")) || (key == "claim_map" && keys.count("attributes"))) {
+			Bad("a client spec names both \"attributes\" and \"claim_map\" - both write the attributes; name one");
+		}
 		if (written) {
 			written->insert(key);
 		}
@@ -443,6 +452,11 @@ void ApplyClientSpec(IdentityClient &client, const string &spec_json, case_insen
 			client.roles_from = StringArray(value, "roles_from");
 		} else if (key == "roles_constant") {
 			client.roles_constant = StringArray(value, "roles_constant");
+			for (auto &role : client.roles_constant) {
+				if (role.empty()) {
+					Bad("ROLES CONSTANT names a role - '' is none"); // spec 152: a role is never ''
+				}
+			}
 		} else if (key == "unmapped") {
 			auto unmapped = StringUtil::Lower(StringOf(value, "unmapped"));
 			if (unmapped == "as_role" || unmapped == "as role") {
@@ -482,10 +496,10 @@ void ApplyClientSpec(IdentityClient &client, const string &spec_json, case_insen
 			}
 			client.flows = std::move(flows);
 		} else if (key == "secret") {
-			// a secret named anew lives where its own IN says (a "service" key after it), else in the one
-			// service attached - never silently in the previous secret's
+			// a secret named anew lives where its own IN says (a "service" key beside it, in any order), else in
+			// the one service attached - never silently in the previous secret's
 			client.secret = StringOf(value, "secret");
-			client.secret_service.clear();
+			client.secret_service = keys.count("service") ? client.secret_service : string();
 		} else if (key == "service") {
 			client.secret_service = StringOf(value, "service");
 		} else {
@@ -505,14 +519,18 @@ void ApplyIssuerSpec(IdentityIssuer &issuer, const string &spec_json, string &cl
 	}
 	duckdb_yyjson::yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(json.Root(), &iter);
+	case_insensitive_set_t keys;
 	while (auto key_value = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
 		auto key = StringUtil::Lower(Text(key_value));
 		auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key_value);
+		if (!keys.insert(key).second) {
+			Bad("an issuer spec names \"" + key + "\" twice"); // spec 152, as a client spec
+		}
 		if (key == "url") {
 			issuer.url = StringOf(value, "url");
 		} else if (key == "secret") {
 			issuer.secret = StringOf(value, "secret");
-			issuer.secret_service.clear();
+			issuer.secret_service = keys.count("service") ? issuer.secret_service : string(); // as a client's
 		} else if (key == "service") {
 			issuer.secret_service = StringOf(value, "service");
 		} else if (key == "client") {

@@ -227,7 +227,9 @@ mode of default-deny is a refusal, and the refusal names the function.
   refused as ambiguous, never served from the union of their grants; a schema alias's tail is taken
   by parts, never by bytes.
 - Roles, groups, issuers and clients are values (claims, mapping targets), not SQL identifiers: they
-  may be written quoted, and compare exactly.
+  may be written quoted. Roles and groups compare exactly; an issuer or a client is found in any case
+  (its name is unique in any case), and the authorizer reads it the same way (spec 152). A role is
+  never `''` - only a function grant names `''`, meaning every role.
 - Schema v20 declares `min_reader_version` 20: a build before spec 116 refuses such a catalog rather
   than split a quoted part as a path; the migration refuses while one name is spelled several ways
   and lists them (`test/sql/acl_quoted_names.test`).
@@ -376,7 +378,9 @@ combined with a certificate. Both doors require cert **and** key together.
   `acl_check_catalog` names a body stored before (`body_function_denied`). No definition names the
   policy catalog's own tables, under any reading of the name. A change to an issuer or a client behind
   a mapping to an administering role, a mapping to such a role, and a catalog's `manage` for a role a
-  mapping reaches are `passthrough`'s.
+  mapping reaches are `passthrough`'s - the names are read as the store resolves them (any case), and a
+  batch is judged with what it maps and grants itself, in either order (spec 152). The judgment is made
+  when the statement is decided: a statement prepared then is executed as decided.
 - **A view as another role sees no more than that role, and reads no rows** (spec 120): `SET SESSION VIEW AS
   ROLE` is `policy`'s or `passthrough`'s, acts only on the session the statement runs under (the call takes no
   session argument, so no session can be put into another role's view by someone else), rewrites the
