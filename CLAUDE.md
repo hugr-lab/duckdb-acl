@@ -473,7 +473,7 @@ scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, 
 rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
 `Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
 grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
-the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a, 3b, 3c, 3d, 3e built):
+the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f built):
 the batch is read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered)
 - a moved family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`, `MakeAdminTableCall` for CHECK's
 `table_call`), anything else passes through as tokens (`AclMgmtLegacy`) to the compiler as its own text
@@ -486,9 +486,11 @@ a space). 3c: the virtual catalog's objects - CREATE / ALTER / COMMENT ON / ANAL
 [VIRTUAL] REFERENCE, CHECK, REPAIR, the ADD forms - `AclPathToken` (a path judged whole into its canonical key),
 `AclPathName`, `AclList` (a list as written, each comment a space), `AclBody` (one plain quoted token its value, else
 its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT, ALTER GRANT (`WITH (…)` a
-list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant handed to the
-compiler). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the transform, a list inside it a marker
-its reading replaces (`TextArg::splice`). Stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
+list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant a point grant,
+`PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the transform, a list inside it a marker
+its reading replaces (`TextArg::splice`). 3f: function categories and grants, platform's point grants, sources,
+resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's registered forms. Stage 4 the
+policy texts. Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an

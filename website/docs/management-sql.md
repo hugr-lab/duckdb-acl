@@ -68,9 +68,9 @@ catalog forms refuse.
   a nested schema answers its path, and a schema part with a dot is shown quoted (`"a.b"`, `a."b.c"`)
   so it never reads as two levels. Lineage names a dataset by the same key rules
   (`Sales Mart.main.Order Items`, `c."a.b".Sink`).
-- Quoted values take `'…'` or `"…"`; a doubled quote is a literal one. The empty text is `''` - in
-  the forms read by duckdb's tokenizer (roles, mappings, view-as, the virtual catalog's objects,
-  grants, issuers and clients) `""` is an empty identifier, which it refuses.
+- Quoted values take `'…'` or `"…"`; a doubled quote is a literal one. The empty text is `''` - the
+  management forms are read by duckdb's tokenizer (but `ACL GRANT | REVOKE SECRET`), to which `""` is
+  an empty identifier, which it refuses.
 - A body (after `AS` or `MACRO`) is either one quoted string - the whole body, nothing after it - or
   written inline to the end of the statement: a `;` inside a literal does not end it, one outside
   does. In the forms of the virtual catalog's objects (`CREATE | ALTER VIRTUAL …`, `ADD …`) a `$$…$$`
@@ -78,12 +78,12 @@ catalog forms refuse.
   token or after its last.
 - A list is written `( … )` or as the legacy quoted csv/JSON string; both are accepted wherever a
   list is taken. `WITH (select, insert)` and `CAPS '{"select": true, "insert": true}'` store the same.
-  In the forms of roles, the virtual catalog's objects, grants, issuers and clients a comment inside a
-  parenthesised list reads as a space, and a list split into items (claims, columns, keys, pairs,
-  parameters, REMAP, TYPES, an issuer's or a client's lists) refuses a `$$…$$` string, an `E'…'`
-  string with a backslash and a backtick name - an RLS predicate takes any literal. Where an item is a
-  value (a role's claims, an issuer's or a client's lists) a string continued on the next line is
-  refused too; a mask or a REMAP item is SQL and duckdb joins it.
+  A comment inside a parenthesised list reads as a space, and a list split into items (claims, columns,
+  keys, pairs, parameters, REMAP, TYPES, a category's members, a resource group's limits, an issuer's
+  or a client's lists) refuses a `$$…$$` string, an `E'…'` string with a backslash and a backtick name
+  - an RLS predicate takes any literal. Where an item is a value (a role's claims, a resource group's
+  limits, an issuer's or a client's lists) a string continued on the next line is refused too; a mask
+  or a REMAP item is SQL and duckdb joins it.
 - Keywords are case-insensitive. Statements of a batch are separated by `;`.
 - Write modes on `CREATE`: `CREATE` refuses an existing object, `CREATE OR REPLACE` overwrites,
   `CREATE … IF NOT EXISTS` keeps what is there. The legacy `ADD` forms always upsert. Where a
@@ -708,7 +708,7 @@ session's `USE` a short name is read in its catalog first), and `acl_function_co
 schema[, function]]])` lists their parameters, result columns and a scalar's return type.
 
 ```sql
-CREATE FUNCTION CATEGORY <name> [COMMENT '<text>']
+CREATE [OR REPLACE] FUNCTION CATEGORY <name> [COMMENT '<text>']
 ALTER FUNCTION CATEGORY <name> ADD (<function> [, …]) | DROP (<function> [, …])
 ALTER FUNCTION CATEGORY <name> SET COMMENT '<text>'      -- it must exist; the members stay (spec 120)
 DROP FUNCTION CATEGORY [IF EXISTS] <name>
@@ -723,8 +723,12 @@ REVOKE FUNCTION <function> FROM ROLE <role> | FROM ALL ROLES
 ```
 
 A `<function>` is `name`, `schema.name` or `database.schema.name` - a bare name is `system.main`,
-where every builtin lives - optionally followed by `TABLE`; an operator is double-quoted (`"+"`,
-`"IS DISTINCT FROM"`). A member or an admitting grant must name a function this node has, unless the
+where every builtin lives - optionally followed by `TABLE` (or `SCALAR`, the default). Each part is a
+word or a double-quoted name, read as duckdb reads a qualified name (`""` a quote): an operator is
+double-quoted (`"+"`, `"IS DISTINCT FROM"`, `system.main."||"`), and a kind is read only outside
+quotes (`main."read_csv TABLE"` is a function of that name). A part never starts or ends with a
+space; `category` alone names a category (`system.main.category` is the function). The members of a
+category are written the same way. A member or an admitting grant must name a function this node has, unless the
 kind was written explicitly: that is how a fleet-shared catalog records a function of an extension
 the writing node does not carry. The never set - `acl_*`, `ducklake_*`, `quack_*`, `arrow_scan*`,
 `query`, `query_table`, `json_execute_serialized_sql`, a scanner's `*_query` / `*_execute` /
@@ -742,8 +746,12 @@ ACL ADMIN REVOKE FUNCTION CATEGORY spatial FROM ALL ROLES;      -- spatial is no
 ACL ADMIN DROP FUNCTION CATEGORY IF EXISTS sequences;           -- with its members and grants
 ```
 
-The bulk form is the native mode: `ACL NATIVE SELECT acl_function_category_add('myext', list(function_name))
-FROM duckdb_functions() WHERE function_name LIKE 'myext_%';`. A category acts in every catalog a role
+The bulk form is a native statement (the operator's own connection, or `ACL NATIVE` under a passthrough
+principal): `SELECT acl_function_category_add('myext', list(function_name || CASE WHEN function_type IN
+('table', 'table_macro') THEN ' TABLE' ELSE '' END)) FROM duckdb_functions() WHERE function_name LIKE 'myext_%'
+AND function_type <> 'pragma' AND function_name NOT IN (SELECT name FROM acl_function_status() WHERE status =
+'never');` - a table function is named with `TABLE`, and the never set is left out (one of its names refuses
+the whole list). A category acts in every catalog a role
 holds, so these statements take an unrestricted `manage` scope - a catalog-scoped one is refused as
 "not catalog-specific".
 
@@ -796,7 +804,8 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
 ## Resource groups
 
 ```sql
-CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] (<limit> <value>, …) [DEFAULT] [COMMENT '<text>']
+CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] [(<limit> <value>, …)] [DEFAULT] [COMMENT '<text>']
+                                      -- DEFAULT and COMMENT in any order, each once
 ALTER RESOURCE GROUP <group> SET DEFAULT | DROP DEFAULT
 ALTER RESOURCE GROUP <group> SET (<limit> <value>, …)   -- only the limits named change (spec 120)
 ALTER RESOURCE GROUP <group> SET COMMENT '<text>'

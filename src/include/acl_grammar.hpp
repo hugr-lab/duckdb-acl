@@ -65,8 +65,9 @@ struct MgmtParsed {
 	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
 	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, spec
 	//! 095's lists read into a JSON spec (ITEMS a list of values, REQUIRE / ATTRIBUTES / CLAIM_MAP their readers'
-	//! JSON), the rest as is; `splice` is the marker in the argument the reading replaces, '' = the whole argument
-	enum class TextKind : uint8_t { CLAIMS, COLUMNS, TEXT, ITEMS, REQUIRE, ATTRIBUTES, CLAIM_MAP };
+	//! JSON), a resource group's limits for ResourceLimitsJson, the rest as is; `splice` is the marker in the argument
+	//! the reading replaces, '' = the whole argument
+	enum class TextKind : uint8_t { CLAIMS, COLUMNS, TEXT, ITEMS, REQUIRE, ATTRIBUTES, CLAIM_MAP, LIMITS };
 	struct TextArg {
 		idx_t arg;
 		string text;

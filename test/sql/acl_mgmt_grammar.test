@@ -1,7 +1,7 @@
 # name: test/sql/acl_mgmt_grammar.test
-# description: spec 150, stage 3 - the management statements read by rules of duckdb's parser: a family that moved
-#   compiles to the acl_* call it always compiled to, a statement of a family that has not moved yet goes as its own
-#   text to the management compiler, and a batch may hold both. First family: the operations of a node.
+# description: spec 150, stage 3 - the management statements read by rules of duckdb's parser: each family compiles
+#   to the acl_* call it always compiled to (a form a linked module registers - hugr-node's - still goes as its own
+#   text to the management compiler, until 3g). A resource group first (the first family the tests used), then 3a-3f.
 # group: [sql]
 
 require acl
@@ -18,7 +18,7 @@ SET GLOBAL acl_allow_anonymous_admin=true;
 statement ok
 SET GLOBAL acl_jwks_locations = 'test/idp/';
 
-# --- a family not moved yet: as its own text, as before ------------------------------------------------------------
+# --- a resource group, the family the first tests used (a rule since 3f) ------------------------------------------
 
 statement ok
 ACL ADMIN CREATE RESOURCE GROUP grammar_one (window_max 8);
@@ -192,13 +192,20 @@ SELECT count(*) FROM aclcat.acl.roles WHERE role = 'never_made';
 ----
 0
 
-# a statement the tokenizer refuses is the compiler's to judge, in its own words; the rest of the batch is read by its
-# rules as before
+# a statement the tokenizer refuses (since 3f every family here is a rule) is refused in its words, and the batch
+# runs none of its statements
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG grammar_cat;
 
-statement ok
-ACL ADMIN ALTER RESOURCE GROUP grammar_one SET COMMENT ""; RESUME NODE;
+statement error
+ACL ADMIN DRAIN NODE; ALTER RESOURCE GROUP grammar_one SET COMMENT "";
+----
+zero-length delimited identifier
+
+query I
+SELECT acl_drain_status();
+----
+serving
 
 # ... and a moved form's `""` is the tokenizer's zero-length identifier (`''` is the empty text)
 statement error
@@ -1141,28 +1148,28 @@ SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'changes';
 ----
 0
 
-# a statement no rule reads yet goes to the compiler as its text, whose scanner knows '...' and "..." and whitespace
-# only: a comment, a $$...$$ string, an E'...' one with a backslash or a backtick name would be read otherwise than
-# written (before stage 3d, `GRANT CATALOG … WITH (select, /*, manage, */ insert)` granted manage) - refused until its
-# family is a rule
+# the compiler's scanner knows '...' and "..." and whitespace only: a comment, a $$...$$ string, an E'...' one with a
+# backslash or a backtick name was read otherwise than written (before stage 3d, `GRANT CATALOG … WITH (select, /*,
+# manage, */ insert)` granted manage) - a family that is a rule reads them as duckdb does
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG hidden; CREATE ROLE hider;
 
-statement error
+# (since 3f every family of this repository is a rule: hugr-node's own forms are the compiler's until 3g) - a comment
+# inside a rule's list is a space, and one between its words too
+statement ok
 ACL ADMIN CREATE RESOURCE GROUP hider_group (window_max 8 /* a note */);
-----
-a comment in a statement no rule reads yet
 
-query I
-SELECT count(*) FROM aclcat.acl.resource_groups WHERE "group" = 'hider_group';
-----
-0
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP /* x */ hider_group TO ROLE hider;
 
-# ... while a statement that does not compile keeps its own refusal
-statement error
-ACL ADMIN GRANT RESOURCE GROUP /* x */ grammar_one TO ROLE hider;
+query II
+SELECT (SELECT window_max FROM aclcat.acl.resource_groups WHERE "group" = 'hider_group'),
+       (SELECT count(*) FROM aclcat.acl.role_resource_groups WHERE "group" = 'hider_group' AND role = 'hider');
 ----
-expected a group name
+8	1
+
+statement ok
+ACL ADMIN DROP RESOURCE GROUP hider_group;
 
 # a body is read as what it is - one statement, one expression - before anything of the batch runs: a `;` ends a
 # statement wherever it stands outside a literal, so a body cut by one does not parse and is never stored, and the
@@ -1658,3 +1665,391 @@ query I
 SELECT count(*) FROM acl_clients() WHERE name IN ('svc', 'never');
 ----
 0
+
+# --- function grants and categories, platform's point grants, sources, resource groups (stage 3f) - rules, the same
+# calls ---------------------------------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE fgrantee;
+
+# a category: created with its comment, members added and dropped as written (a comment in the list is a space),
+# its comment set, granted, denied, revoked, dropped
+statement ok
+ACL ADMIN CREATE FUNCTION CATEGORY text_tools COMMENT 'string helpers';
+ALTER FUNCTION CATEGORY text_tools ADD (lower, upper /* the other case */, read_csv TABLE, "||");
+ALTER FUNCTION CATEGORY text_tools DROP (upper);
+ALTER FUNCTION CATEGORY text_tools SET COMMENT 'text helpers';
+
+query III
+SELECT (SELECT comment FROM aclcat.acl.function_categories WHERE category = 'text_tools'),
+       (SELECT string_agg(name || ':' || kind, ',' ORDER BY name) FROM aclcat.acl.function_category_members
+        WHERE category = 'text_tools'),
+       (SELECT count(*) FROM aclcat.acl.function_category_members WHERE category = 'text_tools' AND name = 'upper');
+----
+text helpers	lower:scalar,read_csv:table,||:scalar	0
+
+statement error
+ACL ADMIN ALTER FUNCTION CATEGORY text_tools ADD ();
+----
+ADD takes the members in parentheses
+
+statement ok
+ACL ADMIN GRANT FUNCTION CATEGORY text_tools TO ROLE fgrantee; DENY FUNCTION CATEGORY text_tools TO ALL ROLES;
+
+query T
+SELECT string_agg(role || '/' || allowed, ',' ORDER BY role) FROM aclcat.acl.function_grants
+WHERE category = 'text_tools';
+----
+/false,fgrantee/true
+
+statement ok
+ACL ADMIN REVOKE FUNCTION CATEGORY text_tools FROM ALL ROLES; REVOKE FUNCTION CATEGORY text_tools FROM ROLE fgrantee;
+
+query I
+SELECT count(*) FROM aclcat.acl.function_grants WHERE category = 'text_tools';
+----
+0
+
+# a function by name: a path, a kind written, an operator in double quotes; a deny; revoked
+statement ok
+ACL ADMIN GRANT FUNCTION read_csv TABLE TO ROLE fgrantee; GRANT FUNCTION system.main.lower TO ROLE fgrantee;
+GRANT FUNCTION "||" TO ROLE fgrantee; DENY FUNCTION upper TO ROLE fgrantee;
+
+query T
+SELECT string_agg(name || ':' || kind || ':' || allowed, ',' ORDER BY name) FROM aclcat.acl.function_grants
+WHERE role = 'fgrantee';
+----
+lower:scalar:true,read_csv:table:true,upper:scalar:false,||:scalar:true
+
+statement ok
+ACL ADMIN REVOKE FUNCTION read_csv TABLE FROM ROLE fgrantee; REVOKE FUNCTION upper FROM ROLE fgrantee;
+
+query T
+SELECT string_agg(name, ',' ORDER BY name) FROM aclcat.acl.function_grants WHERE role = 'fgrantee';
+----
+lower,||
+
+statement ok
+ACL ADMIN DROP FUNCTION CATEGORY text_tools; DROP FUNCTION CATEGORY IF EXISTS text_tools;
+
+query I
+SELECT count(*) FROM aclcat.acl.function_categories WHERE category = 'text_tools';
+----
+0
+
+# a function or a view of the platform catalog: its point grant (spec 117), never with a kind; DENY VIEW is platform's
+statement ok
+ACL ADMIN GRANT FUNCTION platform.drain TO ROLE fgrantee; DENY VIEW platform.sessions TO ROLE fgrantee;
+GRANT VIEW platform.main.issuers TO ROLE fgrantee;
+
+query T
+SELECT string_agg(kind || ':' || object || ':' || allowed, ',' ORDER BY object) FROM aclcat.acl.platform_grants
+WHERE role = 'fgrantee';
+----
+function:drain:true,view:issuers:true,view:sessions:false
+
+statement ok
+ACL ADMIN REVOKE FUNCTION platform.drain FROM ROLE fgrantee; REVOKE VIEW platform.sessions FROM ROLE fgrantee;
+REVOKE VIEW platform.issuers FROM ROLE fgrantee;
+
+query I
+SELECT count(*) FROM aclcat.acl.platform_grants WHERE role = 'fgrantee';
+----
+0
+
+statement error
+ACL ADMIN GRANT FUNCTION platform.drain TABLE TO ROLE fgrantee;
+----
+a function of the platform catalog is named without TABLE or SCALAR
+
+statement error
+ACL ADMIN DENY VIEW granted.t TO ROLE fgrantee;
+----
+DENY VIEW names a view of the platform catalog
+
+statement error
+ACL ADMIN GRANT VIEW platform.sessions TO ROLE fgrantee WITH (select);
+----
+a grant on a view of the platform catalog takes no WITH
+
+# a source (spec 118.3): granted and revoked
+statement ok
+ACL ADMIN GRANT SOURCE phys.main TO ROLE fgrantee;
+
+query T
+SELECT string_agg(kind || ':' || object, ',') FROM aclcat.acl.platform_grants WHERE role = 'fgrantee';
+----
+source:phys.main
+
+statement ok
+ACL ADMIN REVOKE SOURCE phys.main FROM ROLE fgrantee;
+
+query I
+SELECT count(*) FROM aclcat.acl.platform_grants WHERE role = 'fgrantee';
+----
+0
+
+# a resource group: its limits, DEFAULT and COMMENT in any order, each once; altered; granted, revoked, dropped
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP rg_grammar WITH (window_max 16, batch_bytes '4MiB') COMMENT 'tests' DEFAULT;
+
+query IIII
+SELECT window_max, batch_bytes, comment, is_default FROM aclcat.acl.resource_groups WHERE "group" = 'rg_grammar';
+----
+16	4194304	tests	true
+
+statement error
+ACL ADMIN CREATE OR REPLACE RESOURCE GROUP rg_grammar (window_max 8) DEFAULT DEFAULT;
+----
+DEFAULT is written twice
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP rg_grammar SET (window_max 32); ALTER RESOURCE GROUP rg_grammar SET COMMENT 'more';
+ALTER RESOURCE GROUP rg_grammar DROP DEFAULT;
+
+query IIII
+SELECT window_max, batch_bytes, comment, is_default FROM aclcat.acl.resource_groups WHERE "group" = 'rg_grammar';
+----
+32	4194304	more	NULL
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP rg_grammar TO ROLE fgrantee;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_resource_groups WHERE "group" = 'rg_grammar' AND role = 'fgrantee';
+----
+1
+
+statement ok
+ACL ADMIN REVOKE RESOURCE GROUP rg_grammar FROM ROLE fgrantee; DROP RESOURCE GROUP rg_grammar;
+DROP RESOURCE GROUP IF EXISTS rg_grammar;
+
+query I
+SELECT count(*) FROM aclcat.acl.resource_groups WHERE "group" = 'rg_grammar';
+----
+0
+
+# a limit is a value: a string continued on the next line is refused (duckdb joins it, the reader would not)
+statement error
+ACL ADMIN CREATE RESOURCE GROUP rg_never (batch_bytes '4'
+'MiB');
+----
+a string continued on the next line
+
+# a form that does not read as its rule says how it is written
+statement error
+ACL ADMIN GRANT FUNCTION TO ROLE fgrantee;
+----
+write GRANT FUNCTION [CATEGORY]
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP rg_never SET;
+----
+write ALTER RESOURCE GROUP
+
+statement error
+ACL ADMIN DENY FUNCTION lower;
+----
+write DENY FUNCTION [CATEGORY]
+
+# a function is read as duckdb reads a qualified name - each part a word or a double-quoted name (`""` a quote), a
+# kind only outside quotes: what is written is what is stored (the old reader took `main."read_csv TABLE"` for the
+# table function read_csv, kept a quote in a part, trimmed a part's edge space and dropped a trailing dot)
+statement error
+ACL ADMIN GRANT FUNCTION system.main."read_csv TABLE" TO ROLE fgrantee;
+----
+this node has no scalar function system.main.read_csv table
+
+statement error
+ACL ADMIN GRANT FUNCTION "system ".main.lower TO ROLE fgrantee;
+----
+never empty nor starts or ends with a space
+
+statement error
+ACL ADMIN GRANT FUNCTION " system".main.lower TO ROLE fgrantee;
+----
+never empty nor starts or ends with a space
+
+statement ok
+ACL ADMIN DENY FUNCTION "sys.tem".main.f TABLE TO ROLE fgrantee; DENY FUNCTION lake."a.b".f TABLE TO ROLE fgrantee;
+DENY FUNCTION a."it's".f TABLE TO ROLE fgrantee; DENY FUNCTION "a""b" TABLE TO ROLE fgrantee;
+
+query T
+SELECT string_agg(database || '|' || schema || '|' || name || '|' || kind, ',' ORDER BY database, schema, name)
+FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND NOT allowed AND kind = 'table';
+----
+a|it's|f|table,lake|a.b|f|table,sys.tem|main|f|table,system|main|a"b|table
+
+statement ok
+ACL ADMIN REVOKE FUNCTION "sys.tem".main.f TABLE FROM ROLE fgrantee; REVOKE FUNCTION lake."a.b".f TABLE FROM ROLE
+fgrantee; REVOKE FUNCTION a."it's".f TABLE FROM ROLE fgrantee; REVOKE FUNCTION "a""b" TABLE FROM ROLE fgrantee;
+
+# ... a name with a space that reads as written is kept, and SCALAR is a kind
+statement ok
+ACL ADMIN DENY FUNCTION lake."my schema".peek SCALAR TO ROLE fgrantee; DENY FUNCTION lake.main."my func" SCALAR
+TO ROLE fgrantee; DENY FUNCTION system.main."IS DISTINCT FROM" TO ROLE fgrantee;
+
+query T
+SELECT string_agg(database || '|' || schema || '|' || name || '|' || kind, ',' ORDER BY name)
+FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND NOT allowed AND kind = 'scalar';
+----
+system|main|is distinct from|scalar,lake|main|my func|scalar,lake|my schema|peek|scalar
+
+# the function forms read the same: a quoted part, a kind after any space outside quotes; an unquoted part holds no
+# apostrophe or parenthesis (one ended the csv split of a members list)
+statement ok
+SELECT acl_grant_function('fgrantee', 'system.main."||"'), acl_deny_function('"read_csv" TABLE');
+
+query I
+SELECT count(*) FROM aclcat.acl.function_grants WHERE (role = 'fgrantee' AND name = '||' AND allowed)
+OR (role = '' AND name = 'read_csv' AND kind = 'table' AND NOT allowed);
+----
+2
+
+statement ok
+SELECT acl_revoke_function('fgrantee', 'system.main."||"'), acl_revoke_function('', '"read_csv" TABLE'),
+       acl_revoke_function('', '"read_csv"');
+
+statement ok
+SELECT acl_grant_function('fgrantee', 'read_csv' || chr(10) || 'TABLE');
+
+query I
+SELECT kind FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND name = 'read_csv';
+----
+table
+
+statement ok
+SELECT acl_revoke_function('fgrantee', 'read_csv TABLE');
+
+statement error
+SELECT acl_deny_function('lo' || chr(9) || 'wer SCALAR');
+----
+holds no apostrophe, parenthesis or control character
+
+statement error
+SELECT acl_function_category_add('nosuch', 'it''s TABLE, lower TABLE');
+----
+holds no apostrophe, parenthesis
+
+statement error
+SELECT acl_deny_function('lower()');
+----
+holds no apostrophe, parenthesis
+
+# a category's members are read by the same reader: a quoted part is its name, a trailing dot or an empty part refused
+statement ok
+ACL ADMIN CREATE FUNCTION CATEGORY quoted; ALTER FUNCTION CATEGORY quoted ADD (lower, "main"."upper", system.main."||");
+
+query T
+SELECT string_agg(name, ',' ORDER BY name) FROM aclcat.acl.function_category_members WHERE category = 'quoted';
+----
+lower,upper,||
+
+statement ok
+ACL ADMIN ALTER FUNCTION CATEGORY quoted DROP (system.main."lower", "system"."main"."upper", "||");
+
+query I
+SELECT count(*) FROM aclcat.acl.function_category_members WHERE category = 'quoted';
+----
+0
+
+statement error
+ACL ADMIN ALTER FUNCTION CATEGORY quoted ADD (lower.);
+----
+is no function name
+
+statement error
+ACL ADMIN ALTER FUNCTION CATEGORY quoted ADD (system..lower);
+----
+never empty
+
+statement ok
+ACL ADMIN ALTER FUNCTION CATEGORY quoted ADD (read_csv
+TABLE);
+
+query T
+SELECT kind FROM aclcat.acl.function_category_members WHERE category = 'quoted' AND name = 'read_csv';
+----
+table
+
+statement ok
+ACL ADMIN DROP FUNCTION CATEGORY quoted;
+
+# CATEGORY alone is no function's name: a category's name forgotten is refused, never a grant of `category`
+statement error
+ACL ADMIN DENY FUNCTION CATEGORY TO ALL ROLES;
+----
+FUNCTION CATEGORY names a category
+
+statement error
+ACL ADMIN REVOKE FUNCTION category FROM ROLE fgrantee;
+----
+FUNCTION CATEGORY names a category
+
+# ALL ROLES is a function grant's: an object grant and a platform grant refuse it where read, so the batch runs
+# nothing
+statement error
+ACL ADMIN CREATE ROLE never_seated; GRANT TABLE granted.t TO ALL ROLES;
+----
+an object grant names one role
+
+statement error
+ACL ADMIN CREATE ROLE never_seated; REVOKE VIEW platform.sessions FROM ALL ROLES;
+----
+a grant on the platform catalog names one role
+
+statement error
+ACL ADMIN CREATE ROLE never_seated; REVOKE TABLE granted.t FROM ALL ROLES;
+----
+an object grant names one role
+
+statement error
+ACL ADMIN CREATE ROLE never_seated; GRANT FUNCTION platform.drain TO ALL ROLES;
+----
+a grant on the platform catalog names one role
+
+statement error
+ACL ADMIN CREATE ROLE never_seated; DENY VIEW platform.sessions TO ALL ROLES;
+----
+a grant on the platform catalog names one role
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'never_seated';
+----
+0
+
+# the forms' other spellings: OR REPLACE on a category, DROP () refused, a group without limits, a limit or COMMENT
+# written twice refused
+statement ok
+ACL ADMIN CREATE OR REPLACE FUNCTION CATEGORY again; ALTER FUNCTION CATEGORY again ADD (lower);
+
+statement error
+ACL ADMIN ALTER FUNCTION CATEGORY again DROP ();
+----
+DROP takes the members in parentheses
+
+statement ok
+ACL ADMIN DROP FUNCTION CATEGORY again; CREATE RESOURCE GROUP bare;
+
+query I
+SELECT count(*) FROM aclcat.acl.resource_groups WHERE "group" = 'bare' AND window_max IS NULL;
+----
+1
+
+statement error
+ACL ADMIN CREATE OR REPLACE RESOURCE GROUP bare COMMENT 'a' COMMENT 'b';
+----
+COMMENT is written twice
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP bare SET (window_max 1, window_max 7);
+----
+limit "window_max" is written twice
+
+statement error
+ACL ADMIN CREATE OR REPLACE RESOURCE GROUP bare (window_max 1, WINDOW_MAX = 7);
+----
+limit "WINDOW_MAX" is written twice
+
+statement ok
+ACL ADMIN DROP RESOURCE GROUP bare;

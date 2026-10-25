@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d, 3e built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d, 3e, 3f built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -243,8 +243,8 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   separators only are empty), `REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT … FROM ROLE r`, `ALTER GRANT CATALOG c
   TO ROLE r SET CAPS | RLS | COLUMNS '<text>' | MAIN <word>`. A grant on a view of the platform catalog (`GRANT |
   REVOKE VIEW platform.x`, spec 117, `PlatformObjectName`) is a point grant the compiler still reads: its transform
-  answers legacy data with the statement's span (`PlatformViewGrant`); another name of platform's stays an object
-  grant, refused as the reserved catalog. Fixed with the move (3c's review, 3d's): `WITH (…)` is a list of names
+  answers legacy data with the statement's span (`PlatformViewGrant`; a call since 3f); another name of platform's
+  stays an object grant, refused as the reserved catalog. Fixed with the move (3c's review, 3d's): `WITH (…)` is a list of names
   (`AclCapsList`: a word or a double-quoted name, lower-cased, the same twice one, `JsonQuote`d - `CapsListToJson`
   pasted the text between the commas, so `\u006danage` stored manage); `ParseCaps(json, strict)` where caps are WRITTEN
   (a grant, `ALTER GRANT SET CAPS`, `check_grant`, the function forms) refuses an escape in the JSON (a name is a word
@@ -289,7 +289,32 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   wins), never read by an authorizer. 3e's review also found two
   holes of spec 117's authorizer (a name written in another case, a batch mapping and granting manage together) -
   spec 152's.
-- 3f: function categories and grants, platform grants, sources, resource groups.
+- 3f (built): function categories and grants (spec 072: `CREATE | ALTER … ADD | DROP (…) | SET COMMENT | DROP [IF
+  EXISTS] FUNCTION CATEGORY`, `GRANT | DENY | REVOKE FUNCTION [CATEGORY] … TO | FROM ROLE r | ALL ROLES`), the platform
+  catalog's point grants (spec 117: `GRANT | DENY | REVOKE FUNCTION platform.<f>`, `DENY VIEW platform.<v>`, and `GRANT
+  | REVOKE VIEW platform.<v>` through the object grant's rule, whose role is now `ROLE r | ALL ROLES` - ALL ROLES
+  refused where read), sources (spec 118.3: `GRANT | REVOKE SOURCE <db>[.<schema>]`), resource groups (spec 085: `CREATE
+  [OR REPLACE] RESOURCE GROUP g [WITH] [(limits)] [DEFAULT] [COMMENT '…']`, `ALTER … SET (limits) | SET COMMENT | SET
+  DEFAULT | DROP DEFAULT`, `DROP [IF EXISTS]`, `GRANT | REVOKE RESOURCE GROUP g TO | FROM ROLE r`). A function spec is
+  its path's key, a one-part name no bare word could be (`"||"`, `"IS DISTINCT FROM"`) in double quotes, then `TABLE` /
+  `SCALAR` as written - what `ParseFunctionSpec` reads, as the compiler's `FunctionSpecText` wrote it; a platform
+  function takes no kind (refused). The limits are `TextKind::LIMITS`, read by the compiler's `ResourceLimitsJson`, and
+  a value list: a string continued on the next line refused. Fixed with the move (3f's reviews): a function spec is read
+  as duckdb reads a qualified name - `ParseFunctionSpec` reads its parts with `QualifiedName::ParseComponents` (a word
+  or a double-quoted name, `""` a quote), a kind only as a last word after any space outside quotes, an unquoted part
+  plain (a space only - no apostrophe, parenthesis, tab, line break or control character), a part never empty nor with
+  an edge space, a trailing dot refused; the rule writes each part double-quoted. The old reader cut text: a space in a
+  qualified name's last part ended the name at a kind word (`system.main."read_csv TABLE"` stored the table function
+  read_csv, as the compiler's `Dotted` did), a quote was kept in a part, an edge space trimmed, a trailing dot dropped -
+  and a category's member with a quoted part (`DROP (system.main."lower")`, what the DBeaver editor writes) dropped
+  nothing, silently; `category` alone is refused (a category's forgotten name read as a grant of a function `category`);
+  `ALL ROLES` on an object grant and a platform grant refused where read (the call refused it after the batch's earlier
+  statements ran); a limit written twice refused (the last won). Changed: comments inside the forms after their first
+  words (one after `DENY` / `CREATE` / `ALTER` / `DROP` is 3g's classification); `""` the tokenizer's; a quoted part
+  touching the next word (`"lower"TABLE`) refused; DEFAULT / COMMENT each once and the platform grant's clause or kind
+  refusals are the old refusals in new words. After 3f no family of this repository is the compiler's - the legacy path
+  (`AclMgmtLegacy`, `CompileMgmtText`, `LegacyUnreadable`) serves hugr-node's registered forms until 3g, and its tests
+  are hugr-node's.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
   `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
 

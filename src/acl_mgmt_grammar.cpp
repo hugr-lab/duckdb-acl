@@ -1,8 +1,8 @@
 // Spec 150, stage 3: the management statements as rules of duckdb's PEG parser. A management batch (the rest after
 // `ACL <prefix> ACL`, or after `ACL ADMIN`) is parsed with a grammar whose Statement is ours: each family that moved
-// to rules compiles to the acl_* call it always compiled to, and a statement no rule reads yet goes, as its own text,
-// to the management compiler (acl_admin_sql.cpp) - one family moves per PR. Never registered: a connection cannot
-// switch it on.
+// to rules compiles to the acl_* call it always compiled to, and a statement no rule reads (since 3f only a form a
+// linked module registers - hugr-node's, until 3g) goes, as its own text, to the management compiler
+// (acl_admin_sql.cpp). Never registered: a connection cannot switch it on.
 
 #include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
@@ -1419,22 +1419,51 @@ void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t 
 	}
 }
 
-//! A grant on a view of the platform catalog (`GRANT | REVOKE VIEW platform.x`): a point grant on the system catalog
-//! (spec 117), the compiler's for now - the statement goes to it as its text (legacy data, its span). Any other name
-//! of platform's stays an object grant, which refuses the reserved catalog in its own words
-unique_ptr<MgmtParseData> PlatformViewGrant(ParseResult &parse_result, idx_t kind, const string &path_key) {
-	auto &list = parse_result.Cast<ListParseResult>();
+//! `AclRoleTarget <- AclAllRoles / AclOneRole`: `ROLE r` names the role, `ALL ROLES` is the role '' - every role's
+//! (a function grant's alone; the other calls refuse it)
+string RoleTargetOf(ParseResult &result) {
+	auto &target = Strip(result).Cast<ListParseResult>();
+	if (target.Name() == "AclAllRoles") {
+		return string();
+	}
+	return NameOf(target.GetChild(1), "a role name"); // AclOneRole <- 'ROLE' AclName
+}
+
+//! A point grant on the platform catalog (spec 117) - `GRANT | DENY | REVOKE VIEW | FUNCTION platform.<x>`: the
+//! call, or null when the path is no object of platform's (then a view's grant is an object grant, which refuses the
+//! reserved catalog in its own words). `verb` grant / deny / revoke, `role` '' for ALL ROLES (which the call refuses)
+unique_ptr<MgmtParseData> PlatformGrantCall(const char *kind, const string &path_key, const string &verb,
+                                            const string &role) {
 	string leaf;
-	if (KeywordOf(list.GetChild(kind)) != "view" || !PlatformObjectName(NamePath::FromKey(path_key).Parts(), leaf)) {
+	if (!PlatformObjectName(NamePath::FromKey(path_key).Parts(), leaf)) {
 		return nullptr;
 	}
-	if (!parse_result.offset.IsValid() || !parse_result.length.IsValid()) {
-		throw ParserException("acl admin: a grant has no position");
+	if (role.empty()) {
+		// refused where read, so a batch holding it runs nothing (the call refuses it too)
+		throw BinderException("acl admin: a grant on the platform catalog names one role - never every role (ALL "
+		                      "ROLES)");
 	}
-	auto data = make_uniq<MgmtParseData>();
-	data->legacy = true;
-	data->start = parse_result.offset.GetIndex();
-	data->end = data->start + parse_result.length.GetIndex();
+	if (verb == "revoke") {
+		auto data = Call("acl_revoke_platform");
+		data->args = {Value(role), Value(kind), Value(leaf)};
+		return data;
+	}
+	auto data = Call("acl_grant_platform");
+	data->args = {Value(role), Value(kind), Value(leaf), Value(verb == "deny" ? "false" : "true")};
+	return data;
+}
+
+//! `GRANT | REVOKE VIEW platform.<v> TO | FROM ROLE r` through the object grant's rule: platform's point grant, which
+//! takes no clause of an object grant
+unique_ptr<MgmtParseData> PlatformViewGrant(ListParseResult &list, const string &verb, optional_idx clauses) {
+	if (KeywordOf(list.GetChild(1)) != "view") {
+		return nullptr;
+	}
+	auto data = PlatformGrantCall("view", PathOf(list.GetChild(2)), verb, RoleTargetOf(list.GetChild(4)));
+	if (data && clauses.IsValid() && list.Child<OptionalParseResult>(clauses.GetIndex()).HasResult()) {
+		throw BinderException("acl admin: a grant on a view of the platform catalog takes no WITH, CAPS, RLS or "
+		                      "COLUMNS - it is the view, granted or denied");
+	}
 	return data;
 }
 
@@ -1487,22 +1516,31 @@ arena_ptr<TransformResultValue> FinalizeGrantSchema(PEGTransformer &transformer,
 	return MgmtResult(transformer, std::move(data));
 }
 
-// AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' 'ROLE' AclName AclObjectClause* - the object's own grant (spec
+//! An object grant's role (`AclRoleTarget`): one role - ALL ROLES is a function grant's and platform's (which refuses
+//! it), refused where read so a batch holding it runs nothing
+void ObjectGrantRole(ParseResult &target) {
+	if (RoleTargetOf(target).empty()) {
+		throw BinderException("acl admin: an object grant names one role - TO | FROM ROLE <role>, never ALL ROLES");
+	}
+}
+
+// AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' AclRoleTarget AclObjectClause* - the object's own grant (spec
 // 011): it narrows the object for this role, it never widens it
 arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
-	if (auto platform = PlatformViewGrant(parse_result, 1, PathOf(list.GetChild(2)))) {
+	if (auto platform = PlatformViewGrant(list, "grant", 5)) {
 		return MgmtResult(transformer, std::move(platform));
 	}
 	auto data = Call("acl_grant_object");
+	ObjectGrantRole(list.GetChild(4));
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
-	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
+	data->args = {Value(RoleTargetOf(list.GetChild(4))), Value(vcat), Value(vname)};
 	GrantClauses clauses;
 	clauses.caps = AddArg(*data);
 	clauses.rls = AddArg(*data);
 	clauses.columns = AddArg(*data);
-	GrantClausesInto(transformer, list, 6, clauses, *data);
+	GrantClausesInto(transformer, list, 5, clauses, *data);
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -1524,17 +1562,18 @@ arena_ptr<TransformResultValue> FinalizeRevokeSchema(PEGTransformer &transformer
 	return MgmtResult(transformer, std::move(data));
 }
 
-// AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' 'ROLE' AclName (spec 120): the object's own grant - the
+// AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' AclRoleTarget (spec 120): the object's own grant - the
 // catalog's stays
 arena_ptr<TransformResultValue> FinalizeRevokeObject(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
-	if (auto platform = PlatformViewGrant(parse_result, 1, PathOf(list.GetChild(2)))) {
+	if (auto platform = PlatformViewGrant(list, "revoke", optional_idx())) {
 		return MgmtResult(transformer, std::move(platform));
 	}
 	auto data = Call("acl_revoke_object");
+	ObjectGrantRole(list.GetChild(4));
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
-	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
+	data->args = {Value(RoleTargetOf(list.GetChild(4))), Value(vcat), Value(vname)};
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -1833,6 +1872,217 @@ arena_ptr<TransformResultValue> FinalizeDropIdentity(PEGTransformer &transformer
 	return MgmtResult(transformer, std::move(data));
 }
 
+// --- function grants and categories (spec 072), platform's point grants (spec 117), sources (spec 118.3), resource
+// groups (spec 085) ---------------------------------------------------------------------------------------------
+
+//! `AclFunctionSpec <- AclPath AclGrantFunctionKind?` as the spec the admin functions parse (ParseFunctionSpec): each
+//! part of the path double-quoted (`""` a quote) - the reader takes a quoted part as written and a kind only outside
+//! quotes - then the kind written; `key` the path's key
+string FunctionSpecOf(ParseResult &result, string &key, bool &kind_written) {
+	auto &spec = Strip(result).Cast<ListParseResult>();
+	key = PathOf(spec.GetChild(0));
+	auto parts = NamePath::FromKey(key).Parts();
+	if (parts.size() == 1 && StringUtil::CIEquals(parts[0], "category")) {
+		throw BinderException("acl admin: FUNCTION CATEGORY names a category - write FUNCTION CATEGORY <name>, or a "
+		                      "function named category as system.main.category");
+	}
+	vector<string> quoted;
+	for (auto &part : parts) {
+		quoted.push_back("\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"");
+	}
+	auto text = StringUtil::Join(quoted, ".");
+	auto &kind = spec.Child<OptionalParseResult>(1);
+	kind_written = kind.HasResult();
+	if (kind_written) {
+		text += KeywordOf(kind.GetResult()) == "table" ? " TABLE" : " SCALAR";
+	}
+	return text;
+}
+
+// AclGrantFunctionCategory <- AclFunctionGrantVerb 'FUNCTION' 'CATEGORY' AclName 'TO' AclRoleTarget - a deny wins
+// over every grant (spec 072)
+arena_ptr<TransformResultValue> FinalizeGrantFunctionCategory(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_grant_function_category");
+	data->args = {Value(RoleTargetOf(list.GetChild(5))), Value(NameOf(list.GetChild(3), "a category name")),
+	              Value(KeywordOf(list.GetChild(0)) == "deny" ? "false" : "true")};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeFunctionCategory <- 'REVOKE' 'FUNCTION' 'CATEGORY' AclName 'FROM' AclRoleTarget: the row goes, grant or
+// deny alike
+arena_ptr<TransformResultValue> FinalizeRevokeFunctionCategory(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_function_category");
+	data->args = {Value(RoleTargetOf(list.GetChild(5))), Value(NameOf(list.GetChild(3), "a category name"))};
+	return MgmtResult(transformer, std::move(data));
+}
+
+//! A function grant by name (`acl_grant_function` / `acl_revoke_function`) or, for `platform.<f>`, platform's point
+//! grant (spec 117) - which names no kind
+arena_ptr<TransformResultValue> FunctionGrant(PEGTransformer &transformer, ParseResult &spec_part, const string &verb,
+                                              const string &role) {
+	string key;
+	bool kind_written = false;
+	auto spec = FunctionSpecOf(spec_part, key, kind_written);
+	if (auto platform = PlatformGrantCall("function", key, verb, role)) {
+		if (kind_written) {
+			throw BinderException("acl admin: a function of the platform catalog is named without TABLE or SCALAR");
+		}
+		return MgmtResult(transformer, std::move(platform));
+	}
+	auto data = Call(verb == "revoke" ? "acl_revoke_function" : "acl_grant_function");
+	data->args = {Value(role), Value(spec)};
+	if (verb != "revoke") {
+		data->args.emplace_back(verb == "deny" ? "false" : "true");
+	}
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantFunction <- AclFunctionGrantVerb 'FUNCTION' AclFunctionSpec 'TO' AclRoleTarget - a grant by name admits the
+// key whatever its categories
+arena_ptr<TransformResultValue> FinalizeGrantFunction(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	return FunctionGrant(transformer, list.GetChild(2), KeywordOf(list.GetChild(0)), RoleTargetOf(list.GetChild(4)));
+}
+
+// AclRevokeFunction <- 'REVOKE' 'FUNCTION' AclFunctionSpec 'FROM' AclRoleTarget
+arena_ptr<TransformResultValue> FinalizeRevokeFunction(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	return FunctionGrant(transformer, list.GetChild(2), "revoke", RoleTargetOf(list.GetChild(4)));
+}
+
+// AclDenyView <- 'DENY' 'VIEW' AclPath 'TO' AclRoleTarget - a view of the platform catalog (spec 117); a virtual
+// catalog's view is narrowed by its grant, never denied
+arena_ptr<TransformResultValue> FinalizeDenyView(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = PlatformGrantCall("view", PathOf(list.GetChild(2)), "deny", RoleTargetOf(list.GetChild(4)));
+	if (!data) {
+		throw BinderException("acl admin: DENY VIEW names a view of the platform catalog (platform.<view>)");
+	}
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclCreateFunctionCategory <- 'CREATE' AclOrReplace? 'FUNCTION' 'CATEGORY' AclName AclComment? - the operator's own
+// category; a re-create keeps the members and grants and takes the new comment
+arena_ptr<TransformResultValue> FinalizeCreateFunctionCategory(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_create_function_category");
+	auto name = NameOf(list.GetChild(4), "a category name");
+	data->args = {Value(name), Value(OptionalComment(transformer, list, 5, *data))};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterFunctionCategory <- 'ALTER' 'FUNCTION' 'CATEGORY' AclName AclCategoryChange - SET COMMENT '…' (it must
+// exist; its members stay) | ADD (…) | DROP (…): the members as written, which the admin function parses
+arena_ptr<TransformResultValue> FinalizeAlterFunctionCategory(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto category = NameOf(list.GetChild(3), "a category name");
+	auto &change = Strip(list.GetChild(4)).Cast<ListParseResult>();
+	if (change.Name() == "AclCategoryComment") {
+		// AclCategoryComment <- 'SET' AclComment
+		auto data = Call("acl_comment_function_category");
+		data->args = {Value(category), Value(Quoted(transformer, ClauseList(change.GetChild(1)), 1, "comment", *data))};
+		return MgmtResult(transformer, std::move(data));
+	}
+	// AclCategoryMembers <- AclCategoryVerb AclParenList (AclCategoryVerb <- 'ADD' / 'DROP')
+	bool add = KeywordOf(change.GetChild(0)) == "add";
+	auto &members = Strip(change.GetChild(1)).Cast<ListParseResult>();
+	if (!members.Child<OptionalParseResult>(1).HasResult()) {
+		throw BinderException("acl admin: ALTER FUNCTION CATEGORY %s the members in parentheses",
+		                      add ? "ADD takes" : "DROP takes");
+	}
+	auto data = Call(add ? "acl_function_category_add" : "acl_function_category_remove");
+	data->args = {Value(category), Value(string())};
+	ParensInto(members, 1, MgmtParsed::TextKind::TEXT, false, *data);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclDropFunctionCategory <- 'DROP' 'FUNCTION' 'CATEGORY' AclIfExists? AclName - the members and every grant on it go
+// too
+arena_ptr<TransformResultValue> FinalizeDropFunctionCategory(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_drop_function_category");
+	data->args = {Value(NameOf(list.GetChild(4), "a category name")), Value(DropMode(list, 3))};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantSource <- 'GRANT' 'SOURCE' AclPath 'TO' 'ROLE' AclName / AclRevokeSource <- 'REVOKE' 'SOURCE' AclPath
+// 'FROM' 'ROLE' AclName (spec 118.3): `<database>[.<schema>]`, the physical tree a catalog admin sees under
+// platform.attached and the only sources it builds over; a revoke leaves what the role declared over it working
+arena_ptr<TransformResultValue> FinalizeSourceGrant(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call(KeywordOf(list.GetChild(0)) == "grant" ? "acl_grant_source" : "acl_revoke_source");
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(PathOf(list.GetChild(2)))};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclCreateResourceGroup <- 'CREATE' AclOrReplace? 'RESOURCE' 'GROUP' AclName 'WITH'? AclParenList? AclGroupClause*
+// (spec 085) - a re-create replaces the limits, the roles bound to it stay; DEFAULT (spec 096: the principals bound to
+// no group are its members) and COMMENT in any order, each once
+arena_ptr<TransformResultValue> FinalizeCreateResourceGroup(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_create_resource_group");
+	data->args = {Value(NameOf(list.GetChild(4), "a group name")), Value("{}"), Value(string()), Value(string())};
+	auto &limits = list.Child<OptionalParseResult>(6);
+	if (limits.HasResult()) {
+		// the limits `(window_max 64, batch_bytes '32MiB', …)`, read once the tokens are known (ResourceLimitsJson)
+		ParensInto(limits.GetResult(), 1, MgmtParsed::TextKind::LIMITS, false, *data);
+	}
+	case_insensitive_set_t seen;
+	for (auto &clause : Clauses(list, 7)) {
+		auto &part = Strip(clause.get());
+		if (part.Name() == "AclComment") {
+			ClauseOnce(seen, "comment");
+			data->args[2] = Value(Quoted(transformer, part.Cast<ListParseResult>(), 1, "comment", *data));
+		} else {
+			ClauseOnce(seen, "default"); // AclGroupDefault <- 'DEFAULT'
+			data->args[3] = Value("true");
+		}
+	}
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterResourceGroup <- 'ALTER' 'RESOURCE' 'GROUP' AclName AclGroupChange (spec 096 / 120) - SET (limits): only the
+// named limits change | SET COMMENT '…' | SET DEFAULT | DROP DEFAULT
+arena_ptr<TransformResultValue> FinalizeAlterResourceGroup(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_alter_resource_group");
+	data->args = {Value(NameOf(list.GetChild(3), "a group name")), Value(string()), Value(string())};
+	auto &change = Strip(list.GetChild(4)).Cast<ListParseResult>();
+	auto name = change.Name();
+	if (name == "AclGroupSetLimits") {
+		data->args[1] = Value("limits"); // AclGroupSetLimits <- 'SET' AclParenList
+		ParensInto(change.GetChild(1), 2, MgmtParsed::TextKind::LIMITS, false, *data);
+	} else if (name == "AclGroupSetComment") {
+		data->args[1] = Value("comment"); // AclGroupSetComment <- 'SET' AclComment
+		data->args[2] = Value(Quoted(transformer, ClauseList(change.GetChild(1)), 1, "comment", *data));
+	} else {
+		// AclGroupSetDefault <- 'SET' 'DEFAULT' / AclGroupDropDefault <- 'DROP' 'DEFAULT'
+		data->args[1] = Value("default");
+		data->args[2] = Value(name == "AclGroupSetDefault" ? "true" : "false");
+	}
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclDropResourceGroup <- 'DROP' 'RESOURCE' 'GROUP' AclIfExists? AclName - its role bindings go too
+arena_ptr<TransformResultValue> FinalizeDropResourceGroup(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_drop_resource_group");
+	data->args = {Value(NameOf(list.GetChild(4), "a group name")), Value(DropMode(list, 3))};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantResourceGroup <- 'GRANT' 'RESOURCE' 'GROUP' AclName 'TO' 'ROLE' AclName / AclRevokeResourceGroup <- 'REVOKE'
+// 'RESOURCE' 'GROUP' AclName 'FROM' 'ROLE' AclName
+arena_ptr<TransformResultValue> FinalizeResourceGroupGrant(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto grant = KeywordOf(list.GetChild(0)) == "grant";
+	auto data = Call(grant ? "acl_grant_resource_group" : "acl_revoke_resource_group");
+	data->args = {Value(NameOf(list.GetChild(6), "a role name")), Value(NameOf(list.GetChild(3), "a group name"))};
+	return MgmtResult(transformer, std::move(data));
+}
+
 // --- a statement no rule reads yet ------------------------------------------------------------------------------
 
 // AclMgmtLegacy <- AclTailToken+ : its span, for the management compiler
@@ -2121,14 +2371,14 @@ public:
 		                                         Start<FinalizeGrantSchema>));
 		changes.push_back(GrammarChange::AddRule("AclObjectKind <- 'TABLE' / 'VIEW' / 'OBJECT'"));
 		changes.push_back(GrammarChange::AddRule(
-		    "AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' 'ROLE' AclName AclObjectClause*",
+		    "AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' AclRoleTarget AclObjectClause*",
 		    Start<FinalizeGrantObject>));
 		changes.push_back(GrammarChange::AddRule("AclRevokeCatalog <- 'REVOKE' 'CATALOG' AclName 'FROM' 'ROLE' AclName",
 		                                         Start<FinalizeRevokeCatalog>));
 		changes.push_back(GrammarChange::AddRule("AclRevokeSchema <- 'REVOKE' 'SCHEMA' AclPath 'FROM' 'ROLE' AclName",
 		                                         Start<FinalizeRevokeSchema>));
 		changes.push_back(GrammarChange::AddRule(
-		    "AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' 'ROLE' AclName", Start<FinalizeRevokeObject>));
+		    "AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' AclRoleTarget", Start<FinalizeRevokeObject>));
 		changes.push_back(GrammarChange::AddRule("AclSetRlsValue <- 'RLS' AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclSetColumnsValue <- 'COLUMNS' AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclSetMainValue <- 'MAIN' AclWordToken"));
@@ -2191,6 +2441,68 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclIdentityKind <- 'ISSUER' / 'CLIENT'"));
 		changes.push_back(GrammarChange::AddRule("AclDropIdentity <- 'DROP' AclIdentityKind AclIfExists? AclNameValue",
 		                                         Start<FinalizeDropIdentity>));
+		// function grants and categories (spec 072), platform's point grants (spec 117), sources (spec 118.3),
+		// resource groups (spec 085)
+		changes.push_back(GrammarChange::AddRule("AclAllRoles <- 'ALL' 'ROLES'"));
+		changes.push_back(GrammarChange::AddRule("AclOneRole <- 'ROLE' AclName"));
+		changes.push_back(GrammarChange::AddRule("AclRoleTarget <- AclAllRoles / AclOneRole"));
+		changes.push_back(GrammarChange::AddRule("AclGrantFunctionKind <- 'TABLE' / 'SCALAR'"));
+		changes.push_back(GrammarChange::AddRule("AclFunctionSpec <- AclPath AclGrantFunctionKind?"));
+		changes.push_back(GrammarChange::AddRule("AclFunctionGrantVerb <- 'GRANT' / 'DENY'"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGrantFunctionCategory <- AclFunctionGrantVerb 'FUNCTION' 'CATEGORY' AclName 'TO' AclRoleTarget",
+		    Start<FinalizeGrantFunctionCategory>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGrantFunction <- AclFunctionGrantVerb 'FUNCTION' AclFunctionSpec 'TO' AclRoleTarget",
+		    Start<FinalizeGrantFunction>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclRevokeFunctionCategory <- 'REVOKE' 'FUNCTION' 'CATEGORY' AclName 'FROM' AclRoleTarget",
+		    Start<FinalizeRevokeFunctionCategory>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclRevokeFunction <- 'REVOKE' 'FUNCTION' AclFunctionSpec 'FROM' AclRoleTarget",
+		                           Start<FinalizeRevokeFunction>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclDenyView <- 'DENY' 'VIEW' AclPath 'TO' AclRoleTarget", Start<FinalizeDenyView>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclCreateFunctionCategory <- 'CREATE' AclOrReplace? 'FUNCTION' 'CATEGORY' AclName AclComment?",
+		    Start<FinalizeCreateFunctionCategory>));
+		changes.push_back(GrammarChange::AddRule("AclCategoryComment <- 'SET' AclComment"));
+		changes.push_back(GrammarChange::AddRule("AclCategoryVerb <- 'ADD' / 'DROP'"));
+		changes.push_back(GrammarChange::AddRule("AclCategoryMembers <- AclCategoryVerb AclParenList"));
+		changes.push_back(GrammarChange::AddRule("AclCategoryChange <- AclCategoryComment / AclCategoryMembers"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclAlterFunctionCategory <- 'ALTER' 'FUNCTION' 'CATEGORY' AclName AclCategoryChange",
+		    Start<FinalizeAlterFunctionCategory>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclDropFunctionCategory <- 'DROP' 'FUNCTION' 'CATEGORY' AclIfExists? AclName",
+		                           Start<FinalizeDropFunctionCategory>));
+		changes.push_back(GrammarChange::AddRule("AclGrantSource <- 'GRANT' 'SOURCE' AclPath 'TO' 'ROLE' AclName",
+		                                         Start<FinalizeSourceGrant>));
+		changes.push_back(GrammarChange::AddRule("AclRevokeSource <- 'REVOKE' 'SOURCE' AclPath 'FROM' 'ROLE' AclName",
+		                                         Start<FinalizeSourceGrant>));
+		changes.push_back(GrammarChange::AddRule("AclGroupDefault <- 'DEFAULT'"));
+		changes.push_back(GrammarChange::AddRule("AclGroupClause <- AclGroupDefault / AclComment"));
+		changes.push_back(GrammarChange::AddRule("AclCreateResourceGroup <- 'CREATE' AclOrReplace? 'RESOURCE' 'GROUP' "
+		                                         "AclName 'WITH'? AclParenList? AclGroupClause*",
+		                                         Start<FinalizeCreateResourceGroup>));
+		changes.push_back(GrammarChange::AddRule("AclGroupSetLimits <- 'SET' AclParenList"));
+		changes.push_back(GrammarChange::AddRule("AclGroupSetComment <- 'SET' AclComment"));
+		changes.push_back(GrammarChange::AddRule("AclGroupSetDefault <- 'SET' 'DEFAULT'"));
+		changes.push_back(GrammarChange::AddRule("AclGroupDropDefault <- 'DROP' 'DEFAULT'"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGroupChange <- AclGroupSetLimits / AclGroupSetComment / AclGroupSetDefault / AclGroupDropDefault"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclAlterResourceGroup <- 'ALTER' 'RESOURCE' 'GROUP' AclName AclGroupChange",
+		                           Start<FinalizeAlterResourceGroup>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclDropResourceGroup <- 'DROP' 'RESOURCE' 'GROUP' AclIfExists? AclName",
+		                           Start<FinalizeDropResourceGroup>));
+		changes.push_back(
+		    GrammarChange::AddRule("AclGrantResourceGroup <- 'GRANT' 'RESOURCE' 'GROUP' AclName 'TO' 'ROLE' AclName",
+		                           Start<FinalizeResourceGroupGrant>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclRevokeResourceGroup <- 'REVOKE' 'RESOURCE' 'GROUP' AclName 'FROM' 'ROLE' AclName",
+		    Start<FinalizeResourceGroupGrant>));
 		// a statement no rule reads yet: its tokens, to the management compiler
 		changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
 		changes.push_back(
@@ -2210,7 +2522,11 @@ public:
 		    "AclAnalyzeObject / AclDropRelation / AclDropReference / AclDropCatalog / AclDropSchema / "
 		    "AclDropFunction / AclDropObject / AclGrantCatalog / AclGrantSchema / AclGrantObject / AclRevokeCatalog / "
 		    "AclRevokeSchema / AclRevokeObject / AclAlterGrant / AclCreateIssuer / AclCreateClient / AclAlterIssuer / "
-		    "AclAlterClient / AclDropIdentity / AclMgmtLegacy"));
+		    "AclAlterClient / AclDropIdentity / AclGrantFunctionCategory / AclGrantFunction / "
+		    "AclRevokeFunctionCategory / AclRevokeFunction / AclDenyView / AclCreateFunctionCategory / "
+		    "AclAlterFunctionCategory / AclDropFunctionCategory / AclGrantSource / AclRevokeSource / "
+		    "AclCreateResourceGroup / AclAlterResourceGroup / AclDropResourceGroup / AclGrantResourceGroup / "
+		    "AclRevokeResourceGroup / AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
@@ -2637,10 +2953,11 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 					value = ClaimsListText(text, tokens, span.start, span.end);
 				} else {
 					auto kind = span.kind;
-					value = ListText(text, tokens, span.start, span.end, span.sql,
-					                 kind == MgmtParsed::TextKind::ITEMS || kind == MgmtParsed::TextKind::REQUIRE ||
-					                     kind == MgmtParsed::TextKind::ATTRIBUTES ||
-					                     kind == MgmtParsed::TextKind::CLAIM_MAP);
+					value =
+					    ListText(text, tokens, span.start, span.end, span.sql,
+					             kind == MgmtParsed::TextKind::ITEMS || kind == MgmtParsed::TextKind::REQUIRE ||
+					                 kind == MgmtParsed::TextKind::ATTRIBUTES ||
+					                 kind == MgmtParsed::TextKind::CLAIM_MAP || kind == MgmtParsed::TextKind::LIMITS);
 				}
 				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind, span.splice});
 			}
