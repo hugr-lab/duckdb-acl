@@ -301,8 +301,9 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   function takes no kind (refused). The limits are `TextKind::LIMITS`, read by the compiler's `ResourceLimitsJson`, and
   a value list: a string continued on the next line refused. Fixed with the move (3f's reviews): a function spec is read
   as duckdb reads a qualified name - `ParseFunctionSpec` reads its parts with `QualifiedName::ParseComponents` (a word
-  or a double-quoted name, `""` a quote), a kind only as a last word outside quotes, a part never empty nor with an edge
-  space, a trailing dot refused; the rule writes each part double-quoted. The old reader cut text: a space in a
+  or a double-quoted name, `""` a quote), a kind only as a last word after any space outside quotes, an unquoted part
+  plain (a space only - no apostrophe, parenthesis, tab, line break or control character), a part never empty nor with
+  an edge space, a trailing dot refused; the rule writes each part double-quoted. The old reader cut text: a space in a
   qualified name's last part ended the name at a kind word (`system.main."read_csv TABLE"` stored the table function
   read_csv, as the compiler's `Dotted` did), a quote was kept in a part, an edge space trimmed, a trailing dot dropped -
   and a category's member with a quoted part (`DROP (system.main."lower")`, what the DBeaver editor writes) dropped

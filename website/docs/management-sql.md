@@ -746,9 +746,12 @@ ACL ADMIN REVOKE FUNCTION CATEGORY spatial FROM ALL ROLES;      -- spatial is no
 ACL ADMIN DROP FUNCTION CATEGORY IF EXISTS sequences;           -- with its members and grants
 ```
 
-The bulk form is the native mode: `ACL NATIVE SELECT acl_function_category_add('myext', list(function_name ||
-CASE WHEN function_type IN ('table', 'table_macro') THEN ' TABLE' ELSE '' END)) FROM duckdb_functions() WHERE
-function_name LIKE 'myext_%' AND function_type <> 'pragma';` (a table function is named with `TABLE`). A category acts in every catalog a role
+The bulk form is a native statement (the operator's own connection, or `ACL NATIVE` under a passthrough
+principal): `SELECT acl_function_category_add('myext', list(function_name || CASE WHEN function_type IN
+('table', 'table_macro') THEN ' TABLE' ELSE '' END)) FROM duckdb_functions() WHERE function_name LIKE 'myext_%'
+AND function_type <> 'pragma' AND function_name NOT IN (SELECT name FROM acl_function_status() WHERE status =
+'never');` - a table function is named with `TABLE`, and the never set is left out (one of its names refuses
+the whole list). A category acts in every catalog a role
 holds, so these statements take an unrestricted `manage` scope - a catalog-scoped one is refused as
 "not catalog-specific".
 

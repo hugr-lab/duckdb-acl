@@ -193,8 +193,9 @@ ACL ADMIN REVOKE FUNCTION lake.main.peek TABLE FROM ROLE analyst;
   unless `kind` was written explicitly - so a fleet-shared catalog can carry a function of an
   extension the writing node does not have.
 - A key in the never set → refused at write time.
-- Bulk from a selection is the native mode, as the owner asked:
-  `ACL NATIVE SELECT acl_function_category_add('myext', list(function_name)) FROM duckdb_functions() WHERE function_name LIKE 'myext_%';`
+- Bulk from a selection is the native mode, as the owner asked (a table function named with `TABLE`, pragmas and the
+  never set left out - management-sql.md has the statement):
+  `SELECT acl_function_category_add('myext', list(function_name || CASE WHEN function_type IN ('table', 'table_macro') THEN ' TABLE' ELSE '' END)) FROM duckdb_functions() WHERE function_name LIKE 'myext_%' AND function_type <> 'pragma';`
 - A category acts in every catalog a role holds, so writing categories and function grants takes
   **global `manage`** (spec 009); a catalog-scoped `manage` does not reach them.
 

@@ -851,6 +851,18 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 		spec = spec.substr(0, space.GetIndex());
 		StringUtil::Trim(spec);
 	}
+	// inside an unquoted name a space only (`IS DISTINCT FROM`): a tab or a line break there named nothing a call
+	// resolves to
+	quoted = false;
+	for (auto c : spec) {
+		if (c == '"') {
+			quoted = !quoted;
+		} else if (!quoted && ((StringUtil::CharacterIsSpace(c) && c != ' ') || c == 0x7f)) {
+			throw BinderException("%s: \"%s\" - an unquoted part of a function's name holds no apostrophe, "
+			                      "parenthesis or control character",
+			                      fn, spec_p);
+		}
+	}
 	// the name: up to three parts, each a word or a double-quoted name with `""` for a quote - read as duckdb reads a
 	// qualified name (spec 150 stage 3f's reviews: a quote kept in a part, a part's edge space trimmed, a trailing dot
 	// dropped each named another function than written)

@@ -1907,7 +1907,24 @@ OR (role = '' AND name = 'read_csv' AND kind = 'table' AND NOT allowed);
 2
 
 statement ok
-SELECT acl_revoke_function('fgrantee', 'system.main."||"'), acl_allow_function('"read_csv" TABLE');
+SELECT acl_revoke_function('fgrantee', 'system.main."||"'), acl_revoke_function('', '"read_csv" TABLE'),
+       acl_revoke_function('', '"read_csv"');
+
+statement ok
+SELECT acl_grant_function('fgrantee', 'read_csv' || chr(10) || 'TABLE');
+
+query I
+SELECT kind FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND name = 'read_csv';
+----
+table
+
+statement ok
+SELECT acl_revoke_function('fgrantee', 'read_csv TABLE');
+
+statement error
+SELECT acl_deny_function('lo' || chr(9) || 'wer SCALAR');
+----
+holds no apostrophe, parenthesis or control character
 
 statement error
 SELECT acl_function_category_add('nosuch', 'it''s TABLE, lower TABLE');
