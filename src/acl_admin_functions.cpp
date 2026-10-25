@@ -835,8 +835,15 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 	for (idx_t i = 0; i < spec.size(); i++) {
 		if (spec[i] == '"') {
 			quoted = !quoted; // a doubled quote toggles twice
-		} else if (!quoted && (spec[i] == ' ' || spec[i] == '\t')) {
+		} else if (!quoted && StringUtil::CharacterIsSpace(spec[i])) {
 			space = i;
+		} else if (!quoted && (spec[i] == '\'' || spec[i] == '(' || spec[i] == ')' ||
+		                       static_cast<unsigned char>(spec[i]) < 0x20)) {
+			// a word holds none (no function has one): an apostrophe or a parenthesis ended the csv split of the
+			// members (`it's, lower` read as one), and `lower()` / `'lower'` named nothing a call resolves to
+			throw BinderException("%s: \"%s\" - an unquoted part of a function's name holds no apostrophe, parenthesis "
+			                      "or control character",
+			                      fn, spec_p);
 		}
 	}
 	if (space.IsValid() && ParseFunctionKind(spec.substr(space.GetIndex() + 1), key.kind)) {
@@ -845,8 +852,8 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 		StringUtil::Trim(spec);
 	}
 	// the name: up to three parts, each a word or a double-quoted name with `""` for a quote - read as duckdb reads a
-	// qualified name (spec 152's review: a quote kept in a part, a part's edge space trimmed, a trailing dot dropped
-	// each named another function than written)
+	// qualified name (spec 150 stage 3f's reviews: a quote kept in a part, a part's edge space trimmed, a trailing dot
+	// dropped each named another function than written)
 	vector<Identifier> parts;
 	string error;
 	if (!spec.empty() && spec.back() != '.') {

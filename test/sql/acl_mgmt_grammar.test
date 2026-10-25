@@ -1884,6 +1884,41 @@ statement ok
 ACL ADMIN REVOKE FUNCTION "sys.tem".main.f TABLE FROM ROLE fgrantee; REVOKE FUNCTION lake."a.b".f TABLE FROM ROLE
 fgrantee; REVOKE FUNCTION a."it's".f TABLE FROM ROLE fgrantee; REVOKE FUNCTION "a""b" TABLE FROM ROLE fgrantee;
 
+# ... a name with a space that reads as written is kept, and SCALAR is a kind
+statement ok
+ACL ADMIN DENY FUNCTION lake."my schema".peek SCALAR TO ROLE fgrantee; DENY FUNCTION lake.main."my func" SCALAR
+TO ROLE fgrantee; DENY FUNCTION system.main."IS DISTINCT FROM" TO ROLE fgrantee;
+
+query T
+SELECT string_agg(database || '|' || schema || '|' || name || '|' || kind, ',' ORDER BY name)
+FROM aclcat.acl.function_grants WHERE role = 'fgrantee' AND NOT allowed AND kind = 'scalar';
+----
+system|main|is distinct from|scalar,lake|main|my func|scalar,lake|my schema|peek|scalar
+
+# the function forms read the same: a quoted part, a kind after any space outside quotes; an unquoted part holds no
+# apostrophe or parenthesis (one ended the csv split of a members list)
+statement ok
+SELECT acl_grant_function('fgrantee', 'system.main."||"'), acl_deny_function('"read_csv" TABLE');
+
+query I
+SELECT count(*) FROM aclcat.acl.function_grants WHERE (role = 'fgrantee' AND name = '||' AND allowed)
+OR (role = '' AND name = 'read_csv' AND kind = 'table' AND NOT allowed);
+----
+2
+
+statement ok
+SELECT acl_revoke_function('fgrantee', 'system.main."||"'), acl_allow_function('"read_csv" TABLE');
+
+statement error
+SELECT acl_function_category_add('nosuch', 'it''s TABLE, lower TABLE');
+----
+holds no apostrophe, parenthesis
+
+statement error
+SELECT acl_deny_function('lower()');
+----
+holds no apostrophe, parenthesis
+
 # a category's members are read by the same reader: a quoted part is its name, a trailing dot or an empty part refused
 statement ok
 ACL ADMIN CREATE FUNCTION CATEGORY quoted; ALTER FUNCTION CATEGORY quoted ADD (lower, "main"."upper", system.main."||");
@@ -1910,6 +1945,15 @@ statement error
 ACL ADMIN ALTER FUNCTION CATEGORY quoted ADD (system..lower);
 ----
 never empty
+
+statement ok
+ACL ADMIN ALTER FUNCTION CATEGORY quoted ADD (read_csv
+TABLE);
+
+query T
+SELECT kind FROM aclcat.acl.function_category_members WHERE category = 'quoted' AND name = 'read_csv';
+----
+table
 
 statement ok
 ACL ADMIN DROP FUNCTION CATEGORY quoted;
