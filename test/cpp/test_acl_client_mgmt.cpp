@@ -9,6 +9,7 @@
 #include "acl_test_util.hpp"
 
 #include "acl_admin_sql.hpp"
+#include "acl_parser_override.hpp"
 
 using namespace acl_test;
 
@@ -62,6 +63,30 @@ int main(int argc, char *argv[]) {
 				Check(!duckdb::acl::ClientTextIsMgmt(text, rest), "a query: " + text);
 			}
 		});
+		Scenario("USE [SCHEMA] on duckdb's tokens (spec 150 3g-2b): the SET it compiles to, or the text unchanged",
+		         [&] {
+			         std::vector<std::pair<std::string, std::string>> cases = {
+			             {"USE SCHEMA out", "SET acl_use_schema = 'out'"},
+			             {"USE /* c */ SCHEMA -- x\n out;", "SET acl_use_schema = 'out'"},
+			             {"USE SCHEMA \"out\".\"deep\"", "SET acl_use_schema = '\"out\".\"deep\"'"},
+			             {"USE SCHEMA out . deep", "SET acl_use_schema = 'out.deep'"},
+			             {"USE SCHEMA \"a'b\"", "SET acl_use_schema = '\"a''b\"'"},
+			             {"USE SCHEMA 2024", "SET acl_use_schema = '2024'"},
+			             {"USE SCHEMA 1abc", "SET acl_use_schema = '1abc'"},
+			             {"USE a.b.c", "SET schema = 'a.b.c'"},
+			             {"USE a.b", "USE a.b"},
+			             {"USE schema.x", "USE schema.x"},
+			             {"USE SCHEMA \"open", "USE SCHEMA \"open"},
+			             {"USE SCHEMA out; SELECT 1", "USE SCHEMA out; SELECT 1"},
+			             {"USE SCHEMA out.", "USE SCHEMA out."},
+			             {"USE SCHEMA 'out'", "USE SCHEMA 'out'"},
+			             {"SELECT 1", "SELECT 1"},
+			         };
+			         for (auto &entry : cases) {
+				         auto got = duckdb::acl::UseSchemaAsSet(entry.first);
+				         Check(got == entry.second, entry.first + " -> " + got);
+			         }
+		         });
 		Scenario("the rest past the markers is what the door's other checks read", [&] {
 			std::string rest;
 			Check(!duckdb::acl::ClientTextIsMgmt("TRACE 'x' SELECT platform.create_role('z')", rest) &&

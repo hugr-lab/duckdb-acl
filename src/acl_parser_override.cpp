@@ -1055,96 +1055,64 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 //! spec 114: `USE SCHEMA <name>[;]` as the one statement of the text -> `SET acl_use_schema = '<name>'`,
 //! which the rewriter reads as USE of that schema in the session's catalog; `<name>` may be a nested schema's
 //! path (`raw.eu`, spec 116: each part an identifier). `USE <catalog>.<schema path>` of three parts or more - beyond
-//! duckdb's grammar - becomes `SET schema = '...'`, read the same way. Any other text unchanged.
+//! duckdb's grammar - becomes `SET schema = '...'`, read the same way. Any other text unchanged. Read on duckdb's
+//! tokens (spec 150 3g-2b): comments are gone, a part is a word (a digit-led one too: the tokenizer's number then
+//! word, written together) or a double-quoted name as written, `.` between them with any space around it
 string UseSchemaAsSet(const string &text) {
-	idx_t i = 0;
-	auto skip_space = [&]() { // whitespace and comments, as the parser skips them
-		while (i < text.size()) {
-			if (StringUtil::CharacterIsSpace(text[i])) {
-				i++;
-			} else if (text.compare(i, 2, "--") == 0) {
-				auto end = text.find('\n', i);
-				i = end == string::npos ? text.size() : end + 1;
-			} else if (text.compare(i, 2, "/*") == 0) {
-				auto end = text.find("*/", i + 2);
-				if (end == string::npos) {
-					return; // unterminated: not ours to read
-				}
-				i = end + 2;
-			} else {
-				return;
-			}
+	auto heads = ReadStatementHeads(text, 256);
+	if (heads.size() != 1 || heads[0].size() >= 256) {
+		return text; // one statement only (a `;` after it opens no other)
+	}
+	auto &tokens = heads[0];
+	for (auto &token : tokens) {
+		if (token.unterminated) {
+			return text; // the text ends inside a string or a name: not ours to read
 		}
-	};
-	auto word = [&](const char *expected) {
-		auto size = strlen(expected);
-		if (i + size > text.size() || !StringUtil::CIEquals(text.substr(i, size), expected)) {
-			return false;
-		}
-		if (i + size < text.size() && !StringUtil::CharacterIsSpace(text[i + size]) && text[i + size] != '-' &&
-		    text[i + size] != '/') {
-			return false;
-		}
-		i += size;
-		return true;
-	};
-	skip_space();
-	if (!word("use")) {
+	}
+	if (tokens.empty() || !tokens[0].IsWord("use")) {
 		return text;
 	}
-	skip_space();
-	// `USE SCHEMA <path>`, or `USE <catalog>.<schema path>` of three parts or more (duckdb's grammar stops at
-	// two): both become the SET the rewriter reads
-	bool schema_form = word("schema");
-	skip_space();
-	// a schema name, or a nested schema's path: identifiers (quoted or bare) joined by `.` (spec 116 / 114)
+	idx_t at = 1;
+	// `USE SCHEMA <path>` - `USE schema.x` is duckdb's USE of the catalog `schema`
+	bool schema_form =
+	    at < tokens.size() && tokens[at].IsWord("schema") && !(at + 1 < tokens.size() && tokens[at + 1].text == ".");
+	if (schema_form) {
+		at++;
+	}
+	auto plain = [](const HeadToken &token) {
+		return token.kind == HeadToken::Kind::WORD || token.kind == HeadToken::Kind::NUMBER;
+	};
 	string name;
 	idx_t parts = 0;
-	for (;;) {
+	while (at < tokens.size()) {
+		auto &first = tokens[at];
 		string part;
-		if (i < text.size() && text[i] == '"') {
-			for (i++; i < text.size(); i++) {
-				if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
-					part += '"';
-					i++;
-				} else if (text[i] == '"') {
-					break;
-				} else {
-					part += text[i];
-				}
+		if (first.kind == HeadToken::Kind::QUOTED_NAME && !first.text.empty() && first.text[0] == '"') {
+			part = first.text;
+			at++;
+		} else if (plain(first)) {
+			// a word, or the tokens a digit-led word is read as - written together, no space between
+			part = first.text;
+			for (at++; at < tokens.size() && plain(tokens[at]) &&
+			           tokens[at].offset == tokens[at - 1].offset + tokens[at - 1].text.size();
+			     at++) {
+				part += tokens[at].text;
 			}
-			if (i >= text.size()) {
-				return text;
-			}
-			i++;
-			part = "\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"";
 		} else {
-			while (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_' ||
-			                           static_cast<unsigned char>(text[i]) >= 0x80)) {
-				part += text[i++];
-			}
-		}
-		if (part.empty()) {
 			return text;
 		}
 		name += (name.empty() ? "" : ".") + part;
 		parts++;
-		auto at = i;
-		skip_space(); // `a . b`, as duckdb's grammar reads it
-		if (i < text.size() && text[i] == '.') {
-			i++;
-			skip_space();
+		if (at < tokens.size() && tokens[at].text == ".") {
+			at++;
+			if (at == tokens.size()) {
+				return text; // a trailing dot
+			}
 			continue;
 		}
-		i = at;
 		break;
 	}
-	skip_space();
-	if (i < text.size() && text[i] == ';') {
-		i++;
-	}
-	skip_space();
-	if (name.empty() || i != text.size()) {
+	if (name.empty() || at != tokens.size()) {
 		return text;
 	}
 	if (!schema_form) {

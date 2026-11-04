@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1 and 3g-2a built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1, 3g-2a and 3g-2b built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -353,7 +353,14 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       refusal (`… holds GRANT / REVOKE SECRET statements only` - the compiler never runs there), a GRANT / REVOKE
       SECRET not read as its rule its form's (`RefuseSecretsForm`); one inside a management batch, read or not, goes
       in a batch of its own.
-    - 3g-2b: `USE [SCHEMA]` (`UseSchemaAsSet`) - sugar over duckdb's statement in a query batch.
+    - 3g-2b (built): `USE [SCHEMA]` (spec 114, `UseSchemaAsSet`) - sugar over duckdb's USE in a query batch (and the
+      Flight door's command check), compiled to `SET acl_use_schema` / `SET schema` - is read on duckdb's tokens
+      (`ReadStatementHeads`; `HeadToken` carries each token's text and whether it is unterminated): one statement,
+      `USE`, `SCHEMA` unless a `.` follows it (`USE schema.x` is duckdb's USE of the catalog `schema`), then parts - a
+      word (a digit-led one: the tokenizer's number then word, written together) or a `"…"` as written - joined by
+      `.` with any space around it. The hand scanner goes. Changed: a comment anywhere between the tokens, as duckdb
+      reads it; a word holding `$` is a part (the scan stopped at it, leaving the text to duckdb); a text ending
+      inside a string or a name is left to duckdb, as before.
     - 3g-2c: `ATTACH … LINEAGE '<x>'` (`acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.

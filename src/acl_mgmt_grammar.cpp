@@ -2864,6 +2864,8 @@ vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count) {
 		}
 		HeadToken entry;
 		entry.offset = token.offset;
+		entry.text = token.text;
+		entry.unterminated = token.unterminated;
 		auto &text_of = token.text;
 		if (!text_of.empty() && (text_of[0] == '"' || text_of[0] == '`')) {
 			entry.kind = HeadToken::Kind::QUOTED_NAME;
