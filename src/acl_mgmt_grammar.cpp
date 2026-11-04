@@ -2103,8 +2103,20 @@ arena_ptr<TransformResultValue> FinalizeSecretGrant(PEGTransformer &transformer,
 	string named;
 	auto &service = list.Child<OptionalParseResult>(5);
 	if (service.HasResult()) {
-		// AclSecretService <- AclSecretServiceWord AclNameValue (AclSecretServiceWord <- 'FROM' / 'IN')
-		named = NameValueOf(transformer, ClauseList(service.GetResult()).GetChild(1), "a secrets service", *data);
+		// AclSecretService <- AclSecretServiceWord AclSecretServiceName (AclSecretServiceWord <- 'FROM' / 'IN';
+		// AclSecretServiceName <- StringLiteral / AclName): one catalog's name, as an issuer's IN names it
+		auto &clause = ClauseList(service.GetResult());
+		auto &value = Strip(clause.GetChild(1));
+		named = value.Name() == "AclName" || value.Name() == "AclNameToken"
+		            ? NameOf(value, "a secrets service")
+		            : Quoted(transformer, clause, 1, "secrets service", *data);
+		if (named.empty()) {
+			throw BinderException("acl admin: FROM | IN names a secrets service - '' names none (leave it out for "
+			                      "the one attached)");
+		}
+	}
+	if (name.empty() || who.empty()) {
+		throw BinderException("acl admin: a secret and the role or group it goes to are named - '' names none");
 	}
 	data->args = {Value(name), Value(kind + ":" + who), Value(named)};
 	return MgmtResult(transformer, std::move(data));
@@ -2534,7 +2546,8 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclSecretPrincipalKind <- 'ROLE' / 'GROUP'"));
 		changes.push_back(GrammarChange::AddRule("AclSecretPrincipal <- AclSecretPrincipalKind AclNameValue"));
 		changes.push_back(GrammarChange::AddRule("AclSecretServiceWord <- 'FROM' / 'IN'"));
-		changes.push_back(GrammarChange::AddRule("AclSecretService <- AclSecretServiceWord AclNameValue"));
+		changes.push_back(GrammarChange::AddRule("AclSecretServiceName <- StringLiteral / AclName"));
+		changes.push_back(GrammarChange::AddRule("AclSecretService <- AclSecretServiceWord AclSecretServiceName"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclGrantSecret <- 'GRANT' 'SECRET' AclNameValue 'TO' AclSecretPrincipal AclSecretService?",
 		    Start<FinalizeSecretGrant>));

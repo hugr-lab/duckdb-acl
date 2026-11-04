@@ -32,10 +32,6 @@ struct AdminScanner {
 		Skip();
 		return pos >= text.size();
 	}
-	bool AtSemicolon() {
-		Skip();
-		return pos < text.size() && text[pos] == ';';
-	}
 	string PeekWord() {
 		Skip();
 		auto saved = pos;

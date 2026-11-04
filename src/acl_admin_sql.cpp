@@ -1,8 +1,8 @@
 // The ACL management grammar (spec 008). Since spec 150's stage 3 the management statements are rules
-// (acl_mgmt_grammar.cpp); what is left here reads the lists a rule hands over (ParseMgmtBatch's readers), compiles a
-// form a linked module registers (hugr-node's) and `ACL GRANT | REVOKE SECRET` until 3g, and refuses a moved form's
-// text in its own words. The authorizer every management statement passes is acl_platform.cpp's (spec 117). The
-// parser override is its only caller.
+// (acl_mgmt_grammar.cpp); what is left here reads the lists a rule hands over (ParseMgmtBatch's readers), builds the
+// secrets service's call from its rule's reading (spec 082), compiles a form a linked module registers (hugr-node's,
+// until 3g-3), and refuses a moved form's text in its own words. The authorizer every management statement passes is
+// acl_platform.cpp's (spec 117). The parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -659,6 +659,14 @@ string ResourceLimitsJson(const string &inside) {
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
+//! A GRANT / REVOKE SECRET its rule did not read (spec 082 / 150 3g-2a): the form in its own words
+[[noreturn]] void RefuseSecretsForm(bool grant) {
+	RefuseMovedForm(grant
+	                    ? "write GRANT SECRET <name> TO ROLE <role> | GROUP <group> [FROM | IN <service>] (a role or a "
+	                      "group, never one user)"
+	                    : "write REVOKE SECRET <name> FROM ROLE <role> | GROUP <group> [FROM | IN <service>]");
+}
+
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
 	if (auto parse = FindMgmtGrammar(keyword)) {
@@ -725,8 +733,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
 		if (s.Accept("secret")) {
-			RefuseMovedForm("write GRANT SECRET <name> TO ROLE | GROUP <principal> [FROM | IN <catalog>] - a secret is "
-			                "granted to a ROLE or a GROUP, never to one user");
+			RefuseSecretsForm(true);
 		}
 		if (s.Accept("source")) {
 			RefuseMovedForm("write GRANT SOURCE <database>[.<schema>] TO ROLE <role>");
@@ -746,7 +753,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
 		if (s.Accept("secret")) {
-			RefuseMovedForm("write REVOKE SECRET <name> FROM ROLE | GROUP <principal> [FROM | IN <catalog>]");
+			RefuseSecretsForm(false);
 		}
 		if (s.Accept("source")) {
 			RefuseMovedForm("write REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>");
@@ -928,6 +935,10 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 	vector<unique_ptr<SQLStatement>> statements;
 	for (auto &piece : pieces) {
 		auto &entry = piece.parsed;
+		if (entry.secrets || (entry.legacy && IsSecretsStart(entry.text))) {
+			throw BinderException("acl admin: GRANT / REVOKE SECRET goes in a batch of its own - its right is the "
+			                      "secrets capability, not an administration scope");
+		}
 		if (entry.legacy) {
 			try {
 				statements.push_back(CompileMgmtText(entry.text));
@@ -949,10 +960,6 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				throw;
 			}
 			continue;
-		}
-		if (entry.secrets) {
-			throw BinderException("acl admin: GRANT / REVOKE SECRET goes in a batch of its own - its right is the "
-			                      "secrets capability, not an administration scope");
 		}
 		for (auto &list : entry.texts) {
 			string read;
@@ -1134,8 +1141,9 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 	// the whole batch is read by its rules before any service is chosen: a malformed batch says so first
 	vector<SecretsStatement> parsed;
 	for (auto &entry : grammar.ReadManagement(text, options)) {
-		if (entry.legacy) {
-			CompileMgmtText(entry.text); // a GRANT / REVOKE SECRET not read as its rule refuses in its own words
+		if (entry.legacy && IsSecretsStart(entry.text)) {
+			// a GRANT / REVOKE SECRET its rule did not read, in that form's own words - the compiler never runs here
+			RefuseSecretsForm(ReadStatementHeads(entry.text, 1)[0][0].IsWord("grant"));
 		}
 		if (!entry.secrets) {
 			throw BinderException(

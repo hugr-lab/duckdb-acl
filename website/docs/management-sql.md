@@ -69,8 +69,8 @@ catalog forms refuse.
   so it never reads as two levels. Lineage names a dataset by the same key rules
   (`Sales Mart.main.Order Items`, `c."a.b".Sink`).
 - Quoted values take `'…'` or `"…"`; a doubled quote is a literal one. The empty text is `''` - the
-  management forms are read by duckdb's tokenizer (but `ACL GRANT | REVOKE SECRET`), to which `""` is
-  an empty identifier, which it refuses.
+  management forms are read by duckdb's tokenizer, to which `""` is an empty identifier, which it
+  refuses.
 - A body (after `AS` or `MACRO`) is either one quoted string - the whole body, nothing after it - or
   written inline to the end of the statement: a `;` inside a literal does not end it, one outside
   does. In the forms of the virtual catalog's objects (`CREATE | ALTER VIRTUAL …`, `ADD …`) a `$$…$$`
@@ -771,7 +771,9 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
 ```
 
 - **The catalog** is the one written, which must be a secrets service; otherwise the one attached.
-  Several unnamed is refused with what to write.
+  Several unnamed is refused with what to write. It is one name (a word, `"…"` or `'…'`); the secret's
+  name and the principal are names that are values - quoted either way, or words joined by `.`
+  (`v2.lake`) - and none of them is `''`.
 - **No service attached** (a standalone node, spec 118): `CREATE` / `DROP SECRET` that name no storage
   keep the secret on the node by duckdb's own rule - `PERSISTENT` in its secret files (**a file on the
   node's disk**: `secret_directory`, in the clear), otherwise in memory until the node restarts. The

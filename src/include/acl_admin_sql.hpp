@@ -35,7 +35,8 @@ bool IsSecretsStart(const string &text);
 //! Compile a batch of GRANT / REVOKE SECRET statements (nothing else may be in it) into the service
 //! catalog's own calls; the catalog is the one each statement names or the one attached
 //! (PolicyStore::SecretService).
-//! spec 150 3g-2: the statements are read by the management grammar's rules (`grammar`, `options` as ParseMgmtBatch's).
+//! spec 150 3g-2a: the statements are read by the management grammar's rules (`grammar`, `options` as
+//! ParseMgmtBatch's).
 vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicyStore &store, AclGrammarCache &grammar,
                                                    const ParserOptions &options);
 
