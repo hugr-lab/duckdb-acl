@@ -473,7 +473,7 @@ scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, 
 rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
 `Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
 grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
-the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f, 3g-1 built):
+the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f, 3g-1, 3g-2a built):
 the batch is read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered)
 - a moved family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`, `MakeAdminTableCall` for CHECK's
 `table_call`), anything else passes through as tokens (`AclMgmtLegacy`) to the compiler as its own text
@@ -491,14 +491,15 @@ grant, `PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT 
 transform, a list inside it a marker its reading replaces (`TextArg::splice`). 3f: function categories and grants,
 platform's point grants, sources, resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's
 registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`;
-`SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). Then 3g-2 (SECRET, USE, ATTACH
-LINEAGE), 3g-3 (modules' rules, hugr-node), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
+`SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). 3g-2a: GRANT / REVOKE SECRET as
+rules (`MgmtParsed::secrets`). Then 3g-2b (USE), 3g-2c (ATTACH LINEAGE), 3g-3 (modules' rules, hugr-node), spec 151,
+stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`
 capability of the MAIN grant (never implied, not by `manage` either): `ACL GRANT|REVOKE SECRET n TO|FROM
-ROLE|GROUP p [FROM|IN c]` compiles in `Prefixed` (ahead of the admin-scope check) to
+ROLE|GROUP p [FROM|IN c]` (rules since spec 150 3g-2a) compiles in `Prefixed` (ahead of the admin-scope check) to
 `c.main.grant_secret('n','role:p',['use'])` / `revoke_secret`; `CREATE [PERSISTENT] SECRET` / `DROP
 SECRET` are retargeted to the service (`TEMPORARY` refused, parameters constants only - duckdb evaluates
 calls there on the node). `PolicyStore::SecretService(named)` picks the catalog (named, else the one

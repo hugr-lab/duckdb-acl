@@ -48,6 +48,15 @@ std::vector<std::string> TakeCalls() {
 	return out;
 }
 
+//! The calls heard, for a message
+std::string Joined(const std::vector<std::string> &calls_heard) {
+	std::string out;
+	for (auto &call : calls_heard) {
+		out += (out.empty() ? "" : " | ") + call;
+	}
+	return out.empty() ? "nothing" : out;
+}
+
 //! The service's secrets: persistent, named after the catalog (tresor's TresorSecretStorage)
 class FakeServiceStorage : public CatalogSetSecretStorage {
 public:
@@ -223,6 +232,17 @@ int main(int argc, char *argv[]) {
 			      "a batch of them runs each");
 			Refused(con, "ACL ROLE \"plain\" ACL GRANT SECRET lake TO ROLE analysts", "needs the secrets capability");
 			Check(TakeCalls().empty(), "a refused grant reaches nothing");
+			// spec 150 3g-2a: the forms are rules - a comment between the words, a name quoted either way (a doubled
+			// quote one), a dotted secret name, the service named by IN / FROM: what reaches the service is as written
+			Check(One(con, "ACL ROLE \"keeper\" ACL GRANT /* c */ SECRET 'it''s' TO GROUP \"Data \"\"Team\"\"\" -- x\n"
+			               "IN corp") == "true",
+			      "a commented, quoted grant ran");
+			Check(One(con, "ACL ROLE \"keeper\" ACL REVOKE SECRET v2.lake FROM ROLE r9 FROM \"corp\"") == "true",
+			      "a dotted name, the service quoted");
+			auto shaped = TakeCalls();
+			Check(shaped == std::vector<std::string> {"grant_secret(it's, group:Data \"Team\", [use])",
+			                                          "revoke_secret(v2.lake, role:r9)"},
+			      "the values reach the service as written: " + Joined(shaped));
 		});
 
 		Scenario("CREATE / DROP SECRET land in the service, never in the node's own secret manager", [&] {

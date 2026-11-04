@@ -51,6 +51,8 @@ struct MgmtParseData : ParserExtensionParseData {
 	//! the call is a table function, read in FROM (CHECK VIRTUAL CATALOG)
 	bool table_call = false;
 	bool current_session = false;
+	//! the secrets service's call (MgmtParsed::secrets)
+	bool secrets = false;
 	vector<QuotedValue> quoted;
 	//! words that must be written bare (a level is a word, never a quoted name)
 	vector<QuotedValue> bare;
@@ -2083,6 +2085,43 @@ arena_ptr<TransformResultValue> FinalizeResourceGroupGrant(PEGTransformer &trans
 	return MgmtResult(transformer, std::move(data));
 }
 
+// --- the node's secrets service (spec 082) ----------------------------------------------------------------------
+
+// AclGrantSecret <- 'GRANT' 'SECRET' AclNameValue 'TO' AclSecretPrincipal AclSecretService? / AclRevokeSecret <-
+// 'REVOKE' 'SECRET' AclNameValue 'FROM' AclSecretPrincipal AclSecretService? - the service's own grant (tresor spec
+// 009): to a ROLE or a GROUP, never to one user; the service the statement names (FROM | IN c) or the one attached
+arena_ptr<TransformResultValue> FinalizeSecretGrant(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	bool grant = KeywordOf(list.GetChild(0)) == "grant";
+	auto data = Call(grant ? "grant_secret" : "revoke_secret");
+	data->secrets = true;
+	auto name = NameValueOf(transformer, list.GetChild(2), "a secret name", *data);
+	// AclSecretPrincipal <- AclSecretPrincipalKind AclNameValue (AclSecretPrincipalKind <- 'ROLE' / 'GROUP')
+	auto &principal = Strip(list.GetChild(4)).Cast<ListParseResult>();
+	auto kind = KeywordOf(principal.GetChild(0));
+	auto who = NameValueOf(transformer, principal.GetChild(1), "a role or group", *data);
+	string named;
+	auto &service = list.Child<OptionalParseResult>(5);
+	if (service.HasResult()) {
+		// AclSecretService <- AclSecretServiceWord AclSecretServiceName (AclSecretServiceWord <- 'FROM' / 'IN';
+		// AclSecretServiceName <- StringLiteral / AclName): one catalog's name, as an issuer's IN names it
+		auto &clause = ClauseList(service.GetResult());
+		auto &value = Strip(clause.GetChild(1));
+		named = value.Name() == "AclName" || value.Name() == "AclNameToken"
+		            ? NameOf(value, "a secrets service")
+		            : Quoted(transformer, clause, 1, "secrets service", *data);
+		if (named.empty()) {
+			throw BinderException("acl admin: FROM | IN names a secrets service - '' names none (leave it out for "
+			                      "the one attached)");
+		}
+	}
+	if (name.empty() || who.empty()) {
+		throw BinderException("acl admin: a secret and the role or group it goes to are named - '' names none");
+	}
+	data->args = {Value(name), Value(kind + ":" + who), Value(named)};
+	return MgmtResult(transformer, std::move(data));
+}
+
 // --- a statement no rule reads yet ------------------------------------------------------------------------------
 
 // AclMgmtLegacy <- AclTailToken+ : its span, for the management compiler
@@ -2503,6 +2542,18 @@ public:
 		changes.push_back(GrammarChange::AddRule(
 		    "AclRevokeResourceGroup <- 'REVOKE' 'RESOURCE' 'GROUP' AclName 'FROM' 'ROLE' AclName",
 		    Start<FinalizeResourceGroupGrant>));
+		// the node's secrets service (spec 082)
+		changes.push_back(GrammarChange::AddRule("AclSecretPrincipalKind <- 'ROLE' / 'GROUP'"));
+		changes.push_back(GrammarChange::AddRule("AclSecretPrincipal <- AclSecretPrincipalKind AclNameValue"));
+		changes.push_back(GrammarChange::AddRule("AclSecretServiceWord <- 'FROM' / 'IN'"));
+		changes.push_back(GrammarChange::AddRule("AclSecretServiceName <- StringLiteral / AclName"));
+		changes.push_back(GrammarChange::AddRule("AclSecretService <- AclSecretServiceWord AclSecretServiceName"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGrantSecret <- 'GRANT' 'SECRET' AclNameValue 'TO' AclSecretPrincipal AclSecretService?",
+		    Start<FinalizeSecretGrant>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclRevokeSecret <- 'REVOKE' 'SECRET' AclNameValue 'FROM' AclSecretPrincipal AclSecretService?",
+		    Start<FinalizeSecretGrant>));
 		// a statement no rule reads yet: its tokens, to the management compiler
 		changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
 		changes.push_back(
@@ -2526,7 +2577,7 @@ public:
 		    "AclRevokeFunctionCategory / AclRevokeFunction / AclDenyView / AclCreateFunctionCategory / "
 		    "AclAlterFunctionCategory / AclDropFunctionCategory / AclGrantSource / AclRevokeSource / "
 		    "AclCreateResourceGroup / AclAlterResourceGroup / AclDropResourceGroup / AclGrantResourceGroup / "
-		    "AclRevokeResourceGroup / AclMgmtLegacy"));
+		    "AclRevokeResourceGroup / AclGrantSecret / AclRevokeSecret / AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
@@ -2974,6 +3025,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			parsed.args = data.args;
 			parsed.table_call = data.table_call;
 			parsed.current_session = data.current_session;
+			parsed.secrets = data.secrets;
 			for (auto &span : data.spans) {
 				string value;
 				if (span.resolved) {
