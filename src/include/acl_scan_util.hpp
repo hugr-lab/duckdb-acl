@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 // acl_scan_util.hpp — the text-scanning helpers (a word, whitespace, a quoted literal with the doubled-quote
-// escape) the management compiler (hugr-node's forms, GRANT / REVOKE SECRET) uses until spec 150's stage 3g makes
+// escape) the management compiler (hugr-node's forms) uses until spec 150's stage 3g makes
 // them rules, and the readers that stay: the override's one-word ACL gate, the quack drain's stream id, the
 // policy-store name check (TextNamesPolicyStore). Nothing here parses SQL.
 //===----------------------------------------------------------------------===//

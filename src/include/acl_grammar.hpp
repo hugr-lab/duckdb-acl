@@ -62,6 +62,9 @@ struct MgmtParsed {
 	bool current_session = false;
 	//! the call is a table function, read in FROM (`CHECK VIRTUAL CATALOG`)
 	bool table_call = false;
+	//! spec 082: `GRANT | REVOKE SECRET` - the secrets service's call, not an acl_* one: `function` is grant_secret /
+	//! revoke_secret, `args` the secret's name, the principal (`role:r` / `group:g`) and the service named ('' none)
+	bool secrets = false;
 	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
 	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, spec
 	//! 095's lists read into a JSON spec (ITEMS a list of values, REQUIRE / ATTRIBUTES / CLAIM_MAP their readers'

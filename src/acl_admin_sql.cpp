@@ -724,6 +724,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		RefuseObjectForm(s, true);
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
+		if (s.Accept("secret")) {
+			RefuseMovedForm("write GRANT SECRET <name> TO ROLE | GROUP <principal> [FROM | IN <catalog>] - a secret is "
+			                "granted to a ROLE or a GROUP, never to one user");
+		}
 		if (s.Accept("source")) {
 			RefuseMovedForm("write GRANT SOURCE <database>[.<schema>] TO ROLE <role>");
 		}
@@ -741,6 +745,9 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		RefuseGrantForm(s, "grant");
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
+		if (s.Accept("secret")) {
+			RefuseMovedForm("write REVOKE SECRET <name> FROM ROLE | GROUP <principal> [FROM | IN <catalog>]");
+		}
 		if (s.Accept("source")) {
 			RefuseMovedForm("write REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>");
 		}
@@ -943,6 +950,10 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			}
 			continue;
 		}
+		if (entry.secrets) {
+			throw BinderException("acl admin: GRANT / REVOKE SECRET goes in a batch of its own - its right is the "
+			                      "secrets capability, not an administration scope");
+		}
 		for (auto &list : entry.texts) {
 			string read;
 			switch (list.kind) {
@@ -1079,15 +1090,6 @@ bool IsSecretsStart(const string &text) {
 
 namespace {
 
-//! A name as written: quoted (either quote) or a bare word
-string SecretsName(AdminScanner &s, const char *what) {
-	s.Skip();
-	if (s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"')) {
-		return s.Quoted(what);
-	}
-	return s.Word(what);
-}
-
 //! `GRANT SECRET <name> TO ROLE|GROUP <principal> [FROM|IN <catalog>]` /
 //! `REVOKE SECRET <name> FROM ROLE|GROUP <principal> [FROM|IN <catalog>]` ->
 //! `SELECT * FROM <catalog>.main.grant_secret('<name>', 'role:<r>', ['use'])` /
@@ -1099,30 +1101,6 @@ struct SecretsStatement {
 	string principal;
 	string named; // the catalog the statement names ('' = none)
 };
-
-SecretsStatement ParseSecretsStatement(AdminScanner &s) {
-	SecretsStatement out;
-	auto verb = StringUtil::Lower(s.Word("GRANT or REVOKE"));
-	bool grant = verb == "grant";
-	out.grant = grant;
-	s.Expect("secret");
-	auto name = SecretsName(s, "secret name");
-	s.Expect(grant ? "to" : "from");
-	string kind;
-	if (s.Accept("role")) {
-		kind = "role";
-	} else if (s.Accept("group")) {
-		kind = "group";
-	} else {
-		throw BinderException("acl admin: a secret is granted to a ROLE or a GROUP, never to one user");
-	}
-	out.name = name;
-	out.principal = kind + ":" + SecretsName(s, "role or group");
-	if (s.Accept("from") || s.Accept("in")) {
-		out.named = SecretsName(s, "catalog");
-	}
-	return out;
-}
 
 unique_ptr<SQLStatement> CompileSecretsStatement(const SecretsStatement &parsed, PolicyStore &store) {
 	auto service = store.SecretService(parsed.named);
@@ -1151,27 +1129,24 @@ unique_ptr<SQLStatement> CompileSecretsStatement(const SecretsStatement &parsed,
 
 } // namespace
 
-vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicyStore &store) {
-	// the whole batch is read before any service is chosen: a malformed batch says so first
+vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicyStore &store, AclGrammarCache &grammar,
+                                                   const ParserOptions &options) {
+	// the whole batch is read by its rules before any service is chosen: a malformed batch says so first
 	vector<SecretsStatement> parsed;
-	AdminScanner scanner(text);
-	while (!scanner.Done()) {
-		if (scanner.AtSemicolon()) {
-			scanner.pos++;
-			continue;
+	for (auto &entry : grammar.ReadManagement(text, options)) {
+		if (entry.legacy) {
+			CompileMgmtText(entry.text); // a GRANT / REVOKE SECRET not read as its rule refuses in its own words
 		}
-		AdminScanner ahead(text);
-		ahead.pos = scanner.pos;
-		if ((!ahead.Accept("grant") && !ahead.Accept("revoke")) || !StringUtil::CIEquals(ahead.PeekWord(), "secret")) {
+		if (!entry.secrets) {
 			throw BinderException(
-			    "acl admin: a GRANT / REVOKE SECRET batch holds GRANT / REVOKE SECRET statements only, "
-			    "written without comments (its reader becomes a rule in stage 3g-2)");
+			    "acl admin: a GRANT / REVOKE SECRET batch holds GRANT / REVOKE SECRET statements only");
 		}
-		parsed.push_back(ParseSecretsStatement(scanner));
-		scanner.Skip();
-		if (scanner.pos < text.size() && text[scanner.pos] != ';') {
-			throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
-		}
+		SecretsStatement statement;
+		statement.grant = entry.function == "grant_secret";
+		statement.name = entry.args[0].ToString();
+		statement.principal = entry.args[1].ToString();
+		statement.named = entry.args[2].ToString();
+		parsed.push_back(std::move(statement));
 	}
 	vector<unique_ptr<SQLStatement>> statements;
 	for (auto &statement : parsed) {

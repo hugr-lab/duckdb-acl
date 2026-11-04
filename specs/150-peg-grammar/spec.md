@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f and 3g-1 built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1 and 3g-2a built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -339,7 +339,15 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
     a client that never fetched (spec 111); a GRANT / REVOKE SECRET batch's statements are checked where its
     scanner stands (the heads of the whole rest per statement made it quadratic) - a comment in it is refused
     until 3g-2.
-  - 3g-2: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE` as rules.
+  - 3g-2, in parts (one PR each):
+    - 3g-2a (built): `GRANT | REVOKE SECRET n TO | FROM ROLE | GROUP p [FROM | IN c]` (spec 082) are rules
+      (`AclGrantSecret` / `AclRevokeSecret`, `MgmtParsed::secrets` - the service's call, not an acl_* one);
+      `ParseSecretsBatch` reads the batch by them and `CompileSecretsStatement` builds the service's table call as
+      before; the hand reader (`ParseSecretsStatement`, `SecretsName`) goes. Changed: a comment between the words is
+      a space, a name a NameValue (dotted words too); a GRANT / REVOKE SECRET inside a management batch is refused
+      in its own words (`… goes in a batch of its own`).
+    - 3g-2b: `USE [SCHEMA]` (`UseSchemaAsSet`) - sugar over duckdb's statement in a query batch.
+    - 3g-2c: `ATTACH … LINEAGE '<x>'` (`acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the

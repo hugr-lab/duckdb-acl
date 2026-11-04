@@ -85,8 +85,7 @@ catalog forms refuse.
   limits, an issuer's or a client's lists) a string continued on the next line is refused too; a mask
   or a REMAP item is SQL and duckdb joins it.
 - Keywords are case-insensitive. Statements of a batch are separated by `;`, where duckdb's tokenizer
-  ends a statement. A comment may stand anywhere between a form's words, as in SQL (not yet in
-  `GRANT | REVOKE SECRET`).
+  ends a statement. A comment may stand anywhere between a form's words, as in SQL.
 - Write modes on `CREATE`: `CREATE` refuses an existing object, `CREATE OR REPLACE` overwrites,
   `CREATE … IF NOT EXISTS` keeps what is there. The legacy `ADD` forms always upsert. Where a
   function takes a `mode` argument the values are `create`, `replace`, `skip` and `upsert` (or

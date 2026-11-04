@@ -770,7 +770,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// manages only for a principal it knows as an administrator (tresor spec 009)
 		audit.phase = Reason::PARSE;
 		vector<unique_ptr<SQLStatement>> statements;
-		ParseOfRest(nullptr, ErrorsAsJson(options), [&]() { statements = ParseSecretsBatch(prefix.rest, store); });
+		ParseOfRest(nullptr, ErrorsAsJson(options),
+		            [&]() { statements = ParseSecretsBatch(prefix.rest, store, grammar, options); });
 		for (auto &stmt : statements) {
 			// the execution must find its decision (spec 074's note, matched by the text the statement
 			// carries): that note is what puts the session on the connection while the service's call
