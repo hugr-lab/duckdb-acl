@@ -713,7 +713,7 @@ schema[, function]]])` lists their parameters, result columns and a scalar's ret
 CREATE [OR REPLACE] FUNCTION CATEGORY <name> [COMMENT '<text>']
 ALTER FUNCTION CATEGORY <name> ADD (<function> [, …]) | DROP (<function> [, …])
 ALTER FUNCTION CATEGORY <name> SET COMMENT '<text>'      -- it must exist; the members stay (spec 120)
-DROP FUNCTION CATEGORY [IF EXISTS] <name>
+DROP FUNCTION CATEGORY [IF EXISTS] <name>      -- a category named cascade / restrict is dropped quoted ("cascade")
 
 GRANT  FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES
 DENY   FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES

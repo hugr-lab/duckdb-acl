@@ -16,10 +16,21 @@ int main(int argc, char *argv[]) {
 		const std::string nbsp = "\xc2\xa0"; // U+00A0, a space duckdb's parser normalizes
 		Scenario("management, however it is spaced or commented", [&] {
 			std::vector<std::string> management = {
-			    "ACL REVOKE CATALOG c FROM ROLE r",       "REVOKE" + nbsp + "CATALOG c FROM ROLE r",
-			    "ACL/* x */REVOKE CATALOG c FROM ROLE r", "ACL-- x\nREVOKE CATALOG c FROM ROLE r",
-			    nbsp + ";REVOKE CATALOG c FROM ROLE r",   "CREATE" + nbsp + "ROLE m",
-			    "  /* lead */ acl DROP /* c */ ROLE m",   "GRANT SECRET s TO ROLE r",
+			    "ACL REVOKE CATALOG c FROM ROLE r",
+			    "REVOKE" + nbsp + "CATALOG c FROM ROLE r",
+			    "ACL/* x */REVOKE CATALOG c FROM ROLE r",
+			    "ACL-- x\nREVOKE CATALOG c FROM ROLE r",
+			    nbsp + ";REVOKE CATALOG c FROM ROLE r",
+			    "CREATE" + nbsp + "ROLE m",
+			    "  /* lead */ acl DROP /* c */ ROLE m",
+			    "GRANT SECRET s TO ROLE r",
+			    // the markers a client writes itself, its ACL marker (management unless NATIVE), an empty statement
+			    "TRACE 'x' GRANT CATALOG c TO ROLE r",
+			    "LINEAGE JOB 'j' ACL CREATE ROLE m",
+			    "ACL ; REVOKE CATALOG c FROM ROLE r",
+			    "acl ; ; CREATE ROLE m",
+			    "TRACE 'x' ; CREATE ROLE m",
+			    "ACL SELECT 1",
 			};
 			for (auto &text : management) {
 				Check(duckdb::acl::ClientTextIsMgmt(text), "management: " + text);
@@ -28,12 +39,15 @@ int main(int argc, char *argv[]) {
 		Scenario("a query stays a query", [&] {
 			std::vector<std::string> queries = {
 			    "SELECT 1",
-			    "ACL SELECT 1",
 			    "SELECT 'GRANT CATALOG c TO ROLE r'",
 			    "/* GRANT CATALOG c TO ROLE r */ SELECT 1",
 			    "ANALYZE virtual",
 			    "CREATE FUNCTION category(x) AS x",
 			    "DROP FUNCTION category CASCADE",
+			    "DROP FUNCTION category RESTRICT",
+			    "ANALYZE virtual.t",
+			    "ACL NATIVE SELECT 1",
+			    "TRACE 'x' SELECT 1",
 			    "",
 			};
 			for (auto &text : queries) {

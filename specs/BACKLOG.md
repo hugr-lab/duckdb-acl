@@ -47,6 +47,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
 
 ## Open
 
+- **A management statement that returns rows, prepared over Flight, loses them** (found 2026-11-04 by spec 150 3g-1's
+  re-review): `[ACL] CHECK VIRTUAL CATALOG c` (a table call) and `GRANT | REVOKE SECRET` (the service's table call)
+  are commands to the door (spec 111: run at GetFlightInfo); ad hoc the kept result is delivered at DoGet, but
+  prepared, `AnswersOnlyCount` announces an empty dataset schema and JDBC reads an update - acl-clients 007.3's bug,
+  fixed there for `SELECT * FROM platform.check_catalog(…)`. A fix announces the call's result schema.
+
 - **An `acl_*` admin call over many rows writes from parallel threads** (found 2026-10-25 by spec 150 3f's review):
   `SELECT acl_function_category_add(category, list(...)) FROM … GROUP BY category` with many groups runs the writes
   on several threads and fails with `acl catalog: version bump failed: … Conflict on update!` after some groups

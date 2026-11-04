@@ -318,7 +318,7 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
 - 3g, in three PRs (the owner, 2026-11-04):
   - 3g-1 (built): the batch's classification on duckdb's tokens - `ReadStatementHeads` (acl_mgmt_grammar.cpp:
     `CompiledGrammar::DefaultGrammar()`'s tokenizer, never throwing, the statements as it ends them) hands each
-    statement's first tokens (a word, a quoted name, a plain string, other) to `IsMgmtHead`, the decision table
+    statement's first tokens (a word, a quoted name, a digit-led number, a plain string, other) to `IsMgmtHead`, the decision table
     `IsMgmtStart` read off the text; `StartsWithMgmt` / `BatchHasMgmtStatement` / `BatchIsAllMgmt` /
     `RefuseRepeatedPrefix` / `IsSecretsStart` read the heads, and `SplitBatchText` / `IsMgmtStart` / `CommentEnd`
     go. Changed: a comment between a form's first words is gone (`CREATE /* c */ ROLE`, `DENY -- …⏎FUNCTION` were
@@ -329,8 +329,10 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
     after the prefix is judged for a second `ACL` too (`ACL ROLE "r" ; ACL …`, `ACL ROLE "r" ACL ACL …`). Fixed by
     the reviews: a digit-led name (`FUNCTION CATEGORY 1x`, the tokenizer's number then word) is a name;
     `DROP FUNCTION category CASCADE | RESTRICT` is duckdb's DROP of a macro (the scan read it as ours, dropping the
-    category `cascade`); the Flight door's command detection (`ClientTextIsMgmt`) reads the client's text as the
-    override does - duckdb's normalized text (a Unicode space is a space), the `ACL` marker a token - so a
+    category `cascade` - a category of that name is dropped quoted); the Flight door's command detection
+    (`ClientTextIsMgmt`) reads the client's text as the override does behind the door's prefix - duckdb's normalized
+    text (a Unicode space is a space), the markers a client writes itself (`TRACE '…'`, `LINEAGE JOB '…'`), its `ACL`
+    marker (management unless NATIVE follows: it compiles or is refused at Prepare), an empty statement - so a
     management statement the door missed (`REVOKE<NBSP>CATALOG …`, `ACL/* x */REVOKE …`) no longer ran only at DoGet, lost by
     a client that never fetched (spec 111); a GRANT / REVOKE SECRET batch's statements are checked where its
     scanner stands (the heads of the whole rest per statement made it quadratic) - a comment in it is refused

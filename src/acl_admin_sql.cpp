@@ -1007,16 +1007,41 @@ bool StartsWithMgmt(const string &text) {
 }
 
 bool ClientTextIsMgmt(const string &query) {
-	// as the override reads it: duckdb's normalized text, the client's `ACL` marker a token of its own
-	auto heads = BatchHeads(Parser::NormalizeSQLString(query));
+	// as the override reads it behind the door's prefix: duckdb's normalized text, the markers a client may write
+	// itself (TRACE / PARENT / LINEAGE … '<value>'), then its mode marker - `ACL` without NATIVE is management, which
+	// compiles or is refused at Prepare - else the first statement's head past an empty one
+	vector<vector<HeadToken>> heads;
+	try {
+		heads = ReadStatementHeads(Parser::NormalizeSQLString(query), 24);
+	} catch (std::exception &) {
+		return false; // text duckdb cannot normalize (invalid UTF-8): Prepare refuses it
+	}
 	if (heads.empty()) {
 		return false;
 	}
-	auto head = heads[0];
-	if (!head.empty() && head[0].IsWord("acl")) {
-		head.erase(head.begin());
+	auto &first = heads[0];
+	idx_t at = 0;
+	auto value_at = [&](idx_t index) {
+		return index < first.size() && first[index].kind == HeadToken::Kind::STRING;
+	};
+	while (at < first.size()) {
+		if ((first[at].IsWord("trace") || first[at].IsWord("parent")) && value_at(at + 1)) {
+			at += 2;
+		} else if (first[at].IsWord("lineage") && at + 1 < first.size() &&
+		           (first[at + 1].IsWord("parent") || first[at + 1].IsWord("root") || first[at + 1].IsWord("job")) &&
+		           value_at(at + 2)) {
+			at += 3;
+		} else {
+			break;
+		}
 	}
-	return IsMgmtHead(head);
+	if (at < first.size() && first[at].IsWord("acl")) {
+		return !(at + 1 < first.size() && first[at + 1].IsWord("native"));
+	}
+	if (at < first.size()) {
+		return IsMgmtHead(vector<HeadToken>(first.begin() + NumericCast<int64_t>(at), first.end()));
+	}
+	return heads.size() > 1 && IsMgmtHead(heads[1]); // the markers alone, then `;` (an empty statement)
 }
 
 //===--------------------------------------------------------------------===//
@@ -1117,8 +1142,9 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 		AdminScanner ahead(text);
 		ahead.pos = scanner.pos;
 		if ((!ahead.Accept("grant") && !ahead.Accept("revoke")) || !StringUtil::CIEquals(ahead.PeekWord(), "secret")) {
-			throw BinderException("acl admin: a GRANT / REVOKE SECRET batch holds nothing else (and no comment - its "
-			                      "reader becomes a rule in stage 3g-2)");
+			throw BinderException(
+			    "acl admin: a GRANT / REVOKE SECRET batch holds GRANT / REVOKE SECRET statements only, "
+			    "written without comments (its reader becomes a rule in stage 3g-2)");
 		}
 		parsed.push_back(ParseSecretsStatement(scanner));
 		scanner.Skip();
