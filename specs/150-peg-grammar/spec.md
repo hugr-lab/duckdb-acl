@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d, 3e, 3f built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f and 3g-1 built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -315,8 +315,21 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   refusals are the old refusals in new words. After 3f no family of this repository is the compiler's - the legacy path
   (`AclMgmtLegacy`, `CompileMgmtText`, `LegacyUnreadable`) serves hugr-node's registered forms until 3g, and its tests
   are hugr-node's.
-- 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
-  `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
+- 3g, in three PRs (the owner, 2026-11-04):
+  - 3g-1 (built): the batch's classification on duckdb's tokens - `ReadStatementHeads` (acl_mgmt_grammar.cpp:
+    `CompiledGrammar::DefaultGrammar()`'s tokenizer, never throwing, the statements as it ends them) hands each
+    statement's first tokens (a word, a quoted name, a plain string, other) to `IsMgmtHead`, the decision table
+    `IsMgmtStart` read off the text; `StartsWithMgmt` / `BatchHasMgmtStatement` / `BatchIsAllMgmt` /
+    `RefuseRepeatedPrefix` / `IsSecretsStart` read the heads, and `SplitBatchText` / `IsMgmtStart` / `CommentEnd`
+    go. Changed: a comment between a form's first words is gone (`CREATE /* c */ ROLE`, `DENY -- …⏎FUNCTION` were
+    sent to duckdb as native SQL), a quoted name after `ANALYZE VIRTUAL` is ours, a `;` ends a statement where
+    duckdb ends one - inside parentheses too, and not inside a `$1$…$1$` duckdb does not read as a string (a
+    query batch with a management statement after such a `;` is the mixed batch refused).
+  - 3g-2: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE` as rules.
+  - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
+    `AdminScanner` and the compiler go, hugr-node re-pins.
+- Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
+  rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 
 **Open questions**
 

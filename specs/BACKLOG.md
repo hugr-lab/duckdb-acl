@@ -47,6 +47,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
 
 ## Open
 
+- **An `acl_*` admin call over many rows writes from parallel threads** (found 2026-10-25 by spec 150 3f's review):
+  `SELECT acl_function_category_add(category, list(...)) FROM … GROUP BY category` with many groups runs the writes
+  on several threads and fails with `acl catalog: version bump failed: … Conflict on update!` after some groups
+  committed. One aggregate row (the docs' bulk form) is not affected; `SET threads = 1` is the workaround. A fix
+  serializes the catalog writes of one statement, or refuses a write outside the first row's thread.
+
 - **A Flight door left serving aborts the process at exit** (found 2026-10-20 by spec 140's `tls.sh` fix): the
   CLI that served a door and exits without `acl_flight_stop` ends in `libc++abi: terminating`. `ServedDoors` is a
   function-static, destroyed with a serving thread still joinable in it. quack's registry has been leaked, with an

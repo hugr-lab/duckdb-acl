@@ -2789,6 +2789,44 @@ public:
 
 } // namespace
 
+vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count) {
+	vector<MatcherToken> tokens;
+	SplitTokenizerBehavior behavior(text, tokens);
+	CompiledGrammar::DefaultGrammar()->GetTokenizer().TokenizeInput(behavior);
+	vector<vector<HeadToken>> heads;
+	bool open = false;
+	for (auto &token : tokens) {
+		if (token.type == TokenType::TERMINATOR) {
+			open = false;
+			continue;
+		}
+		if (token.type == TokenType::END_OF_INPUT || token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE ||
+		    token.type == TokenType::COMMENT) {
+			continue;
+		}
+		if (!open) {
+			heads.emplace_back();
+			open = true;
+		}
+		auto &head = heads.back();
+		if (head.size() >= count) {
+			continue;
+		}
+		HeadToken entry;
+		auto &text_of = token.text;
+		if (!text_of.empty() && text_of[0] == '"') {
+			entry.kind = HeadToken::Kind::QUOTED_NAME;
+		} else if (token.type == TokenType::STRING_LITERAL && text_of[0] == '\'') {
+			entry.kind = HeadToken::Kind::STRING; // a plain '…' (an E'…' or a $$…$$ is no session id)
+		} else if ((token.type == TokenType::KEYWORD || token.type == TokenType::IDENTIFIER) && !text_of.empty()) {
+			entry.kind = HeadToken::Kind::WORD;
+			entry.word = StringUtil::Lower(text_of);
+		}
+		head.push_back(std::move(entry));
+	}
+	return heads;
+}
+
 vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text) {
 	vector<MatcherToken> tokens;
 	SplitTokenizerBehavior behavior(text, tokens);

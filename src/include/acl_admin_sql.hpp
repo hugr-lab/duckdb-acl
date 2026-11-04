@@ -20,10 +20,6 @@ class SQLStatement;
 namespace acl {
 class AclGrammarCache;
 
-//! Whether text opens with a management statement (CREATE VIRTUAL ..., GRANT ..., ALTER ..., ...):
-//! how the anonymous `ACL ADMIN` form tells a management batch from native SQL it may also carry.
-bool IsMgmtStart(const string &text);
-
 //! Compile a management batch (statements separated by `;`) into admin-function calls. Parse-time
 //! only: nothing is written until the statements execute. A statement that does not read is refused (a
 //! ParserException from the tokenizer, a BinderException from a form).
@@ -41,13 +37,11 @@ bool IsSecretsStart(const string &text);
 //! (PolicyStore::SecretService).
 vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicyStore &store);
 
-//! spec 117: split a batch's text into its statements (quote-, comment- and paren-aware) - what the
-//! mixed-batch rule reads: a batch is all management statements or none
-vector<string> SplitBatchText(const string &text);
 //! spec 117: a statement after the first that starts with its own `ACL` prefix - refused with a message of its
 //! own (a second prefix inside a batch is text, never a prefix)
 void RefuseRepeatedPrefix(const string &text);
-//! spec 117: whether any statement of the batch opens with a management form
+//! spec 117: whether any statement of the batch opens with a management form - each judged by its head on duckdb's
+//! tokens (spec 150 stage 3g-1: a comment between the words is gone, `;` ends a statement as duckdb ends it)
 bool BatchHasMgmtStatement(const string &text);
 //! spec 117: whether every statement of the batch opens with a management form
 bool BatchIsAllMgmt(const string &text);

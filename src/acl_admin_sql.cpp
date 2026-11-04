@@ -248,129 +248,94 @@ void RegisterMgmtGrammar(const char *keyword, MgmtGrammar parse) {
 	MgmtGrammars().push_back({keyword, parse});
 }
 
-bool IsMgmtStart(const string &text) {
-	AdminScanner scanner(text);
-	auto first = scanner.PeekWord();
-	if (StringUtil::CIEquals(first, "add") || StringUtil::CIEquals(first, "grant") ||
-	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map")) {
+namespace {
+
+//! spec 150, stage 3g-1: whether a statement is the management grammar's, judged by its head on duckdb's tokens (a
+//! comment between the words is gone, a string or a quoted name one token): the words duckdb has no statement for,
+//! and duckdb's own verbs only with the marker or the noun that is ours alone
+bool IsMgmtHead(const vector<HeadToken> &head) {
+	auto word = [&](idx_t index) {
+		return index < head.size() && head[index].kind == HeadToken::Kind::WORD ? head[index].word : string();
+	};
+	auto named = [&](idx_t index) {
+		return index < head.size() &&
+		       (head[index].kind == HeadToken::Kind::WORD || head[index].kind == HeadToken::Kind::QUOTED_NAME);
+	};
+	auto first = word(0);
+	if (first.empty()) {
+		return false;
+	}
+	if (first == "add" || first == "grant" || first == "revoke" || first == "map") {
 		return true;
 	}
 	if (FindMgmtGrammar(first)) {
 		return true; // a linked module's form (spec 126: CLUSTER - duckdb has no CLUSTER statement)
 	}
-	if (StringUtil::CIEquals(first, "deny")) {
-		// DENY FUNCTION [CATEGORY] … (spec 072), DENY VIEW platform.<v> (spec 117): duckdb has no DENY at all
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		return StringUtil::CIEquals(ahead.PeekWord(), "function") || StringUtil::CIEquals(ahead.PeekWord(), "view");
+	auto second = word(1);
+	if (first == "deny") {
+		return second == "function" || second == "view"; // spec 072 / 117: duckdb has no DENY at all
 	}
-	if (StringUtil::CIEquals(first, "check") || StringUtil::CIEquals(first, "repair")) {
-		// CHECK VIRTUAL CATALOG / REPAIR VIRTUAL TABLE (spec 039): ours always name a VIRTUAL target
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
+	if (first == "check" || first == "repair") {
+		return second == "virtual"; // spec 039: ours always name a VIRTUAL target
 	}
-	if (StringUtil::CIEquals(first, "profile") || StringUtil::CIEquals(first, "kill")) {
-		// PROFILE SESSION ... (spec 074 slice 3), KILL SESSION '<id>' (spec 118): duckdb has neither
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		return StringUtil::CIEquals(ahead.PeekWord(), "session");
+	if (first == "profile" || first == "kill") {
+		return second == "session"; // spec 074 / 118: duckdb has neither
 	}
-	if (StringUtil::CIEquals(first, "drain") || StringUtil::CIEquals(first, "resume")) {
-		// DRAIN NODE / RESUME NODE (spec 118): duckdb has no such statements
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		return StringUtil::CIEquals(ahead.PeekWord(), "node");
+	if (first == "drain" || first == "resume") {
+		return second == "node"; // spec 118
 	}
-	if (StringUtil::CIEquals(first, "migrate")) {
-		// MIGRATE POLICY CATALOG ... (spec 118)
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		return StringUtil::CIEquals(ahead.PeekWord(), "policy");
+	if (first == "migrate") {
+		return second == "policy"; // spec 118
 	}
-	if (StringUtil::CIEquals(first, "set")) {
-		// SET SESSION '<id>' AUDIT LEVEL ... (spec 118): a session named by a single-quoted id - duckdb's
-		// SET SESSION <setting> (spec 068's TimeZone) names a setting, never a string
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		if (!ahead.Accept("session")) {
-			return false;
-		}
-		ahead.Skip();
-		if (ahead.pos < ahead.text.size() && ahead.text[ahead.pos] == '\'') {
-			return true;
-		}
-		// SET SESSION VIEW AS ROLE ... (spec 120.3): no setting is written `view as`
-		return ahead.Accept("view") && ahead.Accept("as");
+	if (first == "set") {
+		// SET SESSION '<id>' AUDIT LEVEL … (spec 118): a session named by a single-quoted id - duckdb's SET SESSION
+		// <setting> names a setting, never a string; SET SESSION VIEW AS ROLE … (spec 120.3): no setting is `view as`
+		return second == "session" &&
+		       ((head.size() > 2 && head[2].kind == HeadToken::Kind::STRING) || (word(2) == "view" && word(3) == "as"));
 	}
-	if (StringUtil::CIEquals(first, "reset")) {
-		// RESET SESSION VIEW AS (spec 120.3) - duckdb's RESET SESSION <setting> names one word
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		return ahead.Accept("session") && ahead.Accept("view") && ahead.Accept("as");
+	if (first == "reset") {
+		return second == "session" && word(2) == "view" && word(3) == "as"; // spec 120.3
 	}
-	if (StringUtil::CIEquals(first, "comment") || StringUtil::CIEquals(first, "analyze")) {
-		// duckdb owns COMMENT ON <object> and ANALYZE: ours always name a VIRTUAL target
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		if (StringUtil::CIEquals(first, "analyze")) {
-			// `ANALYZE virtual` is duckdb's ANALYZE of a table named virtual: ours names a target after it
-			if (!StringUtil::CIEquals(ahead.PeekWord(), "virtual")) {
-				return false;
-			}
-			ahead.Word("virtual");
-			return !ahead.PeekWord().empty();
-		}
-		ahead.Accept("on");
-		return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
+	if (first == "analyze") {
+		// `ANALYZE virtual` is duckdb's ANALYZE of a table named virtual: ours names a target after it
+		return second == "virtual" && named(2);
 	}
-	if (StringUtil::CIEquals(first, "create") || StringUtil::CIEquals(first, "drop") ||
-	    StringUtil::CIEquals(first, "alter")) {
-		AdminScanner ahead(text);
-		ahead.Word("keyword");
-		auto second = ahead.PeekWord();
-		// CREATE/ALTER/DROP FUNCTION CATEGORY (spec 072): duckdb's CREATE FUNCTION is a macro, so the
-		// third word is what tells ours apart
-		auto function_category = [&]() {
-			if (!StringUtil::CIEquals(second, "function")) {
-				return false;
-			}
-			ahead.Word("function");
-			if (!StringUtil::CIEquals(ahead.PeekWord(), "category")) {
-				return false;
-			}
-			// CREATE FUNCTION category(x) AS … is duckdb's macro named `category`: ours names one after it
-			ahead.Word("category");
-			return !ahead.PeekWord().empty() || (!ahead.Done() && ahead.text[ahead.pos] == '"');
-		};
-		if (StringUtil::CIEquals(first, "create")) {
-			if (StringUtil::CIEquals(second, "or")) {
-				// CREATE OR REPLACE VIRTUAL … - look past the modifier for the marker
-				ahead.Word("or");
-				ahead.Accept("replace");
-				second = ahead.PeekWord();
-			}
-			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
-			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "client") ||
-			       StringUtil::CIEquals(second, "resource") || function_category();
-		}
-		if (StringUtil::CIEquals(first, "alter")) {
-			// duckdb owns ALTER TABLE/VIEW/...: our object forms carry the VIRTUAL marker, and
-			// ALTER ROLE/ISSUER/GRANT do not exist in duckdb at all
-			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
-			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "client") ||
-			       StringUtil::CIEquals(second, "grant") || StringUtil::CIEquals(second, "resource") ||
-			       function_category();
-		}
-		// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
-		return StringUtil::CIEquals(second, "relation") || StringUtil::CIEquals(second, "virtual") ||
-		       StringUtil::CIEquals(second, "role") || StringUtil::CIEquals(second, "issuer") ||
-		       StringUtil::CIEquals(second, "client") || StringUtil::CIEquals(second, "map") ||
-		       StringUtil::CIEquals(second, "reference") || StringUtil::CIEquals(second, "resource") ||
-		       function_category();
+	if (first == "comment") {
+		// duckdb owns COMMENT ON <object>: ours always name a VIRTUAL target
+		return word(second == "on" ? 2 : 1) == "virtual";
 	}
-	return false;
+	if (first != "create" && first != "drop" && first != "alter") {
+		return false;
+	}
+	idx_t at = 1;
+	if (first == "create" && second == "or") {
+		at = word(2) == "replace" ? 3 : 2; // CREATE OR REPLACE …: the marker after the modifier
+	}
+	auto noun = word(at);
+	// CREATE/ALTER/DROP FUNCTION CATEGORY <name> (spec 072): duckdb's CREATE FUNCTION is a macro - one named
+	// `category` (`CREATE FUNCTION category(x) AS …`) has no name after the word
+	bool function_category = noun == "function" && word(at + 1) == "category" && named(at + 2);
+	if (first == "create") {
+		return noun == "virtual" || noun == "role" || noun == "issuer" || noun == "client" || noun == "resource" ||
+		       function_category;
+	}
+	if (first == "alter") {
+		// duckdb owns ALTER TABLE/VIEW/…: our object forms carry VIRTUAL, ALTER ROLE/ISSUER/GRANT are not duckdb's
+		return noun == "virtual" || noun == "role" || noun == "issuer" || noun == "client" || noun == "grant" ||
+		       noun == "resource" || function_category;
+	}
+	// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
+	return noun == "relation" || noun == "virtual" || noun == "role" || noun == "issuer" || noun == "client" ||
+	       noun == "map" || noun == "reference" || noun == "resource" || function_category;
 }
+
+//! The heads of a batch's statements: enough tokens for the longest decision (`CREATE OR REPLACE FUNCTION CATEGORY
+//! <name>`)
+vector<vector<HeadToken>> BatchHeads(const string &text) {
+	return ReadStatementHeads(text, 6);
+}
+
+} // namespace
 
 namespace {
 
@@ -858,118 +823,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	throw BinderException("acl admin: unknown management statement \"%s\"", keyword);
 }
 
-//! The whole batch is management statements (the first one decided that); mixing is refused
-
 } // namespace
 
-namespace {
-
-//! Where a comment that opens at `start` ends, as duckdb's tokenizer reads it (spec 150: the batch's split and the
-//! grammar's agree) - a line comment at a line break of either kind, a block comment at the `*/` of its own depth
-idx_t CommentEnd(const string &text, idx_t start) {
-	if (text.compare(start, 2, "--") == 0) {
-		auto end = text.find_first_of("\n\r", start);
-		return end == string::npos ? text.size() : end;
-	}
-	idx_t depth = 0;
-	for (idx_t i = start; i + 1 < text.size(); i++) {
-		if (text[i] == '/' && text[i + 1] == '*') {
-			depth++;
-			i++;
-		} else if (text[i] == '*' && text[i + 1] == '/') {
-			if (--depth == 0) {
-				return i + 2;
-			}
-			i++;
-		}
-	}
-	return text.size();
-}
-
-} // namespace
-
-vector<string> SplitBatchText(const string &text) {
-	vector<string> out;
-	string current;
-	idx_t depth = 0;
-	auto flush = [&]() {
-		// the statement without what opens it but says nothing: whitespace and comments
-		idx_t i = 0;
-		while (i < current.size()) {
-			if (StringUtil::CharacterIsSpace(current[i])) {
-				i++;
-			} else if (current.compare(i, 2, "--") == 0 || current.compare(i, 2, "/*") == 0) {
-				i = CommentEnd(current, i);
-			} else {
-				break;
-			}
-		}
-		auto statement = current.substr(i);
-		StringUtil::Trim(statement);
-		if (!statement.empty()) {
-			out.push_back(statement);
-		}
-		current.clear();
-	};
-	for (idx_t i = 0; i < text.size(); i++) {
-		auto c = text[i];
-		if (c == '\'' || c == '"') {
-			// a literal or a quoted identifier, the doubled quote its own escape
-			current += c;
-			for (i++; i < text.size(); i++) {
-				current += text[i];
-				if (text[i] == c) {
-					if (i + 1 < text.size() && text[i + 1] == c) {
-						current += text[++i];
-						continue;
-					}
-					break;
-				}
-			}
-			continue;
-		}
-		if (c == '$') {
-			// a dollar-quoted string: $tag$ ... $tag$
-			auto close = text.find('$', i + 1);
-			if (close != string::npos) {
-				auto tag = text.substr(i, close - i + 1);
-				bool word = true;
-				for (idx_t k = 1; k + 1 < tag.size(); k++) {
-					word = word && IsWordChar(tag[k]);
-				}
-				auto end = word ? text.find(tag, close + 1) : string::npos;
-				if (end != string::npos) {
-					current += text.substr(i, end + tag.size() - i);
-					i = end + tag.size() - 1;
-					continue;
-				}
-			}
-		}
-		if ((c == '-' || c == '/') && i + 1 < text.size() && text[i + 1] == (c == '-' ? '-' : '*')) {
-			auto end = CommentEnd(text, i);
-			current += text.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '(') {
-			depth++;
-		} else if (c == ')' && depth > 0) {
-			depth--;
-		} else if (c == ';' && depth == 0) {
-			flush();
-			continue;
-		}
-		current += c;
-	}
-	flush();
-	return out;
-}
+namespace {} // namespace
 
 void RefuseRepeatedPrefix(const string &text) {
-	auto statements = SplitBatchText(text);
-	for (idx_t i = 1; i < statements.size(); i++) {
-		idx_t pos = 0;
-		if (StringUtil::CIEquals(ReadWord(statements[i], pos), "acl")) {
+	auto heads = BatchHeads(text);
+	for (idx_t i = 1; i < heads.size(); i++) {
+		if (!heads[i].empty() && heads[i][0].IsWord("acl")) {
 			throw BinderException("acl admin: one ACL prefix per batch - the statements after the first are written "
 			                      "without a prefix of their own (statement %llu starts with ACL)",
 			                      i + 1);
@@ -978,8 +839,8 @@ void RefuseRepeatedPrefix(const string &text) {
 }
 
 bool BatchHasMgmtStatement(const string &text) {
-	for (auto &statement : SplitBatchText(text)) {
-		if (IsMgmtStart(statement)) {
+	for (auto &head : BatchHeads(text)) {
+		if (IsMgmtHead(head)) {
 			return true;
 		}
 	}
@@ -987,13 +848,13 @@ bool BatchHasMgmtStatement(const string &text) {
 }
 
 bool BatchIsAllMgmt(const string &text) {
-	auto statements = SplitBatchText(text);
-	for (auto &statement : statements) {
-		if (!IsMgmtStart(statement)) {
+	auto heads = BatchHeads(text);
+	for (auto &head : heads) {
+		if (!IsMgmtHead(head)) {
 			return false;
 		}
 	}
-	return !statements.empty();
+	return !heads.empty();
 }
 
 //! One management statement written as text, compiled by the management compiler (a form no rule reads)
@@ -1142,8 +1003,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 }
 
 bool StartsWithMgmt(const string &text) {
-	auto statements = SplitBatchText(text);
-	return !statements.empty() && IsMgmtStart(statements[0]);
+	auto heads = BatchHeads(text);
+	return !heads.empty() && IsMgmtHead(heads[0]);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1151,11 +1012,11 @@ bool StartsWithMgmt(const string &text) {
 //===--------------------------------------------------------------------===//
 
 bool IsSecretsStart(const string &text) {
-	AdminScanner scanner(text);
-	if (!scanner.Accept("grant") && !scanner.Accept("revoke")) {
+	auto heads = ReadStatementHeads(text, 2);
+	if (heads.empty() || heads[0].size() < 2) {
 		return false; // never throws: it only decides which grammar the text is
 	}
-	return StringUtil::CIEquals(scanner.PeekWord(), "secret");
+	return (heads[0][0].IsWord("grant") || heads[0][0].IsWord("revoke")) && heads[0][1].IsWord("secret");
 }
 
 namespace {

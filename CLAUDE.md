@@ -473,7 +473,7 @@ scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, 
 rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
 `Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
 grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
-the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f built):
+the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f, 3g-1 built):
 the batch is read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered)
 - a moved family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`, `MakeAdminTableCall` for CHECK's
 `table_call`), anything else passes through as tokens (`AclMgmtLegacy`) to the compiler as its own text
@@ -489,8 +489,9 @@ its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW
 list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant a point grant,
 `PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the transform, a list inside it a marker
 its reading replaces (`TextArg::splice`). 3f: function categories and grants, platform's point grants, sources,
-resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's registered forms. Stage 4 the
-policy texts. Tests `acl_prefix_grammar.test`,
+resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's registered forms. 3g-1: the batch's
+classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`; `SplitBatchText` gone). Then 3g-2 (SECRET,
+USE, ATTACH LINEAGE), 3g-3 (modules' rules, hugr-node), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
@@ -733,7 +734,7 @@ include any point grant); `platform_grants(role, object, kind, allowed)` written
 (`GRANT|DENY|REVOKE VIEW|FUNCTION platform.x`, `acl_grant_platform` / `acl_revoke_platform`), never to
 '' nor on ESCALATES/INFRASTRUCTURE/OPEN; a deny wins over a bundle, not passthrough. `admins` keyed
 `(role, scope, vcat)` (v21, min_reader 21), spec 009's rows read as bundles, nothing rewritten. Under a
-principal prefix the grammar needs no marker (`StartsWithMgmt`, the batch split by `SplitBatchText`); a
+principal prefix the grammar needs no marker (`StartsWithMgmt`, each statement's head on duckdb's tokens - spec 150 3g-1); a
 batch mixing management and queries is refused (`BatchHasMgmtStatement`); `NoteManagement` gives each
 compiled call its text hash. Listings: `PlatformListingCtes` (pobjects/pcolumns) joined into
 `MetadataListingSql`, `PlatformFunctionRows` into duckdb_functions / acl_function_columns - absent on the

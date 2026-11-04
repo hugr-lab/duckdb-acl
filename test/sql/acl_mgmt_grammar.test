@@ -846,10 +846,12 @@ SELECT (SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_one'),
 ----
 1	SELECT a /* kept */ FROM phys.main.t
 
+# ... and `$1$` is no string to duckdb's tokenizer: the batch is three statements as duckdb ends them, the last
+# (`$1$)`) none of ours - refused as a mixed batch before any runs (spec 150 3g-1: the batch's heads on duckdb's tokens)
 statement error
 ACL ADMIN ALTER VIRTUAL VIEW objects.v SET AS SELECT (1 AS "", $1$; DROP ROLE grammar_one; $1$);
 ----
-zero-length delimited identifier
+a batch mixing management statements and queries
 
 query I
 SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_one';
@@ -2053,3 +2055,46 @@ limit "WINDOW_MAX" is written twice
 
 statement ok
 ACL ADMIN DROP RESOURCE GROUP bare;
+
+# --- the batch's classification (stage 3g-1): each statement's head on duckdb's tokens, never a text scan ---------
+
+# a comment between a form's first words is gone, as duckdb's tokenizer reads it (the text scan sent these to duckdb)
+statement ok
+ACL ADMIN CREATE /* a note */ ROLE headed; DENY -- the deny
+FUNCTION upper TO ROLE headed; ALTER /* x */ FUNCTION /* y */ CATEGORY base SET COMMENT 'base';
+
+query II
+SELECT (SELECT count(*) FROM aclcat.acl.roles WHERE role = 'headed'),
+       (SELECT count(*) FROM aclcat.acl.function_grants WHERE role = 'headed' AND name = 'upper' AND NOT allowed);
+----
+1	1
+
+# a quoted name after ANALYZE VIRTUAL is ours (the scan read only a bare word there)
+statement ok
+ACL ADMIN ANALYZE VIRTUAL "granted".t;
+
+# a string is one token: management words inside a query's literal are no statement of the batch
+query I
+ACL ROLE "headed" SELECT 'x; GRANT CATALOG granted TO ROLE headed' AS s;
+----
+x; GRANT CATALOG granted TO ROLE headed
+
+# ... while a `;` ends a statement where duckdb ends one, inside parentheses too: the part after it is a statement
+statement error
+ACL ROLE "headed" SELECT (1; GRANT CATALOG granted TO ROLE headed);
+----
+a batch mixing management statements and queries
+
+# a second prefix behind a comment is still a second prefix
+statement error
+ACL ADMIN DRAIN NODE; /* the next */ ACL ADMIN RESUME NODE;
+----
+one ACL prefix per batch
+
+query I
+SELECT acl_drain_status();
+----
+serving
+
+statement ok
+ACL ADMIN DROP ROLE headed;
