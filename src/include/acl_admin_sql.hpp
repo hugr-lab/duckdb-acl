@@ -50,8 +50,9 @@ bool BatchIsAllMgmt(const string &text);
 bool StartsWithMgmt(const string &text);
 //! A client's statement text (a door's - spec 111 runs a management statement where Flight SQL runs a command) as the
 //! override will read it behind the door's prefix: duckdb's normalized text (a Unicode space is a space), the markers a
-//! client writes itself, its `ACL` marker (management unless NATIVE follows), else the first statement's head
-bool ClientTextIsMgmt(const string &query);
+//! client writes itself, its `ACL` marker (management unless NATIVE follows), else the first statement's head.
+//! `rest`: the normalized text past those markers, for the door's other judgments of the client's statement
+bool ClientTextIsMgmt(const string &query, string &rest);
 
 // The authorization gate (spec 009) moved to acl_platform.hpp (spec 117): AuthorizeMgmt is the one
 // authorizer of the grammar and of a direct platform.<op>(…) call alike.

@@ -1006,42 +1006,63 @@ bool StartsWithMgmt(const string &text) {
 	return !heads.empty() && IsMgmtHead(heads[0]);
 }
 
-bool ClientTextIsMgmt(const string &query) {
-	// as the override reads it behind the door's prefix: duckdb's normalized text, the markers a client may write
-	// itself (TRACE / PARENT / LINEAGE … '<value>'), then its mode marker - `ACL` without NATIVE is management, which
-	// compiles or is refused at Prepare - else the first statement's head past an empty one
+bool ClientTextIsMgmt(const string &query, string &rest) {
+	// as the override reads it behind the door's prefix (`ACL SESSION '<h>' ` + the door's markers + this text):
+	// duckdb's normalized text; the markers a client may write itself, as the prefix rule reads them (`AclMarker*`:
+	// `TRACE | PARENT <value>`, `LINEAGE` then `PARENT | ROOT | JOB <value>` parts, a value '…' or "…"); its mode
+	// marker - `ACL` without NATIVE is management, which compiles or is refused at Prepare; else the first statement's
+	// head past an empty one. `rest`: the text past the markers and the mode marker, for the door's other checks
+	string normalized;
 	vector<vector<HeadToken>> heads;
 	try {
-		heads = ReadStatementHeads(Parser::NormalizeSQLString(query), 24);
+		normalized = Parser::NormalizeSQLString(query);
+		heads = ReadStatementHeads(normalized, 32);
 	} catch (std::exception &) {
+		rest = query;
 		return false; // text duckdb cannot normalize (invalid UTF-8): Prepare refuses it
 	}
+	rest = normalized;
 	if (heads.empty()) {
 		return false;
 	}
 	auto &first = heads[0];
 	idx_t at = 0;
 	auto value_at = [&](idx_t index) {
-		return index < first.size() && first[index].kind == HeadToken::Kind::STRING;
+		return index < first.size() &&
+		       (first[index].kind == HeadToken::Kind::STRING || first[index].kind == HeadToken::Kind::QUOTED_NAME);
+	};
+	auto lineage_part_at = [&](idx_t index) {
+		return index < first.size() &&
+		       (first[index].IsWord("parent") || first[index].IsWord("root") || first[index].IsWord("job")) &&
+		       value_at(index + 1);
 	};
 	while (at < first.size()) {
-		if ((first[at].IsWord("trace") || first[at].IsWord("parent")) && value_at(at + 1)) {
+		if (first[at].IsWord("lineage") && lineage_part_at(at + 1)) {
+			at++;
+			while (lineage_part_at(at)) {
+				at += 2; // the parts repeat, greedily, as AclLineagePart+ takes them
+			}
+		} else if ((first[at].IsWord("trace") || first[at].IsWord("parent")) && value_at(at + 1)) {
 			at += 2;
-		} else if (first[at].IsWord("lineage") && at + 1 < first.size() &&
-		           (first[at + 1].IsWord("parent") || first[at + 1].IsWord("root") || first[at + 1].IsWord("job")) &&
-		           value_at(at + 2)) {
-			at += 3;
 		} else {
 			break;
 		}
 	}
+	auto rest_from = [&](idx_t index) {
+		rest = index < first.size() ? normalized.substr(first[index].offset) : string();
+	};
 	if (at < first.size() && first[at].IsWord("acl")) {
-		return !(at + 1 < first.size() && first[at + 1].IsWord("native"));
+		bool native = at + 1 < first.size() && first[at + 1].IsWord("native");
+		rest_from(at + (native ? 2 : 1));
+		return !native;
 	}
 	if (at < first.size()) {
+		rest_from(at);
 		return IsMgmtHead(vector<HeadToken>(first.begin() + NumericCast<int64_t>(at), first.end()));
 	}
-	return heads.size() > 1 && IsMgmtHead(heads[1]); // the markers alone, then `;` (an empty statement)
+	// the markers alone, then `;` (an empty statement)
+	rest = heads.size() > 1 && !heads[1].empty() ? normalized.substr(heads[1][0].offset) : string();
+	return heads.size() > 1 && IsMgmtHead(heads[1]);
 }
 
 //===--------------------------------------------------------------------===//

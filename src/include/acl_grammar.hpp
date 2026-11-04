@@ -87,6 +87,8 @@ struct HeadToken {
 	enum class Kind : uint8_t { WORD, QUOTED_NAME, NUMBER, STRING, OTHER };
 	Kind kind = Kind::OTHER;
 	string word;
+	//! where the token starts in the text read
+	idx_t offset = 0;
 	bool IsWord(const char *keyword) const {
 		return kind == Kind::WORD && word == keyword;
 	}

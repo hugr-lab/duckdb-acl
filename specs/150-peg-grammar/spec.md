@@ -331,8 +331,10 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
     `DROP FUNCTION category CASCADE | RESTRICT` is duckdb's DROP of a macro (the scan read it as ours, dropping the
     category `cascade` - a category of that name is dropped quoted); the Flight door's command detection
     (`ClientTextIsMgmt`) reads the client's text as the override does behind the door's prefix - duckdb's normalized
-    text (a Unicode space is a space), the markers a client writes itself (`TRACE '…'`, `LINEAGE JOB '…'`), its `ACL`
-    marker (management unless NATIVE follows: it compiles or is refused at Prepare), an empty statement - so a
+    text (a Unicode space is a space), the markers a client writes itself as the prefix rule reads them (`TRACE |
+    PARENT <value>`, `LINEAGE` then its repeated parts, a value '…' or "…"), its `ACL` marker (management unless
+    NATIVE follows: it compiles or is refused at Prepare), an empty statement - and its other checks (a platform
+    call, a client's SET / CREATE / DROP / ALTER) read the text past those markers - so a
     management statement the door missed (`REVOKE<NBSP>CATALOG …`, `ACL/* x */REVOKE …`) no longer ran only at DoGet, lost by
     a client that never fetched (spec 111); a GRANT / REVOKE SECRET batch's statements are checked where its
     scanner stands (the heads of the whole rest per statement made it quadratic) - a comment in it is refused

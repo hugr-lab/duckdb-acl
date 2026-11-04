@@ -2250,12 +2250,13 @@ public:
 	static bool ClientStatementIsCommand(const string &query) {
 		// spec 117: a management statement - the grammar, bare or after the `ACL` marker - is a change, not
 		// a query, whatever call it compiles to: run where Flight SQL says a statement runs
-		if (acl::ClientTextIsMgmt(query)) {
+		string rest; // the client's statement past the markers it wrote itself (TRACE '…', LINEAGE …, ACL NATIVE)
+		if (acl::ClientTextIsMgmt(query, rest)) {
 			return true; // (GRANT / REVOKE SECRET open with a management phrase too)
 		}
 		try {
 			Parser parser(ParserOptions::Builtin());
-			parser.ParseQuery(UseSchemaAsSet(query)); // `USE SCHEMA s` is the SET it compiles to
+			parser.ParseQuery(UseSchemaAsSet(rest)); // `USE SCHEMA s` is the SET it compiles to
 			if (parser.statements.size() != 1) {
 				return false;
 			}

@@ -49,7 +49,7 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
 
 - **A management statement that returns rows, prepared over Flight, loses them** (found 2026-11-04 by spec 150 3g-1's
   re-review): `[ACL] CHECK VIRTUAL CATALOG c` (a table call) and `GRANT | REVOKE SECRET` (the service's table call)
-  are commands to the door (spec 111: run at GetFlightInfo); ad hoc the kept result is delivered at DoGet, but
+  are commands to the door (spec 111: run at GetFlightInfo; behind a client's marker too since 150 3g-1); ad hoc the kept result is delivered at DoGet, but
   prepared, `AnswersOnlyCount` announces an empty dataset schema and JDBC reads an update - acl-clients 007.3's bug,
   fixed there for `SELECT * FROM platform.check_catalog(…)`. A fix announces the call's result schema.
 
