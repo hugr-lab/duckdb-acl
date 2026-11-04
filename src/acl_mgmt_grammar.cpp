@@ -2789,6 +2789,47 @@ public:
 
 } // namespace
 
+vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count) {
+	vector<MatcherToken> tokens;
+	SplitTokenizerBehavior behavior(text, tokens);
+	CompiledGrammar::DefaultGrammar()->GetTokenizer().TokenizeInput(behavior);
+	vector<vector<HeadToken>> heads;
+	bool open = false;
+	for (auto &token : tokens) {
+		if (token.type == TokenType::TERMINATOR) {
+			open = false;
+			continue;
+		}
+		if (token.type == TokenType::END_OF_INPUT) {
+			continue; // comments never reach the tokens
+		}
+		if (!open) {
+			heads.emplace_back();
+			open = true;
+		}
+		auto &head = heads.back();
+		if (head.size() >= count) {
+			continue;
+		}
+		HeadToken entry;
+		entry.offset = token.offset;
+		auto &text_of = token.text;
+		if (!text_of.empty() && (text_of[0] == '"' || text_of[0] == '`')) {
+			entry.kind = HeadToken::Kind::QUOTED_NAME;
+		} else if (token.type == TokenType::NUMBER_LITERAL && !text_of.empty() &&
+		           StringUtil::CharacterIsDigit(text_of[0])) {
+			entry.kind = HeadToken::Kind::NUMBER; // a `.` is a number token too (`ANALYZE virtual.t` stays duckdb's)
+		} else if (token.type == TokenType::STRING_LITERAL && text_of[0] == '\'') {
+			entry.kind = HeadToken::Kind::STRING; // a plain '…' (an E'…' or a $$…$$ is no session id)
+		} else if ((token.type == TokenType::KEYWORD || token.type == TokenType::IDENTIFIER) && !text_of.empty()) {
+			entry.kind = HeadToken::Kind::WORD;
+			entry.word = StringUtil::Lower(text_of);
+		}
+		head.push_back(std::move(entry));
+	}
+	return heads;
+}
+
 vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text) {
 	vector<MatcherToken> tokens;
 	SplitTokenizerBehavior behavior(text, tokens);

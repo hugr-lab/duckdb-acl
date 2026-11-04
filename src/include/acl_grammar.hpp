@@ -80,6 +80,24 @@ struct MgmtParsed {
 //! A marker's words as a client writes them: `TRACE`, `LINEAGE JOB`, ...
 const char *MarkerWords(GrammarPrefix::MarkerKind kind);
 
+//! spec 150, stage 3g-1: one token of a statement's head as duckdb's tokenizer reads it (comments are gone): a bare
+//! word (lower-cased), a quoted name (`"…"` or a backtick one), a number written with a leading digit (`1x` is the
+//! tokenizer's number then word: a name to our rules), a single-quoted string, or anything else
+struct HeadToken {
+	enum class Kind : uint8_t { WORD, QUOTED_NAME, NUMBER, STRING, OTHER };
+	Kind kind = Kind::OTHER;
+	string word;
+	//! where the token starts in the text read
+	idx_t offset = 0;
+	bool IsWord(const char *keyword) const {
+		return kind == Kind::WORD && word == keyword;
+	}
+};
+//! A batch's statements, as duckdb's tokenizer ends them (`;` outside a literal or a comment), each by its first
+//! `count` tokens - what decides whose statement it is (the management grammar's or duckdb's). Never throws: a text
+//! that ends inside a comment or a string has the heads before it, and its own reader refuses it
+vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count);
+
 //! The grammars the override compiles, one per set of the caller's grammar extensions
 class AclGrammarCache {
 public:

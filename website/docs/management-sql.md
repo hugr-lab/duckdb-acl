@@ -84,7 +84,9 @@ catalog forms refuse.
   - an RLS predicate takes any literal. Where an item is a value (a role's claims, a resource group's
   limits, an issuer's or a client's lists) a string continued on the next line is refused too; a mask
   or a REMAP item is SQL and duckdb joins it.
-- Keywords are case-insensitive. Statements of a batch are separated by `;`.
+- Keywords are case-insensitive. Statements of a batch are separated by `;`, where duckdb's tokenizer
+  ends a statement. A comment may stand anywhere between a form's words, as in SQL (not yet in
+  `GRANT | REVOKE SECRET`).
 - Write modes on `CREATE`: `CREATE` refuses an existing object, `CREATE OR REPLACE` overwrites,
   `CREATE … IF NOT EXISTS` keeps what is there. The legacy `ADD` forms always upsert. Where a
   function takes a `mode` argument the values are `create`, `replace`, `skip` and `upsert` (or
@@ -711,7 +713,7 @@ schema[, function]]])` lists their parameters, result columns and a scalar's ret
 CREATE [OR REPLACE] FUNCTION CATEGORY <name> [COMMENT '<text>']
 ALTER FUNCTION CATEGORY <name> ADD (<function> [, …]) | DROP (<function> [, …])
 ALTER FUNCTION CATEGORY <name> SET COMMENT '<text>'      -- it must exist; the members stay (spec 120)
-DROP FUNCTION CATEGORY [IF EXISTS] <name>
+DROP FUNCTION CATEGORY [IF EXISTS] <name>      -- a category named cascade / restrict is dropped quoted ("cascade")
 
 GRANT  FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES
 DENY   FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES

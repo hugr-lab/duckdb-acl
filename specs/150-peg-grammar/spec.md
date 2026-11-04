@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d, 3e, 3f built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f and 3g-1 built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -138,16 +138,16 @@ A moved family's text form stays only as a refusal in the form's own words ("wri
 not read as its rule falls to it, and only the rule accepts - never two readers. A form a rule began with more after
 it before its `;` (PEG keeps the rule that matched, so the statement fails there) goes the same way: its tokens up to
 the `;`, as text, to the compiler - the batch's other statements are not blamed. duckdb's grammar splits the batch (a
-`;` inside parentheses now ends a statement - none of ours holds one; `SplitBatchText` reads comments as the
-tokenizer does, a line comment ending at either line break, block comments nested); a text the tokenizer refuses is
+`;` inside parentheses now ends a statement - none of ours holds one; since 3g-1 the batch's classification reads the
+same tokens, `ReadStatementHeads`); a text the tokenizer refuses is
 read piece by piece - the pieces it reads by their rules, the refused one by the compiler in its own words (a moved
 form refused there says the tokenizer's: an unterminated string), and a batch no piece of which holds the refusal (an
 unterminated comment the split drops) is refused whole - never run without it. Values a rule reads are checked against their
 tokens - one plain quoted literal (an empty `''` passes, as it did: the function judges it; `""` is a zero-length
 identifier the tokenizer refuses), a level a bare word. hugr-node's registered forms
 (`RegisterMgmtGrammar`, spec 126) take the legacy path unchanged. The text checks that tell a management batch from
-native SQL (`IsMgmtStart`, `StartsWithMgmt`, `BatchHasMgmtStatement`, `SplitBatchText`, `RefuseRepeatedPrefix`) stay
-until the last PR of the stage, which judges the batch by its parse and drops `AdminScanner`.
+native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` and `SplitBatchText` gone); 3g-3 drops
+`AdminScanner`.
 
 - 3a (built): the grammar, the legacy path, and the operations of a node - `KILL SESSION '<id>'`,
   `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`, `PROFILE SESSION CURRENT|'<id>' ON|ALL|SAMPLED|OFF`, `DRAIN NODE`,
@@ -315,8 +315,35 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   refusals are the old refusals in new words. After 3f no family of this repository is the compiler's - the legacy path
   (`AclMgmtLegacy`, `CompileMgmtText`, `LegacyUnreadable`) serves hugr-node's registered forms until 3g, and its tests
   are hugr-node's.
-- 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
-  `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
+- 3g, in three PRs (the owner, 2026-11-04):
+  - 3g-1 (built): the batch's classification on duckdb's tokens - `ReadStatementHeads` (acl_mgmt_grammar.cpp:
+    `CompiledGrammar::DefaultGrammar()`'s tokenizer, never throwing, the statements as it ends them) hands each
+    statement's first tokens (a word, a quoted name, a digit-led number, a plain string, other) to `IsMgmtHead`, the decision table
+    `IsMgmtStart` read off the text; `StartsWithMgmt` / `BatchHasMgmtStatement` / `BatchIsAllMgmt` /
+    `RefuseRepeatedPrefix` / `IsSecretsStart` read the heads, and `SplitBatchText` / `IsMgmtStart` / `CommentEnd`
+    go. Changed: a comment between a form's first words is gone (`CREATE /* c */ ROLE`, `DENY -- …⏎FUNCTION` were
+    sent to duckdb as native SQL), a quoted name after `ANALYZE VIRTUAL` is ours, a `;` ends a statement where
+    duckdb ends one - inside parentheses too, and not inside a `$1$…$1$` duckdb does not read as a string (a
+    query batch with a management statement after such a `;` is the mixed batch refused), an `E'…\'…'` string or a
+    backtick name holding a `'` no longer misleads the split (it refused such a query as mixed); the first statement
+    after the prefix is judged for a second `ACL` too (`ACL ROLE "r" ; ACL …`, `ACL ROLE "r" ACL ACL …`). Fixed by
+    the reviews: a digit-led name (`FUNCTION CATEGORY 1x`, the tokenizer's number then word) is a name;
+    `DROP FUNCTION category CASCADE | RESTRICT` is duckdb's DROP of a macro (the scan read it as ours, dropping the
+    category `cascade` - a category of that name is dropped quoted); the Flight door's command detection
+    (`ClientTextIsMgmt`) reads the client's text as the override does behind the door's prefix - duckdb's normalized
+    text (a Unicode space is a space), the markers a client writes itself as the prefix rule reads them (`TRACE |
+    PARENT <value>`, `LINEAGE` then its repeated parts, a value '…' or "…"), its `ACL` marker (management unless
+    NATIVE follows: it compiles or is refused at Prepare), an empty statement - and its other checks (a platform
+    call, a client's SET / CREATE / DROP / ALTER) read the text past those markers - so a
+    management statement the door missed (`REVOKE<NBSP>CATALOG …`, `ACL/* x */REVOKE …`) no longer ran only at DoGet, lost by
+    a client that never fetched (spec 111); a GRANT / REVOKE SECRET batch's statements are checked where its
+    scanner stands (the heads of the whole rest per statement made it quadratic) - a comment in it is refused
+    until 3g-2.
+  - 3g-2: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE` as rules.
+  - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
+    `AdminScanner` and the compiler go, hugr-node re-pins.
+- Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
+  rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 
 **Open questions**
 

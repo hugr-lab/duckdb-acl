@@ -1,7 +1,7 @@
 # Spec 152: the role-target authorizer reads names, batches and roles as the store does
 
 - **Status**: implemented (accepted by the owner, 2026-10-25: the empty role refused everywhere, revokes too; strict
-  specs; the URL reading dropped; the prepared statement proposed as a known limit)
+  specs; the URL reading dropped; 2026-11-04: the prepared statement accepted as a known limit)
 - **Date**: 2026-10-24
 - **Author**: hugr lab (found by spec 150 stage 3e's security review, and this spec's own reviews)
 
@@ -54,7 +54,7 @@ Fail closed: each change widens what is refused, but the URL comparison's remova
 The at-use rules (a privileged role reached by an issuer-scope mapping, `AS ROLE` or a constant does not count) are
 unchanged.
 
-**Known limit (proposed, 2026-10-25):** the judgment is made when the statement is decided - at its parse. A
+**Known limit (accepted by the owner, 2026-11-04):** the judgment is made when the statement is decided - at its parse. A
 management statement prepared (`Connection::Prepare`, a Flight prepared statement) executes as decided, even when the
 model changed between Prepare and Execute, so the order rules above are not re-read for it. It needs the `policy`
 bundle and a client that prepares; what it can reach is a catalog's `manage` for a claim (less than `policy` already
