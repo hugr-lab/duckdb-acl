@@ -663,8 +663,9 @@ string ResourceLimitsJson(const string &inside) {
 [[noreturn]] void RefuseSecretsForm(bool grant) {
 	RefuseMovedForm(grant
 	                    ? "write GRANT SECRET <name> TO ROLE <role> | GROUP <group> [FROM | IN <service>] (a role or a "
-	                      "group, never one user)"
-	                    : "write REVOKE SECRET <name> FROM ROLE <role> | GROUP <group> [FROM | IN <service>]");
+	                      "group, never one user; the service one name - a dotted one quoted: IN \"a.b\")"
+	                    : "write REVOKE SECRET <name> FROM ROLE <role> | GROUP <group> [FROM | IN <service>] (the "
+	                      "service one name - a dotted one quoted: IN \"a.b\")");
 }
 
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {

@@ -346,10 +346,10 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       before; the hand reader (`ParseSecretsStatement`, `SecretsName`, `AdminScanner::AtSemicolon`) goes. Changed:
       a comment between the words is a space (and a Unicode space or a zero-width one separates words, as everywhere
       duckdb's tokenizer reads - `r<ZWSP>in<ZWSP>ternal` is the principal `r` and the service `ternal`); the secret's
-      name and the principal are NameValues (dotted words too), the service one name (`StringLiteral / AclName`, as an
-      issuer's `IN`); `""` is the tokenizer's refusal, `''` refused for each (it named the attached service, or sent
+      name and the principal are NameValues (dotted words too), the service one name (`StringLiteral / AclName` - a word, `"…"` or `'…'`; a
+      dotted one quoted, `IN "a.b"`); `""` is the tokenizer's refusal, `''` refused for each (it named the attached service, or sent
       `role:`); a literal not written plainly (`E'…'`, `$$…$$`, a backtick name, a continued string, a non-ASCII bare
-      word) is refused in the rules' words; a statement of a secrets batch that is not a secrets one is the batch's
+      word) is refused - in the rules' words for the name and the principal, in the form's for the service; a statement of a secrets batch that is not a secrets one is the batch's
       refusal (`… holds GRANT / REVOKE SECRET statements only` - the compiler never runs there), a GRANT / REVOKE
       SECRET not read as its rule its form's (`RefuseSecretsForm`); one inside a management batch, read or not, goes
       in a batch of its own.
