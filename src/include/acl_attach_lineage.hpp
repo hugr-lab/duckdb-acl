@@ -6,13 +6,17 @@
 // Spec 112 §9: `ATTACH … LINEAGE '<identity>'` - the operator names a source where it attaches it.
 // The parser override takes the trailing `LINEAGE '<x>'` off each such statement and compiles it to
 // the native ATTACH followed by `acl_lineage_source('<alias>', '<x>')`. This is the text side only:
-// a quote-, identifier- and comment-aware split of a batch into its statements, and the marker found
-// at the end of an ATTACH. Header-only, no parse - what the text means is the native parser's.
+// the batch's statements and the marker at the end of an ATTACH, read on duckdb's own tokens (spec 150
+// 3g-2c: strings, quoted names and comments as duckdb reads them). What the text means is the native parser's.
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
+#include "acl_grammar.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 namespace acl {
@@ -24,45 +28,6 @@ struct AttachLineageSegment {
 	string identity;
 	bool marked = false;
 };
-
-namespace attach_lineage_detail {
-
-struct Token {
-	idx_t start;
-	idx_t end;
-	char kind; // 'w' word, 's' single-quoted string, 'p' anything else
-};
-
-inline bool WordStart(char c) {
-	return StringUtil::CharacterIsAlpha(c) || c == '_';
-}
-
-inline bool WordPart(char c) {
-	return WordStart(c) || StringUtil::CharacterIsDigit(c) || c == '$';
-}
-
-//! Skip a quoted run starting at `pos` (the opening quote); a doubled quote is an escaped one.
-//! Answers the position after the closing quote, or the text's end for an unterminated one.
-inline idx_t SkipQuoted(const string &text, idx_t pos, char quote, bool backslash) {
-	idx_t i = pos + 1;
-	while (i < text.size()) {
-		if (backslash && text[i] == '\\' && i + 1 < text.size()) {
-			i += 2;
-			continue;
-		}
-		if (text[i] == quote) {
-			if (i + 1 < text.size() && text[i + 1] == quote) {
-				i += 2;
-				continue;
-			}
-			return i + 1;
-		}
-		i++;
-	}
-	return text.size();
-}
-
-} // namespace attach_lineage_detail
 
 //! Does the text possibly carry the marker? Cheap and allocation-free: every unprefixed statement
 //! passes through the override, and nearly none is an ATTACH.
@@ -76,83 +41,35 @@ inline bool MayCarryAttachLineage(const string &text) {
 }
 
 //! The batch's statements, each with the identity its trailing `LINEAGE '<x>'` declared. `found` is
-//! whether any statement carried the marker - false leaves the text to the native parser untouched.
+//! whether any statement carried the marker - false leaves the text to the native parser untouched (also a
+//! text ending inside a comment, a string or a name: the native parser refuses it)
 inline vector<AttachLineageSegment> SplitAttachLineage(const string &text, bool &found) {
-	using attach_lineage_detail::SkipQuoted;
-	using attach_lineage_detail::Token;
-	using attach_lineage_detail::WordPart;
-	using attach_lineage_detail::WordStart;
 	found = false;
 	vector<AttachLineageSegment> segments;
-	vector<Token> tokens;
-	idx_t segment_start = 0;
-	auto close_segment = [&](idx_t end) {
+	bool open = false;
+	auto heads = ReadStatementHeads(text, NumericLimits<idx_t>::Maximum(), &open);
+	if (open) {
+		return segments;
+	}
+	for (auto &tokens : heads) {
 		AttachLineageSegment segment;
-		if (tokens.empty()) {
-			segment_start = end + 1;
-			return;
-		}
-		auto &first = tokens.front();
+		auto start = tokens.front().offset;
+		auto &last = tokens.back();
+		auto end = last.offset + last.text.size();
 		auto n = tokens.size();
-		bool attach =
-		    first.kind == 'w' && StringUtil::CIEquals(text.substr(first.start, first.end - first.start), "attach");
-		auto &last = tokens[n - 1];
-		bool closed = last.kind == 's' && last.end - last.start >= 2 && text[last.end - 1] == '\'';
-		if (attach && n >= 4 && closed && tokens[n - 2].kind == 'w' &&
-		    StringUtil::CIEquals(text.substr(tokens[n - 2].start, tokens[n - 2].end - tokens[n - 2].start),
-		                         "lineage")) {
-			auto &literal = tokens[n - 1];
-			auto raw = text.substr(literal.start + 1, literal.end - literal.start - 2);
-			segment.identity = StringUtil::Replace(raw, "''", "'");
+		// `ATTACH … LINEAGE '<x>'`: an ATTACH whose last two tokens are the word and one plain literal
+		if (tokens[0].IsWord("attach") && n >= 4 && tokens[n - 2].IsWord("lineage") &&
+		    last.kind == HeadToken::Kind::STRING && last.text.size() >= 2) {
+			segment.identity = StringUtil::Replace(last.text.substr(1, last.text.size() - 2), "''", "'");
 			segment.marked = true;
-			segment.text = text.substr(segment_start, tokens[n - 2].start - segment_start);
-			segment.original = text.substr(segment_start, end - segment_start);
+			segment.text = text.substr(start, tokens[n - 2].offset - start);
+			segment.original = text.substr(start, end - start);
 			found = true;
 		} else {
-			segment.text = text.substr(segment_start, end - segment_start);
+			segment.text = text.substr(start, end - start);
 		}
 		segments.push_back(std::move(segment));
-		tokens.clear();
-		segment_start = end + 1;
-	};
-	idx_t i = 0;
-	while (i < text.size()) {
-		auto c = text[i];
-		if (StringUtil::CharacterIsSpace(c)) {
-			i++;
-		} else if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
-			auto eol = text.find('\n', i);
-			i = eol == string::npos ? text.size() : eol + 1;
-		} else if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
-			auto close = text.find("*/", i + 2);
-			i = close == string::npos ? text.size() : close + 2;
-		} else if (c == '\'') {
-			auto end = SkipQuoted(text, i, '\'', false);
-			tokens.push_back(Token {i, end, 's'});
-			i = end;
-		} else if (c == '"') {
-			auto end = SkipQuoted(text, i, '"', false);
-			tokens.push_back(Token {i, end, 'w'});
-			i = end;
-		} else if ((c == 'e' || c == 'E') && i + 1 < text.size() && text[i + 1] == '\'') {
-			auto end = SkipQuoted(text, i + 1, '\'', true); // E'…': backslash escapes, never the marker's
-			tokens.push_back(Token {i, end, 'p'});
-			i = end;
-		} else if (WordStart(c)) {
-			auto start = i;
-			while (i < text.size() && WordPart(text[i])) {
-				i++;
-			}
-			tokens.push_back(Token {start, i, 'w'});
-		} else if (c == ';') {
-			close_segment(i);
-			i++;
-		} else {
-			tokens.push_back(Token {i, i + 1, 'p'});
-			i++;
-		}
 	}
-	close_segment(text.size());
 	return segments;
 }
 

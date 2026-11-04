@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1, 3g-2a and 3g-2b built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1 and 3g-2 built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -366,7 +366,16 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       comment is left to duckdb, which refuses it (the reader dropped the open comment, compiling what came before
       it); `;;` after the USE, a word holding `$` and the comment forms duckdb reads otherwise than the scan (`--`
       ended by `\r`, nested `/* */`) now read as duckdb reads them; a backtick name stays duckdb's.
-    - 3g-2c: `ATTACH … LINEAGE '<x>'` (`acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH.
+    - 3g-2c (built): `ATTACH … LINEAGE '<x>'` (spec 112 §9, `acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH,
+      compiled to the native ATTACH and `acl_lineage_source(alias, x)` - is read on duckdb's tokens: the batch's
+      statements as the tokenizer ends them (`ReadStatementHeads`, every token), the marker an ATTACH's last two
+      tokens - the word `LINEAGE` and one plain `'…'` literal - and each statement's text its first token to its
+      last; the runtime's `AttachLineageIdentity` reads the same way. The hand splitter goes (`MayCarryAttachLineage`,
+      a substring test, stays the fast path). Changed: a `$$…$$` / `$tag$…$tag$` string, an `E'…'` with a `\'` and a
+      backtick name are one token each (the splitter knew `'…'`, `"…"` and `E'…'` only, so a `;` or the marker's
+      words inside the others split or marked the batch otherwise than duckdb reads it); a text ending inside a
+      comment, a string or a name is the native parser's, which refuses it (the splitter ran what came before an open
+      comment).
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the

@@ -1171,6 +1171,24 @@ SELECT 'ATTACH x LINEAGE ''y''' -- LINEAGE 'z'
 ----
 ATTACH x LINEAGE 'y'
 
+# spec 150 3g-2c: read on duckdb's tokens - a $$...$$ string holding the marker's words and a `;` is one token, a
+# comment anywhere between the words is gone, and a text ending inside a comment is the native parser's (refused)
+query T
+SELECT $$a; ATTACH x LINEAGE 'y'$$ AS s; ATTACH ':memory:' AS m3 /* the mart */ LINEAGE -- its identity
+'postgres://m3:5432';
+----
+a; ATTACH x LINEAGE 'y'
+
+query T
+SELECT acl_lineage_source('m3', 'postgres://m3:5432/other');
+----
+postgres://m3:5432/other
+
+statement error
+ATTACH ':memory:' AS m4 LINEAGE 'postgres://m4:5432' /* never closed
+----
+unterminated
+
 # under ACL NATIVE (passthrough) the same sugar
 statement ok
 ACL ADMIN ACL NATIVE ATTACH ':memory:' AS m2 LINEAGE 'postgres://m2:5432';
