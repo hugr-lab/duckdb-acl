@@ -692,7 +692,9 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
 	bool principal_prefix = prefix.kind == AclPrefix::Kind::ROLE || prefix.kind == AclPrefix::Kind::TOKEN ||
 	                        prefix.kind == AclPrefix::Kind::SESSION;
-	if ((anonymous || principal_prefix) && !prefix.marked && StartsWithMgmt(prefix.rest)) {
+	// the batch's heads on duckdb's tokens, read once (spec 150 3g-1 / 3g-2b): whose statements it holds
+	auto heads = ReadStatementHeads(prefix.rest, 6);
+	if ((anonymous || principal_prefix) && !prefix.marked && StartsWithMgmt(heads)) {
 		// the trusted gateway may write management statements unmarked, and (spec 117) so may a principal:
 		// under its prefix the leading phrase is ours whatever duckdb's grammar grows - a principal holds no
 		// physical rights for a GRANT of duckdb's to mean. An explicit `ACL NATIVE` means "plain SQL, do not
@@ -700,7 +702,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		mode = AclPrefix::Mode::MANAGE;
 	}
 	if (mode == AclPrefix::Mode::MANAGE || (principal_prefix && mode == AclPrefix::Mode::QUERY)) {
-		RefuseRepeatedPrefix(prefix.rest);
+		RefuseRepeatedPrefix(heads);
 	}
 	if (mode != AclPrefix::Mode::QUERY) {
 		// management, or native SQL outside the virtual catalog - an event of its own kind from the first
@@ -708,7 +710,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		audit.proto.kind = "admin";
 		audit.refused_statement = mode == AclPrefix::Mode::MANAGE ? "manage" : "native";
 	}
-	if (principal_prefix && mode == AclPrefix::Mode::QUERY && BatchHasMgmtStatement(prefix.rest)) {
+	if (principal_prefix && mode == AclPrefix::Mode::QUERY && BatchHasMgmtStatement(heads)) {
 		// spec 117: the first statement is a query and a later one management - refused, never split
 		NoteDenyReason(Reason::STATEMENT_TYPE);
 		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "
@@ -717,7 +719,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 
 	// spec 082: GRANT / REVOKE SECRET manage the node's secrets service, not the ACL - judged by the
 	// explicit `secrets` capability below, never by an administration scope
-	bool secrets = mode == AclPrefix::Mode::MANAGE && IsSecretsStart(prefix.rest);
+	bool secrets = mode == AclPrefix::Mode::MANAGE && IsSecretsStart(heads);
 	// spec 120.3: a session viewed as a role reads that role's metadata; management (but leaving the mode),
 	// secrets and native SQL are refused - judged on the session's own principal, never the viewed role
 	string lost;
@@ -838,7 +840,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		AclParseGuard guard;
 		Parser parser(inner);
 		// spec 114: `USE SCHEMA s` - a form duckdb's grammar lacks - is the session's default schema
-		auto rest = mode == AclPrefix::Mode::QUERY ? UseSchemaAsSet(prefix.rest) : prefix.rest;
+		bool one_use = heads.size() == 1 && !heads[0].empty() && heads[0][0].IsWord("use");
+		auto rest = mode == AclPrefix::Mode::QUERY && one_use ? UseSchemaAsSet(prefix.rest) : prefix.rest;
 		ParseOfRest(&rest, ErrorsAsJson(options), [&]() { parser.ParseQuery(rest); });
 		statements = std::move(parser.statements);
 	}
@@ -1055,96 +1058,97 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 //! spec 114: `USE SCHEMA <name>[;]` as the one statement of the text -> `SET acl_use_schema = '<name>'`,
 //! which the rewriter reads as USE of that schema in the session's catalog; `<name>` may be a nested schema's
 //! path (`raw.eu`, spec 116: each part an identifier). `USE <catalog>.<schema path>` of three parts or more - beyond
-//! duckdb's grammar - becomes `SET schema = '...'`, read the same way. Any other text unchanged.
+//! duckdb's grammar - becomes `SET schema = '...'`, read the same way. Any other text unchanged. Read on duckdb's
+//! tokens (spec 150 3g-2b): comments are gone, a part is a word (a digit-led one too: the tokenizer's number then
+//! word, written together) or a double-quoted name as written, `.` between them with any space around it
 string UseSchemaAsSet(const string &text) {
-	idx_t i = 0;
-	auto skip_space = [&]() { // whitespace and comments, as the parser skips them
-		while (i < text.size()) {
-			if (StringUtil::CharacterIsSpace(text[i])) {
-				i++;
-			} else if (text.compare(i, 2, "--") == 0) {
-				auto end = text.find('\n', i);
-				i = end == string::npos ? text.size() : end + 1;
-			} else if (text.compare(i, 2, "/*") == 0) {
-				auto end = text.find("*/", i + 2);
-				if (end == string::npos) {
-					return; // unterminated: not ours to read
-				}
-				i = end + 2;
-			} else {
-				return;
-			}
-		}
-	};
-	auto word = [&](const char *expected) {
-		auto size = strlen(expected);
-		if (i + size > text.size() || !StringUtil::CIEquals(text.substr(i, size), expected)) {
-			return false;
-		}
-		if (i + size < text.size() && !StringUtil::CharacterIsSpace(text[i + size]) && text[i + size] != '-' &&
-		    text[i + size] != '/') {
-			return false;
-		}
-		i += size;
-		return true;
-	};
-	skip_space();
-	if (!word("use")) {
+	bool open = false;
+	auto heads = ReadStatementHeads(text, 256, &open);
+	if (open || heads.size() != 1 || heads[0].size() >= 256) {
+		// one statement only (a `;` after it opens no other), never a text ending inside a comment, a string or a
+		// name (duckdb refuses it); a USE of 256 tokens is no path duckdb reads either
 		return text;
 	}
-	skip_space();
-	// `USE SCHEMA <path>`, or `USE <catalog>.<schema path>` of three parts or more (duckdb's grammar stops at
-	// two): both become the SET the rewriter reads
-	bool schema_form = word("schema");
-	skip_space();
-	// a schema name, or a nested schema's path: identifiers (quoted or bare) joined by `.` (spec 116 / 114)
+	// duckdb's tokenizer reads a `.` next to digits into a number (`raw.2024` is `raw`, `.2024`; `2024_01.`, `1.e5`,
+	// `1.` one token each): such a token is split at its dots, so a part after a dot may be digit-led as the first may
+	vector<HeadToken> tokens;
+	for (auto &token : heads[0]) {
+		// digits, `_` separators and an exponent's `e` - never a sign (`1e-5` is no part)
+		bool numeric = !token.text.empty() && StringUtil::Contains(token.text, ".") &&
+		               token.text.find_first_not_of("0123456789._eE") == string::npos;
+		if (!numeric) {
+			tokens.push_back(token);
+			continue;
+		}
+		idx_t start = 0;
+		for (idx_t i = 0; i <= token.text.size(); i++) {
+			if (i < token.text.size() && token.text[i] != '.') {
+				continue;
+			}
+			if (i > start) {
+				HeadToken piece;
+				piece.kind = HeadToken::Kind::NUMBER;
+				piece.text = token.text.substr(start, i - start);
+				piece.offset = token.offset + start;
+				tokens.push_back(std::move(piece));
+			}
+			if (i < token.text.size()) {
+				HeadToken dot;
+				dot.text = ".";
+				dot.offset = token.offset + i;
+				tokens.push_back(std::move(dot));
+			}
+			start = i + 1;
+		}
+	}
+	if (!tokens[0].IsWord("use")) {
+		return text;
+	}
+	idx_t at = 1;
+	// `USE SCHEMA <path>` - `USE schema.x` is duckdb's USE of the catalog `schema`
+	bool schema_form =
+	    at < tokens.size() && tokens[at].IsWord("schema") && !(at + 1 < tokens.size() && tokens[at + 1].text == ".");
+	if (schema_form) {
+		at++;
+	}
+	// a word, or digits (`1e5` too - never a signed `1e-5`)
+	auto plain = [](const HeadToken &token) {
+		return token.kind == HeadToken::Kind::WORD ||
+		       (token.kind == HeadToken::Kind::NUMBER &&
+		        token.text.find_first_not_of("0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") ==
+		            string::npos);
+	};
 	string name;
 	idx_t parts = 0;
-	for (;;) {
+	while (at < tokens.size()) {
+		auto &first = tokens[at];
 		string part;
-		if (i < text.size() && text[i] == '"') {
-			for (i++; i < text.size(); i++) {
-				if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
-					part += '"';
-					i++;
-				} else if (text[i] == '"') {
-					break;
-				} else {
-					part += text[i];
-				}
+		if (first.kind == HeadToken::Kind::QUOTED_NAME && first.text[0] == '"') { // a backtick name is duckdb's
+			part = first.text;
+			at++;
+		} else if (plain(first)) {
+			// a word, or the tokens a digit-led word is read as - written together, no space between
+			part = first.text;
+			for (at++; at < tokens.size() && plain(tokens[at]) &&
+			           tokens[at].offset == tokens[at - 1].offset + tokens[at - 1].text.size();
+			     at++) {
+				part += tokens[at].text;
 			}
-			if (i >= text.size()) {
-				return text;
-			}
-			i++;
-			part = "\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"";
 		} else {
-			while (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_' ||
-			                           static_cast<unsigned char>(text[i]) >= 0x80)) {
-				part += text[i++];
-			}
-		}
-		if (part.empty()) {
 			return text;
 		}
 		name += (name.empty() ? "" : ".") + part;
 		parts++;
-		auto at = i;
-		skip_space(); // `a . b`, as duckdb's grammar reads it
-		if (i < text.size() && text[i] == '.') {
-			i++;
-			skip_space();
+		if (at < tokens.size() && tokens[at].text == ".") {
+			at++;
+			if (at == tokens.size()) {
+				return text; // a trailing dot
+			}
 			continue;
 		}
-		i = at;
 		break;
 	}
-	skip_space();
-	if (i < text.size() && text[i] == ';') {
-		i++;
-	}
-	skip_space();
-	if (name.empty() || i != text.size()) {
+	if (name.empty() || at != tokens.size()) {
 		return text;
 	}
 	if (!schema_form) {

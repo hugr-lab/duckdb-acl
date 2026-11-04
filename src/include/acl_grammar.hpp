@@ -90,16 +90,20 @@ struct HeadToken {
 	enum class Kind : uint8_t { WORD, QUOTED_NAME, NUMBER, STRING, OTHER };
 	Kind kind = Kind::OTHER;
 	string word;
-	//! where the token starts in the text read
+	//! the token as written, and where it starts in the text read
+	string text;
 	idx_t offset = 0;
+	//! a string or a quoted name the text ends inside
+	bool unterminated = false;
 	bool IsWord(const char *keyword) const {
 		return kind == Kind::WORD && word == keyword;
 	}
 };
 //! A batch's statements, as duckdb's tokenizer ends them (`;` outside a literal or a comment), each by its first
 //! `count` tokens - what decides whose statement it is (the management grammar's or duckdb's). Never throws: a text
-//! that ends inside a comment or a string has the heads before it, and its own reader refuses it
-vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count);
+//! that ends inside a comment or a string has the heads before it, and its own reader refuses it; `open`, when given,
+//! says whether it does (a comment never becomes a token, so no head shows one)
+vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open = nullptr);
 
 //! The grammars the override compiles, one per set of the caller's grammar extensions
 class AclGrammarCache {

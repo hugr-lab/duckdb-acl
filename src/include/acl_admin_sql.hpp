@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include "acl_grammar.hpp"
 #include "acl_policy.hpp"
 
 #include "duckdb/parser/parser_options.hpp"
@@ -32,6 +33,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 //! spec 082: whether text opens with `GRANT SECRET` / `REVOKE SECRET` - the node's secrets service,
 //! not the ACL: judged by the `secrets` capability, never by an administration scope.
 bool IsSecretsStart(const string &text);
+bool IsSecretsStart(const vector<vector<HeadToken>> &heads); // the same, on heads read once
 //! Compile a batch of GRANT / REVOKE SECRET statements (nothing else may be in it) into the service
 //! catalog's own calls; the catalog is the one each statement names or the one attached
 //! (PolicyStore::SecretService).
@@ -43,14 +45,17 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 //! spec 117: a statement after the first that starts with its own `ACL` prefix - refused with a message of its
 //! own (a second prefix inside a batch is text, never a prefix)
 void RefuseRepeatedPrefix(const string &text);
+void RefuseRepeatedPrefix(const vector<vector<HeadToken>> &heads); // the same, on heads read once
 //! spec 117: whether any statement of the batch opens with a management form - each judged by its head on duckdb's
 //! tokens (spec 150 stage 3g-1: a comment between the words is gone, `;` ends a statement as duckdb ends it)
 bool BatchHasMgmtStatement(const string &text);
+bool BatchHasMgmtStatement(const vector<vector<HeadToken>> &heads); // the same, on heads read once
 //! spec 117: whether every statement of the batch opens with a management form
 bool BatchIsAllMgmt(const string &text);
 //! spec 117: whether the batch's first statement - past what opens it but says nothing (whitespace,
 //! comments) - opens with a management form: what decides a batch is management
 bool StartsWithMgmt(const string &text);
+bool StartsWithMgmt(const vector<vector<HeadToken>> &heads); // the same, on heads read once
 //! A client's statement text (a door's - spec 111 runs a management statement where Flight SQL runs a command) as the
 //! override will read it behind the door's prefix: duckdb's normalized text (a Unicode space is a space), the markers a
 //! client writes itself, its `ACL` marker (management unless NATIVE follows), else the first statement's head.

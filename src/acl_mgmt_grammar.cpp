@@ -2840,10 +2840,16 @@ public:
 
 } // namespace
 
-vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count) {
+vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open_out) {
 	vector<MatcherToken> tokens;
 	SplitTokenizerBehavior behavior(text, tokens);
 	CompiledGrammar::DefaultGrammar()->GetTokenizer().TokenizeInput(behavior);
+	if (open_out) {
+		*open_out = !behavior.open.empty();
+		for (auto &token : tokens) {
+			*open_out = *open_out || token.unterminated;
+		}
+	}
 	vector<vector<HeadToken>> heads;
 	bool open = false;
 	for (auto &token : tokens) {
@@ -2864,6 +2870,8 @@ vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count) {
 		}
 		HeadToken entry;
 		entry.offset = token.offset;
+		entry.text = token.text;
+		entry.unterminated = token.unterminated;
 		auto &text_of = token.text;
 		if (!text_of.empty() && (text_of[0] == '"' || text_of[0] == '`')) {
 			entry.kind = HeadToken::Kind::QUOTED_NAME;

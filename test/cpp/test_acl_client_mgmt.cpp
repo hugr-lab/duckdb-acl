@@ -9,6 +9,7 @@
 #include "acl_test_util.hpp"
 
 #include "acl_admin_sql.hpp"
+#include "acl_parser_override.hpp"
 
 using namespace acl_test;
 
@@ -62,6 +63,52 @@ int main(int argc, char *argv[]) {
 				Check(!duckdb::acl::ClientTextIsMgmt(text, rest), "a query: " + text);
 			}
 		});
+		Scenario(
+		    "USE [SCHEMA] on duckdb's tokens (spec 150 3g-2b): the SET it compiles to, or the text unchanged", [&] {
+			    std::vector<std::pair<std::string, std::string>> cases = {
+			        {"USE SCHEMA out", "SET acl_use_schema = 'out'"},
+			        {"USE /* c */ SCHEMA -- x\n out;", "SET acl_use_schema = 'out'"},
+			        {"USE SCHEMA \"out\".\"deep\"", "SET acl_use_schema = '\"out\".\"deep\"'"},
+			        {"USE SCHEMA out . deep", "SET acl_use_schema = 'out.deep'"},
+			        {"USE SCHEMA \"a'b\"", "SET acl_use_schema = '\"a''b\"'"},
+			        {"USE SCHEMA 2024", "SET acl_use_schema = '2024'"},
+			        {"USE SCHEMA 1abc", "SET acl_use_schema = '1abc'"},
+			        {"USE a.b.c", "SET schema = 'a.b.c'"},
+			        {"USE a.b", "USE a.b"},
+			        {"USE schema.x", "USE schema.x"},
+			        {"USE SCHEMA \"open", "USE SCHEMA \"open"},
+			        {"USE SCHEMA out; SELECT 1", "USE SCHEMA out; SELECT 1"},
+			        {"USE SCHEMA out.", "USE SCHEMA out."},
+			        {"USE SCHEMA 'out'", "USE SCHEMA 'out'"},
+			        {"SELECT 1", "SELECT 1"},
+			        // digit-led parts after a dot (the tokenizer reads `.2024` into a number), an open comment, junk
+			        {"USE SCHEMA raw.2024", "SET acl_use_schema = 'raw.2024'"},
+			        {"USE mart.out.2024", "SET schema = 'mart.out.2024'"},
+			        {"USE SCHEMA a.1b", "SET acl_use_schema = 'a.1b'"},
+			        {"USE SCHEMA \"q\".2024", "SET acl_use_schema = '\"q\".2024'"},
+			        {"USE SCHEMA 2024.\"q1\"", "SET acl_use_schema = '2024.\"q1\"'"},
+			        {"USE 2024.q1.x", "SET schema = '2024.q1.x'"},
+			        {"USE SCHEMA a$b", "SET acl_use_schema = 'a$b'"},
+			        {"USE SCHEMA mart.2024_01", "SET acl_use_schema = 'mart.2024_01'"},
+			        {"USE mart.2024_01.x", "SET schema = 'mart.2024_01.x'"},
+			        {"USE SCHEMA out.1e5", "SET acl_use_schema = 'out.1e5'"},
+			        {"USE SCHEMA 2024.e5", "SET acl_use_schema = '2024.e5'"},
+			        {"USE SCHEMA 1.5e3", "SET acl_use_schema = '1.5e3'"},
+			        {"USE SCHEMA out;;", "SET acl_use_schema = 'out'"},
+			        {"USE SCHEMA 1.", "USE SCHEMA 1."},
+			        {"USE SCHEMA 1..2", "USE SCHEMA 1..2"},
+			        {"USE SCHEMA 1e-5", "USE SCHEMA 1e-5"},
+			        {"USE SCHEMA out /* open", "USE SCHEMA out /* open"},
+			        {"USE SCHEMA `out`", "USE SCHEMA `out`"},
+			        {"", ""},
+			        {";", ";"},
+			        {"/* only */", "/* only */"},
+			    };
+			    for (auto &entry : cases) {
+				    auto got = duckdb::acl::UseSchemaAsSet(entry.first);
+				    Check(got == entry.second, entry.first + " -> " + got);
+			    }
+		    });
 		Scenario("the rest past the markers is what the door's other checks read", [&] {
 			std::string rest;
 			Check(!duckdb::acl::ClientTextIsMgmt("TRACE 'x' SELECT platform.create_role('z')", rest) &&
