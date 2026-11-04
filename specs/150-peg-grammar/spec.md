@@ -359,9 +359,9 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       whether the text ends inside a comment): one statement, `USE`, `SCHEMA` unless a `.` follows it (`USE
       schema.x` is duckdb's USE of the catalog `schema`), then parts - a word (a digit-led one: the tokenizer's
       number then word, written together) or a `"…"` as written - joined by `.` with any space around it. A number
-      token holding a dot (`.2024`, `2024.`, `1.5` - the tokenizer reads a dot next to digits into a number) is split
-      at its dots, so a digit-led part stands anywhere in the path (`raw.2024`, `mart.out.2024`); a signed number
-      (`1e-5`) is no part. The hand scanner goes. `Prefixed` reads the batch's heads once (the classification's
+      token holding a dot (`.2024`, `2024_01.`, `1.e5` - the tokenizer reads a dot next to digits into a number; digits,
+      `_` and an exponent's `e`, never a sign) is split at its dots, so a digit-led part stands anywhere in the path
+      (`raw.2024`, `mart.out.2024`, `mart.2024_01`, `out.1e5`); a signed number (`1e-5`) is no part. The hand scanner goes. `Prefixed` reads the batch's heads once (the classification's
       checks take them, `UseSchemaAsSet` runs only for a batch that is one USE). Changed: a text ending inside a
       comment is left to duckdb, which refuses it (the reader dropped the open comment, compiling what came before
       it); `;;` after the USE, a word holding `$` and the comment forms duckdb reads otherwise than the scan (`--`

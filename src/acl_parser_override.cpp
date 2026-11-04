@@ -1069,12 +1069,13 @@ string UseSchemaAsSet(const string &text) {
 		// name (duckdb refuses it); a USE of 256 tokens is no path duckdb reads either
 		return text;
 	}
-	// duckdb's tokenizer reads a `.` next to digits into a number (`raw.2024` is `raw`, `.2024`; `1.` one token): such
-	// a token is split at its dots, so a part after a dot may be digit-led as the first may
+	// duckdb's tokenizer reads a `.` next to digits into a number (`raw.2024` is `raw`, `.2024`; `2024_01.`, `1.e5`,
+	// `1.` one token each): such a token is split at its dots, so a part after a dot may be digit-led as the first may
 	vector<HeadToken> tokens;
 	for (auto &token : heads[0]) {
+		// digits, `_` separators and an exponent's `e` - never a sign (`1e-5` is no part)
 		bool numeric = !token.text.empty() && StringUtil::Contains(token.text, ".") &&
-		               token.text.find_first_not_of("0123456789.") == string::npos;
+		               token.text.find_first_not_of("0123456789._eE") == string::npos;
 		if (!numeric) {
 			tokens.push_back(token);
 			continue;
