@@ -5,6 +5,7 @@
 // parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "acl_grammar.hpp"
 #include "acl_admin_scanner.hpp"
 #include "acl_platform.hpp"
@@ -259,7 +260,8 @@ bool IsMgmtHead(const vector<HeadToken> &head) {
 	};
 	auto named = [&](idx_t index) {
 		return index < head.size() &&
-		       (head[index].kind == HeadToken::Kind::WORD || head[index].kind == HeadToken::Kind::QUOTED_NAME);
+		       (head[index].kind == HeadToken::Kind::WORD || head[index].kind == HeadToken::Kind::QUOTED_NAME ||
+		        head[index].kind == HeadToken::Kind::NUMBER);
 	};
 	auto first = word(0);
 	if (first.empty()) {
@@ -313,8 +315,10 @@ bool IsMgmtHead(const vector<HeadToken> &head) {
 	}
 	auto noun = word(at);
 	// CREATE/ALTER/DROP FUNCTION CATEGORY <name> (spec 072): duckdb's CREATE FUNCTION is a macro - one named
-	// `category` (`CREATE FUNCTION category(x) AS …`) has no name after the word
-	bool function_category = noun == "function" && word(at + 1) == "category" && named(at + 2);
+	// `category` (`CREATE FUNCTION category(x) AS …`) has no name after the word, nor does duckdb's DROP of it
+	// (`DROP FUNCTION category CASCADE | RESTRICT`)
+	bool function_category = noun == "function" && word(at + 1) == "category" && named(at + 2) &&
+	                         !(first == "drop" && (word(at + 2) == "cascade" || word(at + 2) == "restrict"));
 	if (first == "create") {
 		return noun == "virtual" || noun == "role" || noun == "issuer" || noun == "client" || noun == "resource" ||
 		       function_category;
@@ -334,10 +338,6 @@ bool IsMgmtHead(const vector<HeadToken> &head) {
 vector<vector<HeadToken>> BatchHeads(const string &text) {
 	return ReadStatementHeads(text, 6);
 }
-
-} // namespace
-
-namespace {
 
 //! spec 150, stage 3: a moved family's form written so its rule did not read it - the form's own words. Its own type,
 //! so a batch whose tokenizer refused that very statement says the tokenizer's words instead (an unterminated string)
@@ -825,14 +825,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 
 } // namespace
 
-namespace {} // namespace
-
 void RefuseRepeatedPrefix(const string &text) {
 	auto heads = BatchHeads(text);
-	for (idx_t i = 1; i < heads.size(); i++) {
+	// the rest after the prefix (and its marker) never starts with ACL either: `ACL ROLE "r" ; ACL …`
+	for (idx_t i = 0; i < heads.size(); i++) {
 		if (!heads[i].empty() && heads[i][0].IsWord("acl")) {
-			throw BinderException("acl admin: one ACL prefix per batch - the statements after the first are written "
-			                      "without a prefix of their own (statement %llu starts with ACL)",
+			throw BinderException("acl admin: one ACL prefix per batch - the statements after the prefix are written "
+			                      "without one of their own (statement %llu starts with ACL)",
 			                      i + 1);
 		}
 	}
@@ -1007,6 +1006,19 @@ bool StartsWithMgmt(const string &text) {
 	return !heads.empty() && IsMgmtHead(heads[0]);
 }
 
+bool ClientTextIsMgmt(const string &query) {
+	// as the override reads it: duckdb's normalized text, the client's `ACL` marker a token of its own
+	auto heads = BatchHeads(Parser::NormalizeSQLString(query));
+	if (heads.empty()) {
+		return false;
+	}
+	auto head = heads[0];
+	if (!head.empty() && head[0].IsWord("acl")) {
+		head.erase(head.begin());
+	}
+	return IsMgmtHead(head);
+}
+
 //===--------------------------------------------------------------------===//
 // The node's secrets service (spec 082)
 //===--------------------------------------------------------------------===//
@@ -1102,9 +1114,11 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 			scanner.pos++;
 			continue;
 		}
-		auto at = scanner.pos;
-		if (!IsSecretsStart(text.substr(at))) {
-			throw BinderException("acl admin: a GRANT / REVOKE SECRET batch holds nothing else");
+		AdminScanner ahead(text);
+		ahead.pos = scanner.pos;
+		if ((!ahead.Accept("grant") && !ahead.Accept("revoke")) || !StringUtil::CIEquals(ahead.PeekWord(), "secret")) {
+			throw BinderException("acl admin: a GRANT / REVOKE SECRET batch holds nothing else (and no comment - its "
+			                      "reader becomes a rule in stage 3g-2)");
 		}
 		parsed.push_back(ParseSecretsStatement(scanner));
 		scanner.Skip();

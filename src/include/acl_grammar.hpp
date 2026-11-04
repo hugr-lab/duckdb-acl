@@ -81,9 +81,10 @@ struct MgmtParsed {
 const char *MarkerWords(GrammarPrefix::MarkerKind kind);
 
 //! spec 150, stage 3g-1: one token of a statement's head as duckdb's tokenizer reads it (comments are gone): a bare
-//! word (lower-cased), a double-quoted name, a single-quoted string, or anything else
+//! word (lower-cased), a quoted name (`"…"` or a backtick one), a number written with a leading digit (`1x` is the
+//! tokenizer's number then word: a name to our rules), a single-quoted string, or anything else
 struct HeadToken {
-	enum class Kind : uint8_t { WORD, QUOTED_NAME, STRING, OTHER };
+	enum class Kind : uint8_t { WORD, QUOTED_NAME, NUMBER, STRING, OTHER };
 	Kind kind = Kind::OTHER;
 	string word;
 	bool IsWord(const char *keyword) const {

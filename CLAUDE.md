@@ -486,13 +486,14 @@ a space). 3c: the virtual catalog's objects - CREATE / ALTER / COMMENT ON / ANAL
 [VIRTUAL] REFERENCE, CHECK, REPAIR, the ADD forms - `AclPathToken` (a path judged whole into its canonical key),
 `AclPathName`, `AclList` (a list as written, each comment a space), `AclBody` (one plain quoted token its value, else
 its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT, ALTER GRANT (`WITH (…)` a
-list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant a point grant,
-`PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the transform, a list inside it a marker
-its reading replaces (`TextArg::splice`). 3f: function categories and grants, platform's point grants, sources,
-resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's registered forms. 3g-1: the batch's
-classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`; `SplitBatchText` gone). Then 3g-2 (SECRET,
-USE, ATTACH LINEAGE), 3g-3 (modules' rules, hugr-node), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
-`acl_prefix_completion.test`, `acl_mgmt_grammar.test`.
+list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant a point
+grant, `PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the
+transform, a list inside it a marker its reading replaces (`TextArg::splice`). 3f: function categories and grants,
+platform's point grants, sources, resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's
+registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`;
+`SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). Then 3g-2 (SECRET, USE, ATTACH
+LINEAGE), 3g-3 (modules' rules, hugr-node), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
+`acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`
@@ -734,8 +735,8 @@ include any point grant); `platform_grants(role, object, kind, allowed)` written
 (`GRANT|DENY|REVOKE VIEW|FUNCTION platform.x`, `acl_grant_platform` / `acl_revoke_platform`), never to
 '' nor on ESCALATES/INFRASTRUCTURE/OPEN; a deny wins over a bundle, not passthrough. `admins` keyed
 `(role, scope, vcat)` (v21, min_reader 21), spec 009's rows read as bundles, nothing rewritten. Under a
-principal prefix the grammar needs no marker (`StartsWithMgmt`, each statement's head on duckdb's tokens - spec 150 3g-1); a
-batch mixing management and queries is refused (`BatchHasMgmtStatement`); `NoteManagement` gives each
+principal prefix the grammar needs no marker (`StartsWithMgmt`, each statement's head on duckdb's tokens - spec
+150 3g-1); a batch mixing management and queries is refused (`BatchHasMgmtStatement`); `NoteManagement` gives each
 compiled call its text hash. Listings: `PlatformListingCtes` (pobjects/pcolumns) joined into
 `MetadataListingSql`, `PlatformFunctionRows` into duckdb_functions / acl_function_columns - absent on the
 quack door (`SessionDoorOf`). Flight: a management statement / call is a command (runs at GetFlightInfo),

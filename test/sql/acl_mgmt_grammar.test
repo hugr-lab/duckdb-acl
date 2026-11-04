@@ -2063,11 +2063,59 @@ statement ok
 ACL ADMIN CREATE /* a note */ ROLE headed; DENY -- the deny
 FUNCTION upper TO ROLE headed; ALTER /* x */ FUNCTION /* y */ CATEGORY base SET COMMENT 'base';
 
-query II
+query III
 SELECT (SELECT count(*) FROM aclcat.acl.roles WHERE role = 'headed'),
-       (SELECT count(*) FROM aclcat.acl.function_grants WHERE role = 'headed' AND name = 'upper' AND NOT allowed);
+       (SELECT count(*) FROM aclcat.acl.function_grants WHERE role = 'headed' AND name = 'upper' AND NOT allowed),
+       (SELECT comment FROM aclcat.acl.function_categories WHERE category = 'base');
 ----
-1	1
+1	1	base
+
+# ... in a later statement's head too: a query batch holding one is the mixed batch
+statement error
+ACL ROLE "headed" SELECT 1; KILL /* k */ SESSION 'x';
+----
+a batch mixing management statements and queries
+
+query I
+ACL ADMIN SET SESSION /* c */ 'nosuch' AUDIT LEVEL all;
+----
+false
+
+# a name the tokenizer reads as a number then a word (`1x`) is a name after FUNCTION CATEGORY
+statement ok
+ACL ADMIN CREATE FUNCTION CATEGORY 1x; DROP FUNCTION CATEGORY 1x;
+
+# duckdb's own forms that open like ours stay duckdb's: a macro named category, its DROP, a table named virtual
+statement ok
+ACL ADMIN CREATE OR REPLACE FUNCTION category(x) AS x + 1;
+
+query I
+SELECT category(1);
+----
+2
+
+statement ok
+ACL ADMIN DROP /* the macro */ FUNCTION category CASCADE;
+
+statement error
+SELECT category(1);
+----
+category
+
+statement ok
+CREATE TABLE virtual (a INTEGER);
+
+statement ok
+ACL ADMIN ANALYZE /* a note */ virtual;
+
+statement ok
+DROP TABLE virtual;
+
+# an E'...' string with a backslash escape is one token, as duckdb reads it (the text split ended it at `\'`)
+query I
+ACL ROLE "headed" SELECT E'a\';GRANT CATALOG granted TO ROLE headed' AS s;
+----
+a';GRANT CATALOG granted TO ROLE headed
 
 # a quoted name after ANALYZE VIRTUAL is ours (the scan read only a bare word there)
 statement ok
@@ -2088,6 +2136,11 @@ a batch mixing management statements and queries
 # a second prefix behind a comment is still a second prefix
 statement error
 ACL ADMIN DRAIN NODE; /* the next */ ACL ADMIN RESUME NODE;
+----
+one ACL prefix per batch
+
+statement error
+ACL ROLE "headed" ; ACL ADMIN DRAIN NODE;
 ----
 one ACL prefix per batch
 

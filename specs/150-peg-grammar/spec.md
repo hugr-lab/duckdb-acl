@@ -138,16 +138,16 @@ A moved family's text form stays only as a refusal in the form's own words ("wri
 not read as its rule falls to it, and only the rule accepts - never two readers. A form a rule began with more after
 it before its `;` (PEG keeps the rule that matched, so the statement fails there) goes the same way: its tokens up to
 the `;`, as text, to the compiler - the batch's other statements are not blamed. duckdb's grammar splits the batch (a
-`;` inside parentheses now ends a statement - none of ours holds one; `SplitBatchText` reads comments as the
-tokenizer does, a line comment ending at either line break, block comments nested); a text the tokenizer refuses is
+`;` inside parentheses now ends a statement - none of ours holds one; since 3g-1 the batch's classification reads the
+same tokens, `ReadStatementHeads`); a text the tokenizer refuses is
 read piece by piece - the pieces it reads by their rules, the refused one by the compiler in its own words (a moved
 form refused there says the tokenizer's: an unterminated string), and a batch no piece of which holds the refusal (an
 unterminated comment the split drops) is refused whole - never run without it. Values a rule reads are checked against their
 tokens - one plain quoted literal (an empty `''` passes, as it did: the function judges it; `""` is a zero-length
 identifier the tokenizer refuses), a level a bare word. hugr-node's registered forms
 (`RegisterMgmtGrammar`, spec 126) take the legacy path unchanged. The text checks that tell a management batch from
-native SQL (`IsMgmtStart`, `StartsWithMgmt`, `BatchHasMgmtStatement`, `SplitBatchText`, `RefuseRepeatedPrefix`) stay
-until the last PR of the stage, which judges the batch by its parse and drops `AdminScanner`.
+native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` and `SplitBatchText` gone); 3g-3 drops
+`AdminScanner`.
 
 - 3a (built): the grammar, the legacy path, and the operations of a node - `KILL SESSION '<id>'`,
   `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`, `PROFILE SESSION CURRENT|'<id>' ON|ALL|SAMPLED|OFF`, `DRAIN NODE`,
@@ -324,7 +324,17 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
     go. Changed: a comment between a form's first words is gone (`CREATE /* c */ ROLE`, `DENY -- …⏎FUNCTION` were
     sent to duckdb as native SQL), a quoted name after `ANALYZE VIRTUAL` is ours, a `;` ends a statement where
     duckdb ends one - inside parentheses too, and not inside a `$1$…$1$` duckdb does not read as a string (a
-    query batch with a management statement after such a `;` is the mixed batch refused).
+    query batch with a management statement after such a `;` is the mixed batch refused), an `E'…\'…'` string or a
+    backtick name holding a `'` no longer misleads the split (it refused such a query as mixed); the first statement
+    after the prefix is judged for a second `ACL` too (`ACL ROLE "r" ; ACL …`, `ACL ROLE "r" ACL ACL …`). Fixed by
+    the reviews: a digit-led name (`FUNCTION CATEGORY 1x`, the tokenizer's number then word) is a name;
+    `DROP FUNCTION category CASCADE | RESTRICT` is duckdb's DROP of a macro (the scan read it as ours, dropping the
+    category `cascade`); the Flight door's command detection (`ClientTextIsMgmt`) reads the client's text as the
+    override does - duckdb's normalized text (a Unicode space is a space), the `ACL` marker a token - so a
+    management statement the door missed (`REVOKE<NBSP>CATALOG …`, `ACL/* x */REVOKE …`) no longer ran only at DoGet, lost by
+    a client that never fetched (spec 111); a GRANT / REVOKE SECRET batch's statements are checked where its
+    scanner stands (the heads of the whole rest per statement made it quadratic) - a comment in it is refused
+    until 3g-2.
   - 3g-2: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE` as rules.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.

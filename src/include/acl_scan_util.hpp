@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
-// acl_scan_util.hpp — the text-scanning helpers the management grammar and the batch checks still
-// use until spec 150's stage 3 makes them rules (a word, whitespace, a quoted literal with the
-// doubled-quote escape); the override's one-word ACL gate too. Nothing here parses SQL.
+// acl_scan_util.hpp — the text-scanning helpers the management compiler (hugr-node's forms, GRANT /
+// REVOKE SECRET) still uses until spec 150's stage 3g makes them rules (a word, whitespace, a quoted
+// literal with the doubled-quote escape); the override's one-word ACL gate too. Nothing here parses SQL.
 //===----------------------------------------------------------------------===//
 #pragma once
 

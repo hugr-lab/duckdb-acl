@@ -199,7 +199,8 @@ before it does not know the bundles).
 - **spec 095** needed no change of its own: `RolesFor` / `ValidateIdentity` ask `RolePrivileged`, which
   now asks `AdminRights::Privileged()` - any bundle, any point grant (a deny too), a catalog's manage.
 - **The grammar** is decided on the batch's first statement past whitespace and comments
-  (`StartsWithMgmt` over `SplitBatchText`, which respects quotes, comments, `$tag$` and parentheses), and
+  (`StartsWithMgmt` over `SplitBatchText`, which respects quotes, comments, `$tag$` and parentheses - since spec 150
+  3g-1 over each statement's head on duckdb's tokens), and
   `ParseMgmtBatch` parses statement by statement on the same split - so a comment in front of a
   management statement is now allowed. The mixed-batch refusal applies to `ACL ADMIN` too (it used to be
   `unknown management statement`). `USE platform` is refused before the session check, so under any

@@ -359,11 +359,12 @@ SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'nested';
 ----
 0
 
-# a doubled marker is not a marker either: the management parser sees "ACL" as a statement keyword
+# a doubled marker is not a marker either: the rest starts with ACL, a second prefix (spec 150 3g-1 judges the first
+# statement too)
 statement error
 ACL ROLE "platform" ACL ACL NATIVE SELECT 1;
 ----
-<REGEX>:.*unknown management statement "ACL".*
+<REGEX>:.*one ACL prefix per batch.*
 
 # and a manage scope is stopped by the scope check before any of that matters
 statement error
