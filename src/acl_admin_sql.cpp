@@ -841,7 +841,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 } // namespace
 
 void RefuseRepeatedPrefix(const string &text) {
-	auto heads = BatchHeads(text);
+	RefuseRepeatedPrefix(BatchHeads(text));
+}
+
+void RefuseRepeatedPrefix(const vector<vector<HeadToken>> &heads) {
 	// the rest after the prefix (and its marker) never starts with ACL either: `ACL ROLE "r" ; ACL …`
 	for (idx_t i = 0; i < heads.size(); i++) {
 		if (!heads[i].empty() && heads[i][0].IsWord("acl")) {
@@ -853,7 +856,11 @@ void RefuseRepeatedPrefix(const string &text) {
 }
 
 bool BatchHasMgmtStatement(const string &text) {
-	for (auto &head : BatchHeads(text)) {
+	return BatchHasMgmtStatement(BatchHeads(text));
+}
+
+bool BatchHasMgmtStatement(const vector<vector<HeadToken>> &heads) {
+	for (auto &head : heads) {
 		if (IsMgmtHead(head)) {
 			return true;
 		}
@@ -1021,7 +1028,10 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 }
 
 bool StartsWithMgmt(const string &text) {
-	auto heads = BatchHeads(text);
+	return StartsWithMgmt(BatchHeads(text));
+}
+
+bool StartsWithMgmt(const vector<vector<HeadToken>> &heads) {
 	return !heads.empty() && IsMgmtHead(heads[0]);
 }
 
@@ -1089,7 +1099,10 @@ bool ClientTextIsMgmt(const string &query, string &rest) {
 //===--------------------------------------------------------------------===//
 
 bool IsSecretsStart(const string &text) {
-	auto heads = ReadStatementHeads(text, 2);
+	return IsSecretsStart(ReadStatementHeads(text, 2));
+}
+
+bool IsSecretsStart(const vector<vector<HeadToken>> &heads) {
 	if (heads.empty() || heads[0].size() < 2) {
 		return false; // never throws: it only decides which grammar the text is
 	}

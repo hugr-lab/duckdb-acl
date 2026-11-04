@@ -101,8 +101,9 @@ struct HeadToken {
 };
 //! A batch's statements, as duckdb's tokenizer ends them (`;` outside a literal or a comment), each by its first
 //! `count` tokens - what decides whose statement it is (the management grammar's or duckdb's). Never throws: a text
-//! that ends inside a comment or a string has the heads before it, and its own reader refuses it
-vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count);
+//! that ends inside a comment or a string has the heads before it, and its own reader refuses it; `open`, when given,
+//! says whether it does (a comment never becomes a token, so no head shows one)
+vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open = nullptr);
 
 //! The grammars the override compiles, one per set of the caller's grammar extensions
 class AclGrammarCache {

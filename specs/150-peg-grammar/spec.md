@@ -355,12 +355,17 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       in a batch of its own.
     - 3g-2b (built): `USE [SCHEMA]` (spec 114, `UseSchemaAsSet`) - sugar over duckdb's USE in a query batch (and the
       Flight door's command check), compiled to `SET acl_use_schema` / `SET schema` - is read on duckdb's tokens
-      (`ReadStatementHeads`; `HeadToken` carries each token's text and whether it is unterminated): one statement,
-      `USE`, `SCHEMA` unless a `.` follows it (`USE schema.x` is duckdb's USE of the catalog `schema`), then parts - a
-      word (a digit-led one: the tokenizer's number then word, written together) or a `"…"` as written - joined by
-      `.` with any space around it. The hand scanner goes. Changed: a comment anywhere between the tokens, as duckdb
-      reads it; a word holding `$` is a part (the scan stopped at it, leaving the text to duckdb); a text ending
-      inside a string or a name is left to duckdb, as before.
+      (`ReadStatementHeads`; `HeadToken` carries each token's text and whether it is unterminated, and the reader says
+      whether the text ends inside a comment): one statement, `USE`, `SCHEMA` unless a `.` follows it (`USE
+      schema.x` is duckdb's USE of the catalog `schema`), then parts - a word (a digit-led one: the tokenizer's
+      number then word, written together) or a `"…"` as written - joined by `.` with any space around it. A number
+      token holding a dot (`.2024`, `2024.`, `1.5` - the tokenizer reads a dot next to digits into a number) is split
+      at its dots, so a digit-led part stands anywhere in the path (`raw.2024`, `mart.out.2024`); a signed number
+      (`1e-5`) is no part. The hand scanner goes. `Prefixed` reads the batch's heads once (the classification's
+      checks take them, `UseSchemaAsSet` runs only for a batch that is one USE). Changed: a text ending inside a
+      comment is left to duckdb, which refuses it (the reader dropped the open comment, compiling what came before
+      it); `;;` after the USE, a word holding `$` and the comment forms duckdb reads otherwise than the scan (`--`
+      ended by `\r`, nested `/* */`) now read as duckdb reads them; a backtick name stays duckdb's.
     - 3g-2c: `ATTACH … LINEAGE '<x>'` (`acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.
