@@ -18,6 +18,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
+#include "duckdb/parser/peg/parsed_grammar.hpp"
 #include "duckdb/parser/peg/matcher.hpp"
 #include "duckdb/parser/peg/passthrough_dialect.hpp"
 #include "duckdb/parser/peg/special_string_utils.hpp"
@@ -3157,21 +3158,41 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 	if (forms.empty()) {
 		refuse("it reads at least one statement form");
 	}
+	for (auto &change : changes) {
+		for (auto &form : forms) {
+			if (change.Type() == GrammarChangeType::ADD_TERMINAL_RULE_OVERRIDE &&
+			    StringUtil::CIEquals(change.RuleName(), form.statement)) {
+				refuse("a form's rule is read by its rules, never by a matcher of its own");
+			}
+		}
+	}
 	case_insensitive_set_t verbs;
 	for (auto &form : forms) {
 		auto rule = added.find(form.statement);
 		if (rule == added.end()) {
 			refuse("a form's statement is one of the rules it adds (not \"" + form.statement + "\")");
 		}
-		// a form reads a statement headed by the keyword - never one of acl's, duckdb's or another module's
-		auto arrow = rule->second.find("<-");
-		auto body = arrow == string::npos ? string() : rule->second.substr(arrow + 2);
-		StringUtil::Trim(body);
-		auto head = "'" + keyword + "'";
-		if (body.size() < head.size() || !StringUtil::CIEquals(body.substr(0, head.size()), head) ||
-		    (body.size() > head.size() && !StringUtil::CharacterIsSpace(body[head.size()]))) {
-			refuse("a form's rule begins with its keyword (" + StringUtil::Upper(head) + " ...): \"" + form.statement +
-			       "\" does not");
+		// a form reads a statement headed by the keyword - never one of acl's, duckdb's or another module's: its rule,
+		// as duckdb parses it, is the keyword's literal first (a sequence's first part, or the literal alone)
+		bool headed = false;
+		try {
+			ParsedGrammar parsed;
+			parsed.AddRule(rule->second);
+			auto recipe = parsed.GetRule(form.statement);
+			if (recipe) {
+				auto &expression = recipe->recipe.expression;
+				auto &first = expression.type == PEGExpression::Type::SEQUENCE && !expression.children.empty()
+				                  ? expression.children[0]
+				                  : expression;
+				headed =
+				    first.type == PEGExpression::Type::LITERAL && StringUtil::CIEquals(first.text.GetString(), keyword);
+			}
+		} catch (std::exception &) {
+			headed = false;
+		}
+		if (!headed) {
+			refuse("a form's rule begins with its keyword ('" + StringUtil::Upper(keyword) + "' ...): \"" +
+			       form.statement + "\" does not");
 		}
 		for (auto &verb : form.verbs) {
 			verb = StringUtil::Lower(verb);
@@ -3191,25 +3212,22 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 		}
 		return true;
 	};
-	// judged under the lock, then again once compiled: a registration in between is never both
-	auto judge = [&]() {
+	// one registration at a time - judged, compiled and registered as one (the grammars read the registry under its
+	// own lock, which a registration takes only to read and to write)
+	static mutex registration;
+	lock_guard<mutex> one_at_a_time(registration);
+	{
+		lock_guard<mutex> guard(MgmtRulesLock());
 		for (auto &entry : MgmtRulesRegistry()) {
 			if (entry.keyword == keyword) {
 				if (same_forms(entry.forms)) {
-					return false; // the module's load again (another instance)
+					return; // the module's load again (another instance)
 				}
 				refuse("the keyword is registered already, with other forms");
 			}
 		}
 		if (MgmtGrammarCompiledFlag()) {
 			refuse("registered after the first management statement was read - a module registers at load");
-		}
-		return true;
-	};
-	{
-		lock_guard<mutex> guard(MgmtRulesLock());
-		if (!judge()) {
-			return;
 		}
 	}
 	MgmtRulesEntry entry {keyword, std::move(forms), std::move(changes), usage};
@@ -3223,9 +3241,10 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 		refuse("its rules do not compile into the management grammar: " + ErrorData(ex).RawMessage());
 	}
 	lock_guard<mutex> guard(MgmtRulesLock());
-	if (judge()) {
-		MgmtRulesRegistry().push_back(std::move(entry));
+	if (MgmtGrammarCompiledFlag()) {
+		refuse("registered after the first management statement was read - a module registers at load");
 	}
+	MgmtRulesRegistry().push_back(std::move(entry));
 }
 
 bool MgmtRulesKeyword(const string &word, string *usage, const string &verb) {
@@ -3442,7 +3461,8 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			}
 			// ... and only one: its rules never read past a `;` (a terminal override of its own could)
 			auto tail = cursor.Position();
-			while (tail > head && tokens.GetToken(tail - 1).type == TokenType::TERMINATOR) {
+			while (tail > head && (tokens.GetToken(tail - 1).type == TokenType::TERMINATOR ||
+			                       tokens.GetToken(tail - 1).type == TokenType::END_OF_INPUT)) {
 				tail--;
 			}
 			for (auto index = head; index < tail; index++) {

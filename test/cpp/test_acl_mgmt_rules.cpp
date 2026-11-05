@@ -11,6 +11,9 @@
 #include "acl_mgmt_rules.hpp"
 #include "duckdb/parser/peg/matcher.hpp"
 
+#include <atomic>
+#include <thread>
+
 using namespace duckdb;
 using namespace acl_test;
 
@@ -217,6 +220,21 @@ int main(int argc, char *argv[]) {
 		                                        acl::MgmtStart<FinalizeToyHijack>));
 		Check(Has(Refusal("toyhl", "AclToyhlStatement", std::move(hijack)), "begins with its keyword"),
 		      "a form headed by acl's words (KILL SESSION)");
+		// the head is judged on the rule as duckdb parses it, not on its text
+		for (auto &rule : vector<std::string> {"AclToyqStatement <- 'TOYQ' ? 'KILL' 'SESSION' AclWordToken",
+		                                       "AclToyqStatement <- 'TOYQ' * 'KILL' 'SESSION' AclWordToken",
+		                                       "AclToyqStatement <- 'TOYQ' AclQuotedValue / 'KILL' AclQuotedValue",
+		                                       "AclToyqStatement <- ('TOYQ' 'KILL') AclQuotedValue"}) {
+			Check(Has(Refusal("toyq", "AclToyqStatement", One(rule)), "begins with its keyword"), "refused: " + rule);
+		}
+		vector<GrammarChange> overridden;
+		overridden.push_back(
+		    GrammarChange::AddRule("AclToyoStatement <- 'TOYO' AclQuotedValue", acl::MgmtStart<FinalizeToyBad>));
+		overridden.push_back(GrammarChange::AddTerminalRuleOverride(
+		    "AclToyoStatement",
+		    [](const PEGKeywordHelper &) -> unique_ptr<Matcher> { return make_uniq<GreedyTokenMatcher>(); }));
+		Check(Has(Refusal("toyo", "AclToyoStatement", std::move(overridden)), "never by a matcher of its own"),
+		      "a matcher in place of a form's rule");
 		vector<GrammarChange> twice;
 		twice.push_back(
 		    GrammarChange::AddRule("AclToytStatement <- 'TOYT' AclQuotedValue", acl::MgmtStart<FinalizeToyBad>));
@@ -250,6 +268,24 @@ int main(int argc, char *argv[]) {
 
 	// at load, before the first statement is read: the management grammar is compiled then
 	RegisterToy();
+	Scenario("two databases loading the module at once both load it", [&] {
+		// twenty modules, each loaded by two threads at once (the race the reviews measured refused one in two)
+		std::atomic<int> refused {0};
+		for (char letter = 'a'; letter < 'a' + 20; letter++) {
+			auto keyword = std::string("toyw") + letter;
+			auto rule = "AclToyw" + std::string(1, letter) + "Statement";
+			auto load = [&]() {
+				auto why = Refusal(keyword, rule, One(rule + " <- '" + keyword + "' AclQuotedValue"));
+				if (!why.empty()) {
+					refused++;
+				}
+			};
+			std::thread first(load), second(load);
+			first.join();
+			second.join();
+		}
+		Check(refused == 0, "refused " + std::to_string(refused.load()) + " of 40 loads");
+	});
 	Check(Refusal("toybad", "AclToybadStatement", One("AclToybadStatement <- 'TOYBAD' AclQuotedValue")).empty(),
 	      "the module's load again is a no-op");
 	Check(Has(Refusal("toybad", "AclToybadOther", One("AclToybadOther <- 'TOYBAD' AclQuotedValue")),
@@ -339,6 +375,11 @@ int main(int argc, char *argv[]) {
 		Check(Has(semi, "reads past a ';'"), "a module's matcher that reads past a `;`: " + semi);
 		auto alone = Compiled(con, "ACL ADMIN TOYSEMI a b");
 		Check(Has(alone, "acl_session_kill('semi')"), "...while one statement reads: " + alone);
+		for (auto &text :
+		     vector<std::string> {"ACL ADMIN TOYSEMI a;", "ACL ADMIN TOYSEMI a;;", "ACL ADMIN TOYSEMI a; -- c"}) {
+			auto ended = Compiled(con, text);
+			Check(Has(ended, "acl_session_kill('semi')"), "the batch's last `;` is no statement after it: " + ended);
+		}
 	});
 
 	Scenario("the compiled call is judged by the one authorizer", [&] {
