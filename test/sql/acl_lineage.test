@@ -1171,6 +1171,187 @@ SELECT 'ATTACH x LINEAGE ''y''' -- LINEAGE 'z'
 ----
 ATTACH x LINEAGE 'y'
 
+# spec 150 3g-2c: read on duckdb's tokens - a $$...$$ string holding the marker's words and a `;` is one token, a
+# comment anywhere between the words is gone, and a text ending inside a block comment is the native parser's (refused)
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+query T
+SELECT $$a; ATTACH x LINEAGE 'y'$$ AS s; ATTACH ':memory:' AS m3 /* the mart */ LINEAGE -- its identity
+'postgres://m3:5432';
+----
+a; ATTACH x LINEAGE 'y'
+
+statement ok
+SELECT acl_lineage_flush();
+
+# the identity the batch declared, exactly - the comments around the marker are none of it
+query TT
+SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'NAMESPACE';
+----
+postgres://m3:5432	m3
+
+statement ok
+DETACH m3;
+
+statement error
+ATTACH ':memory:' AS m4 LINEAGE 'postgres://m4:5432' /* never closed
+----
+unterminated
+
+# a backtick name holding a `;` is one token (the splitter read an open name and refused the batch) ...
+query I
+SELECT 1 AS `a;b`; ATTACH ':memory:' AS m5 LINEAGE 'postgres://m5:5432';
+----
+1
+
+statement ok
+DETACH m5;
+
+# ... and a nested comment is one comment: the ATTACH inside it is none (the splitter ran it)
+query I
+SELECT 1 /* /* */; ATTACH ':memory:' AS m6 LINEAGE 'postgres://m6:5432'; -- */
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'm6';
+----
+0
+
+# the marker is the last two tokens: the word itself and one plain closed literal - once
+statement error
+ATTACH ':memory:' AS m7 LINEAGE 'postgres://a:5432' LINEAGE 'postgres://b:5432';
+----
+syntax error at or near "LINEAGE"
+
+statement error
+ATTACH ':memory:' AS m7 "LINEAGE" 'postgres://m7:5432';
+----
+syntax error
+
+statement error
+ATTACH ':memory:' AS m7 LINEAGE E'postgres://m7:5432';
+----
+syntax error at or near "LINEAGE"
+
+statement error
+ATTACH ':memory:' AS m7 LINEAGE $$postgres://m7:5432$$;
+----
+syntax error at or near "LINEAGE"
+
+statement error
+ATTACH ':memory:' AS m7 LINEAGE 'postgres://m7:5432
+----
+unterminated
+
+statement ok
+ATTACH ':memory:' AS lineage LINEAGE 'postgres://lineage:5432';
+
+statement ok
+DETACH lineage;
+
+# an identity is judged before the ATTACH runs: refused, nothing is attached (the call used to refuse it after)
+statement error
+ATTACH ':memory:' AS m8 LINEAGE 'postgres://u:p@m8';
+----
+never a credential
+
+statement error
+ATTACH ':memory:' AS m8 LINEAGE 'm8.corp';
+----
+<scheme>://
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('m7', 'm8');
+----
+0
+
+# a statement parsed on its own is refused where it is in the batch, and nothing of the batch runs
+statement error
+ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432';
+SELECT * FROM (;
+----
+LINE 2: SELECT * FROM (
+
+# ... and so does a client reading errors as JSON: the position and the range both count in the batch
+statement ok
+SET errors_as_json = true;
+
+statement error
+ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432'; SELECT * FROM (;
+----
+<REGEX>:.*"position":"68".*
+
+statement error
+ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432'; SELECT * FROM (;
+----
+<REGEX>:.*"location":"\[68,1\]".*
+
+statement ok
+RESET errors_as_json;
+
+statement error
+ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432'; SELECT $$never closed
+----
+syntax error at or near "$$never closed"
+
+# ... as is a refused identity in a later statement: the ATTACH before it never runs
+statement error
+ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432'; ATTACH ':memory:' AS m10 LINEAGE 'm10.corp';
+----
+<scheme>://
+
+# a literal is closed only by its own quote: `''` is a quote inside it (the splitter took this one as closed)
+statement error
+ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432/d''
+----
+unterminated
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('m9', 'm10');
+----
+0
+
+# a $tag$...$tag$ string is one token too
+query T
+SELECT $t$a; ATTACH x LINEAGE 'y'$t$ AS s;
+----
+a; ATTACH x LINEAGE 'y'
+
+# the identity is read trimmed: the ATTACH's own NAMESPACE event is named by what the call declares
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ATTACH ':memory:' AS m11 LINEAGE '  postgres://m11:5432 ';
+
+statement ok
+DETACH m11;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'lifecycle'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'NAMESPACE' ORDER BY seq;
+----
+postgres://m11:5432	CREATE
+postgres://m11:5432	DROP
+
 # under ACL NATIVE (passthrough) the same sugar
 statement ok
 ACL ADMIN ACL NATIVE ATTACH ':memory:' AS m2 LINEAGE 'postgres://m2:5432';
@@ -1182,6 +1363,23 @@ postgres://m2:5432/other
 
 statement ok
 DETACH m2;
+
+# ... judged the same before it runs, and its errors drawn where they are in what follows the marker
+statement error
+ACL ADMIN ACL NATIVE ATTACH ':memory:' AS m12 LINEAGE 'postgres://u:p@m12';
+----
+never a credential
+
+statement error
+ACL ADMIN ACL NATIVE ATTACH ':memory:' AS m12 LINEAGE 'postgres://m12:5432';
+SELECT * FROM (;
+----
+LINE 2: SELECT * FROM (
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'm12';
+----
+0
 
 # a principal neither declares an identity nor reads the status: acl_* is the never set
 statement error

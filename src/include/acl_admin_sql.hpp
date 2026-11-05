@@ -13,6 +13,7 @@
 #include "acl_grammar.hpp"
 #include "acl_policy.hpp"
 
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/parser_options.hpp"
 
 namespace duckdb {
@@ -20,6 +21,10 @@ class SQLStatement;
 
 namespace acl {
 class AclGrammarCache;
+
+//! `SELECT <function>(<args>)` - what every management form compiles to (the authorizer judges the call), and the
+//! call ATTACH … LINEAGE adds (spec 112 §9)
+unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Value> &args);
 
 //! Compile a management batch (statements separated by `;`) into admin-function calls. Parse-time
 //! only: nothing is written until the statements execute. A statement that does not read is refused (a

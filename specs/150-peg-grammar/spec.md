@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1, 3g-2a and 3g-2b built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1 and 3g-2 built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -366,7 +366,33 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       comment is left to duckdb, which refuses it (the reader dropped the open comment, compiling what came before
       it); `;;` after the USE, a word holding `$` and the comment forms duckdb reads otherwise than the scan (`--`
       ended by `\r`, nested `/* */`) now read as duckdb reads them; a backtick name stays duckdb's.
-    - 3g-2c: `ATTACH … LINEAGE '<x>'` (`acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH.
+    - 3g-2c (built): `ATTACH … LINEAGE '<x>'` (spec 112 §9, `acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH,
+      compiled to the native ATTACH and `acl_lineage_source(alias, x)` - is read on duckdb's tokens: the batch's
+      statements as the tokenizer ends them (`ReadStatementHeads(text, 1, &open, 2)` - each by its first token and
+      its last two, a token's `index` its place), the marker an ATTACH's last two tokens - the word `LINEAGE` and one
+      plain closed `'…'` literal - and each statement's text its first token to its last; the runtime's
+      `AttachLineageIdentity` reads the same way. The hand splitter goes (`MayCarryAttachLineage`, a substring test,
+      stays the fast path). Changed, each now as duckdb reads it: a `$$…$$` / `$tag$…$tag$` string and a backtick
+      name are one token (a `;` or the marker's words inside them split or marked the batch); a `--` comment ends at
+      `\r` (the splitter ran on to `\n`, dropping a statement or missing a marker); a nested `/* /* */ */` is one
+      comment (the splitter ran an ATTACH inside it); words the tokenizer joins (a control or non-ASCII byte beside
+      `LINEAGE`) are one; an unterminated `'…''` is no identity (the splitter took it as closed); a text ending inside
+      a block comment is the native parser's, which refuses it, and one ending inside a literal or a name is split as
+      read, its own parse refusing it - nothing of the batch runs either way (the splitter ran what came before an
+      open comment). A statement's text no longer carries the comments around it (a view's SQL is re-rendered, a
+      note's hash is its own `query`). Review fixes: the identity, read trimmed once (the parse,
+      the call and the hook read one value), is judged at parse as `acl_lineage_source` judges it
+      (`LineageIdentityRefusal`, one judgment for both), so a refused one attaches nothing (the ATTACH used to run
+      first); the call is built as an AST (`MakeAdminCall`, declared in acl_admin_sql.hpp), never SQL text; a statement
+      parsed on its own reports its error where it is in the batch (`ParseSegment`: `position` and `location`; under
+      `ACL NATIVE` drawn against the rest); and under a dialect or CONNECT the sugar is off (the connection owner's
+      grammar reads the text by its own tokenizer - as a prefix there is refused, nothing of ours is added to it).
+      Known: a native `ATTACH DATABASE lineage '<path>'` (a typed literal of a user type `lineage`) reads as the
+      marker, as it did; a grammar extension's rule that reads a `;` splits otherwise than the statements here
+      (refused, nothing runs - the connection owner's grammar on an operator's path); the runtime's hook reads an
+      ATTACH's text on the default tokens whatever the connection's grammar (judged where the plan is made, a dialect
+      set earlier in the batch would drop what the parse declared), so a dialect's own ATTACH whose text reads so
+      there names its NAMESPACE event by that literal - lineage naming only.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the

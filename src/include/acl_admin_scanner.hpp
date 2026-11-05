@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "acl_admin_sql.hpp" // MakeAdminCall, for the forms a module registers
 #include "acl_name_path.hpp"
 #include "acl_scan_util.hpp"
 
@@ -248,9 +249,6 @@ struct AdminScanner {
 
 //! Strip one layer of quotes from a list element written as a literal
 string Unquoted(string value);
-
-//! `SELECT <function>(<args>)` - what every management form compiles to (the authorizer judges the call)
-unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Value> &args);
 
 //! spec 126: a management form a linked module adds - `keyword …` after the prefix (or `ACL ADMIN`) is
 //! management, and `parse` compiles it (the scanner stands after the keyword). Registered at load, before the
