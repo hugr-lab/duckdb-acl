@@ -2185,3 +2185,21 @@ statement error
 ACL ADMIN ACL DROP TABLE t;
 ----
 <REGEX>:.*DROP TABLE is no management statement.*
+
+# duckdb's own CREATE FUNCTION (a macro) is no FUNCTION CATEGORY; a quoted noun is no word
+statement error
+ACL ADMIN ACL CREATE FUNCTION f(x) AS x;
+----
+<REGEX>:.*CREATE FUNCTION is no management statement.*
+
+statement error
+ACL ADMIN ACL DROP "t";
+----
+<REGEX>:.*unknown management statement "drop".*
+
+# a batch is refused at its first statement no rule reads - a later statement's own refusal is never reached
+statement error
+ACL ADMIN GRANT SOURCE; KILL SESSION E'x';
+----
+<REGEX>:.*write GRANT SOURCE <database>\[\.<schema>\] TO ROLE <role>.*
+

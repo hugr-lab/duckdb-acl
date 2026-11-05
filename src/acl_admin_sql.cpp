@@ -635,6 +635,15 @@ string ResourceLimitsJson(const string &inside) {
 	                      "service one name - a dotted one quoted: IN \"a.b\")");
 }
 
+//! A CREATE / ALTER / DROP after the `ACL` marker that is no management statement: said so, naming what it is
+[[noreturn]] void RefuseNotManagement(const string &verb, const string &noun) {
+	if (noun.empty()) {
+		throw BinderException("acl admin: unknown management statement \"%s\"", verb);
+	}
+	throw BinderException("acl admin: %s %s is no management statement", StringUtil::Upper(verb),
+	                      StringUtil::Upper(noun));
+}
+
 //! spec 150 3g-3c: a management statement no rule reads - refused in its form's own words, chosen by its head on
 //! duckdb's tokens (every form is a rule: nothing is compiled from text any more)
 [[noreturn]] void RefuseUnreadStatement(const string &text) {
@@ -695,6 +704,9 @@ string ResourceLimitsJson(const string &inside) {
 			    "[COMMENT '<text>']");
 		}
 		if (noun == "function") {
+			if (head.Word(at + 1) != "category") {
+				RefuseNotManagement("create", noun); // duckdb's CREATE FUNCTION is a macro
+			}
 			RefuseMovedForm("write CREATE [OR REPLACE] FUNCTION CATEGORY <category> [COMMENT '<text>']");
 		}
 		// spec 150, stage 3e: CREATE ISSUER | CLIENT are rules - one that reaches here did not read as its rule
@@ -703,7 +715,7 @@ string ResourceLimitsJson(const string &inside) {
 			                "<secret> [IN <service>]] [<client clause> ...]");
 		}
 		if (noun != "issuer") {
-			throw BinderException("acl admin: CREATE %s is no management statement", StringUtil::Upper(noun));
+			RefuseNotManagement("create", noun);
 		}
 		RefuseMovedForm("write CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <issuer> | '<url>' [URL '<url>'] [FROM "
 		                "SECRET <secret> [IN <service>]] [CLIENT FROM SECRET <secret> [IN <service>]] [<client clause> "
@@ -757,6 +769,9 @@ string ResourceLimitsJson(const string &inside) {
 	}
 	if (StringUtil::CIEquals(keyword, "alter")) {
 		auto noun = head.Word(1);
+		if (noun == "function" && head.Word(2) != "category") {
+			RefuseNotManagement("alter", noun);
+		}
 		if (noun == "function") {
 			RefuseMovedForm(
 			    "write ALTER FUNCTION CATEGORY <category> ADD | DROP (<function> [TABLE | SCALAR], ...) | SET COMMENT "
@@ -785,7 +800,7 @@ string ResourceLimitsJson(const string &inside) {
 		}
 		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
 		if (noun != "virtual") {
-			throw BinderException("acl admin: ALTER %s is no management statement", StringUtil::Upper(noun));
+			RefuseNotManagement("alter", noun);
 		}
 		RefuseObjectChange(head, 2, "alter");
 	}
@@ -805,6 +820,9 @@ string ResourceLimitsJson(const string &inside) {
 			RefuseMovedForm("write DROP RESOURCE GROUP [IF EXISTS] <group>");
 		}
 		if (noun == "function") {
+			if (head.Word(2) != "category") {
+				RefuseNotManagement("drop", noun);
+			}
 			RefuseMovedForm("write DROP FUNCTION CATEGORY [IF EXISTS] <category>");
 		}
 		if (noun == "reference") {
@@ -820,7 +838,7 @@ string ResourceLimitsJson(const string &inside) {
 			RefuseMovedForm("write DROP MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
 		}
 		if (noun != "virtual") {
-			throw BinderException("acl admin: DROP %s is no management statement", StringUtil::Upper(noun));
+			RefuseNotManagement("drop", noun);
 		}
 		RefuseObjectChange(head, 2, "drop");
 	}
@@ -1128,7 +1146,7 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 	vector<SecretsStatement> parsed;
 	for (auto &entry : grammar.ReadManagement(text, options)) {
 		if (entry.unread && IsSecretsStart(entry.text)) {
-			// a GRANT / REVOKE SECRET its rule did not read, in that form's own words - the compiler never runs here
+			// a GRANT / REVOKE SECRET its rule did not read, in that form's own words - nothing is compiled from text
 			RefuseSecretsForm(ReadStatementHeads(entry.text, 1)[0][0].IsWord("grant"));
 		}
 		if (!entry.secrets) {

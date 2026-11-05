@@ -26,7 +26,8 @@ there - no re-entry, no mode laundering" (spec 009).
 `LINEAGE …`) and the client's `ACL` / `ACL NATIVE` - is read by a rule of DuckDB's own PEG parser, with DuckDB's
 tokenizer: no hand scanner reads the prefix, so there is no second reading of where it ends. The management statements
 are rules too, and so are a linked module's (hugr-node's `CLUSTER`), on the same tokens; a statement no rule reads is
-refused, never read by hand. The rest of the statement is then parsed as its own text the way its mode parses it - a
+refused, never read by hand (the lists inside a statement - REQUIRE, ATTRIBUTES, a column list, limits - are still split
+by a scanner of ours until they become rules too). The rest of the statement is then parsed as its own text the way its mode parses it - a
 query by DuckDB's parser with the connection's grammar extensions, `ACL NATIVE` as DuckDB's own SQL, management by
 the management rules. Each value in the head is
 one quoted literal written plainly (`'…'` or `"…"`, never empty): a string the tokenizer would join across a line break
