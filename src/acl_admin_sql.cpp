@@ -239,7 +239,17 @@ MgmtGrammar FindMgmtGrammar(const string &keyword) {
 
 } // namespace
 
+bool MgmtGrammarRegistered(const string &keyword) {
+	return FindMgmtGrammar(keyword) != nullptr;
+}
+
 void RegisterMgmtGrammar(const char *keyword, MgmtGrammar parse) {
+	if (MgmtRulesKeyword(keyword)) {
+		// spec 150 3g-3: one reader for a keyword's statements - its rules
+		throw InvalidInputException("acl: RegisterMgmtGrammar(\"%s\"): the keyword is read by its rules "
+		                            "(RegisterMgmtRules)",
+		                            keyword);
+	}
 	lock_guard<mutex> guard(MgmtGrammarLock());
 	for (auto &entry : MgmtGrammars()) {
 		if (StringUtil::CIEquals(entry.keyword, keyword)) {
@@ -670,13 +680,13 @@ string ResourceLimitsJson(const string &inside) {
 
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
-	if (auto parse = FindMgmtGrammar(keyword)) {
-		return parse(s); // spec 126: a linked module's form
-	}
 	string usage;
-	if (MgmtRulesKeyword(keyword, &usage)) {
+	if (MgmtRulesKeyword(keyword, &usage, s.PeekWord())) {
 		// spec 150 3g-3: a linked module's statement its rules did not read - said in the module's words
 		RefuseMovedForm(usage);
+	}
+	if (auto parse = FindMgmtGrammar(keyword)) {
+		return parse(s); // spec 126: a linked module's form
 	}
 	// spec 150, stage 3: the operations of a node are rules (acl_mgmt_grammar.cpp); one that reaches here did not
 	// read as its rule - said in the form's own words

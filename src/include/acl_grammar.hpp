@@ -108,8 +108,10 @@ struct HeadToken {
 //! comment never becomes a token, so no head shows one)
 vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open = nullptr, idx_t tail = 0);
 //! spec 150 3g-3: whether `word` heads a linked module's statements (RegisterMgmtRules, acl_mgmt_rules.hpp), and how
-//! the module says what they are when its rules do not read one
-bool MgmtRulesKeyword(const string &word, string *usage = nullptr);
+//! the module says what a statement with that `verb` (the word after it) is when its rules do not read one
+bool MgmtRulesKeyword(const string &word, string *usage = nullptr, const string &verb = string());
+//! Whether `keyword` is registered through the older seam (RegisterMgmtGrammar, acl_admin_scanner.hpp)
+bool MgmtGrammarRegistered(const string &keyword);
 
 //! The grammars the override compiles, one per set of the caller's grammar extensions
 class AclGrammarCache {

@@ -276,6 +276,7 @@ shared_ptr<GrammarExtension> AclGrammarCache::Extension() const {
 shared_ptr<CompiledGrammar> AclGrammarCache::ManagementGrammar() {
 	std::lock_guard<std::mutex> guard(impl->lock);
 	if (!impl->management_compiled) {
+		NoteMgmtGrammarCompiled();
 		vector<reference<GrammarExtension>> extensions {*impl->management};
 		impl->management_compiled = CompiledGrammar::Create(extensions);
 	}
