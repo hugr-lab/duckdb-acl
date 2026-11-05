@@ -143,7 +143,8 @@ shared_ptr<GrammarExtension> MakeMgmtGrammar();
 vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text,
                                       const ParserOptions &options);
 vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text);
-string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text);
+//! Why a list reader of ours (its scanner) cannot read `text` - one quoted list - as written, '' when it can
+string JudgeListText(shared_ptr<CompiledGrammar> compiled, const string &text);
 //! An instance compiles its management grammar: a module registering after this is refused (spec 150 3g-3)
 void NoteMgmtGrammarCompiled();
 

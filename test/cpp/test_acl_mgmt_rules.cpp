@@ -6,7 +6,6 @@
 
 #include "acl_test_util.hpp"
 
-#include "acl_admin_scanner.hpp"
 #include "acl_admin_sql.hpp"
 #include "acl_mgmt_rules.hpp"
 #include "duckdb/parser/peg/matcher.hpp"
@@ -82,10 +81,6 @@ arena_ptr<TransformResultValue> FinalizeToyHijack(PEGTransformer &transformer, P
 	MgmtCall call(transformer, "acl_session_kill");
 	call.Arg(Value(MgmtCall::Word(parse_result.Cast<ListParseResult>().GetChild(2))));
 	return call.Result();
-}
-
-unique_ptr<SQLStatement> OldSeam(acl::AdminScanner &) {
-	return nullptr;
 }
 
 //! A module's matcher that takes any token - a `;` too (duckdb's own passthrough stops there)
@@ -260,10 +255,6 @@ int main(int argc, char *argv[]) {
 		      "a rule outside the module's names (acl's own AclName)");
 		auto undefined = Refusal("toyu", "AclToyuStatement", One("AclToyuStatement <- 'TOYU' AclNoSuchRule"));
 		Check(Has(undefined, "do not compile"), "a rule that names no rule: " + undefined);
-		acl::RegisterMgmtGrammar("toyold", OldSeam);
-		Check(Has(Refusal("toyold", "AclToyoldStatement", One("AclToyoldStatement <- 'TOYOLD' AclQuotedValue")),
-		          "older seam"),
-		      "a keyword registered through the older seam");
 	});
 
 	// at load, before the first statement is read: the management grammar is compiled then
@@ -291,12 +282,6 @@ int main(int argc, char *argv[]) {
 	Check(Has(Refusal("toybad", "AclToybadOther", One("AclToybadOther <- 'TOYBAD' AclQuotedValue")),
 	          "registered already, with other forms"),
 	      "the keyword again with other forms");
-	try {
-		acl::RegisterMgmtGrammar("toykill", OldSeam);
-		Check(false, "the older seam for a keyword its rules read");
-	} catch (std::exception &ex) {
-		Check(Has(ErrorData(ex).Message(), "read by its rules"), "the older seam for a keyword its rules read");
-	}
 
 	DBConfig config;
 	DuckDB db(nullptr, &config);

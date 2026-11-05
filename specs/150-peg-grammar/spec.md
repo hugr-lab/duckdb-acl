@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1, 3g-2 and 3g-3a built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stages 1-3 implemented (stage 3: 3a-3g), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -417,11 +417,16 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       helper rules around an optional or a repetition (CLUSTER's shared `IN GROUP`). Test
       `test_acl_mgmt_rules.cpp` (a toy module: its forms, readers, refusals, the authorizer, Flight's command
       detection, a second instance).
-    - 3g-3b: hugr-node re-pins and writes its CLUSTER forms as rules (an option list and DEPENDS ON read by rules,
-      not split as text).
-    - 3g-3c: `RegisterMgmtGrammar`, `AdminScanner`, the compiler and `AclMgmtLegacy` go - a moved form's refusal in
-      its own words kept - and hugr-node re-pins again. Until then the old seam serves a keyword only while no rules
-      do (one reader per keyword).
+    - 3g-3b (built, hugr-node spec 020, hugr-node #21): hugr-node re-pins and writes its CLUSTER forms as rules (an
+      option list and DEPENDS ON read by rules, not split as text).
+    - 3g-3c (built): every management statement is a rule - the compiler (`CompileMgmtText`, `ParseMgmtStatement` on
+      `AdminScanner`), the legacy alternative (`AclMgmtLegacy`) and the old seam (`RegisterMgmtGrammar`) go. A
+      statement no rule reads (the batch reader's ParserException, statement by statement) is refused in its form's own
+      words by `RefuseUnreadStatement`, chosen by its head on duckdb's tokens (`HeadWords` over `ReadStatementHeads`)
+      as the compiler chose them - a module's by its usage, a tokenizer refusal still first. `AdminScanner` stays as
+      the readers of a statement's lists (REQUIRE / ATTRIBUTES, a column list, a claim map, limits - handed their text
+      by the rules): they become rules with stage 4, as do their checks (`JudgeListText`, `ScannerUnreadable`, once
+      `JudgeLegacyText`). The suite's refusals are unchanged (11650 assertions); hugr-node re-pins onto it next.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
   rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 

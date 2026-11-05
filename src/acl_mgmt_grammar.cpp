@@ -46,11 +46,8 @@ struct QuotedValue {
 	string what;
 };
 
-//! What a management rule yields: the call it compiles to, or - a statement no rule reads yet - its span
+//! What a management rule yields: the call it compiles to
 struct MgmtParseData : ParserExtensionParseData {
-	bool legacy = false;
-	idx_t start = 0;
-	idx_t end = 0;
 	string function;
 	vector<Value> args;
 	//! the call is a table function, read in FROM (CHECK VIRTUAL CATALOG)
@@ -90,7 +87,7 @@ struct MgmtParseData : ParserExtensionParseData {
 		return make_uniq<MgmtParseData>(*this);
 	}
 	string ToString() const override {
-		return legacy ? "acl management statement" : function;
+		return function;
 	}
 };
 
@@ -2140,16 +2137,6 @@ arena_ptr<TransformResultValue> FinalizeSecretGrant(PEGTransformer &transformer,
 	return MgmtResult(transformer, std::move(data));
 }
 
-// --- a statement no rule reads yet ------------------------------------------------------------------------------
-
-// AclMgmtLegacy <- AclTailToken+ : its span, for the management compiler
-arena_ptr<TransformResultValue> FinalizeLegacy(PEGTransformer &transformer, ParseResult &parse_result) {
-	auto data = make_uniq<MgmtParseData>();
-	data->legacy = true;
-	RepeatSpan(parse_result.Cast<ListParseResult>().GetChild(0), data->start, data->end, "a management statement");
-	return MgmtResult(transformer, std::move(data));
-}
-
 // --- a linked module's statements (spec 150 3g-3: RegisterMgmtRules) ------------------------------------------------
 
 struct MgmtRulesEntry {
@@ -2653,7 +2640,6 @@ public:
 		    GrammarChange::AddTerminalRuleOverride("AclTailToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
 			    return make_uniq<PassthroughTokenMatcher>();
 		    }));
-		changes.push_back(GrammarChange::AddRule("AclMgmtLegacy <- AclTailToken+", Start<FinalizeLegacy>));
 		// a linked module's statements, read like ours (their shared rules are the ones above)
 		string modules;
 		{
@@ -2685,8 +2671,8 @@ public:
 		    "AclRevokeFunctionCategory / AclRevokeFunction / AclDenyView / AclCreateFunctionCategory / "
 		    "AclAlterFunctionCategory / AclDropFunctionCategory / AclGrantSource / AclRevokeSource / "
 		    "AclCreateResourceGroup / AclAlterResourceGroup / AclDropResourceGroup / AclGrantResourceGroup / "
-		    "AclRevokeResourceGroup / AclGrantSecret / AclRevokeSecret / " +
-		    modules + "AclMgmtLegacy"));
+		    "AclRevokeResourceGroup / AclGrantSecret / AclRevokeSecret" +
+		    (modules.empty() ? string() : " / " + modules.substr(0, modules.size() - 3))));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
@@ -2830,11 +2816,11 @@ string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t sta
 	    });
 }
 
-//! Why the management compiler cannot read the tokens in [start, end) as written, '' when it can: its scanner knows
+//! Why a list reader of ours cannot read the tokens in [start, end) as written, '' when it can: its scanner knows
 //! `'…'` and `"…"` and whitespace only, so a comment, a `$$…$$` string, an `E'…'` string with a backslash or a
 //! backtick name would be read as something else than duckdb reads (`WITH (select, /*, manage, */ insert)` granted
-//! manage) - refused until its family is a rule
-string LegacyUnreadable(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
+//! manage) - refused (stage 4 makes the lists rules)
+string ScannerUnreadable(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
 	optional_idx previous_end;
 	for (idx_t index = grammar::FirstTokenFrom(tokens, start); index < tokens.Size(); index++) {
 		auto &token = tokens.GetToken(index);
@@ -3062,7 +3048,7 @@ vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const s
 	return statements;
 }
 
-string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text) {
+string JudgeListText(shared_ptr<CompiledGrammar> compiled, const string &text) {
 	vector<MatcherToken> owned;
 	SplitTokenizerBehavior behavior(text, owned);
 	compiled->GetTokenizer().TokenizeInput(behavior);
@@ -3072,7 +3058,7 @@ string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text)
 			return "a `;`"; // the judgment would stop there, the reader not
 		}
 	}
-	auto why = LegacyUnreadable(text, tokens, 0, text.size());
+	auto why = ScannerUnreadable(text, tokens, 0, text.size());
 	if (!why.empty()) {
 		return why;
 	}
@@ -3131,10 +3117,6 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 	}
 	if (ReservedMgmtKeyword(keyword)) {
 		refuse("the keyword heads acl's or duckdb's own statements - a module's are its own");
-	}
-	if (MgmtGrammarRegistered(keyword)) {
-		refuse(
-		    "the keyword is registered through the older seam (RegisterMgmtGrammar) - one reader for its statements");
 	}
 	// only rules of its own, in its own names: acl's and duckdb's rules stay as they are
 	auto prefix = "Acl" + string(1, StringUtil::CharacterToUpper(keyword[0])) + keyword.substr(1);
@@ -3432,8 +3414,6 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			parsed.legacy = true;
 			parsed.text =
 			    text.substr(tokens.GetToken(start).offset, last.offset + last.length - tokens.GetToken(start).offset);
-			parsed.unreadable =
-			    LegacyUnreadable(text, tokens, tokens.GetToken(start).offset, last.offset + last.length);
 			result.push_back(std::move(parsed));
 			cursor.SetPosition(end);
 			while (cursor.Current() && cursor.Current()->type == TokenType::TERMINATOR) {
@@ -3488,11 +3468,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			}
 		}
 		MgmtParsed parsed;
-		parsed.legacy = data.legacy;
-		if (data.legacy) {
-			parsed.text = text.substr(data.start, data.end - data.start);
-			parsed.unreadable = LegacyUnreadable(text, tokens, data.start, data.end);
-		} else {
+		{
 			parsed.function = data.function;
 			parsed.args = data.args;
 			parsed.table_call = data.table_call;
@@ -3504,7 +3480,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 					value = span.text;
 					if (span.judge) {
 						// a quoted list is split by a reader of ours, which knows no comment
-						auto why = JudgeLegacyText(compiled, value);
+						auto why = JudgeListText(compiled, value);
 						if (!why.empty()) {
 							throw BinderException("acl admin: %s in a quoted %s - its reader would read it otherwise "
 							                      "than written; write the list in parentheses",

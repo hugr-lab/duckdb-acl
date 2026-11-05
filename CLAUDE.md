@@ -473,11 +473,11 @@ scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, 
 rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
 `Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
 grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
-the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f, 3g-1, 3g-2, 3g-3a built):
+the word ACL is never tokenized. Stage 3 moved the management statements one family per PR (3a-3g, all built):
 the batch is read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered)
-- a moved family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`, `MakeAdminTableCall` for CHECK's
-`table_call`), anything else passes through as tokens (`AclMgmtLegacy`) to the compiler as its own text
-(`CompileMgmtText`); a moved family's text form stays only as a refusal in its own words. 3a: KILL SESSION, SET
+- each family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`, `MakeAdminTableCall` for CHECK's
+`table_call`); a statement no rule reads is refused in its form's own words (`RefuseUnreadStatement`, by its head on
+duckdb's tokens - since 3g-3c nothing is compiled from text). 3a: KILL SESSION, SET
 SESSION … AUDIT LEVEL, PROFILE SESSION, DRAIN / RESUME NODE, MIGRATE POLICY CATALOG. 3b: CREATE / ALTER / DROP ROLE,
 GRANT / REVOKE ADMIN, [DROP] MAP, SET / RESET SESSION VIEW AS - the compiler's values on duckdb's tokens
 (`AclTokenMatcher`: a word - the run of tokens the tokenizer split at a leading digit -, a quoted name, a dotted name
@@ -495,8 +495,9 @@ registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStat
 rules (`MgmtParsed::secrets`). 3g-2b: `USE [SCHEMA]` on duckdb's tokens. 3g-2c: `ATTACH … LINEAGE` on duckdb's
 tokens (the identity judged at parse, the sugar off under a dialect). 3g-3a: a module's statements as rules
 (`RegisterMgmtRules` / `MgmtCall`, `acl_mgmt_rules.hpp` - public, hugr-node includes it; forms with their usage, rules
-named `Acl<Keyword>…`, a registration that would touch acl's statements refused at load). Then 3g-3b (hugr-node's
-CLUSTER forms as rules), 3g-3c (the old seam, `AdminScanner` and the compiler go), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
+named `Acl<Keyword>…`, a registration that would touch acl's statements refused at load). 3g-3b: hugr-node's CLUSTER
+forms as rules (its spec 020). 3g-3c: the old seam (`RegisterMgmtGrammar`), the compiler and `AclMgmtLegacy` go;
+`AdminScanner` reads only a statement's lists until stage 4. Then spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`, `test_acl_mgmt_rules.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
@@ -899,8 +900,8 @@ and writes nothing. One plan with the write (`PlanObjectGrant`, `CatalogCheckObj
 says `deployment` and `scopes` (`GrantableAdminScopes()`), and a standalone node does not offer `drift` or the
 profile's writes. The plugin reads both instead of guessing.
 **Spec 126 — the split's seams**: the platform part (`acl_cluster.cpp`) plugs in through registration points -
-`RegisterPlatformView/Function` (a view's `body`, a function's argument `rule`), `RegisterMgmtGrammar` (the scanner
-is `acl_admin_scanner.hpp`), `RegisterAdminScope(CLUSTER)`, and `PolicyStore::NodeTraits` (deployment, node group,
+`RegisterPlatformView/Function` (a view's `body`, a function's argument `rule`), `RegisterMgmtRules` (since spec 150
+3g-3, `acl_mgmt_rules.hpp`; `RegisterMgmtGrammar` on the scanner until then), `RegisterAdminScope(CLUSTER)`, and `PolicyStore::NodeTraits` (deployment, node group,
 group known, profile version). **Spec 127** moved it, with its history and tests, to `hugr-lab/hugr-node`: that
 repository builds this acl in (`acl_sources.cmake`, `LoadAclCore`, `ACL_EMBEDDED`) as one extension, `hugr_node`, and
 registers its part; this repository is the open node (tag `pre-platform-split` = the last state with the part in).

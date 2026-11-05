@@ -45,16 +45,12 @@ struct GrammarPrefix {
 	idx_t rest_start = 0;
 };
 
-//! spec 150, stage 3: a management statement as the grammar read it - a call of an acl_* function a rule compiled,
-//! or (a family not moved to rules yet) the statement's own text for the management compiler
+//! spec 150, stage 3: a management statement as the grammar read it - a call of an acl_* function a rule compiled, or
+//! (`legacy`: no rule reads it) the statement's own text, refused in its form's words
 struct MgmtParsed {
 	bool legacy = false;
 	//! legacy: the statement as written, its first token to its last
 	string text;
-	//! legacy: why the compiler cannot read it as written ('' when it can) - a comment, a `$$…$$` string, an `E'…'`
-	//! string with a backslash or a backtick name, which its scanner does not know: judged once it compiled, so a form
-	//! that does not compile keeps its own refusal
-	string unreadable;
 	//! a rule's: the acl_* function and its arguments
 	string function;
 	vector<Value> args;
@@ -110,8 +106,6 @@ vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bo
 //! spec 150 3g-3: whether `word` heads a linked module's statements (RegisterMgmtRules, acl_mgmt_rules.hpp), and how
 //! the module says what a statement with that `verb` (the word after it) is when its rules do not read one
 bool MgmtRulesKeyword(const string &word, string *usage = nullptr, const string &verb = string());
-//! Whether `keyword` is registered through the older seam (RegisterMgmtGrammar, acl_admin_scanner.hpp)
-bool MgmtGrammarRegistered(const string &keyword);
 
 //! The grammars the override compiles, one per set of the caller's grammar extensions
 class AclGrammarCache {
@@ -130,9 +124,6 @@ public:
 	//! in one statement): each statement's text, first token to last. Throws a ParserException when the text ends
 	//! inside a comment, a string or a quoted name - what it hides is never run without it
 	vector<string> SplitManagement(const string &text);
-	//! Why the management compiler cannot read `text` (one statement) as written, '' when it can
-	//! (MgmtParsed::unreadable)
-	string JudgeLegacy(const string &text);
 
 	//! The rules as a grammar extension, registered so a connection may switch them on for completion
 	//! (`SET active_grammar_extensions = ['acl']`); the override never depends on it being on

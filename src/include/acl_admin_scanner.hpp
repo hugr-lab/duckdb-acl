@@ -1,14 +1,13 @@
 //===----------------------------------------------------------------------===//
 // acl_admin_scanner.hpp
 //
-// The management grammar's scanner (spec 008) and the seam a linked module's grammar plugs into (spec 126):
-// a keyword the override recognizes as management (`CLUSTER …`) and the parser that compiles its text into
-// acl_* calls. The authorizer and the audit stay the override's - a module only compiles text.
+// The scanner the readers of a management statement's lists still use (spec 008): a list a rule read is handed to
+// them as its text (REQUIRE / ATTRIBUTES, a column list, a claim map, limits). Every statement is a rule since spec
+// 150 3g-3c; the lists become rules with stage 4.
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
-#include "acl_admin_sql.hpp" // MakeAdminCall, for the forms a module registers
 #include "acl_name_path.hpp"
 #include "acl_scan_util.hpp"
 
@@ -249,12 +248,6 @@ struct AdminScanner {
 
 //! Strip one layer of quotes from a list element written as a literal
 string Unquoted(string value);
-
-//! spec 126: a management form a linked module adds - `keyword …` after the prefix (or `ACL ADMIN`) is
-//! management, and `parse` compiles it (the scanner stands after the keyword). Registered at load, before the
-//! first statement; idempotent by keyword.
-using MgmtGrammar = unique_ptr<SQLStatement> (*)(AdminScanner &scanner);
-void RegisterMgmtGrammar(const char *keyword, MgmtGrammar parse);
 
 } // namespace acl
 } // namespace duckdb
