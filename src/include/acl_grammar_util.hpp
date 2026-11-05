@@ -10,6 +10,7 @@
 #pragma once
 
 #include "acl_grammar.hpp"
+#include "acl_mgmt_rules.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/peg/transformer/parse_result.hpp"
@@ -112,10 +113,10 @@ inline optional_idx TokenIndexAt(const TokenIterator &tokens, idx_t offset) {
 	return optional_idx();
 }
 
-//! A rule's transform process: its parse result finalized by FINALIZE
+//! A rule's transform process: its parse result finalized by FINALIZE (the one a module's rules use too)
 template <arena_ptr<TransformResultValue> (*FINALIZE)(PEGTransformer &, ParseResult &)>
 arena_ptr<TransformProcess> Start(PEGTransformer &transformer, ParseResult &parse_result) {
-	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FINALIZE);
+	return MgmtStart<FINALIZE>(transformer, parse_result);
 }
 
 //! The text a value's token must be: the value in its quotes, written plainly - so a string the tokenizer
@@ -143,6 +144,8 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
                                       const ParserOptions &options);
 vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text);
 string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text);
+//! An instance compiles its management grammar: a module registering after this is refused (spec 150 3g-3)
+void NoteMgmtGrammarCompiled();
 
 } // namespace acl
 } // namespace duckdb

@@ -473,7 +473,7 @@ scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, 
 rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
 `Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
 grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
-the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f, 3g-1, 3g-2 built):
+the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a-3f, 3g-1, 3g-2, 3g-3a built):
 the batch is read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered)
 - a moved family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`, `MakeAdminTableCall` for CHECK's
 `table_call`), anything else passes through as tokens (`AclMgmtLegacy`) to the compiler as its own text
@@ -493,9 +493,11 @@ platform's point grants, sources, resource groups (`TextKind::LIMITS`) - after i
 registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`;
 `SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). 3g-2a: GRANT / REVOKE SECRET as
 rules (`MgmtParsed::secrets`). 3g-2b: `USE [SCHEMA]` on duckdb's tokens. 3g-2c: `ATTACH … LINEAGE` on duckdb's
-tokens (the identity judged at parse, the sugar off under a dialect). Then 3g-3 (modules' rules, hugr-node), spec
-151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
-`acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`.
+tokens (the identity judged at parse, the sugar off under a dialect). 3g-3a: a module's statements as rules
+(`RegisterMgmtRules` / `MgmtCall`, `acl_mgmt_rules.hpp` - public, hugr-node includes it; forms with their usage, rules
+named `Acl<Keyword>…`, a registration that would touch acl's statements refused at load). Then 3g-3b (hugr-node's
+CLUSTER forms as rules), 3g-3c (the old seam, `AdminScanner` and the compiler go), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
+`acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`, `test_acl_mgmt_rules.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`

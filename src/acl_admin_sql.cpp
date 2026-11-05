@@ -239,7 +239,17 @@ MgmtGrammar FindMgmtGrammar(const string &keyword) {
 
 } // namespace
 
+bool MgmtGrammarRegistered(const string &keyword) {
+	return FindMgmtGrammar(keyword) != nullptr;
+}
+
 void RegisterMgmtGrammar(const char *keyword, MgmtGrammar parse) {
+	if (MgmtRulesKeyword(keyword)) {
+		// spec 150 3g-3: one reader for a keyword's statements - its rules
+		throw InvalidInputException("acl: RegisterMgmtGrammar(\"%s\"): the keyword is read by its rules "
+		                            "(RegisterMgmtRules)",
+		                            keyword);
+	}
 	lock_guard<mutex> guard(MgmtGrammarLock());
 	for (auto &entry : MgmtGrammars()) {
 		if (StringUtil::CIEquals(entry.keyword, keyword)) {
@@ -270,7 +280,7 @@ bool IsMgmtHead(const vector<HeadToken> &head) {
 	if (first == "add" || first == "grant" || first == "revoke" || first == "map") {
 		return true;
 	}
-	if (FindMgmtGrammar(first)) {
+	if (FindMgmtGrammar(first) || MgmtRulesKeyword(first)) {
 		return true; // a linked module's form (spec 126: CLUSTER - duckdb has no CLUSTER statement)
 	}
 	auto second = word(1);
@@ -670,6 +680,13 @@ string ResourceLimitsJson(const string &inside) {
 
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
+	string usage;
+	auto heads = ReadStatementHeads(s.text, 2);
+	auto verb = !heads.empty() && heads[0].size() > 1 ? heads[0][1].word : string();
+	if (MgmtRulesKeyword(keyword, &usage, verb)) {
+		// spec 150 3g-3: a linked module's statement its rules did not read - said in the module's words
+		RefuseMovedForm(usage);
+	}
 	if (auto parse = FindMgmtGrammar(keyword)) {
 		return parse(s); // spec 126: a linked module's form
 	}

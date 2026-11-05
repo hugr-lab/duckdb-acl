@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1 and 3g-2 built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a-3f, 3g-1, 3g-2 and 3g-3a built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -394,7 +394,34 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       set earlier in the batch would drop what the parse declared), so a dialect's own ATTACH whose text reads so
       there names its NAMESPACE event by that literal - lineage naming only.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
-    `AdminScanner` and the compiler go, hugr-node re-pins.
+    `AdminScanner` and the compiler go, hugr-node re-pins. In three steps, so neither repository is ever left
+    without its forms:
+    - 3g-3a (built): the seam - `RegisterMgmtRules(keyword, forms, changes, usage)` and `MgmtCall`
+      (`acl_mgmt_rules.hpp`, public: a module includes it). A module's statement forms (`MgmtStatementForm`: the rule,
+      the verbs after the keyword it covers, its usage) are compiled into the management grammar beside acl's own -
+      each an alternative ahead of `AclMgmtLegacy`; the shared rules a module may name are listed in the header and
+      kept (AclQuotedValue, AclNameValue, AclName, AclWordToken, AclDottedToken, AclComment, and the new AclValue /
+      AclSignedNumber). Its transform builds the acl_* call through `MgmtCall` (`Quoted` / `NameValue` / `Name` /
+      `Text` checked against their tokens as acl's are, and refusing a part they do not read; `Word`, `Keyword`,
+      `Part`, `Optional`, `Each`; `MgmtStart<F>` beside it); a ParserException from it is the module's refusal, never
+      "not read". The keyword makes a statement management (`IsMgmtHead`, `MgmtRulesKeyword`), and one the rules do
+      not read reaches the compiler, which refuses it with the usage of the form its verb names, else the keyword's
+      (a tokenizer refusal wins, as for acl's moved forms). A module reads only the statements headed by its keyword
+      (`module_keyword`, checked against the statement's first token), one statement (a `;` its matcher read past is
+      refused). Refused at registration - at load, never at the first statement: a keyword that is not one word of
+      letters or heads acl's or duckdb's statements (or the prefix's markers), a change that is not a new rule (or a
+      terminal override of one), a rule not named `Acl<Keyword>…`, a form whose statement it does not add or whose
+      rule does not begin with the keyword's literal, a verb two forms name, the keyword again with other forms, the
+      keyword on both seams, a registration after an instance compiled its management grammar, and rules that do not
+      compile (a trial compile with the candidate, before it is registered). `Optional` / `Each` read through the
+      helper rules around an optional or a repetition (CLUSTER's shared `IN GROUP`). Test
+      `test_acl_mgmt_rules.cpp` (a toy module: its forms, readers, refusals, the authorizer, Flight's command
+      detection, a second instance).
+    - 3g-3b: hugr-node re-pins and writes its CLUSTER forms as rules (an option list and DEPENDS ON read by rules,
+      not split as text).
+    - 3g-3c: `RegisterMgmtGrammar`, `AdminScanner`, the compiler and `AclMgmtLegacy` go - a moved form's refusal in
+      its own words kept - and hugr-node re-pins again. Until then the old seam serves a keyword only while no rules
+      do (one reader per keyword).
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
   rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 
