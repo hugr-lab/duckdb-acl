@@ -48,9 +48,11 @@ The reviews found three more problems on the same path, all older than this spec
    a physical table with no record: made after the expansion, or dropped from it on purpose (`DROP VIRTUAL TABLE`).
    `CREATE TABLE IF NOT EXISTS vs.salaries (x INT)` was then a native no-op, and its record handed the role that
    table, data included.
-6. **Type facts lost in a transaction.** The record probes the object's type facts (spec 099) on a connection of
-   the store's. Inside a client's transaction that connection cannot see the new table, so no facts were stored.
-   Under `acl_enum_types = 'varchar'` its ENUM labels were exposed, and `acl_check_catalog` reported `types_stale`.
+6. **Facts lost in a transaction.** The record probes the object on a connection of the store's: its type facts
+   (spec 099), and a view's columns (spec 010). Inside a client's transaction that connection cannot see a table made
+   there, so nothing was stored. dbt's swap (`CREATE m__tmp …; ALTER … RENAME TO m`, one transaction) is that case.
+   Under `acl_enum_types = 'varchar'` the ENUM labels were exposed, and `acl_check_catalog` reported `types_stale` /
+   `schema_stale`.
 7. **Flight ingest with a record** (`mode=create` into an expansion or a `VIRTUAL ONLY` schema) never worked:
    - the door prepares a load, and a `CREATE` with its record is two statements, which do not prepare;
    - into a `VIRTUAL ONLY` schema the `CREATE` was dropped for its record. The load was reported failed after the
@@ -77,19 +79,21 @@ The reviews found three more problems on the same path, all older than this spec
   - A principal cannot forge a record. Its PRAGMA is one of two answered names (`table_info`, `show_tables`), which
     become SELECTs.
 - **`EXPLAIN` of a statement with a record is refused**: "EXPLAIN of a statement that writes the virtual catalog's
-  record is not permitted under ACL - run the statement itself". A DDL with no record still explains: one in a live
-  alias's schema, or a no-op.
+  record is not permitted under ACL - run the statement itself". Every `RENAME` carries a record. A DDL with none
+  explains (a `CREATE` in a live alias's schema), and a no-op answers the empty `Success` it always did.
 - **`IF NOT EXISTS` with no record is the physical name's question.** When the target needs a record and has none
   (`AdmitRecordConflict` passed), the physical `CREATE` turns its `IF NOT EXISTS` into a plain `CREATE`. duckdb then
   refuses a taken name ("already exists"), and the record never runs. A recorded name stays a no-op. A free name is
   made and recorded. A plain `CREATE` of a taken name was already refused natively (spec 051), so the error reveals
   nothing new.
-- **The type facts are probed again at commit** (`TypeFactsAtCommit`, a `ClientContextState` beside spec 113's
-  `RecordRenameUndo`).
-  - When `acl_register_created` runs inside a client's transaction, the relation is queued.
-  - After the commit, `PolicyStore::CatalogRefreshTypeFacts` re-probes it from its stored definition.
-  - A rollback drops the queue. A refresh that fails leaves `types_stale` to `acl_check_catalog`.
-  - In autocommit the `CREATE` has committed before its record runs, so the record's own probe sees it.
+- **A record made in a client's transaction is probed again at its commit** (`RefreshAtCommit`, a
+  `ClientContextState` beside spec 113's `RecordRenameUndo`).
+  - `acl_register_created` and `acl_register_view` queue their name; `acl_rename_relation` queues the new one, so
+    dbt's swap is refreshed under the name that commits.
+  - After the commit, `PolicyStore::CatalogRefreshSchema` (what `ANALYZE` runs) re-probes each one: type facts, a
+    view's columns, an RLS verdict.
+  - A rollback drops the queue. A refresh that fails leaves `types_stale` / `schema_stale` to `acl_check_catalog`.
+  - In autocommit the DDL has committed before its record runs, so the record's own probes see it.
 - **An ingest creates a table only where no record is kept** (a live alias's schema, a session temp). Under the
   `ACL INGEST` prefix, a `CREATE` that needs a record or is `VIRTUAL ONLY` is refused in the rewriter, before anything
   runs: "CREATE the table with SQL, then ingest into it".
@@ -119,7 +123,9 @@ The reviews found three more problems on the same path, all older than this spec
   - an `EXPLAIN` of a no-op answers as before, and one in a live alias explains;
   - `CREATE TABLE IF NOT EXISTS` over an unrecorded physical table is refused, and the table stays unreadable. Over a
     recorded name it is a no-op; a free name is made;
-  - type facts: a CTAS of an ENUM column stores them in autocommit and inside `BEGIN … COMMIT`.
+  - type facts: a CTAS of an ENUM column stores them in autocommit and inside `BEGIN … COMMIT`, and dbt's swap in one
+    transaction stores them under the new name;
+  - a view over a table made in the same transaction gets its columns at commit.
 - `test/cpp/test_acl_ddl_records.cpp`:
   - the column is `Success` for each DDL. sqllogictest cannot see names;
   - a batch answers `Success`, then the query's rows;
@@ -155,9 +161,13 @@ The reviews found three more problems on the same path, all older than this spec
 
 ## Follow-ups
 
-- **Flight's prepared DDL with a record.** A `CREATE TABLE [AS]`, `RENAME` or `DROP` in an expansion is two
-  statements, and the door prepares every statement: "Cannot prepare multiple statements at once!". A one-statement
-  form needs the three answers under the first alternative.
+- **Flight and a table's DDL with a record.** The door prepares every statement, and a `CREATE TABLE [AS]`, a
+  `DROP TABLE` or a table's `RENAME` in an expansion is two statements: "Cannot prepare multiple statements at once!"
+  (before this spec too). A one-statement form needs the three answers under the first alternative.
+- **A record follows the client's `ROLLBACK`** - only a rename does (`RecordRenameUndo`); next, as its own spec. The
+  record is written on the store's own connection, so a rolled-back `CREATE` leaves its record, and a physical table
+  of that name made later - by another role's `CREATE` in another schema over the same home, say - is read through
+  it; a rolled-back `DROP` loses the record and its grants while the table stays.
 - **A record that fails after its `CREATE` committed** leaves an object with no record, as before. `acl_check_catalog`
   reports it (`expansion_stale`).
 - **A `CREATE TABLE … AS` with a record** answers `Success`, not the native `Count`. Before this spec it answered the
@@ -170,3 +180,5 @@ The reviews found three more problems on the same path, all older than this spec
   This is older than this spec, and the next spec takes it.
 - **Inside a client's transaction**, a `RENAME`'s definition lineage (`NoteDefinitionLineage(…, "CREATE")`) is queued
   before the commit. The worker may bind the new name before it is visible. This is older than this spec too.
+- `test/e2e/flight/bootstrap.sql`'s `c.made` must stay empty outside adbc_client.py: run.sh asserts GetDbSchemas
+  exactly, and an empty expansion is not listed.

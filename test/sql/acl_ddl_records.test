@@ -267,6 +267,51 @@ SELECT as_varchar FROM aclcat.acl.relation_types WHERE vname = 'vs.e2';
 ----
 VARCHAR
 
+# dbt's swap in one transaction: the facts follow the rename to the name that commits
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.m__tmp AS SELECT 'a'::ENUM('a', 'b') AS x;
+
+statement ok
+ACL ROLE "wide" ALTER TABLE vs.m__tmp RENAME TO m;
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+query T
+SELECT as_varchar FROM aclcat.acl.relation_types WHERE vname = 'vs.m';
+----
+VARCHAR
+
+# a view over a table made in the same transaction gets its columns at commit
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.base AS SELECT 1 AS id;
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.bv AS SELECT id FROM vs.base;
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+query T
+SELECT name FROM aclcat.acl.object_columns WHERE vname = 'vs.bv';
+----
+id
+
+statement ok
+ACL ROLE "wide" DROP VIEW vs.bv;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.base;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.m;
+
 statement ok
 ACL ROLE "wide" DROP TABLE vs.e1;
 

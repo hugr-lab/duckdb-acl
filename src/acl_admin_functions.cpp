@@ -384,14 +384,16 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! (spec 016). Deliberately narrow - it can only add an alias-form record for an object that was just
 //! created, with no form, projection or policy to choose - and it is unreachable from a principal's
 //! query, where every acl_* name is denied (spec 009).
-//! spec 151: the type facts (spec 099) of what a principal's DDL made inside a client's transaction, probed again once
-//! it committed: the record's probe runs on a connection of the store's, which cannot see an uncommitted table. A
-//! refresh that fails leaves `types_stale` to acl_check_catalog.
-struct TypeFactsAtCommit : ClientContextState {
+//! spec 151: what a principal's DDL recorded inside a client's transaction, probed again once it committed - the
+//! record's probes (type facts, spec 099; a view's columns, spec 010) run on a connection of the store's, which cannot
+//! see a table made in that transaction. Each record's name is queued; a rename queues its new one (dbt's
+//! `CREATE m__tmp; RENAME m__tmp TO m`). A refresh that fails leaves `types_stale` / `schema_stale` to
+//! acl_check_catalog.
+struct RefreshAtCommit : ClientContextState {
 	weak_ptr<PolicyStore> store;
 	vector<std::pair<string, string>> relations;
 
-	explicit TypeFactsAtCommit(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	explicit RefreshAtCommit(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
 	}
 	void TransactionCommit(MetaTransaction &, ClientContext &) override {
 		auto locked = store.lock();
@@ -402,9 +404,9 @@ struct TypeFactsAtCommit : ClientContextState {
 		}
 		for (auto &relation : pending) {
 			try {
-				locked->CatalogRefreshTypeFacts(relation.first, relation.second);
+				locked->CatalogRefreshSchema(relation.first, relation.second);
 			} catch (...) {
-				// the record stands; the check reports the facts it lacks
+				// the record stands; the check reports what it lacks
 			}
 		}
 	}
@@ -413,19 +415,24 @@ struct TypeFactsAtCommit : ClientContextState {
 	}
 };
 
-void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+void RefreshRecordAtCommit(ExpressionState &state, const string &vcat, const string &vname) {
 	auto &context = state.GetContext();
+	if (!context.transaction.HasActiveTransaction() || context.transaction.IsAutoCommit()) {
+		return; // in autocommit the DDL committed before its record ran: the record's own probes saw it
+	}
+	auto later = context.registered_state->GetOrCreate<RefreshAtCommit>("acl_record_refresh_at_commit",
+	                                                                    weak_ptr<PolicyStore>(SharedStoreOf(state)));
+	later->relations.emplace_back(vcat, vname);
+}
+
+void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		AuthorScope author(OptionalArg(args, 4, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_created", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_created", "name"), true);
 		auto phys = StoreOf(state).SpellRelationPhysical(KeyArg(args, 2, row, "acl_register_created", "phys"));
 		StoreOf(state).CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
-		if (context.transaction.HasActiveTransaction() && !context.transaction.IsAutoCommit()) {
-			auto later = context.registered_state->GetOrCreate<TypeFactsAtCommit>(
-			    "acl_type_facts_at_commit", weak_ptr<PolicyStore>(SharedStoreOf(state)));
-			later->relations.emplace_back(vcat, vname);
-		}
+		RefreshRecordAtCommit(state, vcat, vname);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -439,6 +446,7 @@ void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_view", "name"), true);
 		auto body = RequiredArg(args, 2, row, "acl_register_view", "body");
 		StoreOf(state).CatalogRegisterView(vcat, vname, body);
+		RefreshRecordAtCommit(state, vcat, vname);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -494,6 +502,7 @@ void AclRenameRelationFunc(DataChunk &args, ExpressionState &state, Vector &resu
 			                                                                    weak_ptr<PolicyStore>(store));
 			undo->steps.push_back({vcat, new_vname, vname, old_phys});
 		}
+		RefreshRecordAtCommit(state, vcat, new_vname);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }

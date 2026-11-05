@@ -121,8 +121,8 @@ share sessions" (spec 040).
 - The record runs as a `PRAGMA` after the DDL and answers `Success` with no row: nothing of its
   arguments (the physical name, a view's rewritten body) reaches the client (spec 151). An `EXPLAIN`
   of a DDL that writes a record is refused.
-- In a schema that records its objects, `CREATE TABLE IF NOT EXISTS` never adopts a physical table
-  with no record: the name is free only if nothing physical holds it (spec 151).
+- In an expansion, `CREATE TABLE IF NOT EXISTS` never adopts a physical table with no record: the
+  name is free only if nothing physical holds it (spec 151).
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).

@@ -767,9 +767,12 @@ row: the `SELECT acl_…(…)` answered its call as the column's name (the physi
 author's RLS). quack's collector skips it (`AclQuackRecordStatement`, a sync.py hunk), so `CREATE …; SELECT …` answers
 the SELECT. Found by its reviews, fixed: `EXPLAIN` of a statement with a record is refused (it ran the record:
 `EXPLAIN CREATE VIEW` made the view); `CREATE TABLE IF NOT EXISTS` with no record turns ERROR_ON_CONFLICT (it adopted a
-physical table the expansion did not show); a record's type facts in a client's transaction are probed again at commit
-(`TypeFactsAtCommit`); `ACL INGEST` creates only where no record is kept. A one-query DDL + record (MultiStatement) was
-tried and dropped - the spec says why. Tests `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
+physical table the expansion did not show); what a record probes inside a client's transaction is probed again at
+commit (`RefreshAtCommit` -> `CatalogRefreshSchema`; a rename queues its new name); `ACL INGEST` creates only where no
+record is kept. A one-query DDL + record (MultiStatement) was tried and dropped - the spec says why; so over Flight
+(every statement prepared) a CREATE / DROP / RENAME of a TABLE in an expansion still fails ("Cannot prepare multiple
+statements"). Next: a record follows the client's ROLLBACK (only a rename does), and the binder's "Did you mean" in a
+principal's DROP. Tests `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
