@@ -2884,14 +2884,8 @@ struct JsonDocument {
 //! listings and counts leave it out - a console reads a node with such calls (spec 066's addendum), and its read is
 //! nobody connected to the node
 string CallOwnSession(ClientContext &context, PolicyStore &store) {
-	AclSessionView current;
-	string why;
-	auto connection = AclConnection::Reach(context, why);
-	if (!connection || !connection->Current(current) || current.session_id.empty() ||
-	    !store.SessionPerCall(current.session_id)) {
-		return string();
-	}
-	return current.session_id;
+	auto own = CallingSession(context);
+	return !own.empty() && store.SessionPerCall(own) ? own : string();
 }
 
 vector<vector<Value>> NodeRows(ClientContext &context, PolicyStore &store, const string &view) {
@@ -2923,7 +2917,7 @@ vector<vector<Value>> NodeRows(ClientContext &context, PolicyStore &store, const
 		return rows;
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
-	JsonDocument doc(NodeLoadJson(db, store, CallOwnSession(context, store)));
+	JsonDocument doc(NodeLoadJson(db, store, CallingSession(context)));
 	auto root = doc.Root();
 	if (!root) {
 		throw BinderException("acl: the load report is not a document");

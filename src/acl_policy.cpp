@@ -649,24 +649,50 @@ idx_t PolicyStore::SessionSweep() {
 	return SweepLocked(now, skew, idle, exp_binds);
 }
 
-idx_t PolicyStore::SessionCount() {
+PolicyStore::SessionTally PolicyStore::SessionTallyBesides(const string &besides) {
+	return Tally(besides, true);
+}
+
+PolicyStore::SessionTally PolicyStore::Tally(const string &besides, bool judge_live) {
 	// The live total, not the map size: a dead session lingers until the next sweep now that resolving
 	// one no longer erases it (spec 054), and "how many sessions are live right now" must not count
-	// the not-yet-swept dead. Judged read-only, like SessionAlive.
-	auto now = NowSeconds();
-	auto skew = JwtClockSkew();
-	auto idle = SessionIdleTimeout();
-	auto exp_binds = SessionExpEveryUse();
-	lock_guard<mutex> guard(lock);
-	idx_t live = 0;
-	for (auto &entry : sessions) {
-		bool expired = exp_binds && entry.second.expires_at > 0 && entry.second.expires_at + skew < now;
-		bool stale = idle > 0 && entry.second.last_used + idle < now;
-		if (!expired && !stale) {
-			live++;
+	// the not-yet-swept dead. Judged read-only, like SessionAlive. The doors and groups count every record.
+	int64_t now = 0, skew = 0, idle = 0;
+	bool exp_binds = false;
+	if (judge_live) {
+		now = NowSeconds();
+		skew = JwtClockSkew();
+		idle = SessionIdleTimeout();
+		exp_binds = SessionExpEveryUse();
+	}
+	// the doors of the base are always listed, at zero when idle: a gauge that vanishes at zero is
+	// one a dashboard cannot tell from a node that stopped reporting
+	std::map<string, int64_t> doors {{"flight", 0}, {"quack", 0}, {"session", 0}};
+	std::map<string, std::pair<idx_t, idx_t>> groups;
+	SessionTally tally;
+	{
+		lock_guard<mutex> guard(lock);
+		for (auto &entry : sessions) {
+			auto &session = entry.second;
+			if (!besides.empty() && session.per_call && session.id == besides) {
+				continue;
+			}
+			bool expired = exp_binds && session.expires_at > 0 && session.expires_at + skew < now;
+			bool stale = idle > 0 && session.last_used + idle < now;
+			if (judge_live && !expired && !stale) {
+				tally.live++;
+			}
+			doors[session.door]++;
+			if (!session.limits.charged.empty()) {
+				auto &count = groups[session.limits.charged];
+				count.first++;
+				count.second = session.limits.charged_max;
+			}
 		}
 	}
-	return live;
+	tally.by_door.assign(doors.begin(), doors.end());
+	tally.by_group.assign(groups.begin(), groups.end());
+	return tally;
 }
 
 vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
@@ -819,20 +845,6 @@ bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
 	out.expires_at = entry->second.expires_at;
 	out.limits = entry->second.limits;
 	return true;
-}
-
-vector<std::pair<string, std::pair<idx_t, idx_t>>> PolicyStore::SessionCountsByGroup() {
-	lock_guard<mutex> guard(lock);
-	std::map<string, std::pair<idx_t, idx_t>> counts;
-	for (auto &entry : sessions) {
-		auto &limits = entry.second.limits;
-		if (!limits.charged.empty()) {
-			auto &count = counts[limits.charged];
-			count.first++;
-			count.second = limits.charged_max;
-		}
-	}
-	return vector<std::pair<string, std::pair<idx_t, idx_t>>>(counts.begin(), counts.end());
 }
 
 bool PolicyStore::SetSessionProfile(const string &id, int8_t level) {
@@ -1158,16 +1170,7 @@ string TraceMarkers(const string &correlation_id, const string &traceparent) {
 }
 
 vector<std::pair<string, int64_t>> PolicyStore::SessionCountsByDoor() {
-	// the doors of the base are always listed, at zero when idle: a gauge that vanishes at zero is
-	// one a dashboard cannot tell from a node that stopped reporting
-	std::map<string, int64_t> counts {{"flight", 0}, {"quack", 0}, {"session", 0}};
-	{
-		lock_guard<mutex> guard(lock);
-		for (auto &entry : sessions) {
-			counts[entry.second.door]++;
-		}
-	}
-	return vector<std::pair<string, int64_t>>(counts.begin(), counts.end());
+	return Tally(string(), false).by_door;
 }
 
 void PolicyStore::NoteSessionDrain(const string &id, const string &stream) {
