@@ -1126,8 +1126,6 @@ struct PolicyStore {
 	                        case_insensitive_map_t<string> &fields);
 	//! The sweep proper; the caller holds the lock and has read the settings before taking it.
 	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
-	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
-	idx_t SessionCount();
 	//! The node's sessions at one look: the live total (not expired, not idle), and every record per door and per
 	//! charged group with that group's max
 	struct SessionTally {

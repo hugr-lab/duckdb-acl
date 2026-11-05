@@ -76,6 +76,11 @@ int main(int argc, char *argv[]) {
 	Exec(con, "ACL ADMIN CREATE ROLE analyst");
 	Exec(con, "ACL ADMIN CREATE RESOURCE GROUP g (max_sessions 5)");
 	Exec(con, "ACL ADMIN GRANT RESOURCE GROUP g TO ROLE analyst");
+	// the token's role reaches `ops` through its client's own mapping - the one road to a role holding a scope
+	Exec(con, "ACL ADMIN CREATE ROLE ops");
+	Exec(con, "ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT 'test/idp/s' TO ROLE ops");
+	Exec(con, "ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT 'test/idp/s' TO ROLE analyst"); // a mapped claim is no role
+	Exec(con, "SELECT acl_grant_admin('ops', 'observe')");
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 	auto store = acl::PolicyStore::Of(*db.instance);
 	if (!Check(store != nullptr, "the instance has a policy store")) {
@@ -111,6 +116,28 @@ int main(int argc, char *argv[]) {
 		store->SessionClose(call);
 	});
 
+	Scenario("a statement's own session of one call is out of platform.drain's count, another's is in", [&] {
+		auto durable = store->SessionOpen(TOKEN, "flight");
+		auto call = OpenCallSession(*store);
+		if (!Check(!durable.empty() && !call.empty(), "two sessions open")) {
+			return;
+		}
+		auto sessions = [&](const std::string &handle) -> int64_t {
+			auto result = con.Query("ACL SESSION '" + handle + "' SELECT sessions FROM platform.drain");
+			if (result->HasError() || result->RowCount() != 1) {
+				std::cout << "  (platform.drain: " << (result->HasError() ? result->GetError() : "no row") << ")\n";
+				return -1;
+			}
+			return result->Collection().GetValue(0, 0).GetValue<int64_t>();
+		};
+		auto under_call = sessions(call);
+		Check(under_call == 1, "under the call's session, only the other: " + std::to_string(under_call));
+		auto under_durable = sessions(durable);
+		Check(under_durable == 2, "under a connection-long session, both: " + std::to_string(under_durable));
+		store->SessionClose(call);
+		store->SessionClose(durable);
+	});
+
 	Scenario("a call's session that ends while the report is read is in no count", [&] {
 		// the race of the drain e2e: the report is asked for by the call whose session closes meanwhile. One closer
 		// thread, released per round, waits a different while each round, so the close sweeps across the report's
@@ -128,6 +155,7 @@ int main(int argc, char *argv[]) {
 					if (stop.load(std::memory_order_acquire)) {
 						return;
 					}
+					std::this_thread::yield();
 				}
 				seen = round;
 				for (volatile int spin = 0; spin < delay.load(std::memory_order_relaxed); spin = spin + 1) {
@@ -159,6 +187,7 @@ int main(int argc, char *argv[]) {
 			go.store(i + 1, std::memory_order_release);
 			auto report = acl::NodeLoadJson(*db.instance, *store, id);
 			while (done.load(std::memory_order_acquire) != i + 1) {
+				std::this_thread::yield();
 			}
 			if (NumberAfter(report, "\"sessions\":{\"live\":") != 0 || NumberAfter(report, "\"flight\":") != 0) {
 				wrong++;

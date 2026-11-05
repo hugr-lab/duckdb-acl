@@ -629,8 +629,8 @@ drain. A connection-long session - a driver that keeps the door's cookie, a
 quack connection, `acl_session_open` - is refused to an operator too, before anything is verified. For the cookie-less
 call the node verifies the token; whoever else makes one gets the same draining answer, and the seated call's
 `session` event (a decision, on record at the default level) says it was seated while draining. `acl_drain()` counts
-what remains to be drained - not the session of the call that asks - and `platform.sessions` and the load report
-leave that session out too. A draining node hands out no session cookie, so a driver that keeps cookies stays
+what remains to be drained - not the session of the call that asks - and `platform.sessions`, `platform.drain`
+(`acl_session_count()`) and the load report leave that session out too. A draining node hands out no session cookie, so a driver that keeps cookies stays
 cookie-less there and is answered call by call; a cookie it brings is refused.
 
 What keeps working, deliberately: statements, `BEGIN`, ingest, reservations and stream drains on

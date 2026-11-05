@@ -259,26 +259,28 @@ caller's session on the reservation's note). The count is right in either order,
 same naming serves a secrets service that acts for the session (spec 078), which used to see an ended one there.
 
 **Found 2026-11-05 (#267's and #274's CI, drain.sh `sessions_live 2` - about one run in a few dozen): the counts
-were read at several looks.** `NodeLoadJson` took the live total (`SessionCount`), then looked the call's own session up in
-`SessionList` to leave it out, then the per-door and per-group counts - four takes of the store's lock. When the
+were read at several looks.** `NodeLoadJson` took the live total (`SessionCount`), then looked the call's own
+session up in `SessionList` to leave it out, then the per-door and per-group counts - four takes of the store's lock. When the
 DoGet's session ended between the first two (its handler returns while the worker computes the report), the total
 had counted it and the lookup found nothing to leave out; `acl_drain()` judged its own session apart the same way
 (not hit in practice: DRAIN NODE runs at GetFlightInfo, its session live), and `platform.drain`'s `sessions`
 (`acl_session_count()`) left nothing out at all. Now one look: `PolicyStore::SessionTallyBesides(besides)` counts the
 live total and every session per door and per charged group under one lock, the calling statement's session
-(`CallingSession`, its AclConnection) left out of each when it is a session of one call - `NodeLoadJson` (the view,
-`acl_node_load()`), `acl_drain()` and `acl_session_count()` read it; the `acl.sessions.live` gauge counts doors with no
+(`CallingSession`, its AclConnection; `CallOwnSession` for the sessions listing is the same judgment) left out of each
+when it is a session of one call - `NodeLoadJson` (the view, `acl_node_load()`), `acl_drain()` and
+`acl_session_count()` read it; the `acl.sessions.live` gauge counts doors with no
 liveness judged, so its reader reads no setting through the policy catalog. A group whose only session is the call's
 own is no longer listed at 0. `test/cpp/test_acl_session_tally.cpp`: what is left out (door and group too), and 2000
 reports asked for by a call whose session a closer thread ends at a different moment each round (the several looks
-were off in a few hundred of them); drain.sh reads `platform.drain` too.
+were off in a few hundred of them), and `platform.drain` read under `ACL SESSION` of each kind; drain.sh reads
+`platform.drain` too.
 
 **Left open.** A drain waits for every live session up to its orchestrator's deadline, an idle client's too; whether it
 should not wait for an idle session with nothing pinned (spec 135 moves it to another node) is its own spec. The other
-way round (found by the review of the one-look count, read in the code): idle is judged on `last_used`, which a
-quack session touches per statement and a long write at GetFlightInfo not at all - a statement that outlasts
-`acl_session_idle_timeout` (900 s) leaves its session judged idle, and `acl_drain()`'s sweep ends it and may answer 0
-while the statement still runs.
+way round (found by the review of the one-look count, read in the code): idle is judged on `last_used`, which moves
+when a statement starts (a Flight call, a stream pull, a quack statement), never while it runs - a statement that
+outlasts `acl_session_idle_timeout` (900 s) leaves its session judged idle, and `acl_drain()`'s sweep ends it and may
+answer 0 while the statement still runs.
 
 ## Follow-ups
 

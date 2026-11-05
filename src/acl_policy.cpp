@@ -649,10 +649,6 @@ idx_t PolicyStore::SessionSweep() {
 	return SweepLocked(now, skew, idle, exp_binds);
 }
 
-idx_t PolicyStore::SessionCount() {
-	return SessionTallyBesides(string()).live;
-}
-
 PolicyStore::SessionTally PolicyStore::SessionTallyBesides(const string &besides) {
 	return Tally(besides, true);
 }
