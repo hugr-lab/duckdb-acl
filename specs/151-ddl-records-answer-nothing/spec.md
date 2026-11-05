@@ -161,9 +161,9 @@ The reviews found three more problems on the same path, all older than this spec
 
 ## Follow-ups
 
-- **Flight and a table's DDL with a record.** The door prepares every statement, and a `CREATE TABLE [AS]`, a
+- **Flight and a table's DDL with a record.** The door prepared every statement, and a `CREATE TABLE [AS]`, a
   `DROP TABLE` or a table's `RENAME` in an expansion is two statements: "Cannot prepare multiple statements at once!"
-  (before this spec too). A one-statement form needs the three answers under the first alternative.
+  (before this spec too). Done by spec 153: the door runs a client's DDL as text.
 - **A record follows the client's `ROLLBACK`** - only a rename does (`RecordRenameUndo`); next, as its own spec. The
   record is written on the store's own connection, so a rolled-back `CREATE` leaves its record, and a physical table
   of that name made later - by another role's `CREATE` in another schema over the same home, say - is read through

@@ -236,6 +236,37 @@ with connect(acme_token) as conn:
     names = [d[0] for d in cur.description or []]
     shown = (names, cur.fetchall())
     check("its DROP answers the same", shown[1] == [] and not any("acl_" in n for n in names), shown)
+    # spec 153: a TABLE's DDL in an expansion is the DDL and its record - two statements, which the door prepared and
+    # duckdb refused ("Cannot prepare multiple statements"); it runs as text now, on each Flight path
+    cur.execute("CREATE TABLE made.t AS SELECT 7 AS v")
+    shown = cur.fetchall()
+    check("a CREATE TABLE in an expansion runs over Flight", shown == [], shown)
+    cur.execute("ALTER TABLE made.t RENAME TO t2")
+    cur.execute("SELECT v FROM made.t2")
+    shown = cur.fetchall()
+    check("...renames, and reads back", shown == [(7,)], shown)
+    cur.adbc_statement.set_sql_query("DROP TABLE made.t2")
+    cur.adbc_statement.execute_update()  # ExecuteUpdate: DoPut
+    try:
+        # another text than the read above: the driver re-executes a repeated one on its prepared handle, which
+        # keeps the rewrite it was decided with (spec 152)
+        cur.execute("SELECT count(*) FROM made.t2")
+        check("...and ExecuteUpdate drops it", False, cur.fetchall())
+    except Exception as gone:
+        check("...and ExecuteUpdate drops it", "no access to object" in str(gone), gone)
+    # prepared: kept as text, decided when it runs
+    cur.adbc_statement.set_sql_query("CREATE TABLE made.p AS SELECT 1 AS x")
+    cur.adbc_statement.prepare()
+    cur.adbc_statement.execute_update()
+    cur.execute("SELECT x FROM made.p")
+    shown = cur.fetchall()
+    check("a prepared CREATE TABLE in an expansion runs", shown == [(1,)], shown)
+    try:
+        cur.execute("CREATE TABLE made.q AS SELECT 1 AS x", (5,))
+        check("a DDL with a bound parameter is refused", False, "it ran")
+    except Exception as refused:
+        check("a DDL with a bound parameter is refused", "takes no parameters" in str(refused), refused)
+    cur.execute("DROP TABLE made.p")
     tz_option = ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value + "TimeZone"
     conn.adbc_connection.set_options(**{tz_option: "Asia/Tokyo"})
     cur.execute("SELECT '2026-01-01 00:00:00+00'::TIMESTAMPTZ::VARCHAR")

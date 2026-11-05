@@ -39,6 +39,13 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - mirror / pull-through / publish, everything re-signed with our key;
   - public vs private extensions (a token through an http secret, tresor-issued);
   - air-gapped bundles.
+- **Before the platform's release: RLS for versioned tables** (DuckLake, Iceberg; the owner, 2026-11-05). A grant says,
+  per role, which versions of a time-travel table the role reads:
+  - only the current one (any `AT (…)` refused);
+  - strictly one snapshot (the rewrite pins `AT (VERSION => n)`, any other refused);
+  - a date range (an `AT (TIMESTAMP => t)` / `AT (VERSION => v)` admitted only inside it).
+  It needs the grant's syntax and the rewrite of `BaseTableRef::at_clause`, which spec 139 already walks. It also
+  covers the reads that name a version some other way: a scan function's version argument, and the snapshot listings.
 - **Still open with the owner**:
   - 017 §7.4: rebuild others' extensions, or mirror the official binaries;
   - §7.9: the repository's licence;

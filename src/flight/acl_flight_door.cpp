@@ -339,6 +339,8 @@ struct FlightDoorState {
 		//! spec 143: each object its result columns come from, as the principal's listing describes it - read once
 		//! at Prepare, so GetFlightInfo's schema and DoGet's say the same (the origins ride on `profile`)
 		std::map<std::tuple<string, string, string>, shared_ptr<const PolicyStore::ObjectDescription>> described;
+		//! spec 153: a client's DDL, kept as its text (`query`) and run through Query at each execution - no `stmt`
+		bool text_command = false;
 	};
 	std::unordered_map<string, shared_ptr<Reservation>> reservations;
 	//! Refuse a new reservation rather than evict somebody's old one: an evicted one is a mid-flight
@@ -1385,6 +1387,10 @@ public:
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
+			if (RunsAsText(command.query)) {
+				return TextCommandInfo(handle, owner, conn, command.query, prefixed, traceparent,
+				                       command.transaction_id, descriptor);
+			}
 			// Parsed, rewritten and bound ONCE, right here, while the session of this very call is
 			// alive - and kept. A refusal surfaces now, with the client still on GetFlightInfo; the
 			// schema comes from the same binder that will produce the rows; and DoGet has nothing
@@ -1442,6 +1448,44 @@ public:
 		});
 	}
 
+	//! spec 153: a client's DDL at GetFlightInfo - run now as text (spec 111 runs every count here), its answer kept on
+	//! a single-use ticket for the DoGet. The ticket is held first: a full map refuses before anything runs
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	TextCommandInfo(const string &handle, const string &owner, shared_ptr<FlightDoorState::SessionConn> conn,
+	                const string &query, const string &prefixed, const string &traceparent,
+	                const string &transaction_id, const flight::FlightDescriptor &descriptor) {
+		auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
+		reservation->conn = conn;
+		reservation->query = query;
+		reservation->text_command = true;
+		reservation->owner = owner;
+		reservation->single_use = true;
+		auto held = reservation;
+		auto ticket_id = state->PutReservation(std::move(reservation), state->store->SessionIdleTimeout());
+		if (ticket_id.empty()) {
+			return arrow::Status::Invalid("acl: too many open tickets - fetch or retry later");
+		}
+		auto ran = [&]() -> arrow::Status {
+			auto execution = state->LockForStatement(*conn);
+			ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*conn, query));
+			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, transaction_id));
+			ARROW_ASSIGN_OR_RAISE(held->executed, RunAsText(handle, *conn, prefixed, traceparent, nullptr));
+			return arrow::Status::OK();
+		}();
+		if (!ran.ok()) {
+			state->CloseReservation(ticket_id, owner);
+			return ran;
+		}
+		std::shared_ptr<arrow::Schema> schema;
+		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(held->executed->GetTypes(), held->executed->GetNames()));
+		state->store->AuditDoor("flight", "ticket_issued", true, string(), string(), handle);
+		ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
+		std::vector<flight::FlightEndpoint> endpoints {
+		    flight::FlightEndpoint {flight::Ticket {std::move(ticket)}, {}, std::nullopt, {}}};
+		ARROW_ASSIGN_OR_RAISE(auto info, flight::FlightInfo::Make(*schema, descriptor, endpoints, -1, -1, false));
+		return std::make_unique<flight::FlightInfo>(std::move(info));
+	}
+
 	//! Where the rows go out. The statement behind this ticket was prefixed when the ticket was made,
 	//! so the ACL has already had its say; what is left is running it and handing over Arrow.
 	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
@@ -1488,6 +1532,11 @@ public:
 			auto execution = state->LockForStatement(*conn);
 			ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*conn, command.query));
 			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, command.transaction_id));
+			if (RunsAsText(command.query)) {
+				int64_t total = 0; // spec 153
+				ARROW_ASSIGN_OR_RAISE(auto answered, RunAsText(handle, *conn, prefixed, traceparent, &total));
+				return total;
+			}
 			TempScanScope temp_scan(conn->con->context.get());
 			ArmProfile(handle, *conn, nullptr, traceparent); // the Prepare's note serves the Execute
 			unique_ptr<PreparedStatement> stmt;
@@ -1852,6 +1901,26 @@ public:
 			    auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
 			    reservation->conn = conn;
 			    reservation->query = request.query; // spec 111
+			    if (RunsAsText(request.query)) {
+				    // spec 153: a DDL keeps its text - decided at each execution, announced as an update (an
+				    // empty dataset schema, no parameters)
+				    {
+					    auto execution = state->LockForStatement(*reservation->conn);
+					    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, request.query));
+					    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
+				    }
+				    reservation->text_command = true;
+				    reservation->owner = owner;
+				    flightsql::ActionCreatePreparedStatementResult result;
+				    result.dataset_schema = arrow::schema(arrow::FieldVector {});
+				    result.parameter_schema = arrow::schema(arrow::FieldVector {});
+				    auto id = state->PutReservation(std::move(reservation), state->store->SessionIdleTimeout());
+				    if (id.empty()) {
+					    return arrow::Status::Invalid("acl: too many open prepared statements - close some");
+				    }
+				    result.prepared_statement_handle = std::move(id);
+				    return result;
+			    }
 			    {
 				    auto execution = state->LockForStatement(*reservation->conn);
 				    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, request.query));
@@ -1911,6 +1980,13 @@ public:
 			    if (!reservation) {
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
+			    if (reservation->text_command) {
+				    for (auto &row : rows) {
+					    if (!row.empty()) {
+						    return arrow::Status::Invalid("acl: a DDL statement takes no parameters");
+					    }
+				    }
+			    }
 			    auto execution = state->LockForStatement(*reservation->conn);
 			    reservation->parameter_rows = std::move(rows);
 			    reservation->executed.reset(); // spec 111: a count kept for the old parameters is not this one's
@@ -1934,6 +2010,25 @@ public:
 			    }
 			    std::shared_ptr<arrow::Schema> dataset_schema;
 			    std::shared_ptr<arrow::Schema> parameter_schema;
+			    if (reservation->text_command) {
+				    // spec 153: the DDL runs now, decided now; its DoGet answers what it kept
+				    string traceparent;
+				    ARROW_ASSIGN_OR_RAISE(
+				        auto prefixed, Composed(context, handle, *reservation->conn, reservation->query, traceparent));
+				    {
+					    auto execution = state->LockForStatement(*reservation->conn);
+					    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
+					    ARROW_ASSIGN_OR_RAISE(reservation->executed,
+					                          RunAsText(handle, *reservation->conn, prefixed, traceparent, nullptr));
+				    }
+				    ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(reservation->executed->GetTypes(),
+				                                                    reservation->executed->GetNames()));
+				    std::vector<flight::FlightEndpoint> endpoints {
+				        flight::FlightEndpoint {flight::Ticket {descriptor.cmd}, {}, std::nullopt, {}}};
+				    ARROW_ASSIGN_OR_RAISE(
+				        auto info, flight::FlightInfo::Make(*dataset_schema, descriptor, endpoints, -1, -1, false));
+				    return std::make_unique<flight::FlightInfo>(std::move(info));
+			    }
 			    {
 				    auto execution = state->LockForStatement(*reservation->conn);
 				    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
@@ -2005,6 +2100,24 @@ public:
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
 			    ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
+			    if (reservation->text_command) {
+				    // spec 153: the DDL runs once, decided now - no parameter row to run it per
+				    for (auto &row : rows) {
+					    if (!row.empty()) {
+						    return arrow::Status::Invalid("acl: a DDL statement takes no parameters");
+					    }
+				    }
+				    string traceparent;
+				    ARROW_ASSIGN_OR_RAISE(
+				        auto prefixed, Composed(context, caller, *reservation->conn, reservation->query, traceparent));
+				    auto execution = state->LockForStatement(*reservation->conn);
+				    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
+				    reservation->executed.reset();
+				    int64_t total = 0;
+				    ARROW_ASSIGN_OR_RAISE(auto answered,
+				                          RunAsText(caller, *reservation->conn, prefixed, traceparent, &total));
+				    return total;
+			    }
 			    auto execution = state->LockForStatement(*reservation->conn);
 			    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
 			    reservation->executed
@@ -2244,6 +2357,95 @@ public:
 		acl::ProfileConnectionFor(context, state->store->audit, ref.principal, "flight", trace, ref.profile_override);
 	}
 
+	//! spec 153: a client's DDL - past the markers it writes itself, ONE `CREATE` (not a SECRET), `DROP` or `ALTER`
+	//! with no parameter - runs as text, through Query on the session's connection, as quack and a gateway run it.
+	//! A principal's DDL in a schema that records its objects is the DDL and its record (spec 151): two statements,
+	//! which Prepare refuses.
+	static bool RunsAsText(const string &query) {
+		string rest;
+		if (acl::ClientTextIsMgmt(query, rest)) {
+			return false;
+		}
+		try {
+			Parser parser(ParserOptions::Builtin());
+			parser.ParseQuery(rest);
+			if (parser.statements.size() != 1) {
+				return false;
+			}
+			auto &statement = *parser.statements[0];
+			if (!statement.named_param_map.empty() || statement.has_anonymous_parameters) {
+				return false;
+			}
+			switch (statement.type) {
+			case StatementType::DROP_STATEMENT:
+			case StatementType::ALTER_STATEMENT:
+				return true;
+			case StatementType::CREATE_STATEMENT: {
+				auto &info = statement.Cast<CreateStatement>().info;
+				return info && info->type != CatalogType::SECRET_ENTRY;
+			}
+			default:
+				return false;
+			}
+		} catch (std::exception &) {
+			return false; // not ours to judge: the prepared path refuses it in duckdb's words
+		}
+	}
+
+	//! spec 153: run a client's DDL as text on its session's connection (the caller holds `exec` and has run the
+	//! transaction guards): the parse decides it, as on a gateway. The answer is the last statement's result; `count`,
+	//! when asked, the BIGINT counts the run's results carry (the answer is then read for it)
+	arrow::Result<unique_ptr<QueryResult>> RunAsText(const string &handle, FlightDoorState::SessionConn &conn,
+	                                                 const string &prefixed, const string &traceparent,
+	                                                 int64_t *count) {
+		TempScanScope temp_scan(conn.con->context.get());
+		ArmProfile(handle, conn, nullptr, traceparent);
+		auto result = conn.con->Query(prefixed);
+		for (auto each = result.get(); each; each = each->next.get()) {
+			if (each->HasError()) {
+				return StatusFromDuck("acl", each->GetError());
+			}
+		}
+		auto *last = &result;
+		while ((*last)->next) {
+			if (count) {
+				*count += CountOf(**last);
+			}
+			last = &(*last)->next;
+		}
+		if (count) {
+			*count += CountOf(**last);
+		}
+		return std::move(*last);
+	}
+
+	//! A DML's count from its result: one BIGINT column, one row - anything else is no count
+	static int64_t CountOf(QueryResult &result) {
+		auto chunk = result.Fetch();
+		if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
+			auto count = chunk->GetValue(0, 0);
+			if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
+				return count.GetValue<int64_t>();
+			}
+		}
+		return 0;
+	}
+
+	//! The call's composition of a client's text: its trace and lineage context, then the session's prefix ("" when
+	//! the session is gone)
+	arrow::Result<string> Composed(const flight::ServerCallContext &context, const string &handle,
+	                               FlightDoorState::SessionConn &conn, const string &query, string &traceparent) {
+		string correlation_id, lineage_parent, lineage_root, lineage_job;
+		TraceOfCall(context, *conn.con->context, correlation_id, traceparent);
+		ARROW_RETURN_NOT_OK(LineageOfCall(context, *conn.con->context, lineage_parent, lineage_root, lineage_job));
+		auto prefixed = state->store->SessionSql(handle, query, correlation_id, traceparent, lineage_parent,
+		                                         lineage_root, lineage_job);
+		if (prefixed.empty()) {
+			return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+		}
+		return prefixed;
+	}
+
 	//! spec 111: a statement that returns no rows - DML answers its changed rows (CHANGED_ROWS), DDL
 	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
 	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these.
@@ -2381,19 +2583,27 @@ public:
 		// where the reader pulls it and the session's next statement can end it (spec 070)
 		// a statement the door does not stream (a count, a write - StreamsAtDoor) runs to completion
 		// here; a read is submitted, and the reader drains it chunk by chunk
-		auto &stmt = *reservation->stmt;
 		unique_ptr<QueryResult> result;
 		bool retained = false;
 		if (reservation->executed) {
 			result = std::move(reservation->executed); // spec 111: it ran at GetFlightInfo
 			retained = true;
+		} else if (reservation->text_command) {
+			// spec 153: a prepared DDL's DoGet that no GetFlightInfo ran - it runs now, decided now
+			string traceparent;
+			ARROW_ASSIGN_OR_RAISE(auto prefixed,
+			                      Composed(context, handle, *reservation->conn, reservation->query, traceparent));
+			ARROW_ASSIGN_OR_RAISE(result, RunAsText(handle, *reservation->conn, prefixed, traceparent, nullptr));
+			retained = true;
 		} else {
+			auto &stmt = *reservation->stmt;
 			ArmProfile(handle, *reservation->conn, reservation.get(), string());
 			result = StreamsAtDoor(stmt.GetStatementType(), stmt) ? stmt.Submit(values) : stmt.Execute(values);
 		}
 		if (result->HasError()) {
 			return StatusFromDuck("acl", result->GetError());
 		}
+		auto written = reservation->stmt ? reservation->stmt->GetStatementType() : result->GetStatementType();
 		// the session connection's own properties, read once (under `exec`) and used for the schema AND
 		// every batch: the two must agree on the layout (arrow_large_buffer_size, string views - GLOBAL
 		// settings an admin may change while the stream lives), and a per-pull read would race a SET
@@ -2403,7 +2613,7 @@ public:
 		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames(), properties));
 		ARROW_ASSIGN_OR_RAISE(schema, Described(schema, *reservation));
 		auto slot = make_shared_ptr<FlightDoorState::ResultStream>();
-		slot->Take(std::move(result), stmt.GetStatementType(), retained);
+		slot->Take(std::move(result), written, retained);
 		{
 			auto &conn = *reservation->conn;
 			std::lock_guard<std::mutex> stream(conn.stream_lock);

@@ -132,6 +132,13 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   - **DoPut.** It is the main path for DML and DDL: one RPC, nothing left behind on the node.
     - A prepared DML or DDL is announced with an **empty dataset schema**, which JDBC reads as an update
       and executes through `DoPut`.
+  - **DDL runs as text** (spec 153). A `CREATE` (not a secret), `DROP` or `ALTER` with no parameter is not
+    prepared: the door runs it through `Query` on the session's connection, as quack and a gateway do. A
+    principal's table DDL in a schema that records its objects is the DDL and its catalog record, two
+    statements, which no prepared path takes.
+    - A prepared one keeps its text and is decided at each execution.
+    - A parameter bound to it is refused: "a DDL statement takes no parameters".
+    - `executeUpdate` of a DDL with a record answers 0.
       - JDBC's `executeQuery("INSERT …")` therefore writes the row and then throws `Statement did not
         return a result set`, as JDBC defines for a statement that is not a query. The exception does
         not mean nothing was written.
