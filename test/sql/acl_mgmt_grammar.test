@@ -1,7 +1,7 @@
 # name: test/sql/acl_mgmt_grammar.test
 # description: spec 150, stage 3 - the management statements read by rules of duckdb's parser: each family compiles
-#   to the acl_* call it always compiled to (a form a linked module registers - hugr-node's - still goes as its own
-#   text to the management compiler, until 3g). A resource group first (the first family the tests used), then 3a-3f.
+#   to the acl_* call it always compiled to, and a statement no rule reads is refused in its form's words (since 3g-3c
+#   nothing is compiled from text). A resource group first (the first family the tests used), then 3a-3g.
 # group: [sql]
 
 require acl
@@ -1156,8 +1156,8 @@ SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'changes';
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG hidden; CREATE ROLE hider;
 
-# (since 3f every family of this repository is a rule: hugr-node's own forms are the compiler's until 3g) - a comment
-# inside a rule's list is a space, and one between its words too
+# (since 3f every family of this repository is a rule) - a comment inside a rule's list is a space, and one between
+# its words too
 statement ok
 ACL ADMIN CREATE RESOURCE GROUP hider_group (window_max 8 /* a note */);
 
@@ -2151,3 +2151,55 @@ serving
 
 statement ok
 ACL ADMIN DROP ROLE headed;
+
+# --- 3g-3c: a statement no rule reads is refused in its form's words, chosen by its head on duckdb's tokens ---------
+
+# a comment between the head's words: the form's own words (the compiler's scanner read no comment)
+statement error
+ACL ADMIN GRANT /* c */ SOURCE;
+----
+<REGEX>:.*write GRANT SOURCE <database>\[\.<schema>\] TO ROLE <role>.*
+
+statement error
+ACL ADMIN CREATE OR VIRTUAL CATALOG x;
+----
+<REGEX>:.*write CREATE \[OR REPLACE\] VIRTUAL CATALOG.*
+
+# under the ACL marker, a statement that is no management statement is refused as such - never compiled
+statement error
+ACL ADMIN ACL SELECT 1;
+----
+<REGEX>:.*unknown management statement "select".*
+
+statement error
+ACL ADMIN ACL CREATE TABLE t(a INT);
+----
+<REGEX>:.*CREATE TABLE is no management statement.*
+
+statement error
+ACL ADMIN ACL ALTER TABLE t ADD COLUMN b INT;
+----
+<REGEX>:.*ALTER TABLE is no management statement.*
+
+statement error
+ACL ADMIN ACL DROP TABLE t;
+----
+<REGEX>:.*DROP TABLE is no management statement.*
+
+# duckdb's own CREATE FUNCTION (a macro) is no FUNCTION CATEGORY; a quoted noun is no word
+statement error
+ACL ADMIN ACL CREATE FUNCTION f(x) AS x;
+----
+<REGEX>:.*CREATE FUNCTION is no management statement.*
+
+statement error
+ACL ADMIN ACL DROP "t";
+----
+<REGEX>:.*unknown management statement "drop".*
+
+# a batch is refused at its first statement no rule reads - a later statement's own refusal is never reached
+statement error
+ACL ADMIN GRANT SOURCE; KILL SESSION E'x';
+----
+<REGEX>:.*write GRANT SOURCE <database>\[\.<schema>\] TO ROLE <role>.*
+

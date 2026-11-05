@@ -39,12 +39,11 @@ struct MgmtStatementForm {
 };
 
 //! The statements headed by `keyword` (one word of letters acl and duckdb have no statement for: `cluster`) are
-//! management, read by `forms` - each an alternative in the management grammar's choice, ahead of the statements no
-//! rule reads - and the rules `changes` adds (new rules only, named `Acl<Keyword>…`, and terminal overrides of them). A
-//! statement headed by the keyword whose verb no form names is told `usage`. Registered at load, before the first
-//! statement is read: the rules are compiled then, and a registration that does not compile - or comes later - is
-//! refused here. Idempotent by keyword; the keyword with other forms, or registered through the older seam too, is
-//! refused.
+//! management, read by `forms` - each an alternative in the management grammar's choice - and the rules `changes` adds
+//! (new rules only, named `Acl<Keyword>…`, and terminal overrides of them). A statement headed by the keyword whose
+//! verb no form names is told `usage`. Registered at load, before the first statement is read: the rules are compiled
+//! then, and a registration that does not compile - or comes later - is refused here. Idempotent by keyword; the
+//! keyword with other forms is refused.
 void RegisterMgmtRules(const string &keyword, vector<MgmtStatementForm> forms, vector<GrammarChange> changes,
                        const string &usage);
 

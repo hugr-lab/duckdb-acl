@@ -1,8 +1,8 @@
-// The ACL management grammar (spec 008). Since spec 150's stage 3 the management statements are rules
+// The ACL management grammar (spec 008). Since spec 150's stage 3 every management statement is a rule
 // (acl_mgmt_grammar.cpp); what is left here reads the lists a rule hands over (ParseMgmtBatch's readers), builds the
-// secrets service's call from its rule's reading (spec 082), compiles a form a linked module registers (hugr-node's,
-// until 3g-3), and refuses a moved form's text in its own words. The authorizer every management statement passes is
-// acl_platform.cpp's (spec 117). The parser override is its only caller.
+// secrets service's call from its rule's reading (spec 082), and refuses a statement no rule reads in its form's own
+// words (RefuseUnreadStatement). The authorizer every management statement passes is acl_platform.cpp's (spec 117).
+// The parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -212,55 +212,6 @@ unique_ptr<SQLStatement> MakeAdminTableCall(const string &function, const vector
 
 namespace {
 
-struct MgmtGrammarEntry {
-	string keyword;
-	MgmtGrammar parse;
-};
-
-vector<MgmtGrammarEntry> &MgmtGrammars() {
-	static vector<MgmtGrammarEntry> grammars;
-	return grammars;
-}
-
-mutex &MgmtGrammarLock() {
-	static mutex lock;
-	return lock;
-}
-
-MgmtGrammar FindMgmtGrammar(const string &keyword) {
-	lock_guard<mutex> guard(MgmtGrammarLock());
-	for (auto &entry : MgmtGrammars()) {
-		if (StringUtil::CIEquals(entry.keyword, keyword)) {
-			return entry.parse;
-		}
-	}
-	return nullptr;
-}
-
-} // namespace
-
-bool MgmtGrammarRegistered(const string &keyword) {
-	return FindMgmtGrammar(keyword) != nullptr;
-}
-
-void RegisterMgmtGrammar(const char *keyword, MgmtGrammar parse) {
-	if (MgmtRulesKeyword(keyword)) {
-		// spec 150 3g-3: one reader for a keyword's statements - its rules
-		throw InvalidInputException("acl: RegisterMgmtGrammar(\"%s\"): the keyword is read by its rules "
-		                            "(RegisterMgmtRules)",
-		                            keyword);
-	}
-	lock_guard<mutex> guard(MgmtGrammarLock());
-	for (auto &entry : MgmtGrammars()) {
-		if (StringUtil::CIEquals(entry.keyword, keyword)) {
-			return;
-		}
-	}
-	MgmtGrammars().push_back({keyword, parse});
-}
-
-namespace {
-
 //! spec 150, stage 3g-1: whether a statement is the management grammar's, judged by its head on duckdb's tokens (a
 //! comment between the words is gone, a string or a quoted name one token): the words duckdb has no statement for,
 //! and duckdb's own verbs only with the marker or the noun that is ours alone
@@ -280,8 +231,8 @@ bool IsMgmtHead(const vector<HeadToken> &head) {
 	if (first == "add" || first == "grant" || first == "revoke" || first == "map") {
 		return true;
 	}
-	if (FindMgmtGrammar(first) || MgmtRulesKeyword(first)) {
-		return true; // a linked module's form (spec 126: CLUSTER - duckdb has no CLUSTER statement)
+	if (MgmtRulesKeyword(first)) {
+		return true; // a linked module's form (hugr-node's CLUSTER - duckdb has no CLUSTER statement)
 	}
 	auto second = word(1);
 	if (first == "deny") {
@@ -361,12 +312,19 @@ public:
 	throw MovedFormRefusal(usage);
 }
 
+//! A statement's head on duckdb's tokens (comments gone): its words lower-cased by place, '' where no word stands
+struct HeadWords {
+	vector<HeadToken> tokens;
+	string Word(idx_t index) const {
+		return index < tokens.size() && tokens[index].kind == HeadToken::Kind::WORD ? tokens[index].word : string();
+	}
+};
+
 //! spec 150, stage 3c: CREATE VIRTUAL … and the ADD forms are rules (acl_mgmt_grammar.cpp) - one that reaches here did
 //! not read as its rule, said in the form's own words
-[[noreturn]] void RefuseObjectForm(AdminScanner &s, bool add) {
-	auto kind = StringUtil::Lower(s.PeekWord());
-	s.Accept(kind.c_str());
-	bool function = kind == "scalar" || (kind == "table" && s.Accept("function"));
+[[noreturn]] void RefuseObjectForm(const HeadWords &head, idx_t at, bool add) {
+	auto kind = head.Word(at);
+	bool function = kind == "scalar" || (kind == "table" && head.Word(at + 1) == "function");
 	if (add) {
 		if (kind == "view") {
 			RefuseMovedForm("write ADD VIEW <catalog>.<name> [(<columns>)] AS <sql>");
@@ -414,11 +372,10 @@ public:
 }
 
 //! spec 150, stage 3c part 2: ALTER / COMMENT ON / CHECK / REPAIR / ANALYZE / DROP of the objects are rules - one
-//! that reaches here did not read as its rule, said in the form's own words (`s` stands after `VIRTUAL`)
-[[noreturn]] void RefuseObjectChange(AdminScanner &s, const string &verb) {
-	auto kind = StringUtil::Lower(s.PeekWord());
-	s.Accept(kind.c_str());
-	bool function = kind == "scalar" || (kind == "table" && s.Accept("function"));
+//! that reaches here did not read as its rule, said in the form's own words (`at` stands after `VIRTUAL`)
+[[noreturn]] void RefuseObjectChange(const HeadWords &head, idx_t at, const string &verb) {
+	auto kind = head.Word(at);
+	bool function = kind == "scalar" || (kind == "table" && head.Word(at + 1) == "function");
 	if (verb == "alter") {
 		if (kind == "reference") {
 			RefuseMovedForm("write ALTER VIRTUAL REFERENCE <catalog>.<name> SET COMMENT '<text>' | SET CARDINALITY "
@@ -472,9 +429,9 @@ public:
 }
 
 //! spec 150, stage 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT are rules - one that reaches here did
-//! not read as its rule, said in the form's own words (`s` stands after GRANT / REVOKE)
-[[noreturn]] void RefuseGrantForm(AdminScanner &s, const string &verb) {
-	auto kind = StringUtil::Lower(s.PeekWord());
+//! not read as its rule, said in the form's own words (`at` stands after GRANT / REVOKE)
+[[noreturn]] void RefuseGrantForm(const HeadWords &head, idx_t at, const string &verb) {
+	auto kind = head.Word(at);
 	bool grant = verb == "grant";
 	if (kind == "catalog") {
 		RefuseMovedForm(grant ? "write GRANT CATALOG <catalog> TO ROLE <role> [WITH (<capability>, ...) | CAPS "
@@ -678,17 +635,28 @@ string ResourceLimitsJson(const string &inside) {
 	                      "service one name - a dotted one quoted: IN \"a.b\")");
 }
 
-unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
-	auto keyword = s.Word("a management keyword");
-	string usage;
-	auto heads = ReadStatementHeads(s.text, 2);
-	auto verb = !heads.empty() && heads[0].size() > 1 ? heads[0][1].word : string();
-	if (MgmtRulesKeyword(keyword, &usage, verb)) {
-		// spec 150 3g-3: a linked module's statement its rules did not read - said in the module's words
-		RefuseMovedForm(usage);
+//! A CREATE / ALTER / DROP after the `ACL` marker that is no management statement: said so, naming what it is
+[[noreturn]] void RefuseNotManagement(const string &verb, const string &noun) {
+	if (noun.empty()) {
+		throw BinderException("acl admin: unknown management statement \"%s\"", verb);
 	}
-	if (auto parse = FindMgmtGrammar(keyword)) {
-		return parse(s); // spec 126: a linked module's form
+	throw BinderException("acl admin: %s %s is no management statement", StringUtil::Upper(verb),
+	                      StringUtil::Upper(noun));
+}
+
+//! spec 150 3g-3c: a management statement no rule reads - refused in its form's own words, chosen by its head on
+//! duckdb's tokens (every form is a rule: nothing is compiled from text any more)
+[[noreturn]] void RefuseUnreadStatement(const string &text) {
+	HeadWords head;
+	auto heads = ReadStatementHeads(text, 6);
+	if (!heads.empty()) {
+		head.tokens = std::move(heads[0]);
+	}
+	auto keyword = head.Word(0);
+	string usage;
+	if (MgmtRulesKeyword(keyword, &usage, head.Word(1))) {
+		// a linked module's statement its rules did not read - said in the module's words
+		RefuseMovedForm(usage);
 	}
 	// spec 150, stage 3: the operations of a node are rules (acl_mgmt_grammar.cpp); one that reaches here did not
 	// read as its rule - said in the form's own words
@@ -719,138 +687,160 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		                "VIEW platform.<view> TO ROLE <role>");
 	}
 	if (StringUtil::CIEquals(keyword, "create")) {
-		if (s.Accept("or")) {
-			s.Expect("replace");
+		idx_t at = 1;
+		if (head.Word(at) == "or") {
+			at += head.Word(at + 1) == "replace" ? 2 : 1;
 		}
-		if (s.Accept("virtual")) {
-			RefuseObjectForm(s, false);
+		auto noun = head.Word(at);
+		if (noun == "virtual") {
+			RefuseObjectForm(head, at + 1, false);
 		}
-		if (s.Accept("role")) {
+		if (noun == "role") {
 			RefuseMovedForm("write CREATE [OR REPLACE] ROLE [IF NOT EXISTS] <role> [CLAIMS (name = 'value', ...)]");
 		}
-		if (s.Accept("resource")) {
+		if (noun == "resource") {
 			RefuseMovedForm(
 			    "write CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] [(<limit> <value>, ...)] [DEFAULT] "
 			    "[COMMENT '<text>']");
 		}
-		if (s.Accept("function")) {
+		if (noun == "function") {
+			if (head.Word(at + 1) != "category") {
+				RefuseNotManagement("create", noun); // duckdb's CREATE FUNCTION is a macro
+			}
 			RefuseMovedForm("write CREATE [OR REPLACE] FUNCTION CATEGORY <category> [COMMENT '<text>']");
 		}
 		// spec 150, stage 3e: CREATE ISSUER | CLIENT are rules - one that reaches here did not read as its rule
-		if (s.Accept("client")) {
+		if (noun == "client") {
 			RefuseMovedForm("write CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <client> ISSUER <issuer> [FROM SECRET "
 			                "<secret> [IN <service>]] [<client clause> ...]");
 		}
-		s.Expect("issuer");
+		if (noun != "issuer") {
+			RefuseNotManagement("create", noun);
+		}
 		RefuseMovedForm("write CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <issuer> | '<url>' [URL '<url>'] [FROM "
 		                "SECRET <secret> [IN <service>]] [CLIENT FROM SECRET <secret> [IN <service>]] [<client clause> "
 		                "...]");
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
-		RefuseObjectForm(s, true);
+		RefuseObjectForm(head, 1, true);
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
-		if (s.Accept("secret")) {
+		auto noun = head.Word(1);
+		if (noun == "secret") {
 			RefuseSecretsForm(true);
 		}
-		if (s.Accept("source")) {
+		if (noun == "source") {
 			RefuseMovedForm("write GRANT SOURCE <database>[.<schema>] TO ROLE <role>");
 		}
-		if (s.Accept("resource")) {
+		if (noun == "resource") {
 			RefuseMovedForm("write GRANT RESOURCE GROUP <group> TO ROLE <role>");
 		}
-		if (s.Accept("admin")) {
+		if (noun == "admin") {
 			RefuseMovedForm("write GRANT ADMIN <scope> TO ROLE <role>");
 		}
-		if (s.Accept("function")) {
+		if (noun == "function") {
 			RefuseMovedForm("write GRANT FUNCTION [CATEGORY] <name> [TABLE | SCALAR] TO ROLE <role> | ALL ROLES");
 		}
 		// spec 150, stage 3d: GRANT CATALOG | SCHEMA | TABLE | VIEW | OBJECT are rules - one that reaches here did not
 		// read as its rule
-		RefuseGrantForm(s, "grant");
+		RefuseGrantForm(head, 1, "grant");
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
-		if (s.Accept("secret")) {
+		auto noun = head.Word(1);
+		if (noun == "secret") {
 			RefuseSecretsForm(false);
 		}
-		if (s.Accept("source")) {
+		if (noun == "source") {
 			RefuseMovedForm("write REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>");
 		}
-		if (s.Accept("admin")) {
+		if (noun == "admin") {
 			RefuseMovedForm("write REVOKE ADMIN [<scope>] FROM ROLE <role>");
 		}
-		if (s.Accept("resource")) {
+		if (noun == "resource") {
 			RefuseMovedForm("write REVOKE RESOURCE GROUP <group> FROM ROLE <role>");
 		}
-		if (s.Accept("function")) {
+		if (noun == "function") {
 			RefuseMovedForm("write REVOKE FUNCTION [CATEGORY] <name> [TABLE | SCALAR] FROM ROLE <role> | ALL ROLES");
 		}
-		RefuseGrantForm(s, "revoke");
+		RefuseGrantForm(head, 1, "revoke");
 	}
 	if (StringUtil::CIEquals(keyword, "map")) {
 		RefuseMovedForm("write MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
 	}
 	if (StringUtil::CIEquals(keyword, "alter")) {
-		if (s.Accept("function")) {
+		auto noun = head.Word(1);
+		if (noun == "function" && head.Word(2) != "category") {
+			RefuseNotManagement("alter", noun);
+		}
+		if (noun == "function") {
 			RefuseMovedForm(
 			    "write ALTER FUNCTION CATEGORY <category> ADD | DROP (<function> [TABLE | SCALAR], ...) | SET COMMENT "
 			    "'<text>'");
 		}
-		if (s.Accept("resource")) {
+		if (noun == "resource") {
 			RefuseMovedForm(
 			    "write ALTER RESOURCE GROUP <group> SET (<limit> <value>, ...) | SET COMMENT '<text>' | SET "
 			    "DEFAULT | DROP DEFAULT");
 		}
-		if (s.Accept("role")) {
+		if (noun == "role") {
 			RefuseMovedForm("write ALTER ROLE <role> SET COMMENT '<text>' | SET CLAIMS (name = 'value', ...)");
 		}
-		if (s.Accept("issuer")) {
+		if (noun == "issuer") {
 			RefuseMovedForm(
 			    "write ALTER ISSUER <issuer> SET URL '<url>' | [CLIENT] FROM SECRET <secret> [IN <service>] | "
 			    "<client clause> ... | DROP [CLIENT] FROM SECRET");
 		}
-		if (s.Accept("client")) {
+		if (noun == "client") {
 			RefuseMovedForm("write ALTER CLIENT <client> SET FROM SECRET <secret> [IN <service>] | <client clause> "
 			                "... | DROP FROM SECRET");
 		}
-		if (s.Accept("grant")) {
+		if (noun == "grant") {
 			RefuseMovedForm("write ALTER GRANT CATALOG <catalog> TO ROLE <role> SET CAPS '<json>' | SET RLS "
 			                "'<predicate>' | SET COLUMNS '<list>' | SET MAIN true | false");
 		}
 		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
-		s.Expect("virtual");
-		RefuseObjectChange(s, "alter");
+		if (noun != "virtual") {
+			RefuseNotManagement("alter", noun);
+		}
+		RefuseObjectChange(head, 2, "alter");
 	}
 	if (StringUtil::CIEquals(keyword, "comment") || StringUtil::CIEquals(keyword, "check") ||
 	    StringUtil::CIEquals(keyword, "repair") || StringUtil::CIEquals(keyword, "analyze")) {
-		s.Accept("on");
-		s.Accept("virtual");
-		RefuseObjectChange(s, StringUtil::Lower(keyword));
+		idx_t at = 1;
+		at += head.Word(at) == "on" ? 1 : 0;
+		at += head.Word(at) == "virtual" ? 1 : 0;
+		RefuseObjectChange(head, at, StringUtil::Lower(keyword));
 	}
 	if (StringUtil::CIEquals(keyword, "drop")) {
-		if (s.Accept("relation")) {
+		auto noun = head.Word(1);
+		if (noun == "relation") {
 			RefuseMovedForm("write DROP RELATION [IF EXISTS] <catalog>.<name>");
 		}
-		if (s.Accept("resource")) {
+		if (noun == "resource") {
 			RefuseMovedForm("write DROP RESOURCE GROUP [IF EXISTS] <group>");
 		}
-		if (s.Accept("function")) {
+		if (noun == "function") {
+			if (head.Word(2) != "category") {
+				RefuseNotManagement("drop", noun);
+			}
 			RefuseMovedForm("write DROP FUNCTION CATEGORY [IF EXISTS] <category>");
 		}
-		if (s.Accept("reference")) {
+		if (noun == "reference") {
 			RefuseMovedForm("write DROP [VIRTUAL] REFERENCE [IF EXISTS] <catalog>.<name>");
 		}
-		if (s.Accept("role")) {
+		if (noun == "role") {
 			RefuseMovedForm("write DROP ROLE [IF EXISTS] <role>");
 		}
-		if (s.Accept("issuer") || s.Accept("client")) {
+		if (noun == "issuer" || noun == "client") {
 			RefuseMovedForm("write DROP ISSUER | CLIENT [IF EXISTS] <name>");
 		}
-		if (s.Accept("map")) {
+		if (noun == "map") {
 			RefuseMovedForm("write DROP MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
 		}
-		s.Expect("virtual");
-		RefuseObjectChange(s, "drop");
+		if (noun != "virtual") {
+			RefuseNotManagement("drop", noun);
+		}
+		RefuseObjectChange(head, 2, "drop");
 	}
 	throw BinderException("acl admin: unknown management statement \"%s\"", keyword);
 }
@@ -895,16 +885,6 @@ bool BatchIsAllMgmt(const string &text) {
 	return !heads.empty();
 }
 
-//! One management statement written as text, compiled by the management compiler (a form no rule reads)
-unique_ptr<SQLStatement> CompileMgmtText(const string &text) {
-	AdminScanner scanner(text);
-	auto statement = ParseMgmtStatement(scanner);
-	if (!scanner.Done()) {
-		throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
-	}
-	return statement;
-}
-
 vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session,
                                                 AclGrammarCache &grammar, const ParserOptions &options) {
 	RefuseRepeatedPrefix(text);
@@ -913,8 +893,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "
 		                      "kind in a batch of its own");
 	}
-	// spec 150, stage 3: statement by statement as duckdb's grammar splits the batch - each by its rule, or as its own
-	// text by the management compiler
+	// spec 150, stage 3: statement by statement as duckdb's grammar splits the batch - each by its rule; one no rule
+	// reads is refused in its form's words
 	struct Piece {
 		MgmtParsed parsed;
 		//! the tokenizer refused this statement: a moved form says the tokenizer's words
@@ -929,7 +909,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		// a text duckdb's tokenizer refuses (an empty quoted name): statement by statement as that tokenizer ends them
 		// - never a split of ours, which read quotes and comments otherwise (`$1$`, backticks, `E'\''`) and so could
 		// hide a statement end or an open comment. Each statement the grammar reads is its rules', and the one it
-		// refuses goes to the compiler, which says what is wrong in its own words, as it did
+		// refuses is refused in its form's words (or the tokenizer's)
 		ErrorData batch_error(batch_refusal);
 		pieces.clear();
 		for (auto &piece : grammar.SplitManagement(text)) {
@@ -939,9 +919,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				}
 			} catch (ParserException &refusal) {
 				MgmtParsed parsed;
-				parsed.legacy = true;
+				parsed.unread = true;
 				parsed.text = piece;
-				parsed.unreadable = grammar.JudgeLegacy(piece);
 				pieces.push_back(Piece {std::move(parsed), make_shared_ptr<ErrorData>(refusal)});
 			}
 		}
@@ -960,20 +939,14 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 	vector<unique_ptr<SQLStatement>> statements;
 	for (auto &piece : pieces) {
 		auto &entry = piece.parsed;
-		if (entry.secrets || (entry.legacy && IsSecretsStart(entry.text))) {
+		if (entry.secrets || (entry.unread && IsSecretsStart(entry.text))) {
 			throw BinderException("acl admin: GRANT / REVOKE SECRET goes in a batch of its own - its right is the "
 			                      "secrets capability, not an administration scope");
 		}
-		if (entry.legacy) {
+		if (entry.unread) {
+			// a statement no rule reads: refused in its form's own words (or, when the tokenizer refused it, in its)
 			try {
-				statements.push_back(CompileMgmtText(entry.text));
-				if (!entry.unreadable.empty()) {
-					// it compiled - from text its scanner reads otherwise than duckdb does
-					throw BinderException("acl admin: %s in a statement no rule reads yet - its compiler would read it "
-					                      "otherwise than written; write it without (a linked module's form becomes a "
-					                      "rule in stage 3g)",
-					                      entry.unreadable);
-				}
+				RefuseUnreadStatement(entry.text);
 			} catch (MovedFormRefusal &) {
 				if (piece.refused) {
 					// the tokenizer's words - its position counts in the piece, not in the batch, so it goes
@@ -1172,8 +1145,8 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 	// the whole batch is read by its rules before any service is chosen: a malformed batch says so first
 	vector<SecretsStatement> parsed;
 	for (auto &entry : grammar.ReadManagement(text, options)) {
-		if (entry.legacy && IsSecretsStart(entry.text)) {
-			// a GRANT / REVOKE SECRET its rule did not read, in that form's own words - the compiler never runs here
+		if (entry.unread && IsSecretsStart(entry.text)) {
+			// a GRANT / REVOKE SECRET its rule did not read, in that form's own words - nothing is compiled from text
 			RefuseSecretsForm(ReadStatementHeads(entry.text, 1)[0][0].IsWord("grant"));
 		}
 		if (!entry.secrets) {
