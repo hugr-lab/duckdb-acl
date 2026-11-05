@@ -6,6 +6,7 @@ stolen-handle check can ask as a different principal without a second fixture.
 """
 import json, os, sys
 import adbc_driver_flightsql.dbapi as dbapi
+import adbc_driver_manager
 from adbc_driver_flightsql import DatabaseOptions
 
 uri, acme_token = sys.argv[1], sys.argv[2]
@@ -170,6 +171,14 @@ with connect(acme_token, autocommit=False) as conn:
     conn.rollback()
     cur.execute("SELECT count(*) FROM orders WHERE id = 602")
     check("and gone after rollback", cur.fetchall() == [(0,)])
+    # spec 153: a table's DDL in an expansion inside the client's transaction (it runs as text on the session's
+    # connection, in its transaction)
+    write("CREATE TABLE made.tx AS SELECT 3 AS v")
+    conn.commit()
+    cur.execute("SELECT v FROM made.tx")
+    check("a CREATE TABLE in an expansion committed in a transaction", cur.fetchall() == [(3,)])
+    write("DROP TABLE made.tx")
+    conn.commit()
     # the predicate still confines a write inside a transaction - RLS is not a commit-time check
     try:
         write("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (603, 'globex', 1, 0)")
@@ -236,6 +245,39 @@ with connect(acme_token) as conn:
     names = [d[0] for d in cur.description or []]
     shown = (names, cur.fetchall())
     check("its DROP answers the same", shown[1] == [] and not any("acl_" in n for n in names), shown)
+    # spec 153: a TABLE's DDL in an expansion is the DDL and its record - two statements, which the door prepared and
+    # duckdb refused ("Cannot prepare multiple statements"); it runs as text now, on each Flight path
+    cur.execute("CREATE TABLE made.t AS SELECT 7 AS v")
+    shown = cur.fetchall()
+    check("a CREATE TABLE in an expansion runs over Flight", shown == [], shown)
+    cur.execute("ALTER TABLE made.t RENAME TO t2")
+    cur.execute("SELECT v FROM made.t2")
+    shown = cur.fetchall()
+    check("...renames, and reads back", shown == [(7,)], shown)
+    # the raw API on a statement of its own: the cursor keeps its last text's statement and would skip set_sql_query
+    raw = adbc_driver_manager.AdbcStatement(conn.adbc_connection)
+    raw.set_sql_query("DROP TABLE made.t2")
+    shown = raw.execute_update()  # ExecuteUpdate: DoPut
+    check("...ExecuteUpdate drops it, answering 0 (a DDL's answer is its record's)", shown == 0, shown)
+    try:
+        cur.execute("SELECT count(*) FROM made.t2")
+        check("...and its record went with it", False, cur.fetchall())
+    except Exception as gone:
+        check("...and its record went with it", "no access to object" in str(gone), gone)
+    # prepared: kept as text, decided when it runs
+    raw.set_sql_query("CREATE TABLE made.p AS SELECT 1 AS x")
+    raw.prepare()
+    raw.execute_update()
+    raw.close()
+    cur.execute("SELECT x FROM made.p")
+    shown = cur.fetchall()
+    check("a prepared CREATE TABLE in an expansion runs", shown == [(1,)], shown)
+    try:
+        cur.execute("CREATE TABLE made.q AS SELECT 1 AS x", (5,))
+        check("a DDL with a bound parameter is refused", False, "it ran")
+    except Exception as refused:
+        check("a DDL with a bound parameter is refused", "takes no parameters" in str(refused), refused)
+    cur.execute("DROP TABLE made.p")
     tz_option = ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value + "TimeZone"
     conn.adbc_connection.set_options(**{tz_option: "Asia/Tokyo"})
     cur.execute("SELECT '2026-01-01 00:00:00+00'::TIMESTAMPTZ::VARCHAR")

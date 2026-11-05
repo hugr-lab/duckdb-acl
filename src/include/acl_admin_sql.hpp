@@ -66,6 +66,11 @@ bool StartsWithMgmt(const vector<vector<HeadToken>> &heads); // the same, on hea
 //! client writes itself, its `ACL` marker (management unless NATIVE follows), else the first statement's head.
 //! `rest`: the normalized text past those markers, for the door's other judgments of the client's statement
 bool ClientTextIsMgmt(const string &query, string &rest);
+//! spec 153: a client's DDL - its text past the markers it writes, read by the plain parser as ONE `CREATE`, `DROP` or
+//! `ALTER` with no parameter. Not a `CREATE SECRET`: it answers a row (the secrets service's), so the door's prepared
+//! path takes it as a query (a `DROP SECRET` answers none, and is DDL here). The Flight door runs it as text, never
+//! prepared: a principal's DDL in a schema that records its objects is the DDL and its record, two statements
+bool ClientTextIsDdl(const string &query);
 
 // The authorization gate (spec 009) moved to acl_platform.hpp (spec 117): AuthorizeMgmt is the one
 // authorizer of the grammar and of a direct platform.<op>(…) call alike.

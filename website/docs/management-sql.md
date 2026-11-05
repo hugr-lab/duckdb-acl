@@ -578,10 +578,10 @@ object through `acl_register_created` / `acl_register_existing` / `acl_register_
 principal cannot call directly. The record runs as a `PRAGMA acl_register_…(…)` right after the DDL
 (spec 151). The DDL answers `Success` and no row - nothing of the physical name or of a view's rewritten
 body; a `CREATE TABLE … AS` answers so too, not with a count. In a quack batch (`CREATE TABLE …; SELECT
-…`) the `SELECT` answers. Over Flight every statement is prepared, so a DDL that writes a record works
-there only when it is the record alone (`CREATE VIEW`, `DROP VIEW`, a view's `RENAME`, `VIRTUAL ONLY`): a
-`CREATE TABLE`, `DROP TABLE` or table `RENAME` in an expansion is two statements, which the door cannot
-prepare - run it through quack or a gateway. In an expansion, `CREATE TABLE IF NOT EXISTS` of a name with
+…`) the `SELECT` answers. Over Flight the door runs a DDL as text (spec 153), so a `CREATE TABLE`,
+`DROP TABLE` or table `RENAME` in an expansion - the DDL and its record - works there too. With `drop`
+on an expansion, a `DROP` or `CREATE OR REPLACE` acts on the physical table, one the expansion does not
+show included (the owner, 2026-11-05). In an expansion, `CREATE TABLE IF NOT EXISTS` of a name with
 no record is refused when a physical table holds it - it would adopt a table the expansion does not
 show (`VIRTUAL ONLY` registers what exists, by design). An `EXPLAIN` of a DDL that writes a record (any
 `RENAME` among them) is refused; one in a live alias's schema explains, and a no-op answers the empty
