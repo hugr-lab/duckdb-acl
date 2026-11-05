@@ -303,10 +303,11 @@ jobs:
           make test-flight 2>&1 | tee flight.log
           scripts/ci/assert_ran.sh flight.log 0 0
 
-  # Representative second platform; PRs stay on the Linux job to keep them fast
+  # Representative second platform; PRs stay on the Linux job to keep them fast. macos-15, which the
+  # distribution matrix builds osx_arm64 on too: macos-14 runners are going away
   build-test-osx:
     name: Build + test (osx_arm64)
-    runs-on: macos-14
+    runs-on: macos-15
     if: ${{ github.event_name != 'pull_request' }}
     env:
       GEN: ninja
