@@ -1,8 +1,8 @@
 // Spec 150, stage 3: the management statements as rules of duckdb's PEG parser. A management batch (the rest after
 // `ACL <prefix> ACL`, or after `ACL ADMIN`) is parsed with a grammar whose Statement is ours: each family that moved
-// to rules compiles to the acl_* call it always compiled to, and a statement no rule reads (since 3f only a form a
-// linked module registers - hugr-node's, until 3g) goes, as its own text, to the management compiler
-// (acl_admin_sql.cpp). Never registered: a connection cannot switch it on.
+// to rules compiles to the acl_* call it always compiled to (a linked module's statements too, RegisterMgmtRules),
+// and a statement no rule reads is refused in its form's words (acl_admin_sql.cpp's RefuseUnreadStatement). Never
+// registered: a connection cannot switch it on.
 
 #include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
@@ -2634,7 +2634,7 @@ public:
 		changes.push_back(GrammarChange::AddRule(
 		    "AclRevokeSecret <- 'REVOKE' 'SECRET' AclNameValue 'FROM' AclSecretPrincipal AclSecretService?",
 		    Start<FinalizeSecretGrant>));
-		// a statement no rule reads yet: its tokens, to the management compiler
+		// any token up to the statement's end - what AclBody reads
 		changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
 		changes.push_back(
 		    GrammarChange::AddTerminalRuleOverride("AclTailToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
@@ -3399,8 +3399,8 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 		try {
 			statement = parser.ParseTopLevelStatement(cursor);
 		} catch (ParserException &) {
-			// a form a rule began but more follows it before its `;` (PEG keeps the rule that matched): the statement's
-			// tokens up to its `;` go to the compiler as its own text, as a statement no rule reads does
+			// a statement no rule reads - or a form a rule began with more following it before its `;` (PEG keeps the
+			// rule that matched): its tokens up to its `;`, refused in its form's words
 			auto end = start;
 			while (end < tokens.Size() && tokens.GetToken(end).type != TokenType::TERMINATOR &&
 			       tokens.GetToken(end).type != TokenType::END_OF_INPUT) {
@@ -3411,15 +3411,13 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			}
 			auto &last = tokens.GetToken(end - 1);
 			MgmtParsed parsed;
-			parsed.legacy = true;
+			parsed.unread = true;
 			parsed.text =
 			    text.substr(tokens.GetToken(start).offset, last.offset + last.length - tokens.GetToken(start).offset);
 			result.push_back(std::move(parsed));
-			cursor.SetPosition(end);
-			while (cursor.Current() && cursor.Current()->type == TokenType::TERMINATOR) {
-				cursor.Advance();
-			}
-			continue;
+			// the batch is refused at it: reading on would cost a failed match per statement after it (duckdb renders
+			// the batch's tokens for each)
+			break;
 		}
 		if (!statement) {
 			continue; // a separator
@@ -3468,7 +3466,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			}
 		}
 		MgmtParsed parsed;
-		{
+		{ // a rule's call
 			parsed.function = data.function;
 			parsed.args = data.args;
 			parsed.table_call = data.table_call;

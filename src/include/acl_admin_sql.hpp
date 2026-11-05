@@ -31,7 +31,7 @@ unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Valu
 //! ParserException from the tokenizer, a BinderException from a form).
 //! `current_session` is the ops id of the session the batch runs under ('' off a session): what
 //! `PROFILE SESSION CURRENT` names (spec 074 slice 3).
-//! spec 150, stage 3: the batch is read by `grammar`'s management rules, a family no rule reads yet by the compiler.
+//! spec 150, stage 3: the batch is read by `grammar`'s management rules; a statement no rule reads is refused.
 vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session,
                                                 AclGrammarCache &grammar, const ParserOptions &options);
 

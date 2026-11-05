@@ -46,10 +46,10 @@ struct GrammarPrefix {
 };
 
 //! spec 150, stage 3: a management statement as the grammar read it - a call of an acl_* function a rule compiled, or
-//! (`legacy`: no rule reads it) the statement's own text, refused in its form's words
+//! (`unread`: no rule reads it) the statement's own text, refused in its form's words
 struct MgmtParsed {
-	bool legacy = false;
-	//! legacy: the statement as written, its first token to its last
+	bool unread = false;
+	//! unread: the statement as written, its first token to its last
 	string text;
 	//! a rule's: the acl_* function and its arguments
 	string function;

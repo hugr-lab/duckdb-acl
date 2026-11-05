@@ -1,8 +1,8 @@
-// The ACL management grammar (spec 008). Since spec 150's stage 3 the management statements are rules
+// The ACL management grammar (spec 008). Since spec 150's stage 3 every management statement is a rule
 // (acl_mgmt_grammar.cpp); what is left here reads the lists a rule hands over (ParseMgmtBatch's readers), builds the
-// secrets service's call from its rule's reading (spec 082), compiles a form a linked module registers (hugr-node's,
-// until 3g-3), and refuses a moved form's text in its own words. The authorizer every management statement passes is
-// acl_platform.cpp's (spec 117). The parser override is its only caller.
+// secrets service's call from its rule's reading (spec 082), and refuses a statement no rule reads in its form's own
+// words (RefuseUnreadStatement). The authorizer every management statement passes is acl_platform.cpp's (spec 117).
+// The parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -702,6 +702,9 @@ string ResourceLimitsJson(const string &inside) {
 			RefuseMovedForm("write CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <client> ISSUER <issuer> [FROM SECRET "
 			                "<secret> [IN <service>]] [<client clause> ...]");
 		}
+		if (noun != "issuer") {
+			throw BinderException("acl admin: CREATE %s is no management statement", StringUtil::Upper(noun));
+		}
 		RefuseMovedForm("write CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <issuer> | '<url>' [URL '<url>'] [FROM "
 		                "SECRET <secret> [IN <service>]] [CLIENT FROM SECRET <secret> [IN <service>]] [<client clause> "
 		                "...]");
@@ -781,6 +784,9 @@ string ResourceLimitsJson(const string &inside) {
 			                "'<predicate>' | SET COLUMNS '<list>' | SET MAIN true | false");
 		}
 		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
+		if (noun != "virtual") {
+			throw BinderException("acl admin: ALTER %s is no management statement", StringUtil::Upper(noun));
+		}
 		RefuseObjectChange(head, 2, "alter");
 	}
 	if (StringUtil::CIEquals(keyword, "comment") || StringUtil::CIEquals(keyword, "check") ||
@@ -812,6 +818,9 @@ string ResourceLimitsJson(const string &inside) {
 		}
 		if (noun == "map") {
 			RefuseMovedForm("write DROP MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
+		}
+		if (noun != "virtual") {
+			throw BinderException("acl admin: DROP %s is no management statement", StringUtil::Upper(noun));
 		}
 		RefuseObjectChange(head, 2, "drop");
 	}
@@ -858,7 +867,6 @@ bool BatchIsAllMgmt(const string &text) {
 	return !heads.empty();
 }
 
-//! One management statement written as text, compiled by the management compiler (a form no rule reads)
 vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session,
                                                 AclGrammarCache &grammar, const ParserOptions &options) {
 	RefuseRepeatedPrefix(text);
@@ -867,8 +875,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "
 		                      "kind in a batch of its own");
 	}
-	// spec 150, stage 3: statement by statement as duckdb's grammar splits the batch - each by its rule, or as its own
-	// text by the management compiler
+	// spec 150, stage 3: statement by statement as duckdb's grammar splits the batch - each by its rule; one no rule
+	// reads is refused in its form's words
 	struct Piece {
 		MgmtParsed parsed;
 		//! the tokenizer refused this statement: a moved form says the tokenizer's words
@@ -883,7 +891,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		// a text duckdb's tokenizer refuses (an empty quoted name): statement by statement as that tokenizer ends them
 		// - never a split of ours, which read quotes and comments otherwise (`$1$`, backticks, `E'\''`) and so could
 		// hide a statement end or an open comment. Each statement the grammar reads is its rules', and the one it
-		// refuses goes to the compiler, which says what is wrong in its own words, as it did
+		// refuses is refused in its form's words (or the tokenizer's)
 		ErrorData batch_error(batch_refusal);
 		pieces.clear();
 		for (auto &piece : grammar.SplitManagement(text)) {
@@ -893,7 +901,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				}
 			} catch (ParserException &refusal) {
 				MgmtParsed parsed;
-				parsed.legacy = true;
+				parsed.unread = true;
 				parsed.text = piece;
 				pieces.push_back(Piece {std::move(parsed), make_shared_ptr<ErrorData>(refusal)});
 			}
@@ -913,11 +921,11 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 	vector<unique_ptr<SQLStatement>> statements;
 	for (auto &piece : pieces) {
 		auto &entry = piece.parsed;
-		if (entry.secrets || (entry.legacy && IsSecretsStart(entry.text))) {
+		if (entry.secrets || (entry.unread && IsSecretsStart(entry.text))) {
 			throw BinderException("acl admin: GRANT / REVOKE SECRET goes in a batch of its own - its right is the "
 			                      "secrets capability, not an administration scope");
 		}
-		if (entry.legacy) {
+		if (entry.unread) {
 			// a statement no rule reads: refused in its form's own words (or, when the tokenizer refused it, in its)
 			try {
 				RefuseUnreadStatement(entry.text);
@@ -1119,7 +1127,7 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 	// the whole batch is read by its rules before any service is chosen: a malformed batch says so first
 	vector<SecretsStatement> parsed;
 	for (auto &entry : grammar.ReadManagement(text, options)) {
-		if (entry.legacy && IsSecretsStart(entry.text)) {
+		if (entry.unread && IsSecretsStart(entry.text)) {
 			// a GRANT / REVOKE SECRET its rule did not read, in that form's own words - the compiler never runs here
 			RefuseSecretsForm(ReadStatementHeads(entry.text, 1)[0][0].IsWord("grant"));
 		}

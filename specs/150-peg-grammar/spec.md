@@ -426,7 +426,13 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       as the compiler chose them - a module's by its usage, a tokenizer refusal still first. `AdminScanner` stays as
       the readers of a statement's lists (REQUIRE / ATTRIBUTES, a column list, a claim map, limits - handed their text
       by the rules): they become rules with stage 4, as do their checks (`JudgeListText`, `ScannerUnreadable`, once
-      `JudgeLegacyText`). The suite's refusals are unchanged (11650 assertions); hugr-node re-pins onto it next.
+      `JudgeLegacyText`); its members only the statement compiler used go. The batch reader stops at the first
+      statement no rule reads (the batch is refused there: reading on cost a failed match - duckdb renders the batch's
+      tokens for each - per statement after it, 32,000 of them 20 s); under the `ACL` marker a CREATE / ALTER / DROP
+      that is no management statement says so (`CREATE TABLE is no management statement`). A differential against the
+      compiler over 4,658 malformed statements lost no refusal - the words differ where a comment stood between the
+      head's words (now the form's own), for `CREATE OR <noun>` and a non-ASCII letter glued to a word. hugr-node
+      re-pins onto it next.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
   rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 
