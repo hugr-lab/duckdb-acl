@@ -328,7 +328,7 @@ PATCHES = {
         (
             "\tif (data.properties.return_type != StatementReturnType::QUERY_RESULT || stream->Bound()) {\n",
             "\tif (data.properties.return_type != StatementReturnType::QUERY_RESULT || stream->Bound() ||\n"
-            "\t    acl::AclQuackRecordStatement(data)) {\n",
+            "\t    acl::AclQuackRecordStatement(data.statement_type, data.physical_plan->Root())) {\n",
         ),
     ],
 }

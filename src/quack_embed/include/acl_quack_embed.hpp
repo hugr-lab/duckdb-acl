@@ -17,6 +17,7 @@
 #pragma once
 
 #include "acl_policy.hpp"
+#include "duckdb/common/enums/statement_type.hpp"
 
 namespace duckdb {
 
@@ -24,7 +25,7 @@ class ExtensionLoader;
 class Connection;
 class DatabaseInstance;
 class QueryResult;
-class PreparedStatementData;
+class PhysicalOperator;
 
 namespace acl {
 
@@ -54,7 +55,9 @@ void AclQuackStatementStarting(Connection &connection, const string &connection_
 //! True when `data` is the record a principal's DDL / USE writes (spec 151, `PRAGMA acl_…`). The server's result
 //! collector (a sync.py patch) streams a batch's first statement that returns a result, and skips this one, so
 //! `CREATE TABLE …; SELECT …` answers the SELECT as a native quack server does. Never throws.
-bool AclQuackRecordStatement(const PreparedStatementData &data);
+//! (The statement's type and plan root, not the PreparedStatementData: quack declares that a struct and duckdb a class,
+//! and MSVC mangles a reference by the kind its TU saw first - the link failed on windows_amd64.)
+bool AclQuackRecordStatement(StatementType type, const PhysicalOperator &root);
 //! The server's connect, before authentication opens a session (spec 079): true when the door has
 //! a seat for one more client - `seated` quack clients each reserving `acl_quack_client_depth` of
 //! the `acl_quack_server_max_connections` workers. False with the reason to answer, audited as a

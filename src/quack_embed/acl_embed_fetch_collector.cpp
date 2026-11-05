@@ -185,7 +185,7 @@ unique_ptr<PhysicalOperator> MakeQuackFetchCollector(ClientContext &context, Pre
 	// The stream carries the FIRST statement that returns a result, as core does for a result chain.
 	// Every other statement keeps the default collector.
 	if (data.properties.return_type != StatementReturnType::QUERY_RESULT || stream->Bound() ||
-	    acl::AclQuackRecordStatement(data)) {
+	    acl::AclQuackRecordStatement(data.statement_type, data.physical_plan->Root())) {
 		return PhysicalResultCollector::GetResultCollector(context, data);
 	}
 	auto &physical_plan = *data.physical_plan;

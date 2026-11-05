@@ -30,9 +30,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_result.hpp"
-#include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/execution/operator/helper/physical_pragma.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -635,12 +633,8 @@ void AclQuackStatementStarting(Connection &connection, const string &connection_
 	}
 }
 
-bool AclQuackRecordStatement(const PreparedStatementData &data) {
-	if (data.statement_type != StatementType::PRAGMA_STATEMENT || !data.physical_plan) {
-		return false;
-	}
-	auto &root = data.physical_plan->Root();
-	return root.type == PhysicalOperatorType::PRAGMA &&
+bool AclQuackRecordStatement(StatementType type, const PhysicalOperator &root) {
+	return type == StatementType::PRAGMA_STATEMENT && root.type == PhysicalOperatorType::PRAGMA &&
 	       IsAclRecordPragma(root.Cast<PhysicalPragma>().info->function.name.GetIdentifierName());
 }
 
