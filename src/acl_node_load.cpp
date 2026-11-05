@@ -150,23 +150,9 @@ ObserveVerdict ObserveAuthorize(DatabaseInstance &db, PolicyStore &store, const 
 
 string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besides) {
 	auto draining = store.Draining();
-	auto live = store.SessionCount();
-	// the session left out: its door and the group it is charged to, so every count agrees
-	string besides_door, besides_group;
-	bool left_out = false;
-	if (!besides.empty()) {
-		for (auto &session : store.SessionList()) {
-			if (session.id == besides) {
-				besides_door = session.door;
-				besides_group = session.charged_group;
-				left_out = true;
-				break;
-			}
-		}
-	}
-	if (left_out && live > 0) {
-		live--;
-	}
+	// every count at one look, the calling call's own session left out of each (so they agree)
+	auto tally = store.SessionTallyBesides(besides);
+	auto live = tally.live;
 	auto max_sessions = SettingOf(db, "acl_max_sessions", 1000);
 	// spec 096: the node's resource group and the profile version it targets / has applied. Read from
 	// the policy, so guarded: the report answers callers that are not authenticated, and a source that
@@ -214,21 +200,14 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 	bool session_room = !draining && group_known && (max_sessions == 0 || live < max_sessions);
 
 	string by_door;
-	for (auto &door : store.SessionCountsByDoor()) {
-		auto count = door.second;
-		if (left_out && door.first == besides_door && count > 0) {
-			count--;
-		}
-		by_door += (by_door.empty() ? "" : ",") + JsonQuote(door.first) + ":" + std::to_string(count);
+	for (auto &door : tally.by_door) {
+		by_door += (by_door.empty() ? "" : ",") + JsonQuote(door.first) + ":" + std::to_string(door.second);
 	}
 	// spec 085: sessions per resource group that caps them - what an orchestrator routes a tenant by
 	string groups;
-	for (auto &group : store.SessionCountsByGroup()) {
-		auto count = group.second.first;
-		if (left_out && group.first == besides_group && count > 0) {
-			count--;
-		}
-		groups += (groups.empty() ? "" : ",") + JsonQuote(group.first) + ":{\"live\":" + std::to_string(count) +
+	for (auto &group : tally.by_group) {
+		groups += (groups.empty() ? "" : ",") + JsonQuote(group.first) +
+		          ":{\"live\":" + std::to_string(group.second.first) +
 		          ",\"max\":" + std::to_string(group.second.second) + "}";
 	}
 

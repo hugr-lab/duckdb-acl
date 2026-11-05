@@ -258,6 +258,18 @@ Now the execution is named after the call that runs it: the DoGet's own session,
 caller's session on the reservation's note). The count is right in either order, and drain.sh ran 20 of 20. The
 same naming serves a secrets service that acts for the session (spec 078), which used to see an ended one there.
 
+**Found 2026-11-05 (#267's and #274's CI, drain.sh `sessions_live 2` - rarer, a run in tens): the counts were read
+at several looks.** `NodeLoadJson` took the live total (`SessionCount`), then looked the call's own session up in
+`SessionList` to leave it out, then the per-door and per-group counts - four takes of the store's lock. When the
+DoGet's session ended between the first two (its handler returns while the worker computes the report), the total
+had counted it and the lookup found nothing to leave out; `acl_drain()` read its count and judged its own session
+apart the same way. Now one look: `PolicyStore::SessionTallyBesides(besides)` counts the live total and every
+session per door and per charged group under one lock, the calling call's session (an ops id, per-call) left out of
+each - `NodeLoadJson`, `acl_drain()`, and `SessionCount` / `SessionCountsByDoor` / `SessionCountsByGroup` read it. A
+group whose only session is the call's own is no longer listed at 0. `test/cpp/test_acl_session_tally.cpp`: what is
+left out, and 20000 reports asked for by a call whose session closes meanwhile (the several looks were off a few in
+a thousand there).
+
 **Left open.** A drain waits for every live session up to its orchestrator's deadline, an idle client's too; whether it
 should not wait for an idle session with nothing pinned (spec 135 moves it to another node) is its own spec.
 

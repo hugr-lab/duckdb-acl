@@ -1016,7 +1016,7 @@ struct PolicyStore {
 	//! Record the trace a session's client SET (spec 069), by ops id: `name` is acl_correlation_id or
 	//! acl_traceparent, an empty value is a RESET. False for an unknown session.
 	bool SetSessionTrace(const string &id, const string &name, const string &value);
-	//! Live sessions per door (spec 069's acl.sessions.live gauge); a door with none is not listed
+	//! Sessions per door (spec 069's acl.sessions.live gauge); the base's doors are listed at zero
 	vector<std::pair<string, int64_t>> SessionCountsByDoor();
 	//! The rewriter found the session's statement to drain `stream` (spec 042): remembered by ops id
 	//! for the completion hook, which takes it by handle - once - and ignores any statement that left
@@ -1130,6 +1130,16 @@ struct PolicyStore {
 	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
 	idx_t SessionCount();
+	//! The node's sessions at one look (one lock): the live total, and every session per door and per charged group
+	//! with that group's max - `besides` (an ops id) left out when it is a session of one call (spec 066's addendum:
+	//! the calling call's own). Counted apart, a call's own session that ended between two looks was counted by one
+	//! and found by neither (the drain e2e's `sessions_live 2`).
+	struct SessionTally {
+		idx_t live = 0;
+		vector<std::pair<string, int64_t>> by_door;
+		vector<std::pair<string, std::pair<idx_t, idx_t>>> by_group;
+	};
+	SessionTally SessionTallyBesides(const string &besides);
 	//! A door refused a client before any session (spec 079: the node's seats): the `session refused`
 	//! event, with nobody's principal, so the counters and the audit see it like any other refusal.
 	void AuditSessionRefused(const string &door, const char *reason_code, const string &reason);

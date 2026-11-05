@@ -2100,16 +2100,16 @@ void AclDrainFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &store = StoreOf(state);
 	store.SetDraining(true);
 	store.SessionSweep();
-	auto live = NumericCast<int64_t>(store.SessionCount());
 	// what remains to be drained: a session of this one call (a console's DRAIN NODE, spec 066's addendum) ends with
-	// it, so it is not among them - the watch loop reaches 0 from a console too
+	// it, so it is not among them - the watch loop reaches 0 from a console too. Counted and left out at one look.
 	AclSessionView current;
 	string why;
 	auto connection = AclConnection::Reach(state.GetContext(), why);
-	if (live > 0 && connection && connection->Current(current) && !current.session_id.empty() &&
-	    store.SessionPerCall(current.session_id)) {
-		live--;
+	string own;
+	if (connection && connection->Current(current)) {
+		own = current.session_id;
 	}
+	auto live = NumericCast<int64_t>(store.SessionTallyBesides(own).live);
 	result.Reference(Value::BIGINT(live), count_t(args.size()));
 }
 
