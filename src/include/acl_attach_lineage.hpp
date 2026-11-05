@@ -13,19 +13,21 @@
 #pragma once
 
 #include "acl_grammar.hpp"
-#include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 namespace duckdb {
 namespace acl {
 
-//! One statement of a batch: its text (the marker taken off) and the identity it declared ('' = none)
+//! One statement of a batch: its text (the marker taken off), where it starts in the batch, and the identity it
+//! declared ('' = none)
 struct AttachLineageSegment {
 	string text;
 	string original; // as written, the marker included: the ATTACH's own text (its hook reads it back)
 	string identity;
+	idx_t offset = 0;
 	bool marked = false;
 };
 
@@ -40,31 +42,41 @@ inline bool MayCarryAttachLineage(const string &text) {
 	return ci_find("attach") && ci_find("lineage");
 }
 
-//! The batch's statements, each with the identity its trailing `LINEAGE '<x>'` declared. `found` is
-//! whether any statement carried the marker - false leaves the text to the native parser untouched (also a
-//! text ending inside a comment, a string or a name: the native parser refuses it)
+//! The batch's statements, each with the identity its trailing `LINEAGE '<x>'` declared. `found` is whether any
+//! statement carried the marker - false leaves the text to the native parser untouched (also a text ending inside a
+//! block comment: the native parser refuses it). A text ending inside a literal or a name is split as read: that
+//! statement is no marked one, and its own parse refuses it, before anything of the batch runs
 inline vector<AttachLineageSegment> SplitAttachLineage(const string &text, bool &found) {
 	found = false;
 	vector<AttachLineageSegment> segments;
 	bool open = false;
-	auto heads = ReadStatementHeads(text, NumericLimits<idx_t>::Maximum(), &open);
-	if (open) {
+	// each statement by its first token and its last two: all the marker needs, whatever the batch's size
+	auto heads = ReadStatementHeads(text, 1, &open, 2);
+	if (heads.empty() || (open && !heads.back().back().unterminated)) {
 		return segments;
 	}
+	// `ATTACH … LINEAGE '<x>'`: an ATTACH whose last two tokens are the word and one plain, closed literal
+	auto marked = [](const vector<HeadToken> &tokens) {
+		auto &last = tokens.back();
+		return tokens[0].IsWord("attach") && last.index >= 3 && tokens[tokens.size() - 2].IsWord("lineage") &&
+		       last.kind == HeadToken::Kind::STRING && !last.unterminated && last.text.size() >= 2;
+	};
+	if (std::none_of(heads.begin(), heads.end(), marked)) {
+		return segments;
+	}
+	found = true;
 	for (auto &tokens : heads) {
 		AttachLineageSegment segment;
 		auto start = tokens.front().offset;
 		auto &last = tokens.back();
 		auto end = last.offset + last.text.size();
-		auto n = tokens.size();
-		// `ATTACH … LINEAGE '<x>'`: an ATTACH whose last two tokens are the word and one plain literal
-		if (tokens[0].IsWord("attach") && n >= 4 && tokens[n - 2].IsWord("lineage") &&
-		    last.kind == HeadToken::Kind::STRING && last.text.size() >= 2) {
+		segment.offset = start;
+		if (marked(tokens)) {
+			auto &word = tokens[tokens.size() - 2];
 			segment.identity = StringUtil::Replace(last.text.substr(1, last.text.size() - 2), "''", "'");
 			segment.marked = true;
-			segment.text = text.substr(start, tokens[n - 2].offset - start);
+			segment.text = text.substr(start, word.offset - start);
 			segment.original = text.substr(start, end - start);
-			found = true;
 		} else {
 			segment.text = text.substr(start, end - start);
 		}

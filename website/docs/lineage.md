@@ -111,6 +111,9 @@ characters are refused anywhere (`user:password@`, `?password=`, `#…`), and th
 digits, `+`, `-`, `.`. The node never derives it from a DSN or a secret: a host
 behind a proxy is not the host others see.
 
+- Written in the ATTACH, the identity is judged before the ATTACH runs: a refused one attaches nothing.
+  The `LINEAGE` clause is the default SQL grammar's - on a connection under a dialect (or `CONNECT`-ed)
+  it is that grammar's syntax error; declare the identity with `acl_lineage_source` there.
 - It lives in the node's memory, like the ATTACH it describes: the bootstrap declares it at every
   start. `acl_lineage_source(alias, NULL)` clears it; a `DETACH`, or a new ATTACH of the alias, ends it.
   Declared before its ATTACH, it binds to the first attachment of that alias.

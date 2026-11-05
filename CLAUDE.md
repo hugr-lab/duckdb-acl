@@ -492,8 +492,9 @@ transform, a list inside it a marker its reading replaces (`TextArg::splice`). 3
 platform's point grants, sources, resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's
 registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`;
 `SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). 3g-2a: GRANT / REVOKE SECRET as
-rules (`MgmtParsed::secrets`). 3g-2b: `USE [SCHEMA]` on duckdb's tokens. 3g-2c: `ATTACH … LINEAGE` on duckdb's tokens. Then
-3g-3 (modules' rules, hugr-node), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
+rules (`MgmtParsed::secrets`). 3g-2b: `USE [SCHEMA]` on duckdb's tokens. 3g-2c: `ATTACH … LINEAGE` on duckdb's
+tokens (the identity judged at parse, the sugar off under a dialect). Then 3g-3 (modules' rules, hugr-node), spec
+151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
@@ -641,7 +642,8 @@ bootstrap), with no
 default: none = no lineage (`acl_lineage_status()`). A source's identity (`<scheme>://<host:port>[/db]`,
 never userinfo) names its physical datasets: the ext-common `acl_lineage_sources` registry first (hugr
 node), then `acl_lineage_source(alias, identity)` / `ATTACH … LINEAGE '<x>'` (parser-override sugar,
-`acl_attach_lineage.hpp`, read on duckdb's tokens since spec 150 3g-2c; the ATTACH keeps the marker in its text so its NAMESPACE event is named) /
+`acl_attach_lineage.hpp`, read on duckdb's tokens since spec 150 3g-2c; the ATTACH keeps the marker in its text so
+its NAMESPACE event is named) /
 `ACL CLUSTER ATTACH … LINEAGE`, kept per attachment (`weak_ptr<AttachedDatabase>`: a DETACH ends it).
 Runs: one per Flight DoPut batch (`LineageBatchBegin/End`, by text hash), held in a client's explicit
 transaction (`AclProfileState` TransactionCommit/Rollback → `RUN_ABORT`, `LineageOutcome`), a door's

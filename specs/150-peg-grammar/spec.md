@@ -368,14 +368,25 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       ended by `\r`, nested `/* */`) now read as duckdb reads them; a backtick name stays duckdb's.
     - 3g-2c (built): `ATTACH … LINEAGE '<x>'` (spec 112 §9, `acl_attach_lineage.hpp`) - sugar over duckdb's ATTACH,
       compiled to the native ATTACH and `acl_lineage_source(alias, x)` - is read on duckdb's tokens: the batch's
-      statements as the tokenizer ends them (`ReadStatementHeads`, every token), the marker an ATTACH's last two
-      tokens - the word `LINEAGE` and one plain `'…'` literal - and each statement's text its first token to its
-      last; the runtime's `AttachLineageIdentity` reads the same way. The hand splitter goes (`MayCarryAttachLineage`,
-      a substring test, stays the fast path). Changed: a `$$…$$` / `$tag$…$tag$` string, an `E'…'` with a `\'` and a
-      backtick name are one token each (the splitter knew `'…'`, `"…"` and `E'…'` only, so a `;` or the marker's
-      words inside the others split or marked the batch otherwise than duckdb reads it); a text ending inside a
-      comment, a string or a name is the native parser's, which refuses it (the splitter ran what came before an open
-      comment).
+      statements as the tokenizer ends them (`ReadStatementHeads(text, 1, &open, 2)` - each by its first token and
+      its last two, a token's `index` its place), the marker an ATTACH's last two tokens - the word `LINEAGE` and one
+      plain closed `'…'` literal - and each statement's text its first token to its last; the runtime's
+      `AttachLineageIdentity` reads the same way. The hand splitter goes (`MayCarryAttachLineage`, a substring test,
+      stays the fast path). Changed, each now as duckdb reads it: a `$$…$$` / `$tag$…$tag$` string and a backtick
+      name are one token (a `;` or the marker's words inside them split or marked the batch); a `--` comment ends at
+      `\r` (the splitter ran on to `\n`, dropping a statement or missing a marker); a nested `/* /* */ */` is one
+      comment (the splitter ran an ATTACH inside it); words the tokenizer joins (a control or non-ASCII byte beside
+      `LINEAGE`) are one; an unterminated `'…''` is no identity (the splitter took it as closed); a text ending inside
+      a block comment is the native parser's, which refuses it, and one ending inside a literal or a name is split as
+      read, its own parse refusing it - nothing of the batch runs either way (the splitter ran what came before an
+      open comment). A statement's text no longer carries the comments around it (a view's SQL is re-rendered, a
+      note's hash is its own `query`). Review fixes: the identity is judged at parse as `acl_lineage_source` judges it
+      (an address, `LineageIdentityClean`), so a refused one attaches nothing (the ATTACH used to run first); the call
+      is built as an AST (`MakeAdminCall`), never SQL text; a statement parsed on its own reports its error where it
+      is in the batch (`ParseSegment`); and under a dialect or CONNECT the sugar is off (the connection owner's grammar
+      reads the text by its own tokenizer - as a prefix there is refused, nothing of ours is added to it). Known: a
+      native `ATTACH DATABASE lineage '<path>'` (a typed literal of a user type `lineage`) reads as the marker, as it
+      did.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the

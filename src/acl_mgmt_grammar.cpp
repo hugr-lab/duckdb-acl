@@ -2840,7 +2840,7 @@ public:
 
 } // namespace
 
-vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open_out) {
+vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open_out, idx_t tail) {
 	vector<MatcherToken> tokens;
 	SplitTokenizerBehavior behavior(text, tokens);
 	CompiledGrammar::DefaultGrammar()->GetTokenizer().TokenizeInput(behavior);
@@ -2850,26 +2850,10 @@ vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bo
 			*open_out = *open_out || token.unterminated;
 		}
 	}
-	vector<vector<HeadToken>> heads;
-	bool open = false;
-	for (auto &token : tokens) {
-		if (token.type == TokenType::TERMINATOR) {
-			open = false;
-			continue;
-		}
-		if (token.type == TokenType::END_OF_INPUT) {
-			continue; // comments never reach the tokens
-		}
-		if (!open) {
-			heads.emplace_back();
-			open = true;
-		}
-		auto &head = heads.back();
-		if (head.size() >= count) {
-			continue;
-		}
+	auto read = [](const MatcherToken &token, idx_t index) {
 		HeadToken entry;
 		entry.offset = token.offset;
+		entry.index = index;
 		entry.text = token.text;
 		entry.unterminated = token.unterminated;
 		auto &text_of = token.text;
@@ -2884,7 +2868,48 @@ vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bo
 			entry.kind = HeadToken::Kind::WORD;
 			entry.word = StringUtil::Lower(text_of);
 		}
-		head.push_back(std::move(entry));
+		return entry;
+	};
+	vector<vector<HeadToken>> heads;
+	// past its head, the statement's last `tail` tokens so far: where each is in `tokens`, and in the statement
+	vector<pair<idx_t, idx_t>> last;
+	idx_t index = 0;
+	bool open = false;
+	auto end_statement = [&]() {
+		for (auto &entry : last) {
+			heads.back().push_back(read(tokens[entry.first], entry.second));
+		}
+		last.clear();
+		open = false;
+	};
+	for (idx_t at = 0; at < tokens.size(); at++) {
+		auto &token = tokens[at];
+		if (token.type == TokenType::TERMINATOR) {
+			if (open) {
+				end_statement();
+			}
+			continue;
+		}
+		if (token.type == TokenType::END_OF_INPUT) {
+			continue; // comments never reach the tokens
+		}
+		if (!open) {
+			heads.emplace_back();
+			open = true;
+			index = 0;
+		}
+		if (index < count) {
+			heads.back().push_back(read(token, index));
+		} else if (tail > 0) {
+			if (last.size() == tail) {
+				last.erase(last.begin());
+			}
+			last.emplace_back(at, index);
+		}
+		index++;
+	}
+	if (open) {
+		end_statement();
 	}
 	return heads;
 }

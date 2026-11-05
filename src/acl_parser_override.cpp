@@ -1,5 +1,6 @@
 #include "acl_parser_override.hpp"
 
+#include "acl_admin_scanner.hpp"
 #include "acl_admin_sql.hpp"
 #include "acl_platform.hpp"
 #include "acl_attach_lineage.hpp"
@@ -10,6 +11,8 @@
 #include "acl_rewriter.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
@@ -171,13 +174,39 @@ struct AclParseGuard {
 	}
 };
 
+//! A statement of a batch parsed on its own: a parse error's position counts in the batch, where duckdb draws it
+void ParseSegment(Parser &parser, const AttachLineageSegment &segment) {
+	try {
+		parser.ParseQuery(segment.text);
+	} catch (ParserException &ex) {
+		ErrorData error(ex);
+		auto extra_info = error.ExtraInfo();
+		auto entry = extra_info.find("position");
+		idx_t at = 0;
+		if (segment.offset == 0 || entry == extra_info.end() ||
+		    !TryCast::Operation(string_t(entry->second), at, false)) {
+			throw;
+		}
+		extra_info["position"] = to_string(at + segment.offset);
+		throw ParserException(extra_info, error.RawMessage());
+	}
+}
+
 //! Spec 112 §9: a batch with `ATTACH … LINEAGE '<identity>'` - each marked ATTACH parsed as the native
 //! statement it is, followed by `SELECT acl_lineage_source('<alias>', '<identity>')`. Nothing happens
-//! here: the call runs only if the ATTACH did (a batch stops at its first failure). False = no marker,
-//! the text is the native parser's untouched.
+//! here: the call runs only if the ATTACH did (a batch stops at its first failure), and every statement is
+//! parsed - an identity judged - before any runs. False = no marker, the text is the native parser's untouched.
 bool ParseAttachLineage(const string &text, ParserOptions &options, vector<unique_ptr<SQLStatement>> &out) {
 	if (!MayCarryAttachLineage(text)) {
 		return false;
+	}
+	if (options.context) {
+		auto &config = ClientConfig::GetConfig(*options.context);
+		if (config.connected_grammar || config.current_dialect) {
+			// a grammar of the connection owner's choosing reads the text by its own rules: the sugar is the default
+			// grammar's, never added to another (as the prefix is not, spec 150)
+			return false;
+		}
 	}
 	bool found = false;
 	auto segments = SplitAttachLineage(text, found);
@@ -187,7 +216,7 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 	AclParseGuard guard;
 	for (auto &segment : segments) {
 		Parser parser(options);
-		parser.ParseQuery(segment.text);
+		ParseSegment(parser, segment);
 		if (!segment.marked) {
 			for (auto &statement : parser.statements) {
 				out.push_back(std::move(statement));
@@ -202,20 +231,27 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 		if (alias.empty()) {
 			throw ParserException("ATTACH … LINEAGE names the source it describes: write AS <alias>");
 		}
-		if (segment.identity.empty()) {
+		// judged as acl_lineage_source judges it, before the ATTACH runs: a refused identity attaches nothing
+		auto identity = segment.identity;
+		StringUtil::Trim(identity);
+		if (identity.empty()) {
 			throw ParserException("ATTACH … LINEAGE: the identity is empty - leave LINEAGE out instead");
+		}
+		if (identity.find("://") == string::npos) {
+			throw ParserException("ATTACH … LINEAGE: the identity is a source's address, "
+			                      "<scheme>://<host:port>[/<database>] (OpenLineage's naming)");
+		}
+		if (!LineageIdentityClean(identity)) {
+			throw ParserException("ATTACH … LINEAGE: the identity names a source, never a credential - "
+			                      "no user:password@ in it");
 		}
 		// the ATTACH keeps its text as written: the lineage hook reads the identity back from it, so the
 		// ATTACH's own NAMESPACE event already names the source as itself
 		parser.statements[0]->query = segment.original;
 		out.push_back(std::move(parser.statements[0]));
-		auto call = "SELECT acl_lineage_source(" + Value(alias).ToSQLString() + ", " +
-		            Value(segment.identity).ToSQLString() + ")";
-		Parser call_parser(options);
-		call_parser.ParseQuery(call);
-		for (auto &statement : call_parser.statements) {
-			out.push_back(std::move(statement));
-		}
+		auto call = MakeAdminCall("acl_lineage_source", {Value(alias), Value(segment.identity)});
+		call->query = call->ToString();
+		out.push_back(std::move(call));
 	}
 	return true;
 }

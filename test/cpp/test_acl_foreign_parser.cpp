@@ -297,6 +297,13 @@ void Run() {
 		Exec(con, "SET current_dialect = 'toy'");
 		auto under_dialect = con.Query("ACL TOKEN 'tok' SELECT 1");
 		Refused(*under_dialect, "refused on a CONNECT-ed connection or under a dialect", "a prefix under a dialect");
+		// ... and so is ATTACH … LINEAGE (spec 150 3g-2c): the dialect reads the text by its own rules, the sugar is
+		// the default grammar's - the marker is the dialect's syntax error, and nothing is attached
+		auto marked = con.Query("ATTACH ':memory:' AS under_toy LINEAGE 'postgres://toy:5432'");
+		Refused(*marked, "syntax error", "ATTACH … LINEAGE under a dialect");
+		auto attached = con.Query("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'under_toy'");
+		Check(!attached->HasError() && attached->Collection().GetValue(0, 0).GetValue<int64_t>() == 0,
+		      "...and the ATTACH did not run");
 		Exec(con, "RESET current_dialect");
 		auto handle = OpenSession(con);
 		if (Check(!handle.empty(), "a session opens for the token")) {
