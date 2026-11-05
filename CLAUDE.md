@@ -792,8 +792,9 @@ the drop's deletes built from the same list - as sorted value SQL, the mark, the
 own transaction (`WriteWithReads`' `after_writes`), and the policy version it committed. `RecordUndo` (replacing
 `RecordRenameUndo`; cleared at every TransactionBegin/Commit) replays at ROLLBACK newest first through
 `CatalogUndoRecordWrite`, in one write: a record CREATED goes as a drop takes it (what was written on it meanwhile too)
-while it is still that record (`SameRecord`: form/phys/body + its own probed facts), and a rename of such a record
-(`takes_created`) goes back to its old name the same way; a record DROPPED comes back only when every store version
+while it is still that record (`SameRecord`: form/phys/body + the facts probed from its source; declarations go with
+it), a rename of such a record (`takes_created`) is taken where it is and goes back only to a free old name, and a
+take puts back only what the write changed (the mark); a record DROPPED comes back only when every store version
 since the drop is this transaction's own (a cascade - a role / schema / catalog dropped, a catalog grant revoked - never
 touches the name's rows; the version chain sees it; any other write makes the drop stand, named only by the event); a
 replace or a rename is put back while every name's rows are the after-image.

@@ -459,6 +459,80 @@ SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vcat = 'sales' AND vname 
 ----
 0
 
+# ...and when the old name was taken meanwhile (here by the principal's own other session), the renamed record goes
+# where it is
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" CREATE TABLE vs.e(x INT);
+
+statement ok con1
+ACL ROLE "wide" ALTER TABLE vs.e RENAME TO f;
+
+statement ok con2
+ACL ROLE "wide" CREATE VIEW vs.e AS SELECT 1 AS n;
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+query TT
+SELECT vname, form FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname IN ('vs.e', 'vs.f');
+----
+vs.e	view
+
+statement ok
+ACL ROLE "wide" DROP VIEW vs.e;
+
+# --- an operator's declaration on a created record (a key) goes with it: the object never was --------------------
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" CREATE TABLE vs.k(x INT);
+
+statement ok con2
+ACL ADMIN ALTER VIRTUAL TABLE sales.vs.k SET PRIMARY KEY (x);
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname = 'vs.k';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.keys WHERE vcat = 'sales' AND vname = 'vs.k';
+----
+0
+
+# --- a grant a same-named function shared is not put back once the function went meanwhile ----------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.vs.tf(n BIGINT) ALIAS OF range;
+
+statement ok
+ACL ADMIN GRANT OBJECT sales.vs.tf TO ROLE other WITH (select);
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" CREATE TABLE vs.tf(x INT);
+
+statement ok con2
+ACL ADMIN DROP VIRTUAL TABLE FUNCTION sales.vs.tf;
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vcat = 'sales' AND vname = 'vs.tf';
+----
+0
+
 # --- a reference to a table FUNCTION of the same name is the function's: a created record's undo leaves it ---------
 
 statement ok

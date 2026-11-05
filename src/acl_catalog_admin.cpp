@@ -1902,7 +1902,8 @@ namespace {
 //! its filter - in the order a drop deletes them: a reference's columns are found through the reference, so they go
 //! first (the tables have no foreign keys - an insert goes in any order). `grants`: the two whose rows a function of
 //! the same name shares (DropGrantRowsFor); `mark`: schema_dropped's, which a drop sets and a record clears; `own`: the
-//! record's own facts beside its row (what a write of it probed), which nobody else writes on it.
+//! facts a write of the record probes from its source (a commit's probes on another node fill them; an object that
+//! never committed leaves them as its write found it) - not the operator's declarations (keys, a column list).
 struct RelationRowSource {
 	const char *table;
 	string where;
@@ -1922,10 +1923,10 @@ vector<RelationRowSource> RelationRowSources(CatalogBackend &catalog, const stri
 	return {
 	    {"relations", named},
 	    {"object_columns", named + " AND \"kind\" = 'relation'", false, false, true},
-	    {"relation_columns", named, false, false, true},
+	    {"relation_columns", named},
 	    {"relation_types", named, false, false, true},
 	    {"column_comments", named},
-	    {"keys", named + " AND \"kind\" = 'relation'", false, false, true},
+	    {"keys", named + " AND \"kind\" = 'relation'"},
 	    {"role_object_caps", named, true},
 	    {"grant_columns", named, true},
 	    {"reference_columns", in + "\"name\" IN (SELECT \"name\" FROM " + catalog.Tbl("references") + in + ends + ")"},
@@ -2700,10 +2701,11 @@ bool SameRecord(const vector<RelationRowSource> &sources, const PolicyStore::Rel
 	return true;
 }
 
-//! A name's rows taken as a drop takes them (a same-named function keeps the grant rows it shares), then the rows of
-//! `image` put back
+//! A name's rows taken as a drop takes them (a same-named function keeps the grant rows it shares), then the tables
+//! the change wrote put back as it found them (its mark) - never a row it did not write, which the drop of something
+//! else since may have meant to end
 void TakeName(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname,
-              const PolicyStore::RelationRows &image, vector<string> &statements) {
+              const PolicyStore::RelationChange &change, vector<string> &statements) {
 	bool same_named_function = read("SELECT 1 FROM " + catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                                " AND \"vname\" = " + Lit(vname) + " LIMIT 1")
 	                               ->RowCount() > 0;
@@ -2711,7 +2713,9 @@ void TakeName(CatalogBackend &catalog, const ReadFn &read, const string &vcat, c
 	for (idx_t table = 0; table < sources.size(); table++) {
 		if (!(sources[table].grants && same_named_function)) {
 			statements.push_back("DELETE FROM " + catalog.Tbl(sources[table].table) + sources[table].where);
-			InsertRows(catalog, sources[table], image.tables[table], statements);
+			if (Changed(change, table)) {
+				InsertRows(catalog, sources[table], change.before.tables[table], statements);
+			}
 		}
 	}
 }
@@ -2746,18 +2750,21 @@ void UndoStatements(CatalogBackend &catalog, const ReadFn &read, const string &v
 		if (!SameRecord(sources, now[0], first.after)) {
 			throw UndoRefused {Outcome::CHANGED_SINCE};
 		}
-		TakeName(catalog, read, vcat, write.names[0].first, first.before, statements);
+		TakeName(catalog, read, vcat, write.names[0].first, first, statements);
 		return;
 	}
 	if (takes_created && write.names.size() == 2) {
-		// a rename of a record this transaction created goes back to its old name the same way (the create's own
-		// undo then takes it) - else a touched swap would leave a record of nothing
+		// a rename of a record this transaction created is taken where it is, the same way - else a touched swap
+		// would leave a record of nothing - and goes back to its old name while that is free (the create's own undo
+		// then takes it there; a name somebody took since is theirs)
 		auto &moved = write.names[1];
-		if (!now[0].record.empty() || !SameRecord(sources, now[1], moved.second.after)) {
+		if (!SameRecord(sources, now[1], moved.second.after)) {
 			throw UndoRefused {Outcome::CHANGED_SINCE};
 		}
-		TakeName(catalog, read, vcat, moved.first, moved.second.before, statements);
-		PutBack(catalog, vcat, write.names[0].first, first, statements);
+		TakeName(catalog, read, vcat, moved.first, moved.second, statements);
+		if (now[0].record.empty()) {
+			PutBack(catalog, vcat, write.names[0].first, first, statements);
+		}
 		return;
 	}
 	if (write.names.size() == 1 && !first.before.record.empty() && first.after.record.empty()) {

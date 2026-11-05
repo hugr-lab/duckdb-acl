@@ -45,11 +45,14 @@ in one write of the store, by a rule per kind that never undoes over somebody el
   - **a record the write created** goes, as a drop takes a record - a grant, a comment or a reference written on it
     meanwhile goes too (an object that never committed holds nothing; a same-named function keeps the shared grant
     rows, a reference to a table function of that name stays) - but unmarked: the before-image's mark comes back.
-    Only while it is still that record (`SameRecord`: its form, physical name and body, and its own facts - columns,
-    type facts, keys): one written again meanwhile (the operator's, another node's after its commit's probes) is not
-    ours. A rename of such a record (`takes_created`, tracked as the steps are queued) goes back to its old name the
-    same way, whatever was written on it, and the create's undo then takes it - a touched dbt swap would leave a
-    record of nothing otherwise.
+    Only while it is still that record (`SameRecord`: its form, physical name and body, and the facts probed from its
+    source - type facts, its columns' schema): one written again meanwhile (another node's after its commit's
+    probes) is not ours; an operator's declaration on it (a key, a comment, a grant) is not a reason to keep it. A
+    rename of such a record (`takes_created`, tracked as the steps are queued) is taken where it is, the same way,
+    and goes back to its old name only while that is free (the create's undo then takes it there) - a touched dbt
+    swap, or the old name taken by the principal's own other session, would leave a record of nothing otherwise.
+    What is put back after a take is only what the write itself changed (its mark): a grant a dropped same-named
+    function shared stays gone.
   - **a record the write dropped** comes back only when every store version after the drop's is this transaction's
     own (its record writes and the undo's so far). A cascade elsewhere - a role, a schema or a catalog dropped, a
     catalog grant revoked - deletes nothing of the name, whose rows the drop already took, so the images cannot see
@@ -117,7 +120,10 @@ in one write of the store, by a rule per kind that never undoes over somebody el
     open: the drop stands, no grant comes back, the new role reads nothing;
   - **an operator's COMMENT** on a renamed record: the rename is not moved back;
   - **an operator's GRANT and COMMENT** on a created record: the record goes, the grant with it - and so on a record
-    the transaction created and renamed (a touched swap);
+    the transaction created and renamed (a touched swap), and when the old name was taken meanwhile by the
+    principal's own other session;
+  - **an operator's PRIMARY KEY** on a created record: the record and the key go;
+  - **a same-named table function dropped meanwhile**: the grant it shared is not put back;
   - **any other write** (a `CREATE ROLE`) while a DROP is open: the drop stands, its mark stays, the event says so;
   - each skip's event and the counter by reason;
 - an operator's own `DROP RELATION` and `CREATE VIRTUAL TABLE` inside the operator's transaction stay after its
