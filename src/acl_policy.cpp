@@ -945,6 +945,23 @@ void PolicyStore::AuditPolicy(const string &detail, const string &reason) {
 	audit->Emit(std::move(event));
 }
 
+void PolicyStore::AuditRecordNotUndone(const string &object, const string &reason, const string &why) {
+	if (!audit) {
+		return;
+	}
+	audit->Hooks().Counters().Add("acl.policy.records_not_undone", {{"reason", reason}});
+	AuditEvent event;
+	event.kind = "policy";
+	event.detail = "record_not_undone";
+	event.objects.push_back(AuditObject {object, "relation"});
+	event.allowed = true;
+	event.reason = "a client's ROLLBACK did not take back what its DDL recorded: " + why;
+	// a warning the operator must see whenever anything is recorded, though it refuses nothing (as role_union_widens)
+	event.level = AuditLevel::DENIED;
+	event.recorded = audit->Records(event.level, -1);
+	audit->Emit(std::move(event));
+}
+
 void PolicyStore::AuditRoleUnionWidens(const string &object, const string &capability,
                                        const vector<UnionWidening> &pairs) {
 	if (!audit || pairs.empty()) {

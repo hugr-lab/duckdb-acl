@@ -145,8 +145,8 @@ What the door serves, every RPC authenticated per call from the `authorization: 
     - A parameter bound to it is refused: "a DDL statement takes no parameters". A DDL whose text has a
       placeholder (`AS SELECT ?`) stays prepared - in a schema that records its objects it still fails.
     - `executeUpdate` of a DDL with a record answers 0 (its answer is the record's).
-    - Inside a client's transaction, a `ROLLBACK` does not yet take back the catalog record of a `CREATE`
-      or a `DROP` in such a schema (a follow-up of spec 151).
+    - Inside a client's transaction (`BeginTransaction`), a `ROLLBACK` takes back the catalog records its DDL
+      wrote, as on every door ([management SQL](management-sql.md), spec 154).
 - **The catalog RPCs** (spec 046): `GetCatalogs`, `GetDbSchemas`, `GetTables` (with
   `include_schema`), `GetTableTypes`, `GetPrimaryKeys` (declared virtual keys, spec 048),
   `GetImportedKeys`/`GetExportedKeys`/`GetCrossReference` (declared references, spec 022). Every one
@@ -745,7 +745,8 @@ expired / presented by somebody else, a Flight result stream ended (consumed, ca
 capped, failed - with the rows that went out) or an ingest its client cancelled, the password
 handshake, a policy reload or source error, a source a listing could not read (`source_unreadable`, spec 136), a
 principal's roles uniting into cells none of them reads (`role_union_widens`, spec 146 - see
-[security](security.md)), a keys refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
+[security](security.md)), a record a client's `ROLLBACK` could not take back (`record_not_undone`, spec 154 - see
+[management SQL](management-sql.md)), a keys refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
 id - never the handle), what (the statement class - never the text), the verdict, and on a refusal
 one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only`, `function_denied`,
 `statement_type`, `unchecked_predicate`, `setting_denied`, `parse`, `principal`,
@@ -753,7 +754,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
 `unavailable`, `write_policy`, `policy_error`) plus the refusal text.
 
 - **Levels** - `SET GLOBAL acl_audit_level = 'off' | 'denied' | 'decisions' | 'all'` (default
-  `decisions`): refusals only (and spec 146's `role_union_widens`, a warning that refuses nothing); every statement/admin/ingest decision (and a session seated on a draining
+  `decisions`): refusals only (and the warnings that refuse nothing: spec 146's `role_union_widens`, spec 154's
+  `record_not_undone`); every statement/admin/ingest decision (and a session seated on a draining
   node, spec 066's exception); plus the session, door, policy and keys lifecycle. `acl_session_audit_level(<ops id>, <level>)` overrides it for one live session
   (the operator's call, never the principal's). Whatever the level, the **counters count**: metrics
   are a state of the node, audit is a record of it.

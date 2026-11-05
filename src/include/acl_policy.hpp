@@ -591,18 +591,40 @@ struct PolicyStore {
 	string ExistingKeyCsv(const string &vcat, const string &vname, const string &kind);
 	//! Whether `db.schema.name` exists physically - what VIRTUAL ONLY checks before recording it
 	bool PhysicalObjectExists(const string &phys);
+	//! spec 154: one relation name's rows in the policy tables a record or a drop writes (the record, what hangs on it,
+	//! its schema_dropped mark), read inside that write's own transaction
+	struct RelationRows {
+		struct Table {
+			vector<string> columns; // as the read named them
+			vector<string> rows;    // each row's values as SQL, sorted
+		};
+		vector<Table> tables; // one per table, in RelationRowSources' order
+		string record;        // the record's form, physical name and body - empty when the name has none
+	};
+	//! What one record write did to a name: its rows before and after the write
+	struct RelationChange {
+		RelationRows before, after;
+	};
+	//! One record write: the names it changed (a rename: the old name, then the new), the store it wrote and the
+	//! policy version it committed
+	struct RecordWrite {
+		string store;
+		int64_t version = 0;
+		vector<std::pair<string, RelationChange>> names;
+	};
 	//! Record a view a role created (spec 018): its body was resolved with the author's rights, with
 	//! claims left as markers, so reading it is decided by the grant on the view itself
-	void CatalogRegisterView(const string &vcat, const string &vname, const string &body);
+	void CatalogRegisterView(const string &vcat, const string &vname, const string &body,
+	                         optional_ptr<RecordWrite> write = nullptr);
 	//! Record an object a principal's own DDL just created (spec 016): alias form, the schema's
 	//! origin, nothing else to choose
 	void CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
-	                            const string &origin = string());
+	                            const string &origin = string(), optional_ptr<RecordWrite> write = nullptr);
 	//! spec 113: a principal's RENAME inside a granted schema - the record (if the object has one)
 	//! follows the object, in one transaction; `new_phys` empty for a view record (nothing physical)
-	//! Answers whether the object had a record, and its phys before the rename (to undo it).
+	//! Answers whether the object had a record.
 	bool CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname, const string &new_phys,
-	                           string *old_phys = nullptr);
+	                           optional_ptr<RecordWrite> write = nullptr);
 	//! spec 113: the object carries the operator's own declarations - a predicate, a column list, keys,
 	//! references, or a grant on it by name: its name is what they are tied to, so no principal renames it
 	bool CatalogRelationDeclared(const string &vcat, const string &vname);
@@ -702,7 +724,23 @@ struct PolicyStore {
 	                  const string &rls = "", const string &columns = "", bool judge_columns = true,
 	                  bool judge_caps = true);
 	void CatalogRevoke(const string &role, const string &vcat);
-	void CatalogDropRelation(const string &vcat, const string &vname);
+	void CatalogDropRelation(const string &vcat, const string &vname, optional_ptr<RecordWrite> write = nullptr);
+	//! spec 154: a client's ROLLBACK of a record written on the store's own connection, in one write of the store:
+	//! - a record the write created goes as a drop takes it (what was written on it meanwhile too), while it is still
+	//!   that record (its form, physical name, body and probed facts); so does a rename of such a record
+	//!   (`takes_created`), back to its old name;
+	//! - a record the write dropped comes back only while nothing but this transaction wrote the store since
+	//!   (`own`: the versions its record writes and this undo committed) - a cascade (a role, a schema, a catalog
+	//!   dropped, a catalog grant revoked) leaves the name's rows as the drop left them, and is seen only so;
+	//! - anything else (a replaced view, a rename) is put back while every name's rows are what the write left.
+	//! Only the tables the write changed are written; `own` gains the version an undo commits.
+	enum class RecordUndoOutcome : uint8_t { UNDONE, CHANGED_SINCE, WRITTEN_SINCE, OTHER_STORE };
+	RecordUndoOutcome CatalogUndoRecordWrite(const string &vcat, const RecordWrite &write, vector<int64_t> &own,
+	                                         bool takes_created = false);
+	//! spec 154 / 107: after a ROLLBACK's undo, the DATASET event a name needs when what lineage was last told
+	//! (`announced`: the name exists) is not what the catalog now holds; nothing when lineage is off or `store` is
+	//! not the one in use
+	void NoteDefinitionLineageIfChanged(const string &vcat, const string &vname, bool announced, const string &store);
 	//! spec 107: after a virtual object's definition was written (or dropped), the static lineage event
 	//! - its definition as it now stands in the catalog, read back and bound; nothing when lineage is off.
 	//! Queued to the lineage worker: the write never waits on a probe of the source, and nothing the
@@ -1039,6 +1077,9 @@ struct PolicyStore {
 	//! The policy source: `reloaded` (a version change adopted), `written` (a management write
 	//! committed), `source_error` (the source did not answer - the statement was refused)
 	void AuditPolicy(const string &detail, const string &reason);
+	//! spec 154: a client's ROLLBACK left a record as its write made it - `reason` a bounded code (the counter's
+	//! attribute), `why` a fixed sentence, never a value
+	void AuditRecordNotUndone(const string &object, const string &reason, const string &why);
 	//! spec 095: an issuer's or a client's resolved connection changed through its secret
 	void AuditConnection(const string &kind, const string &name, const string &fingerprint);
 	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)

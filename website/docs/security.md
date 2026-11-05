@@ -123,6 +123,14 @@ share sessions" (spec 040).
   of a DDL that writes a record is refused.
 - In an expansion, `CREATE TABLE IF NOT EXISTS` never adopts a physical table with no record: the
   name is free only if nothing physical holds it (spec 151).
+- The record follows the client's transaction: a `ROLLBACK` takes back the records its DDL wrote - a
+  rolled-back `CREATE` leaves none, a rolled-back `DROP` keeps the record and its grants (spec 154). A
+  dropped record comes back only into a policy store nobody else wrote since the `DROP`: an operator's
+  `REVOKE CATALOG`, `DROP ROLE` or schema drop meanwhile is never undone by it, and the object then stays
+  dropped (fail closed: no grant it had comes back without it). A replaced view or a rename another write
+  touched meanwhile is left as it is. Each is audited (`record_not_undone`). A crash before the `ROLLBACK`
+  leaves the records as written: a created one is reported by `acl_check_catalog` (`source_missing`), a
+  dropped one stays dropped.
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).

@@ -672,7 +672,7 @@ capability) is a no-op (`HeldSchema`); a batch of no-ops answers one empty SELEC
 RENAME TO` in the same home at `create` + `drop` (`RewriteAlterStatement` → `acl_rename_relation`):
 not onto a record, not an object carrying the operator's declarations (`CatalogRelationDeclared`), not
 a record declared over another object; the record moves back at the client's ROLLBACK
-(`RecordRenameUndo`). DROP's CASCADE is taken off. Every other ALTER stays refused.
+(`RecordUndo`, spec 154). DROP's CASCADE is taken off. Every other ALTER stays refused.
 
 **Spec 116 — quoted names**: a virtual catalog, schema, object, function - and its physical name - may
 be named the way SQL allows (case, spaces, `.`/`"` in a part). **Every vcat / vname / path / phys string
@@ -770,8 +770,8 @@ the SELECT. Found by its reviews, fixed: `EXPLAIN` of a statement with a record 
 physical table the expansion did not show); what a record probes inside a client's transaction is probed again at
 commit (`RefreshAtCommit` -> `CatalogRefreshSchema`; a rename queues its new name); `ACL INGEST` creates only where no
 record is kept. A one-query DDL + record (MultiStatement) was tried and dropped - the spec says why. With `drop` on an
-expansion the drop is physical, an unrecorded table included (the owner, 2026-11-05). Next: a record follows the
-client's ROLLBACK (only a rename does), and the binder's "Did you mean" in a principal's DROP. Tests
+expansion the drop is physical, an unrecorded table included (the owner, 2026-11-05). A record follows the client's
+ROLLBACK since spec 154. Next: the binder's "Did you mean" in a principal's DROP (spec 155). Tests
 `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
 
 **Spec 153 — a client's DDL over Flight runs as text**: `acl::ClientTextIsDdl` (acl_admin_sql, beside
@@ -783,6 +783,24 @@ each execution on the CALLING session (`RunPreparedDdl`: `ConnFor(caller)`, the 
 parameter refused; `FindReservation` skips a single-use ticket. So a table's CREATE / DROP / RENAME in an expansion
 (DDL + record = two statements, which Prepare refused) works over Flight. Tests `test_acl_client_mgmt.cpp`, e2e
 run.sh + adbc_client.py (expansion `c.made`).
+
+**Spec 154 — a record follows the client's ROLLBACK**: a record is written on the store's own connection (spec 113),
+so a record write inside a client's transaction (`acl_register_created|existing|view`, `acl_drop_relation`,
+`acl_rename_relation`, only while `RunRecord` runs it - an operator's own call commits at once) keeps a `RecordWrite`:
+the names it changed (a rename: both) with their rows before and after (`RelationRowSources` - the tables a drop clears,
+the drop's deletes built from the same list - as sorted value SQL, the mark, the record's form/phys/body), read in its
+own transaction (`WriteWithReads`' `after_writes`), and the policy version it committed. `RecordUndo` (replacing
+`RecordRenameUndo`; cleared at every TransactionBegin/Commit) replays at ROLLBACK newest first through
+`CatalogUndoRecordWrite`, in one write: a record CREATED goes as a drop takes it (what was written on it meanwhile too)
+while it is still that record (`SameRecord`: form/phys/body + its own probed facts), and a rename of such a record
+(`takes_created`) goes back to its old name the same way; a record DROPPED comes back only when every store version
+since the drop is this transaction's own (a cascade - a role / schema / catalog dropped, a catalog grant revoked - never
+touches the name's rows; the version chain sees it; any other write makes the drop stand, named only by the event); a
+replace or a rename is put back while every name's rows are the after-image.
+Conflicts retried; a step not undone is a `policy` event `record_not_undone` + `acl.policy.records_not_undone{reason}`
+(changed_since / written_since / other_store / name_taken / refused). Lineage is reconciled at the end
+(`NoteDefinitionLineageIfChanged`: what a drop / rename announced vs what the catalog holds). Test
+`acl_record_rollback.test`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a

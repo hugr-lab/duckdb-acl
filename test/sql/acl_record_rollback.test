@@ -1,0 +1,722 @@
+# name: test/sql/acl_record_rollback.test
+# description: spec 154 - the catalog record a principal's DDL writes follows the client's ROLLBACK: the record is
+#   written on the store's own connection, so a rolled-back CREATE left its record (a physical table of that name made
+#   later was read through it) and a rolled-back DROP lost the record and its grants while the table stayed. An undo
+#   writes only the tables its record changed, and only while nothing else wrote the name since - an operator's REVOKE
+#   meanwhile stays; and only a record: an operator's own management write commits at once.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE SCHEMA phys.reg;
+
+statement ok
+CREATE TABLE phys.reg.existing(id INT);
+
+# an ENUM column has type facts (spec 099, relation_types), which a DROP clears and its rollback brings back
+statement ok
+CREATE TABLE phys.lake.colors(c ENUM('red', 'green'));
+
+statement ok
+INSERT INTO phys.lake.colors VALUES ('red');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.reg FROM phys.reg;
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE sales.reg.existing;
+
+statement ok
+ACL ADMIN CREATE ROLE wide;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE wide CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE wide WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.reg TO ROLE wide WITH (select, create) VIRTUAL ONLY;
+
+statement ok
+ACL ADMIN CREATE ROLE other;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE other CAPS '{}' MAIN;
+
+statement ok
+SET GLOBAL acl_audit_level = 'decisions';
+
+# --- a rolled-back CREATE leaves no record ------------------------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.payroll(x INT);
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'vs.payroll';
+----
+0
+
+# a physical table of that name made later is not read through a record left behind
+statement ok
+CREATE TABLE phys.lake.payroll(who VARCHAR, pay INT);
+
+statement ok
+INSERT INTO phys.lake.payroll VALUES ('ceo', 999);
+
+statement error
+ACL ROLE "wide" SELECT * FROM vs.payroll;
+----
+<REGEX>:.*no access to object.*
+
+# --- a rolled-back DROP keeps the record and its grants -----------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.keep AS SELECT 1 AS a, 2 AS b;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.keep TO ROLE wide WITH (select) COLUMNS (a);
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.keep;
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+ACL ROLE "wide" SELECT * FROM vs.keep;
+----
+1
+
+# ...and a DROP and a CREATE of the same name in one transaction roll back to the first
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.keep;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.keep AS SELECT 7 AS a, 8 AS b;
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+ACL ROLE "wide" SELECT * FROM vs.keep;
+----
+1
+
+# --- views: a new one goes, a replaced one comes back -------------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.v AS SELECT 1 AS n;
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE OR REPLACE VIEW vs.v AS SELECT 2 AS n;
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.w AS SELECT 3 AS n;
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+ACL ROLE "wide" SELECT n FROM vs.v;
+----
+1
+
+statement error
+ACL ROLE "wide" SELECT n FROM vs.w;
+----
+<REGEX>:.*no access to object.*
+
+# --- dbt's swap rolled back: neither name is left ----------------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.m__tmp AS SELECT 5 AS x;
+
+statement ok
+ACL ROLE "wide" ALTER TABLE vs.m__tmp RENAME TO m;
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname IN ('vs.m', 'vs.m__tmp');
+----
+0
+
+# --- a VIRTUAL ONLY register rolled back ---------------------------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE reg.existing(id INT);
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'reg.existing';
+----
+0
+
+# its schema_dropped mark (the operator dropped it from the expansion on purpose) is back too
+query I
+SELECT count(*) FROM aclcat.acl.schema_dropped WHERE vcat = 'sales' AND path = 'reg' AND name = 'existing';
+----
+1
+
+# --- what hangs on a dropped record comes back with it: references, a column comment, type facts ------------------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.peer AS SELECT 1 AS a;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE sales.keep_peer FROM vs.keep TO vs.peer ON (a = a);
+
+# a value that must come back exactly: a quote, a comment marker, a semicolon, a format directive
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE sales.vs.keep COLUMN b IS 'it''s the second -- ; %s \n';
+
+query I
+SELECT count(*) FROM aclcat.acl.relation_types WHERE vcat = 'sales' AND vname = 'vs.colors';
+----
+1
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.keep;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.colors;
+
+query I
+SELECT count(*) FROM aclcat.acl.references WHERE vcat = 'sales' AND name = 'keep_peer';
+----
+0
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.references WHERE vcat = 'sales' AND name = 'keep_peer';
+----
+1
+
+query I
+SELECT count(*) FROM aclcat.acl.reference_columns WHERE vcat = 'sales' AND name = 'keep_peer';
+----
+2
+
+query T
+SELECT comment FROM aclcat.acl.column_comments WHERE vcat = 'sales' AND vname = 'vs.keep';
+----
+it's the second -- ; %s \n
+
+query I
+SELECT count(*) FROM aclcat.acl.relation_types WHERE vcat = 'sales' AND vname = 'vs.colors';
+----
+1
+
+query T
+ACL ROLE "wide" SELECT c FROM vs.colors;
+----
+red
+
+# --- an operator's REVOKE while the client's transaction is open is never undone ---------------------------------
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.pv AS SELECT 1 AS n;
+
+statement ok
+ACL ADMIN GRANT VIEW sales.vs.pv TO ROLE other WITH (select);
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" CREATE OR REPLACE VIEW vs.pv AS SELECT 2 AS n;
+
+statement ok con2
+ACL ADMIN REVOKE VIEW sales.vs.pv FROM ROLE other;
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+# the grant stays revoked; the view stays what the client's write made it - and the operator is told
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vcat = 'sales' AND vname = 'vs.pv';
+----
+0
+
+query I
+ACL ROLE "wide" SELECT n FROM vs.pv;
+----
+2
+
+query TTT
+SELECT verdict, reason, objects::VARCHAR FROM acl_audit_events() WHERE detail = 'record_not_undone';
+----
+allowed	a client's ROLLBACK did not take back what its DDL recorded: another write changed it since - it stays as that write left it	[{'name': sales.vs.pv, 'capability': relation}]
+
+# --- a dropped record comes back only into a store nobody else wrote since: a cascade never touches the name's rows,
+# which the drop already took - a catalog grant revoked, a role dropped and made again ------------------------------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.cascade AS SELECT 1 AS a, 2 AS secret;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE other CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.cascade TO ROLE other WITH (select) COLUMNS (a);
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" DROP TABLE vs.cascade;
+
+statement ok con2
+ACL ADMIN REVOKE CATALOG sales FROM ROLE other;
+
+statement ok con2
+ACL ADMIN DROP ROLE other;
+
+statement ok con2
+ACL ADMIN CREATE ROLE other;
+
+statement ok con2
+ACL ADMIN GRANT CATALOG sales TO ROLE other CAPS '{}' MAIN;
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+# the drop stands - the table is back physically, its record is not - and no grant came back to the new `other`
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname = 'vs.cascade';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vcat = 'sales' AND vname = 'vs.cascade';
+----
+0
+
+statement error
+ACL ROLE "other" SELECT * FROM vs.cascade;
+----
+<REGEX>:.*no access to object.*
+
+query TT
+SELECT reason, objects::VARCHAR FROM acl_audit_events() WHERE detail = 'record_not_undone' ORDER BY seq DESC LIMIT 1;
+----
+a client's ROLLBACK did not take back what its DDL recorded: the policy store was written since its DROP - the drop stands: add the record and its grants again	[{'name': sales.vs.cascade, 'capability': relation}]
+
+query TI
+SELECT attributes::VARCHAR, value::INTEGER FROM acl_metrics() WHERE name = 'acl.policy.records_not_undone' ORDER BY 1;
+----
+{"reason":"changed_since"}	1
+{"reason":"written_since"}	1
+
+statement ok
+DROP TABLE phys.lake.cascade;
+
+# --- the hand-written swap: DROP the target, RENAME the staging table into its name - both come back ---------------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.target AS SELECT 1 AS a, 2 AS secret;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.target TO ROLE wide WITH (select) COLUMNS (a);
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.staging AS SELECT 3 AS a, 4 AS secret;
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.target;
+
+statement ok
+ACL ROLE "wide" ALTER TABLE vs.staging RENAME TO target;
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+ACL ROLE "wide" SELECT * FROM vs.target;
+----
+1
+
+query II
+ACL ROLE "wide" SELECT * FROM vs.staging;
+----
+3	4
+
+# --- a rename the operator touched meanwhile is not moved back: the record is the operator's to look at now -------
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" ALTER TABLE vs.staging RENAME TO renamed;
+
+statement ok con2
+ACL ADMIN COMMENT ON VIRTUAL TABLE sales.vs.renamed IS 'checked by ops';
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+query TT
+SELECT vname, comment FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname IN ('vs.staging', 'vs.renamed');
+----
+vs.renamed	checked by ops
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'record_not_undone' ORDER BY seq DESC LIMIT 1;
+----
+a client's ROLLBACK did not take back what its DDL recorded: another write changed it since - it stays as that write left it
+
+# the record names an object that is not there - the check says so
+query T
+SELECT problem FROM acl_check_catalog('sales') WHERE object LIKE '%renamed%';
+----
+source_missing
+
+statement ok
+ACL ADMIN DROP RELATION sales.vs.renamed;
+
+# --- a record the transaction created and then renamed (a swap) goes, however the renamed one was touched ----------
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" CREATE TABLE vs.m__tmp(x INT);
+
+statement ok con1
+ACL ROLE "wide" ALTER TABLE vs.m__tmp RENAME TO m;
+
+statement ok con2
+ACL ADMIN GRANT TABLE sales.vs.m TO ROLE other WITH (select);
+
+statement ok con2
+ACL ADMIN COMMENT ON VIRTUAL TABLE sales.vs.m IS 'seen by ops';
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname IN ('vs.m', 'vs.m__tmp');
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vcat = 'sales' AND vname IN ('vs.m', 'vs.m__tmp');
+----
+0
+
+# --- a reference to a table FUNCTION of the same name is the function's: a created record's undo leaves it ---------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.vs.f(n BIGINT) ALIAS OF range;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE sales.peer_f FROM vs.peer TO FUNCTION vs.f(n => a);
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.f(x INT);
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.references WHERE vcat = 'sales' AND name = 'peer_f';
+----
+1
+
+statement ok
+ACL ADMIN DROP VIRTUAL REFERENCE sales.peer_f;
+
+# --- a dropped record stays dropped after ANY other write to the store meanwhile - fail closed, and said so --------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.busy AS SELECT 1 AS a;
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" DROP TABLE vs.busy;
+
+statement ok con2
+ACL ADMIN CREATE ROLE unrelated;
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname = 'vs.busy';
+----
+0
+
+# the drop's mark stays: a REFRESH must not bring the object back without the grants the operator gave it
+query I
+SELECT count(*) FROM aclcat.acl.schema_dropped WHERE vcat = 'sales' AND path = 'vs' AND name = 'busy';
+----
+1
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'record_not_undone' ORDER BY seq DESC LIMIT 1;
+----
+a client's ROLLBACK did not take back what its DDL recorded: the policy store was written since its DROP - the drop stands: add the record and its grants again
+
+statement ok
+DROP TABLE phys.lake.busy;
+
+# --- a created record goes whatever was written on it meanwhile - a grant on an object that never was goes too -----
+
+statement ok con1
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok con1
+ACL ROLE "wide" CREATE TABLE vs.fresh(x INT);
+
+statement ok con2
+ACL ADMIN GRANT TABLE sales.vs.fresh TO ROLE other WITH (select);
+
+statement ok con2
+ACL ADMIN COMMENT ON VIRTUAL TABLE sales.vs.fresh IS 'seen by ops';
+
+statement ok con1
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname = 'vs.fresh';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vcat = 'sales' AND vname = 'vs.fresh';
+----
+0
+
+# --- an operator's own management write is not a record: it commits at once, whatever the transaction ------------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.op_drop(x INT);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ACL ADMIN DROP RELATION sales.vs.op_drop;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.op_added AS phys.lake.payroll;
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT vname FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname IN ('vs.op_drop', 'op_added') ORDER BY 1;
+----
+op_added
+
+# --- a name that needs quoting -------------------------------------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs."a.b"(x INT);
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname = 'vs."a.b"';
+----
+1
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname = 'vs."a.b"';
+----
+0
+
+# --- a failed statement aborts the transaction: its COMMIT rolls back (duckdb answers it), and the record goes -----
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.aborted(x INT);
+
+statement error
+ACL ROLE "wide" SELECT CAST(s AS INT) FROM (VALUES ('x')) v(s);
+----
+<REGEX>:.*Could not convert.*
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND table_name = 'aborted';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname = 'vs.aborted';
+----
+0
+
+# --- a COMMIT keeps what the transaction wrote, and a later ROLLBACK does not replay it ---------------------------
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.first(x INT);
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.second(x INT);
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+query T
+SELECT vname FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname IN ('vs.first', 'vs.second');
+----
+vs.first
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.first;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.pv;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.peer;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.colors;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.target;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.staging;
+
+# --- a COMMIT keeps what the transaction wrote ---------------------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.kept(x INT);
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.keep;
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+query T
+ACL ROLE "wide" SELECT table_name FROM information_schema.tables WHERE table_schema = 'vs' ORDER BY 1;
+----
+kept
+v
+
+# the lineage payloads are JSON (the osx job builds without it: this part last)
+require json
+
+# --- lineage is told what the catalog holds at the end: a view made and dropped inside a rolled-back transaction
+# was never there; a dropped table that came back is there ------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.back(x INT);
+
+statement ok
+SET GLOBAL acl_lineage_level = 'on';
+
+statement ok
+SET GLOBAL acl_lineage_namespace = 'acl://test';
+
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.g AS SELECT 1 AS n;
+
+statement ok
+ACL ROLE "wide" DROP VIEW vs.g;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.back;
+
+statement ok
+ACL ROLE "wide" ROLLBACK;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name' AS dataset,
+    string_agg(payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle', ',' ORDER BY seq)
+FROM acl_lineage_events() WHERE event_type = 'DATASET' AND dataset IN ('sales.vs.g', 'sales.vs.back')
+GROUP BY ALL ORDER BY 1;
+----
+sales.vs.back	DROP,CREATE
+sales.vs.g	DROP

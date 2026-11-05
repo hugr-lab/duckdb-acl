@@ -87,7 +87,7 @@ The reviews found three more problems on the same path, all older than this spec
   made and recorded. A plain `CREATE` of a taken name was already refused natively (spec 051), so the error reveals
   nothing new.
 - **A record made in a client's transaction is probed again at its commit** (`RefreshAtCommit`, a
-  `ClientContextState` beside spec 113's `RecordRenameUndo`).
+  `ClientContextState` beside spec 113's `RecordRenameUndo`, since spec 154 `RecordUndo`).
   - `acl_register_created` and `acl_register_view` queue their name; `acl_rename_relation` queues the new one, so
     dbt's swap is refreshed under the name that commits.
   - After the commit, `PolicyStore::CatalogRefreshSchema` (what `ANALYZE` runs) re-probes each one: type facts, a
@@ -164,10 +164,8 @@ The reviews found three more problems on the same path, all older than this spec
 - **Flight and a table's DDL with a record.** The door prepared every statement, and a `CREATE TABLE [AS]`, a
   `DROP TABLE` or a table's `RENAME` in an expansion is two statements: "Cannot prepare multiple statements at once!"
   (before this spec too). Done by spec 153: the door runs a client's DDL as text.
-- **A record follows the client's `ROLLBACK`** - only a rename does (`RecordRenameUndo`); next, as its own spec. The
-  record is written on the store's own connection, so a rolled-back `CREATE` leaves its record, and a physical table
-  of that name made later - by another role's `CREATE` in another schema over the same home, say - is read through
-  it; a rolled-back `DROP` loses the record and its grants while the table stays.
+- **A record follows the client's `ROLLBACK`**: done by spec 154 (each record write keeps the names' rows before and
+  after it, taken back at the ROLLBACK by a rule that never undoes over another write).
 - **A record that fails after its `CREATE` committed** leaves an object with no record, as before. `acl_check_catalog`
   reports it (`expansion_stale`).
 - **A `CREATE TABLE … AS` with a record** answers `Success`, not the native `Count`. Before this spec it answered the
