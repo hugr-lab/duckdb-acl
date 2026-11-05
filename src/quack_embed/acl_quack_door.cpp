@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_quack_embed.hpp"
+#include "acl_admin_functions.hpp"
 #include "acl_placement.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "quack_fetch_collector.hpp"
@@ -29,6 +30,9 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/execution/operator/helper/physical_pragma.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -629,6 +633,15 @@ void AclQuackStatementStarting(Connection &connection, const string &connection_
 	} catch (...) {
 		// a profile is never worth the statement
 	}
+}
+
+bool AclQuackRecordStatement(const PreparedStatementData &data) {
+	if (data.statement_type != StatementType::PRAGMA_STATEMENT || !data.physical_plan) {
+		return false;
+	}
+	auto &root = data.physical_plan->Root();
+	return root.type == PhysicalOperatorType::PRAGMA &&
+	       IsAclRecordPragma(root.Cast<PhysicalPragma>().info->function.name.GetIdentifierName());
 }
 
 void AclQuackStatementCompleted(Connection &connection, const string &connection_id, const string &sql,

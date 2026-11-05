@@ -120,7 +120,13 @@ int main(int argc, char *argv[]) {
 	});
 
 	Scenario("USE <vcat> makes it the session's catalog", [&]() {
-		CheckOk(*con.Query(session + "USE mart"), "USE mart");
+		auto use = con.Query(session + "USE mart");
+		if (CheckOk(*use, "USE mart")) {
+			// spec 151: its record answers Success, no row - not the session's ops id under the record's call
+			Check(use->GetNames().size() == 1 && use->GetNames()[0].GetIdentifierName() == "Success" &&
+			          use->RowCount() == 0,
+			      "USE answers Success and no row");
+		}
 		Check(One(con, session + "SELECT id FROM facts") == "2", "facts is mart.facts now");
 		Check(One(con, session + "SELECT id FROM out.t") == "3", "a two-part name is read in mart");
 		Check(One(con, session + "SELECT id FROM sales.main.orders") == "1", "a catalog written in front still wins");
@@ -248,6 +254,22 @@ int main(int argc, char *argv[]) {
 		      "a short name on the second session is read in sales");
 		Check(One(con, session + "SELECT id FROM facts") == "2", "the first is in mart (no shared cache)");
 		Exec(con, "SELECT acl_session_close('" + other + "')");
+	});
+
+	Scenario("a USE whose session ended before it ran is an error, not a silent false (spec 151)", [&]() {
+		auto other = OpenSession(con);
+		if (!Check(!other.empty(), "a session opens")) {
+			return;
+		}
+		auto use = con.Prepare("ACL SESSION '" + other + "' USE mart");
+		if (!CheckOk(*use, "a USE prepares")) {
+			return;
+		}
+		Exec(con, "SELECT acl_session_close('" + other + "')");
+		// the record answered `false` as its one row, which nobody read; it answers no row now (spec 151)
+		auto ran = use->Execute();
+		Check(ran->HasError() && Contains(ran->GetError(), "the session is no longer open"),
+		      "the record refuses: " + (ran->HasError() ? ran->GetError() : std::string("no error")));
 	});
 
 	Scenario("lineage names what the session read and wrote", [&]() {

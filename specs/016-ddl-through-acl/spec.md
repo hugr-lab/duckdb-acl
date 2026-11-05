@@ -73,7 +73,9 @@ catalog is updated to match the kind of schema:
 
 The record is written **after** the DDL, as a second statement of the same batch: if creating the
 physical object fails, no record is left behind. The reverse order would leave the catalog claiming
-an object nobody made.
+an object nobody made. (Since spec 151 the record is a `PRAGMA`, and the DDL answers `Success` with no
+row instead of the record's call; an `IF NOT EXISTS` over a physical object with no record is refused,
+never adopted.)
 
 `DROP TABLE` through a virtual name is the user-facing drop: it removes the physical object **and**
 its record. `ACL ADMIN DROP VIRTUAL TABLE` remains the administrative one — it forgets the record and

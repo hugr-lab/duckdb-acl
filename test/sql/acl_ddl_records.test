@@ -1,0 +1,319 @@
+# name: test/sql/acl_ddl_records.test
+# description: spec 151 - the catalog record a principal's DDL writes answers nothing: a CREATE / RENAME / DROP in
+#   a schema that records its objects answers no row (the record was a SELECT answering `true` under its call, the
+#   physical name and a view's rewritten body as the column's name - test/cpp/test_acl_ddl_records.cpp checks the
+#   names); an EXPLAIN of such a statement is refused (its record ran in the EXPLAIN's place); an IF NOT EXISTS
+#   over a physical table with no record does not adopt it; the record's type facts hold inside a transaction too
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE SCHEMA phys.live;
+
+statement ok
+CREATE SCHEMA phys.reg;
+
+statement ok
+CREATE TABLE phys.reg.existing(id INT);
+
+statement ok
+CREATE TABLE phys.lake.orders(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.lake.orders VALUES (1, 'acme', 100), (2, 'globex', 200);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+# an expansion records what a principal makes in it; a live alias reads its schema as it is (no record)
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.lv AS phys.live;
+
+# an expansion where the role registers what exists (VIRTUAL ONLY); created after phys.reg.existing, so it records it
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.reg FROM phys.reg;
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE sales.reg.existing;
+
+statement ok
+ACL ADMIN CREATE ROLE wide CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE wide CAPS '{"explain": true}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE wide WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.lv TO ROLE wide WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.reg TO ROLE wide WITH (select, create) VIRTUAL ONLY;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.orders TO ROLE wide WITH (select) COLUMNS (id, amount) RLS (tenant = acl_claim('tenant'));
+
+# --- a DDL answers no row --------------------------------------------------------------------------------------
+
+query I
+ACL ROLE "wide" CREATE TABLE vs.t1(i INTEGER);
+----
+
+query I
+ACL ROLE "wide" CREATE TABLE vs.t2 AS SELECT 1 AS x;
+----
+
+query I
+ACL ROLE "wide" CREATE VIEW vs.v1 AS SELECT id, amount FROM vs.orders;
+----
+
+query I
+ACL ROLE "wide" ALTER TABLE vs.t2 RENAME TO t3;
+----
+
+query I
+ACL ROLE "wide" ALTER VIEW vs.v1 RENAME TO v2;
+----
+
+# ...and each record was written
+query T
+ACL ROLE "wide" SELECT table_name FROM information_schema.tables WHERE table_schema = 'vs' ORDER BY 1;
+----
+orders
+t1
+t3
+v2
+
+query II
+ACL ROLE "wide" SELECT * FROM vs.v2;
+----
+1	100
+
+query I
+ACL ROLE "wide" DROP VIEW vs.v2;
+----
+
+query I
+ACL ROLE "wide" DROP TABLE vs.t3;
+----
+
+query I
+ACL ROLE "wide" DROP TABLE vs.t1;
+----
+
+query T
+ACL ROLE "wide" SELECT table_name FROM information_schema.tables WHERE table_schema = 'vs' ORDER BY 1;
+----
+orders
+
+# VIRTUAL ONLY: the CREATE is dropped for its record, which registers what exists
+query I
+ACL ROLE "wide" CREATE TABLE reg.existing(id INT);
+----
+
+query I
+ACL ROLE "wide" SELECT count(*) FROM reg.existing;
+----
+0
+
+# a principal cannot write a record itself: its PRAGMA is one of the two answered names
+statement error
+ACL ROLE "wide" PRAGMA acl_register_created('sales', 'vs.made', 'phys.lake.orders');
+----
+<REGEX>:.*PRAGMA "acl_register_created" is not permitted under ACL.*
+
+# --- EXPLAIN of a statement that writes a record is refused, and writes nothing ---------------------------------
+
+# the CREATE VIEW was dropped for its record, and the record ran in the EXPLAIN's place: the view was made
+statement error
+ACL ROLE "wide" EXPLAIN CREATE VIEW vs.ex AS SELECT id FROM vs.orders;
+----
+<REGEX>:.*EXPLAIN of a statement that writes the virtual catalog's record is not permitted.*
+
+# EXPLAIN ANALYZE runs what it explains: the table without its record
+statement error
+ACL ROLE "wide" EXPLAIN ANALYZE CREATE TABLE vs.ext AS SELECT 1 AS x;
+----
+<REGEX>:.*EXPLAIN of a statement that writes the virtual catalog's record is not permitted.*
+
+statement error
+ACL ROLE "wide" EXPLAIN CREATE TABLE vs.ext(i INTEGER);
+----
+<REGEX>:.*EXPLAIN of a statement that writes the virtual catalog's record is not permitted.*
+
+# the record of a DROP ran beside the plan: the table stayed, its record went
+statement error
+ACL ROLE "wide" EXPLAIN DROP TABLE vs.orders;
+----
+<REGEX>:.*EXPLAIN of a statement that writes the virtual catalog's record is not permitted.*
+
+query T
+ACL ROLE "wide" SELECT table_name FROM information_schema.tables WHERE table_schema = 'vs' ORDER BY 1;
+----
+orders
+
+query I
+ACL ROLE "wide" SELECT count(*) FROM information_schema.tables WHERE table_name IN ('ex', 'ext');
+----
+0
+
+# a no-op writes no record: it answers as it did, the empty Success
+query I
+ACL ROLE "wide" EXPLAIN CREATE TABLE IF NOT EXISTS vs.orders(id INT);
+----
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND table_name = 'ext';
+----
+0
+
+# a DDL that writes no record (a live alias's schema) still explains
+statement ok
+ACL ROLE "wide" EXPLAIN CREATE TABLE lv.planned(i INTEGER);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND table_name = 'planned';
+----
+0
+
+# --- IF NOT EXISTS does not adopt a physical table the expansion does not show --------------------------------
+
+# made after the expansion, never recorded: the role cannot read it
+statement ok
+CREATE TABLE phys.lake.salaries(who VARCHAR, pay INT);
+
+statement ok
+INSERT INTO phys.lake.salaries VALUES ('ceo', 999999);
+
+statement error
+ACL ROLE "wide" SELECT * FROM vs.salaries;
+----
+<REGEX>:.*no access to object.*
+
+# the record would have handed it over: the CREATE is the physical name's, and the name is taken
+statement error
+ACL ROLE "wide" CREATE TABLE IF NOT EXISTS vs.salaries(x INT);
+----
+<REGEX>:.*already exists.*
+
+statement error
+ACL ROLE "wide" SELECT * FROM vs.salaries;
+----
+<REGEX>:.*no access to object.*
+
+# a recorded name stays a no-op
+query I
+ACL ROLE "wide" CREATE TABLE IF NOT EXISTS vs.orders(id INT);
+----
+
+# a free name is made and recorded
+query I
+ACL ROLE "wide" CREATE TABLE IF NOT EXISTS vs.fresh(x INT);
+----
+
+query I
+ACL ROLE "wide" SELECT count(*) FROM vs.fresh;
+----
+0
+
+query I
+ACL ROLE "wide" DROP TABLE vs.fresh;
+----
+
+# --- the record's type facts (spec 099) -------------------------------------------------------------------------
+
+query I
+ACL ROLE "wide" CREATE TABLE vs.e1 AS SELECT 'a'::ENUM('a', 'b') AS x;
+----
+
+query T
+SELECT as_varchar FROM aclcat.acl.relation_types WHERE vname = 'vs.e1';
+----
+VARCHAR
+
+# inside a transaction the record's probe cannot see the table yet: the facts are probed again at its commit
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+query I
+ACL ROLE "wide" CREATE TABLE vs.e2 AS SELECT 'a'::ENUM('a', 'b') AS x;
+----
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+query T
+SELECT as_varchar FROM aclcat.acl.relation_types WHERE vname = 'vs.e2';
+----
+VARCHAR
+
+# dbt's swap in one transaction: the facts follow the rename to the name that commits
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.m__tmp AS SELECT 'a'::ENUM('a', 'b') AS x;
+
+statement ok
+ACL ROLE "wide" ALTER TABLE vs.m__tmp RENAME TO m;
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+query T
+SELECT as_varchar FROM aclcat.acl.relation_types WHERE vname = 'vs.m';
+----
+VARCHAR
+
+# a view over a table made in the same transaction gets its columns at commit
+statement ok
+ACL ROLE "wide" BEGIN TRANSACTION;
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.base AS SELECT 1 AS id;
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.bv AS SELECT id FROM vs.base;
+
+statement ok
+ACL ROLE "wide" COMMIT;
+
+query T
+SELECT name FROM aclcat.acl.object_columns WHERE vname = 'vs.bv';
+----
+id
+
+statement ok
+ACL ROLE "wide" DROP VIEW vs.bv;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.base;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.m;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.e1;
+
+statement ok
+ACL ROLE "wide" DROP TABLE vs.e2;

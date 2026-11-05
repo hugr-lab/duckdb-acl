@@ -57,7 +57,6 @@
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/at_clause.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
@@ -361,6 +360,12 @@ public:
 			}
 			auto &explain = stmt.Cast<ExplainStatement>();
 			RewriteStatement(*explain.stmt);
+			if (!follow_ups.empty()) {
+				// spec 151: a statement with a record writes the virtual catalog - the record would run in the
+				// EXPLAIN's place, or beside a plan that made nothing
+				Deny(Reason::STATEMENT_TYPE, "EXPLAIN of a statement that writes the virtual catalog's record is not "
+				                             "permitted under ACL - run the statement itself");
+			}
 			if (replacement) {
 				// the inner statement became a different one (a PRAGMA answered as a SELECT, spec 031):
 				// the EXPLAIN keeps its place and explains what the principal actually runs
@@ -631,15 +636,16 @@ public:
 		return StringUtil::Join(quoted, ".");
 	}
 
-	//! Statements the rewrite appends after the one being rewritten - the catalog record of an object
-	//! a principal's DDL creates or drops. They run only if the DDL before them succeeded, so a failed
-	//! CREATE never leaves a record behind (spec 016).
+	//! Statements the rewrite appends after the one being rewritten - the catalog record (a `PRAGMA acl_…`, spec 151)
+	//! of an object a principal's DDL creates, drops or renames, or of its USE. They run only if the statement before
+	//! them succeeded, so a failed CREATE never leaves a record behind (spec 016).
 	vector<unique_ptr<SQLStatement>> follow_ups;
 	//! Set when a statement is answered by a different one entirely - a PRAGMA rewritten into the
 	//! SELECT that answers it (spec 031). The caller puts this in its place, so an enclosing EXPLAIN
 	//! keeps explaining the statement the principal actually runs.
 	unique_ptr<SQLStatement> replacement;
-	//! Set when the statement itself must not run: VIRTUAL ONLY registers what exists, it never creates
+	//! Set when the statement itself must not run: its record is the whole of it (a view, a USE, VIRTUAL ONLY -
+	//! which registers what exists, never creates), or it is a no-op (IF NOT EXISTS on a taken name)
 	bool drop_statement = false;
 
 private:
@@ -854,19 +860,16 @@ private:
 	// DDL through the ACL (spec 016)
 	//===------------------------------------------------------------------===//
 
-	//! `SELECT acl_…(args)` as a statement of the batch. Built here, never written by a principal:
-	//! every acl_* name is denied in a principal's own query (spec 009).
-	unique_ptr<SQLStatement> AclCall(const string &function, const vector<Value> &arguments) {
-		vector<unique_ptr<ParsedExpression>> children;
+	//! `PRAGMA acl_…(args)`: the record a statement writes, a statement of the batch (spec 151), run by RunRecord in
+	//! acl_admin_functions.cpp. It answers `Success` with no row, so the client sees nothing of its arguments. Built
+	//! here, never written by a principal: a principal's PRAGMA is one of the two answered names.
+	unique_ptr<SQLStatement> AclRecord(const string &function, const vector<Value> &arguments) {
+		auto record = make_uniq<PragmaStatement>();
+		record->info->name = Identifier(function);
 		for (auto &argument : arguments) {
-			children.push_back(ConstantExpression::FromValue(argument));
+			record->info->parameters.push_back(ConstantExpression::FromValue(argument));
 		}
-		auto select = make_uniq<SelectNode>();
-		select->select_list.push_back(make_uniq<FunctionExpression>(Identifier(function), std::move(children)));
-		select->from_table = make_uniq<EmptyTableRef>();
-		auto statement = make_uniq<SelectStatement>();
-		statement->node = std::move(select);
-		return std::move(statement);
+		return std::move(record);
 	}
 
 	//! spec 051: REPLACE is a drop in disguise - a role that may not drop must not replace (probed
@@ -942,6 +945,13 @@ private:
 		}
 		RequireNoCaseSibling(target);
 		Note(key, "create");
+		if (principal.arrow_ingest && (target.virtual_only || target.needs_record)) {
+			// spec 151: the door prepares a load and checks it by the count it answers - a CREATE with its record
+			// is two statements, which do not prepare, and a VIRTUAL ONLY one makes no table at all
+			Deny(Reason::DDL_HOME, "an ingest creates a table only where no catalog record is kept for it (a live "
+			                       "alias's schema, a session temp): " +
+			                           Shown(key) + " needs one - CREATE the table with SQL, then ingest into it");
+		}
 		RequireReplaceDroppable(info, key, target);
 		// the record check guards the TABLE path too: a view record occupies the name with nothing
 		// physical behind it, so "the physical CREATE fails natively" is not enough (the review's
@@ -956,16 +966,24 @@ private:
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
 			drop_statement = true;
-			follow_ups.push_back(AclCall("acl_register_existing", {Value(target.vcat), Value(target.vname), Value(phys),
-			                                                       Value(target.origin), Value(AuthorOf(principal))}));
+			follow_ups.push_back(
+			    AclRecord("acl_register_existing", {Value(target.vcat), Value(target.vname), Value(phys),
+			                                        Value(target.origin), Value(AuthorOf(principal))}));
 			return;
 		}
 		info.SetQualifiedName(ParsePhysName(phys));
 		if (target.needs_record) {
+			// spec 151: IF NOT EXISTS over a physical object with no record must not adopt it - the record would
+			// hand the role a table nobody granted it (made after the expansion, or dropped from it on purpose).
+			// With no record (AdmitRecordConflict) the name is free only if nothing physical holds it
+			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+				info.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
+			}
 			// an expansion shows only its own records, so the new object needs one - written after
 			// the CREATE, so a failure leaves nothing behind
-			follow_ups.push_back(AclCall("acl_register_created", {Value(target.vcat), Value(target.vname), Value(phys),
-			                                                      Value(target.origin), Value(AuthorOf(principal))}));
+			follow_ups.push_back(
+			    AclRecord("acl_register_created", {Value(target.vcat), Value(target.vname), Value(phys),
+			                                       Value(target.origin), Value(AuthorOf(principal))}));
 		}
 	}
 
@@ -1137,7 +1155,7 @@ private:
 			catalog.clear(); // back where the session began
 		}
 		drop_statement = true;
-		follow_ups.push_back(AclCall("acl_session_use", {Value(session_id), Value(catalog), Value(schema)}));
+		follow_ups.push_back(AclRecord("acl_session_use", {Value(session_id), Value(catalog), Value(schema)}));
 		// the statements after it in the same batch read under it too
 		use_catalog = catalog;
 		use_schema = schema;
@@ -1348,7 +1366,7 @@ private:
 		keep_claim_markers = false;
 		auto body = info.query->ToString();
 		drop_statement = true;
-		follow_ups.push_back(AclCall(
+		follow_ups.push_back(AclRecord(
 		    "acl_register_view", {Value(target.vcat), Value(target.vname), Value(body), Value(AuthorOf(principal))}));
 	}
 
@@ -1389,7 +1407,7 @@ private:
 			// a view has no physical object behind it: the record is the whole of it
 			drop_statement = true;
 			follow_ups.push_back(
-			    AclCall("acl_drop_relation", {Value(target.vcat), Value(target.vname), Value("skip")}));
+			    AclRecord("acl_drop_relation", {Value(target.vcat), Value(target.vname), Value("skip")}));
 			return;
 		}
 		if (target.virtual_only) {
@@ -1405,7 +1423,7 @@ private:
 		if (target.needs_record) {
 			// the record goes with the object it described; 'skip' because a name may have none
 			follow_ups.push_back(
-			    AclCall("acl_drop_relation", {Value(target.vcat), Value(target.vname), Value("skip")}));
+			    AclRecord("acl_drop_relation", {Value(target.vcat), Value(target.vname), Value("skip")}));
 		}
 	}
 
@@ -1483,13 +1501,13 @@ private:
 			}
 			drop_statement = true;
 			follow_ups.push_back(
-			    AclCall("acl_rename_relation", {Value(from.vcat), Value(from.vname), Value(to.vname)}));
+			    AclRecord("acl_rename_relation", {Value(from.vcat), Value(from.vname), Value(to.vname)}));
 			return;
 		}
 		auto name = info.GetQualifiedName().Name();
 		info.SetQualifiedName(ParsePhysName(NamePath::ChildKey(from.phys_schema, name.GetIdentifierName())));
 		follow_ups.push_back(
-		    AclCall("acl_rename_relation", {Value(from.vcat), Value(from.vname), Value(to.vname), Value(new_phys)}));
+		    AclRecord("acl_rename_relation", {Value(from.vcat), Value(from.vname), Value(to.vname), Value(new_phys)}));
 	}
 
 	//===------------------------------------------------------------------===//

@@ -260,6 +260,43 @@ int main(int argc, char *argv[]) {
 			Exec(con, "DETACH batch");
 		});
 
+		Scenario("a DDL's catalog record answers nothing of the batch (spec 151)", [&] {
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			Exec(con, "CREATE SCHEMA made");
+			// an expansion records what a principal makes in it - the record follows the DDL
+			Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA c.made FROM memory.made");
+			Exec(con, "ACL ADMIN GRANT SCHEMA c.made TO ROLE analyst WITH (select, create, drop)");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			Exec(con, "ATTACH 'quack:localhost:31975' AS ddl (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			// the record was a SELECT, the batch's first result: it answered `true` under its call as the column
+			auto rows = con.Query("FROM ddl.query('CREATE TABLE made.t(i INTEGER); SELECT 42::BIGINT AS a')");
+			if (CheckOk(*rows, "the batch answers")) {
+				Check(rows->GetNames().size() == 1 && rows->GetNames()[0].GetIdentifierName() == "a" &&
+				          rows->RowCount() == 1 && rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 42,
+				      "...with the SELECT's rows, as a native quack server answers CREATE; SELECT");
+			}
+			// alone, a DDL answers what a native one does: Success, no row - not the view's rewritten body
+			auto alone = con.Query("FROM ddl.query('CREATE VIEW made.v AS SELECT id FROM orders')");
+			if (CheckOk(*alone, "a CREATE VIEW alone answers")) {
+				auto &names = alone->GetNames();
+				Check(names.size() == 1 && names[0].GetIdentifierName() == "Success" && alone->RowCount() == 0,
+				      "...Success and no row (" + (names.empty() ? string("none") : names[0].GetIdentifierName()) +
+				          ")");
+			}
+			// a USE's record too: the batch answers its SELECT
+			auto used = con.Query("FROM ddl.query('USE c; SELECT 7::BIGINT AS b')");
+			if (CheckOk(*used, "USE; SELECT answers")) {
+				Check(used->RowCount() == 1 && used->Collection().GetValue(0, 0).GetValue<int64_t>() == 7,
+				      "...with the SELECT's rows");
+			}
+			auto read = con.Query("FROM ddl.query('SELECT count(*)::BIGINT FROM made.v')");
+			if (CheckOk(*read, "the view reads")) {
+				Check(read->Collection().GetValue(0, 0).GetValue<int64_t>() == 2, "...the author's acme slice");
+			}
+			CheckOk(*con.Query("FROM ddl.query('DROP VIEW made.v; DROP TABLE made.t')"), "cleanup");
+			Exec(con, "DETACH ddl");
+		});
+
 		Scenario("GET /metrics is opt-in and renders what acl_metrics() answers (spec 069)", [&] {
 			auto off = GetObserved("/metrics", OBSERVER_TOKEN);
 			Check(off.status == 404,

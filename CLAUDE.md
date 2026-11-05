@@ -759,6 +759,21 @@ a passthrough mapping and became passthrough), and judges a batch with its own `
 names a property once and the attributes in one spelling. Judged when decided (a prepared statement executes as
 decided - a known limit). Test `platform_review.test`.
 
+**Spec 151 — a DDL's record answers nothing**: the record the rewriter appends after a principal's DDL / USE
+(`acl_register_created|existing|view`, `acl_rename_relation`, `acl_drop_relation`, `acl_session_use`) is `PRAGMA
+<record>(…)`, a statement of its own after the DDL (`AclRecord`; `RunRecord` in acl_admin_functions.cpp binds the
+SYSTEM catalog's scalar of that name; a false answer - a USE for a session gone - is an error). It answers `Success`, no
+row: the `SELECT acl_…(…)` answered its call as the column's name (the physical name, a view's rewritten body with the
+author's RLS). quack's collector skips it (`AclQuackRecordStatement`, a sync.py hunk), so `CREATE …; SELECT …` answers
+the SELECT. Found by its reviews, fixed: `EXPLAIN` of a statement with a record is refused (it ran the record:
+`EXPLAIN CREATE VIEW` made the view); `CREATE TABLE IF NOT EXISTS` with no record turns ERROR_ON_CONFLICT (it adopted a
+physical table the expansion did not show); what a record probes inside a client's transaction is probed again at
+commit (`RefreshAtCommit` -> `CatalogRefreshSchema`; a rename queues its new name); `ACL INGEST` creates only where no
+record is kept. A one-query DDL + record (MultiStatement) was tried and dropped - the spec says why; so over Flight
+(every statement prepared) a CREATE / DROP / RENAME of a TABLE in an expansion still fails ("Cannot prepare multiple
+statements"). Next: a record follows the client's ROLLBACK (only a rename does), and the binder's "Did you mean" in a
+principal's DROP. Tests `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

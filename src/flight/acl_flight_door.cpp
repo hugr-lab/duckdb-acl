@@ -2306,8 +2306,8 @@ public:
 	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation) {
 		auto &stmt = *reservation.stmt;
 		// a client's USE / SET / CREATE / DROP / ALTER answers no rows, whatever the rewrite made of it: a
-		// USE or a CREATE VIEW becomes the record's `SELECT acl_…(…)` (a query to duckdb), and left to the
-		// DoGet a client that never fetches it - ADBC's execute - would lose it (spec 114)
+		// USE or a CREATE VIEW becomes the record's `PRAGMA acl_…(…)` (a query result to duckdb, spec 151), and
+		// left to the DoGet a client that never fetches it - ADBC's execute - would lose it (spec 114)
 		if (ClientStatementIsCommand(reservation.query)) {
 			return true;
 		}
@@ -2857,13 +2857,8 @@ private:
 			auto prefixed = state->store->SessionSql(handle, sql, string(), string(), string(), string(), string());
 			bool ok = !prefixed.empty();
 			if (ok) {
-				auto result = conn.con->Query(prefixed);
-				ok = !result->HasError();
-				// acl_session_use answers false when it recorded nothing
-				for (idx_t row = 0; ok && row < result->RowCount(); row++) {
-					auto value = result->Collection().GetValue(0, row);
-					ok = !(value.type().id() == LogicalTypeId::BOOLEAN && !value.IsNull() && !value.GetValue<bool>());
-				}
+				// a USE's record that wrote nothing is an error (spec 151)
+				ok = !conn.con->Query(prefixed)->HasError();
 			}
 			(ok ? restored : failed).push_back(what);
 		};

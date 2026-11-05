@@ -150,7 +150,10 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   columns apply row by row; a refusal anywhere fails the whole statement and nothing lands. Modes:
   `append` (into an existing writable virtual table), `create` (`CREATE TABLE ... AS`, needs `create`
   on a granted schema with a physical home), `replace` (`CREATE OR REPLACE`, priced at
-  `create`+`drop`); `create_append` is refused as ambiguous. `acl_max_ingest_rows` caps the rows one
+  `create`+`drop`); `create_append` is refused as ambiguous. `create` and `replace` work only where the
+  catalog keeps no record of the table - a live alias's schema or a session temp (`temporary = true`):
+  into an expansion or a `VIRTUAL ONLY` schema they are refused before anything runs (spec 151) - `CREATE`
+  the table with SQL there, then `append` into it. `acl_max_ingest_rows` caps the rows one
   ingest may stream, enforced while reading. A `transaction_id` on ingest is refused, and so is an
   ingest inside a client's open transaction (the refusal says `inside an open transaction`): the
   ingest owns its own transaction so the row-count cross-check decides before commit.

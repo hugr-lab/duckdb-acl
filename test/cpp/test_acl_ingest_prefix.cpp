@@ -46,6 +46,18 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.phys_orders");
 		Exec(con, "ACL ADMIN CREATE ROLE r");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select, insert) MAIN");
+		// spec 151: a schema that records what is made in it (an expansion) and one that does not (a live alias)
+		Exec(con, "CREATE SCHEMA lake");
+		Exec(con, "CREATE SCHEMA live");
+		Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM memory.lake");
+		Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA c.lv AS memory.live");
+		Exec(con, "ACL ADMIN GRANT SCHEMA c.vs TO ROLE r WITH (select, insert, create)");
+		Exec(con, "ACL ADMIN GRANT SCHEMA c.lv TO ROLE r WITH (select, insert, create)");
+		Exec(con, "CREATE SCHEMA reg");
+		Exec(con, "CREATE TABLE reg.existing(id INT)");
+		Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA c.reg FROM memory.reg");
+		Exec(con, "ACL ADMIN DROP VIRTUAL TABLE c.reg.existing");
+		Exec(con, "ACL ADMIN GRANT SCHEMA c.reg TO ROLE r WITH (select, insert, create) VIRTUAL ONLY");
 		Exec(con, "SELECT acl_define_token('tok', 'r', 'tenant=acme')");
 		auto handle = OpenSession(con);
 		if (!Check(!handle.empty(), "a defined token opens a session")) {
@@ -83,6 +95,26 @@ int main(int argc, char *argv[]) {
 			auto dumb = con.Query("ACL INGEST '" + handle +
 			                      "' INSERT INTO orders (id) SELECT id FROM arrow_scan_dumb(NULL, NULL, NULL)");
 			ErrorContains(*dumb, "not allowed", "arrow_scan_dumb stays denied under INGEST");
+		});
+
+		Scenario("an ingest creates a table only where no catalog record is kept for it (spec 151)", [&]() {
+			// the door checks a load by the count its statement answers: a CREATE with its record answers the
+			// record's Success, so the load would be reported failed after the record was written
+			auto recorded =
+			    con.Query("ACL INGEST '" + handle + "' CREATE TABLE vs.loaded AS SELECT * FROM arrow_scan()");
+			ErrorContains(*recorded, "an ingest creates a table only where no catalog record is kept",
+			              "a create into an expansion is refused before anything runs");
+			Check(con.Query("SELECT * FROM memory.lake.loaded")->HasError(), "...and made nothing");
+			// VIRTUAL ONLY makes no table - the load was reported failed after the record of what exists was written
+			auto registered =
+			    con.Query("ACL INGEST '" + handle + "' CREATE TABLE reg.existing AS SELECT * FROM arrow_scan()");
+			ErrorContains(*registered, "an ingest creates a table only where no catalog record is kept",
+			              "a create into a VIRTUAL ONLY schema is refused");
+			Check(con.Query("SELECT 1 FROM store.acl.relations WHERE vname = 'reg.existing'")->RowCount() == 0,
+			      "...and records nothing");
+			// a live alias keeps no record: the gate passes, and duckdb's own bind wants the door's stream
+			auto live = con.Query("ACL INGEST '" + handle + "' CREATE TABLE lv.loaded AS SELECT * FROM arrow_scan()");
+			ErrorContains(*live, "ArrowScanFactory bind input", "a create into a live alias passes to duckdb's check");
 		});
 
 		Scenario("no marker rides after the handle", [&]() {

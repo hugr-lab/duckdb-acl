@@ -17,6 +17,8 @@ CREATE TABLE customers AS
 -- granted create WITHOUT drop, so the replace refusal has a stage of its own
 CREATE SCHEMA staging;
 CREATE SCHEMA staging2;
+-- spec 151: an expansion's home - what a principal makes in it gets a catalog record
+CREATE SCHEMA made_home;
 
 -- spec 099: an ENUM column, read as it is by one virtual table and as VARCHAR by the other
 CREATE TYPE tier AS ENUM ('gold', 'silver');
@@ -77,6 +79,9 @@ ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
 ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage2 AS memory.staging2;
 ACL ADMIN GRANT SCHEMA c.stage2 TO ROLE analyst WITH (select, insert, create);
+-- kept empty outside adbc_client.py's create + drop: run.sh asserts GetDbSchemas exactly, and lists no empty expansion
+ACL ADMIN CREATE VIRTUAL SCHEMA c.made FROM memory.made_home;
+ACL ADMIN GRANT SCHEMA c.made TO ROLE analyst WITH (select, create, drop);
 SET GLOBAL acl_allow_anonymous_admin=false;
 
 SELECT acl_flight_serve('${ACL_E2E_URI}');

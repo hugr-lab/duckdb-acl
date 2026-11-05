@@ -15,5 +15,9 @@ namespace acl {
 //! Register the acl_* admin scalar functions, attaching the shared policy store to each
 void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> store);
 
+//! spec 151: whether `name` is one of the records the rewriter emits after a principal's DDL / USE as
+//! `PRAGMA <name>(…)` (acl_register_created, …, acl_session_use)
+bool IsAclRecordPragma(const string &name);
+
 } // namespace acl
 } // namespace duckdb

@@ -5,6 +5,7 @@
 // co-loaded without a registration clash. Regenerate after a submodule bump.
 //===----------------------------------------------------------------------===//
 #include "quack_fetch_collector.hpp"
+#include "acl_quack_embed.hpp"
 
 #include "duckdb/common/random_engine.hpp"
 #include "duckdb/common/thread.hpp"
@@ -183,7 +184,8 @@ unique_ptr<PhysicalOperator> MakeQuackFetchCollector(ClientContext &context, Pre
                                                      shared_ptr<QuackResultStream> stream) {
 	// The stream carries the FIRST statement that returns a result, as core does for a result chain.
 	// Every other statement keeps the default collector.
-	if (data.properties.return_type != StatementReturnType::QUERY_RESULT || stream->Bound()) {
+	if (data.properties.return_type != StatementReturnType::QUERY_RESULT || stream->Bound() ||
+	    acl::AclQuackRecordStatement(data)) {
 		return PhysicalResultCollector::GetResultCollector(context, data);
 	}
 	auto &physical_plan = *data.physical_plan;
