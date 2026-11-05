@@ -118,11 +118,11 @@ share sessions" (spec 040).
   no amount of DDL produces one".
 - A principal's `CREATE VIEW` is "resolved once, with its author's rights, and reading it is decided
   by the grant on the view" (spec 018).
-- The record runs as a `PRAGMA` in the DDL's own query and answers `Success` with no row (spec 151).
-  Before, it was a `SELECT acl_…(…)` answered to the client under its call as the column's name: the
-  physical name, and for a view the rewritten body - the physical relation, the author's RLS and
-  column list. An `EXPLAIN` of such a DDL ran the record in its place (`EXPLAIN CREATE VIEW` made the
-  view) and is refused.
+- The record runs as a `PRAGMA` after the DDL and answers `Success` with no row: nothing of its
+  arguments (the physical name, a view's rewritten body) reaches the client (spec 151). An `EXPLAIN`
+  of a DDL that writes a record is refused.
+- In a schema that records its objects, `CREATE TABLE IF NOT EXISTS` never adopts a physical table
+  with no record: the name is free only if nothing physical holds it (spec 151).
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).

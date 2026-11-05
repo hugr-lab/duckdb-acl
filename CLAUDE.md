@@ -761,14 +761,15 @@ decided - a known limit). Test `platform_review.test`.
 
 **Spec 151 — a DDL's record answers nothing**: the record the rewriter appends after a principal's DDL / USE
 (`acl_register_created|existing|view`, `acl_rename_relation`, `acl_drop_relation`, `acl_session_use`) is `PRAGMA
-<record>(…)` (`AclRecord`; `RunRecord` in acl_admin_functions.cpp binds the SYSTEM catalog's scalar of that name, and a
-false answer - a USE for a session gone - is an error), and a kept DDL with its record is ONE `MultiStatement` (one
-query: a failed record rolls the CREATE back; one statement for Prepare - a Flight CREATE TABLE in an expansion failed
-"Cannot prepare multiple statements"). It answers `Success`, no row: the `SELECT acl_…(…)` answered its call as the
-column's name (the physical name, a view's rewritten body with the author's RLS). quack's collector skips it
-(`AclQuackRecordStatement`, a sync.py hunk), so `CREATE …; SELECT …` answers the SELECT. `EXPLAIN` over a statement
-the rewrite drops or follows up is refused (it ran the record: `EXPLAIN CREATE VIEW` made the view). Tests
-`acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
+<record>(…)`, a statement of its own after the DDL (`AclRecord`; `RunRecord` in acl_admin_functions.cpp binds the
+SYSTEM catalog's scalar of that name; a false answer - a USE for a session gone - is an error). It answers `Success`, no
+row: the `SELECT acl_…(…)` answered its call as the column's name (the physical name, a view's rewritten body with the
+author's RLS). quack's collector skips it (`AclQuackRecordStatement`, a sync.py hunk), so `CREATE …; SELECT …` answers
+the SELECT. Found by its reviews, fixed: `EXPLAIN` of a statement with a record is refused (it ran the record:
+`EXPLAIN CREATE VIEW` made the view); `CREATE TABLE IF NOT EXISTS` with no record turns ERROR_ON_CONFLICT (it adopted a
+physical table the expansion did not show); a record's type facts in a client's transaction are probed again at commit
+(`TypeFactsAtCommit`); `ACL INGEST` creates only where no record is kept. A one-query DDL + record (MultiStatement) was
+tried and dropped - the spec says why. Tests `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a

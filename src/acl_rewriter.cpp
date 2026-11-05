@@ -360,11 +360,9 @@ public:
 			}
 			auto &explain = stmt.Cast<ExplainStatement>();
 			RewriteStatement(*explain.stmt);
-			if (drop_statement || !follow_ups.empty()) {
-				// spec 151: a statement the rewrite drops or follows up is a write of the virtual catalog (a view, a
-				// recorded table, a USE): the record would run in the EXPLAIN's place, or after a plan that never
-				// made the object (`EXPLAIN CREATE VIEW` created the view; `EXPLAIN ANALYZE CREATE TABLE` made a
-				// table no record shows)
+			if (!follow_ups.empty()) {
+				// spec 151: a statement with a record writes the virtual catalog - the record would run in the
+				// EXPLAIN's place, or beside a plan that made nothing
 				Deny(Reason::STATEMENT_TYPE, "EXPLAIN of a statement that writes the virtual catalog's record is not "
 				                             "permitted under ACL - run the statement itself");
 			}
@@ -638,15 +636,16 @@ public:
 		return StringUtil::Join(quoted, ".");
 	}
 
-	//! The catalog record a principal's DDL writes (an object it creates, drops or renames) or its USE: a
-	//! `PRAGMA acl_…` run after the DDL, in the same query (spec 151), so a failed CREATE never leaves a
-	//! record behind (spec 016) and a failed record takes the CREATE back.
+	//! Statements the rewrite appends after the one being rewritten - the catalog record (a `PRAGMA acl_…`, spec 151)
+	//! of an object a principal's DDL creates, drops or renames, or of its USE. They run only if the statement before
+	//! them succeeded, so a failed CREATE never leaves a record behind (spec 016).
 	vector<unique_ptr<SQLStatement>> follow_ups;
 	//! Set when a statement is answered by a different one entirely - a PRAGMA rewritten into the
 	//! SELECT that answers it (spec 031). The caller puts this in its place, so an enclosing EXPLAIN
 	//! keeps explaining the statement the principal actually runs.
 	unique_ptr<SQLStatement> replacement;
-	//! Set when the statement itself must not run: VIRTUAL ONLY registers what exists, it never creates
+	//! Set when the statement itself must not run: its record is the whole of it (a view, a USE, VIRTUAL ONLY -
+	//! which registers what exists, never creates), or it is a no-op (IF NOT EXISTS on a taken name)
 	bool drop_statement = false;
 
 private:
@@ -861,10 +860,9 @@ private:
 	// DDL through the ACL (spec 016)
 	//===------------------------------------------------------------------===//
 
-	//! `PRAGMA acl_…(args)`: the record a statement writes, a statement of the batch (spec 151). Built here, never
-	//! written by a principal: a principal's PRAGMA is one of the two answered names. It answers what a DDL answers,
-	//! `Success` and no rows - a `SELECT acl_…(args)` answered with its call as its column's name: the physical
-	//! name, a view's rewritten body. RunRecord (acl_admin_functions.cpp) runs it.
+	//! `PRAGMA acl_…(args)`: the record a statement writes, a statement of the batch (spec 151), run by RunRecord in
+	//! acl_admin_functions.cpp. It answers `Success` with no row, so the client sees nothing of its arguments. Built
+	//! here, never written by a principal: a principal's PRAGMA is one of the two answered names.
 	unique_ptr<SQLStatement> AclRecord(const string &function, const vector<Value> &arguments) {
 		auto record = make_uniq<PragmaStatement>();
 		record->info->name = Identifier(function);
@@ -948,9 +946,8 @@ private:
 		RequireNoCaseSibling(target);
 		Note(key, "create");
 		if (principal.arrow_ingest && (target.virtual_only || target.needs_record)) {
-			// spec 151: the door checks a load by the count its statement answers, and a CREATE with its record is one
-			// query that answers the record's Success (a VIRTUAL ONLY one makes no table at all) - refused before
-			// anything runs, never a load reported failed after its record was written
+			// spec 151: the door prepares a load and checks it by the count it answers - a CREATE with its record
+			// is two statements, which do not prepare, and a VIRTUAL ONLY one makes no table at all
 			Deny(Reason::DDL_HOME, "an ingest creates a table only where no catalog record is kept for it (a live "
 			                       "alias's schema, a session temp): " +
 			                           Shown(key) + " needs one - CREATE the table with SQL, then ingest into it");
@@ -976,6 +973,12 @@ private:
 		}
 		info.SetQualifiedName(ParsePhysName(phys));
 		if (target.needs_record) {
+			// spec 151: IF NOT EXISTS over a physical object with no record must not adopt it - the record would
+			// hand the role a table nobody granted it (made after the expansion, or dropped from it on purpose).
+			// With no record (AdmitRecordConflict) the name is free only if nothing physical holds it
+			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+				info.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
+			}
 			// an expansion shows only its own records, so the new object needs one - written after
 			// the CREATE, so a failure leaves nothing behind
 			follow_ups.push_back(
@@ -4689,35 +4692,12 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 				entry.executes = false;
 			}
 		}
-		unique_ptr<SQLStatement> kept;
 		if (rewriter.replacement) {
-			kept = std::move(rewriter.replacement);
+			rewritten.push_back(std::move(rewriter.replacement));
 		} else if (!rewriter.drop_statement) {
-			kept = std::move(stmt);
+			rewritten.push_back(std::move(stmt));
 		}
-		if (kept && !rewriter.follow_ups.empty()) {
-			// spec 151: a DDL and the catalog record it writes are ONE statement, run as one query - one transaction
-			// in autocommit, so a record that fails takes the CREATE back with it (it left an object no listing
-			// showed), and one statement for a door that prepares it (Flight: "Cannot prepare multiple statements").
-			// Its answer is the record's (duckdb serves an expansion's row-returning statement, which must be the last)
-			if (rewriter.follow_ups.size() != 1) {
-				throw InternalException("acl_rewrite: a statement kept with %llu records", rewriter.follow_ups.size());
-			}
-			auto together = make_uniq<MultiStatement>();
-			together->query = kept->query;
-			together->stmt_location = kept->stmt_location;
-			// duckdb refuses to prepare an expansion with parameters - by these
-			together->named_param_map = kept->named_param_map;
-			together->has_anonymous_parameters = kept->has_anonymous_parameters;
-			together->statements.push_back(std::move(kept));
-			together->statements.push_back(std::move(rewriter.follow_ups[0]));
-			rewritten.push_back(std::move(together));
-			continue;
-		}
-		if (kept) {
-			rewritten.push_back(std::move(kept));
-		}
-		// a dropped statement's records (a view's, a USE's) take its place, in order
+		// a DDL statement's catalog record is appended right after it, so the batch stays in order
 		for (auto &follow_up : rewriter.follow_ups) {
 			rewritten.push_back(std::move(follow_up));
 		}

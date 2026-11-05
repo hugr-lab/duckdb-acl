@@ -575,11 +575,15 @@ decision: `INTO <phys schema>` names the physical schema (checked to exist); `VI
 role only register objects that already exist physically; neither follows the schema declaration (an
 alias creates in what it aliases, an expansion in its origin). A principal's own DDL then records the
 object through `acl_register_created` / `acl_register_existing` / `acl_register_view`, which a
-principal cannot call directly. The record runs as `PRAGMA acl_register_…(…)` in the same query as the
-DDL (spec 151): the DDL answers what a native one does - `Success`, no row, nothing of the physical name
-or of a view's rewritten body - a record that fails takes the `CREATE` back, a prepared DDL works, and in
-a quack batch (`CREATE TABLE …; SELECT …`) the `SELECT` answers. An `EXPLAIN` of a DDL that writes a
-record is refused; one that writes none (a live alias's schema) explains.
+principal cannot call directly. The record runs as a `PRAGMA acl_register_…(…)` right after the DDL
+(spec 151). The DDL answers `Success` and no row - nothing of the physical name or of a view's rewritten
+body; a `CREATE TABLE … AS` answers so too, not with a count. In a quack batch (`CREATE TABLE …; SELECT
+…`) the `SELECT` answers. Over Flight, a DDL that writes a record prepares only when it is the record
+alone (`CREATE VIEW`, `VIRTUAL ONLY`); a `CREATE TABLE` in an expansion is two statements, which Flight
+does not prepare. In a schema that records its objects, `CREATE TABLE IF NOT EXISTS` of a name with no
+record is refused when a physical table holds it - it would adopt a table the schema does not show. An
+`EXPLAIN` of a DDL that writes a record is refused; one that writes none (a live alias's schema, a no-op)
+explains.
 
 ```sql
 ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select) COMMENT 'raw zone, read only';

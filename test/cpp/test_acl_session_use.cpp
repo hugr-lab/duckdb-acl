@@ -120,7 +120,13 @@ int main(int argc, char *argv[]) {
 	});
 
 	Scenario("USE <vcat> makes it the session's catalog", [&]() {
-		CheckOk(*con.Query(session + "USE mart"), "USE mart");
+		auto use = con.Query(session + "USE mart");
+		if (CheckOk(*use, "USE mart")) {
+			// spec 151: its record answers Success, no row - not the session's ops id under the record's call
+			Check(use->GetNames().size() == 1 && use->GetNames()[0].GetIdentifierName() == "Success" &&
+			          use->RowCount() == 0,
+			      "USE answers Success and no row");
+		}
 		Check(One(con, session + "SELECT id FROM facts") == "2", "facts is mart.facts now");
 		Check(One(con, session + "SELECT id FROM out.t") == "3", "a two-part name is read in mart");
 		Check(One(con, session + "SELECT id FROM sales.main.orders") == "1", "a catalog written in front still wins");

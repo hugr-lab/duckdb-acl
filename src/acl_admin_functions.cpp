@@ -384,13 +384,48 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! (spec 016). Deliberately narrow - it can only add an alias-form record for an object that was just
 //! created, with no form, projection or policy to choose - and it is unreachable from a principal's
 //! query, where every acl_* name is denied (spec 009).
+//! spec 151: the type facts (spec 099) of what a principal's DDL made inside a client's transaction, probed again once
+//! it committed: the record's probe runs on a connection of the store's, which cannot see an uncommitted table. A
+//! refresh that fails leaves `types_stale` to acl_check_catalog.
+struct TypeFactsAtCommit : ClientContextState {
+	weak_ptr<PolicyStore> store;
+	vector<std::pair<string, string>> relations;
+
+	explicit TypeFactsAtCommit(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	void TransactionCommit(MetaTransaction &, ClientContext &) override {
+		auto locked = store.lock();
+		auto pending = std::move(relations);
+		relations.clear();
+		if (!locked) {
+			return;
+		}
+		for (auto &relation : pending) {
+			try {
+				locked->CatalogRefreshTypeFacts(relation.first, relation.second);
+			} catch (...) {
+				// the record stands; the check reports the facts it lacks
+			}
+		}
+	}
+	void TransactionRollback(MetaTransaction &, ClientContext &, optional_ptr<ErrorData>) override {
+		relations.clear();
+	}
+};
+
 void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
 	for (idx_t row = 0; row < args.size(); row++) {
 		AuthorScope author(OptionalArg(args, 4, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_created", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_created", "name"), true);
 		auto phys = StoreOf(state).SpellRelationPhysical(KeyArg(args, 2, row, "acl_register_created", "phys"));
 		StoreOf(state).CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
+		if (context.transaction.HasActiveTransaction() && !context.transaction.IsAutoCommit()) {
+			auto later = context.registered_state->GetOrCreate<TypeFactsAtCommit>(
+			    "acl_type_facts_at_commit", weak_ptr<PolicyStore>(SharedStoreOf(state)));
+			later->relations.emplace_back(vcat, vname);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -2188,12 +2223,10 @@ void AclSessionUseFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
-//! spec 151: the record a principal's DDL / USE writes, as the rewriter emits it - `PRAGMA <record>(…)`, the system
-//! catalog's own scalar of that name called once where duckdb runs a PRAGMA. The statement answers what the DDL
-//! answers (`Success`, no rows): a `SELECT acl_…(…)` answered its call as its column's name - the physical name, a
-//! view's whole rewritten body - and took a quack batch's one result. Looked up in `system`, never by the search
-//! path, so a macro of that name elsewhere is not what runs. A record that wrote nothing - USE for a session gone
-//! since - is an error, as no answer carries the scalar's false any more.
+//! spec 151: the record a principal's DDL / USE writes, as the rewriter emits it - `PRAGMA <record>(…)` runs the
+//! system catalog's scalar of that name once and answers `Success` with no row. The scalar is looked up in `system`,
+//! never by the search path, so a macro of that name elsewhere is not what runs. A record that wrote nothing (a USE
+//! for a session gone since) is an error: no answer carries the scalar's false.
 void RunRecord(ClientContext &context, const FunctionParameters &parameters, const char *name,
                const char *nothing_written) {
 	auto &entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(

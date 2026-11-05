@@ -220,6 +220,22 @@ with connect(acme_token) as conn:
     cur.execute("SELECT current_schema(), current_database()")
     shown = cur.fetchall()[0]
     check("USE <catalog> resets it to the catalog's root", shown == ("main", "c"), shown)
+    # spec 151: a CREATE VIEW where the catalog records it answers what a DDL answers - not its record's call as the
+    # column's name (the view's rewritten body: the physical relation, the author's RLS)
+    cur.execute("CREATE VIEW made.v AS SELECT id FROM orders")
+    names = [d[0] for d in cur.description or []]
+    shown = (names, cur.fetchall())
+    check("a recorded CREATE VIEW answers no row and nothing of its record",
+          shown[1] == [] and not any("acl_" in n or "memory" in n for n in names), shown)
+    cur.execute("SELECT count(*) FROM orders")
+    slice_rows = cur.fetchall()
+    cur.execute("SELECT count(*) FROM made.v")
+    shown = cur.fetchall()
+    check("...and the view reads the author's slice", shown == slice_rows, (shown, slice_rows))
+    cur.execute("DROP VIEW made.v")
+    names = [d[0] for d in cur.description or []]
+    shown = (names, cur.fetchall())
+    check("its DROP answers the same", shown[1] == [] and not any("acl_" in n for n in names), shown)
     tz_option = ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value + "TimeZone"
     conn.adbc_connection.set_options(**{tz_option: "Asia/Tokyo"})
     cur.execute("SELECT '2026-01-01 00:00:00+00'::TIMESTAMPTZ::VARCHAR")

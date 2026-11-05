@@ -1922,6 +1922,23 @@ void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname
 	});
 }
 
+void PolicyStore::CatalogRefreshTypeFacts(const string &vcat, const string &vname) {
+	RequireCatalog(catalog, "acl_register_created");
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog->Tbl("relations") +
+		                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		if (shape->RowCount() == 0) {
+			return; // dropped since: nothing to describe
+		}
+		ResultRows rows(*shape);
+		auto text = [&](idx_t column) {
+			auto value = rows.GetValue(column, 0);
+			return value.IsNull() ? string() : value.ToString();
+		};
+		statements = catalog->TypeFactStatements(vcat, vname, text(0), text(1), text(2));
+	});
+}
+
 bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vname) {
 	if (!catalog) {
 		return false;

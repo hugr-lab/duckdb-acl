@@ -598,6 +598,9 @@ struct PolicyStore {
 	//! origin, nothing else to choose
 	void CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
 	                            const string &origin = string());
+	//! spec 151: probe a relation's type facts (spec 099) again, from its stored definition - for an object made in
+	//! a transaction the store's own connection could not see into
+	void CatalogRefreshTypeFacts(const string &vcat, const string &vname);
 	//! spec 113: a principal's RENAME inside a granted schema - the record (if the object has one)
 	//! follows the object, in one transaction; `new_phys` empty for a view record (nothing physical)
 	//! Answers whether the object had a record, and its phys before the rename (to undo it).

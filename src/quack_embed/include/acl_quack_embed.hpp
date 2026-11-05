@@ -51,10 +51,9 @@ void AclQuackStatementCompleted(Connection &connection, const string &connection
 //! from the level and the session's trace whether the execution is profiled, and sets the
 //! connection's profiler so. A connection nobody bound is left alone. Never throws.
 void AclQuackStatementStarting(Connection &connection, const string &connection_id);
-//! The server's result collector, choosing the statement whose rows a client's batch answers (quack: the first that
-//! returns a result): true for the record a principal's DDL / USE writes (spec 151, `PRAGMA acl_…`), which answers
-//! nothing of the batch - `CREATE TABLE …; SELECT …` answers the SELECT, as a native quack server does. A sync.py
-//! patch of the generated collector TU. Never throws.
+//! True when `data` is the record a principal's DDL / USE writes (spec 151, `PRAGMA acl_…`). The server's result
+//! collector (a sync.py patch) streams a batch's first statement that returns a result, and skips this one, so
+//! `CREATE TABLE …; SELECT …` answers the SELECT as a native quack server does. Never throws.
 bool AclQuackRecordStatement(const PreparedStatementData &data);
 //! The server's connect, before authentication opens a session (spec 079): true when the door has
 //! a seat for one more client - `seated` quack clients each reserving `acl_quack_client_depth` of

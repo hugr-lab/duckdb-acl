@@ -278,9 +278,16 @@ int main(int argc, char *argv[]) {
 			// alone, a DDL answers what a native one does: Success, no row - not the view's rewritten body
 			auto alone = con.Query("FROM ddl.query('CREATE VIEW made.v AS SELECT id FROM orders')");
 			if (CheckOk(*alone, "a CREATE VIEW alone answers")) {
-				Check(alone->GetNames().size() == 1 && alone->GetNames()[0].GetIdentifierName() == "Success" &&
-				          alone->RowCount() == 0,
-				      "...Success and no row (" + alone->GetNames()[0].GetIdentifierName() + ")");
+				auto &names = alone->GetNames();
+				Check(names.size() == 1 && names[0].GetIdentifierName() == "Success" && alone->RowCount() == 0,
+				      "...Success and no row (" + (names.empty() ? string("none") : names[0].GetIdentifierName()) +
+				          ")");
+			}
+			// a USE's record too: the batch answers its SELECT
+			auto used = con.Query("FROM ddl.query('USE c; SELECT 7::BIGINT AS b')");
+			if (CheckOk(*used, "USE; SELECT answers")) {
+				Check(used->RowCount() == 1 && used->Collection().GetValue(0, 0).GetValue<int64_t>() == 7,
+				      "...with the SELECT's rows");
 			}
 			auto read = con.Query("FROM ddl.query('SELECT count(*)::BIGINT FROM made.v')");
 			if (CheckOk(*read, "the view reads")) {
