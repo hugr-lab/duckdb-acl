@@ -587,6 +587,22 @@ show (`VIRTUAL ONLY` registers what exists, by design). An `EXPLAIN` of a DDL th
 `RENAME` among them) is refused; one in a live alias's schema explains, and a no-op answers the empty
 `Success` it always did.
 
+The record is written in the policy store's own transaction, so other sessions see it before the client's
+`COMMIT`. A `ROLLBACK` (an aborted transaction's `COMMIT`, a closed connection) takes back what the client's
+records wrote, newest first (spec 154):
+
+- a created object's record goes - with a grant or a comment written on it meanwhile, as a `DROP` takes them;
+- a dropped one comes back with its grants, references and comments, but only when nothing else was written to
+  the policy store since the `DROP` (one `CREATE ROLE` by anybody is enough) - otherwise it stays dropped, which
+  only the event names: add the record and its grants again;
+- a replaced view gets its old body back, and a renamed object its old name, unless another write changed them
+  meanwhile (a renamed object the transaction created goes back and goes whatever was written on it).
+
+What is not taken back is left as the write made it, with a `policy` event `record_not_undone`. A `USE` is not
+taken back (a setting, as in duckdb). A node that crashes - or a session moved to another node, until its old
+node ends it - takes nothing back. An operator's own management statement is no record: it commits at once,
+whatever the operator's transaction does.
+
 ```sql
 ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select) COMMENT 'raw zone, read only';
 ACL ADMIN GRANT SCHEMA sales.vs TO ROLE ingest WITH (select, insert, create, drop);

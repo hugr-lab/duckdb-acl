@@ -1896,30 +1896,170 @@ bool PolicyStore::PhysicalObjectExists(const string &phys) {
 	           ->RowCount() > 0;
 }
 
-void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, const string &body) {
+namespace {
+
+//! spec 154: where one relation name's rows live - the tables a record writes and CatalogDropRelation clears, each with
+//! its filter - in the order a drop deletes them: a reference's columns are found through the reference, so they go
+//! first (the tables have no foreign keys - an insert goes in any order). `grants`: the two whose rows a function of
+//! the same name shares (DropGrantRowsFor); `mark`: schema_dropped's, which a drop sets and a record clears; `own`: the
+//! facts a write of the record probes from its source (a commit's probes on another node fill them; an object that
+//! never committed leaves them as its write found it) - not the operator's declarations (keys, a column list).
+struct RelationRowSource {
+	const char *table;
+	string where;
+	bool grants = false;
+	bool mark = false;
+	bool own = false;
+};
+
+vector<RelationRowSource> RelationRowSources(CatalogBackend &catalog, const string &vcat, const string &vname) {
+	auto in = " WHERE \"vcat\" = " + Lit(vcat) + " AND ";
+	auto named = in + "\"vname\" = " + Lit(vname);
+	// a reference's end at a table function of the same name is the function's, not the relation's
+	auto ends = "(\"from_vname\" = " + Lit(vname) + " OR (\"to_vname\" = " + Lit(vname) +
+	            " AND upper(coalesce(\"to_kind\", '')) <> 'FUNCTION'))";
+	string parent, leaf;
+	NamePath::SplitLeaf(vname, parent, leaf);
+	return {
+	    {"relations", named},
+	    {"object_columns", named + " AND \"kind\" = 'relation'", false, false, true},
+	    {"relation_columns", named},
+	    {"relation_types", named, false, false, true},
+	    {"column_comments", named},
+	    {"keys", named + " AND \"kind\" = 'relation'"},
+	    {"role_object_caps", named, true},
+	    {"grant_columns", named, true},
+	    {"reference_columns", in + "\"name\" IN (SELECT \"name\" FROM " + catalog.Tbl("references") + in + ends + ")"},
+	    {"references", in + ends},
+	    {"schema_dropped", in + "\"path\" = " + Lit(parent) + " AND \"name\" = " + Lit(leaf), false, true},
+	};
+}
+
+//! The name's rows, as `read` sees them inside a write's transaction
+PolicyStore::RelationRows ReadRelationRows(const ReadFn &read, CatalogBackend &catalog, const string &vcat,
+                                           const string &vname) {
+	PolicyStore::RelationRows rows;
+	for (auto &source : RelationRowSources(catalog, vcat, vname)) {
+		auto result = read("SELECT * FROM " + catalog.Tbl(source.table) + source.where);
+		ResultRows values(*result);
+		PolicyStore::RelationRows::Table table;
+		for (idx_t column = 0; column < result->ColumnCount(); column++) {
+			table.columns.push_back(result->ColumnName(column).GetIdentifierName());
+		}
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			string text;
+			for (idx_t column = 0; column < result->ColumnCount(); column++) {
+				// a bare NULL: a typed one names the store's type, which another engine may not read back
+				auto value = values.GetValue(column, row);
+				text += (column ? ", " : "") + (value.IsNull() ? string("NULL") : value.ToSQLString());
+			}
+			table.rows.push_back(std::move(text));
+		}
+		std::sort(table.rows.begin(), table.rows.end());
+		rows.tables.push_back(std::move(table));
+	}
+	auto record = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog.Tbl("relations") +
+	                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+	if (record->RowCount() > 0) {
+		ResultRows values(*record);
+		for (idx_t column = 0; column < 3; column++) {
+			auto value = values.GetValue(column, 0);
+			rows.record += (column ? "\x1f" : "") + (value.IsNull() ? string("NULL") : value.ToSQLString());
+		}
+	}
+	return rows;
+}
+
+//! A write's before-images of `names`, read where its body starts - when the write is asked for
+void CaptureBefore(const ReadFn &read, CatalogBackend &catalog, optional_ptr<PolicyStore::RecordWrite> write,
+                   const string &vcat, const vector<string> &names) {
+	if (!write) {
+		return;
+	}
+	write->store = catalog.Tbl("relations");
+	write->names.clear();
+	for (auto &name : names) {
+		PolicyStore::RelationChange change;
+		change.before = ReadRelationRows(read, catalog, vcat, name);
+		write->names.emplace_back(name, std::move(change));
+	}
+}
+
+//! ... and their after-images, read once its statements ran in the same transaction
+std::function<void(const ReadFn &)> CaptureAfter(CatalogBackend &catalog, optional_ptr<PolicyStore::RecordWrite> write,
+                                                 const string &vcat) {
+	if (!write) {
+		return nullptr;
+	}
+	return [&catalog, write, vcat](const ReadFn &read) mutable {
+		for (auto &name : write->names) {
+			name.second.after = ReadRelationRows(read, catalog, vcat, name.first);
+		}
+	};
+}
+
+//! The INSERTs that put an image's rows of one table back
+void InsertRows(CatalogBackend &catalog, const RelationRowSource &source, const PolicyStore::RelationRows::Table &image,
+                vector<string> &statements) {
+	vector<string> columns;
+	for (auto &column : image.columns) {
+		columns.push_back(acl_detail::Ident(column));
+	}
+	for (auto &row : image.rows) {
+		statements.push_back("INSERT INTO " + catalog.Tbl(source.table) + " (" + StringUtil::Join(columns, ", ") +
+		                     ") VALUES (" + row + ")");
+	}
+}
+
+//! A table the change wrote: its rows before differ from its rows after
+bool Changed(const PolicyStore::RelationChange &change, idx_t table) {
+	return change.before.tables[table].rows != change.after.tables[table].rows;
+}
+
+//! Thrown inside an undo's transaction when it must write nothing
+struct UndoRefused {
+	PolicyStore::RecordUndoOutcome outcome;
+};
+
+} // namespace
+
+void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, const string &body,
+                                      optional_ptr<RecordWrite> write) {
 	RequireCatalog(catalog, "acl_register_view");
 	RequireNotReserved(vname);
 	// fixed shape, like the record of a created table: a body and nothing else to choose
-	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		statements = RelationStatements(*catalog, vcat, vname, "view", "", body, "", {}, "", "");
-	});
+	auto version = catalog->WriteWithReads(
+	    [&](const ReadFn &read, vector<string> &statements) {
+		    CaptureBefore(read, *catalog, write, vcat, {vname});
+		    statements = RelationStatements(*catalog, vcat, vname, "view", "", body, "", {}, "", "");
+	    },
+	    CaptureAfter(*catalog, write, vcat));
+	if (write) {
+		write->version = version;
+	}
 }
 
 void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
-                                         const string &origin) {
+                                         const string &origin, optional_ptr<RecordWrite> write) {
 	RequireCatalog(catalog, "acl_register_created");
 	// fixed shape: an alias-form record of the object just created, stamped with the schema's origin
 	// so REFRESH and PRUNE own it like the rest of the expansion
-	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		statements = RelationStatements(*catalog, vcat, vname, "alias", phys, "", "", {}, "", "", origin);
-		// creating a name that was dropped on purpose earlier makes it current again
-		string parent, leaf;
-		NamePath::SplitLeaf(vname, parent, leaf);
-		if (!parent.empty()) {
-			statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
-			                     " AND \"path\" = " + Lit(parent) + " AND \"name\" = " + Lit(leaf));
-		}
-	});
+	auto version = catalog->WriteWithReads(
+	    [&](const ReadFn &read, vector<string> &statements) {
+		    CaptureBefore(read, *catalog, write, vcat, {vname});
+		    statements = RelationStatements(*catalog, vcat, vname, "alias", phys, "", "", {}, "", "", origin);
+		    // creating a name that was dropped on purpose earlier makes it current again
+		    string parent, leaf;
+		    NamePath::SplitLeaf(vname, parent, leaf);
+		    if (!parent.empty()) {
+			    statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " +
+			                         Lit(vcat) + " AND \"path\" = " + Lit(parent) + " AND \"name\" = " + Lit(leaf));
+		    }
+	    },
+	    CaptureAfter(*catalog, write, vcat));
+	if (write) {
+		write->version = version;
+	}
 }
 
 bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vname) {
@@ -1939,20 +2079,16 @@ bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vnam
 }
 
 bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname,
-                                        const string &new_phys, string *old_phys) {
+                                        const string &new_phys, optional_ptr<RecordWrite> write) {
 	RequireCatalog(catalog, "acl_rename_relation");
 	RequireNotReserved(new_vname);
 	bool had_record = false;
-	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+	auto body = [&](const ReadFn &read, vector<string> &statements) {
+		CaptureBefore(read, *catalog, write, vcat, {vname, new_vname});
 		auto where = [&](const string &name) {
 			return " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(name);
 		};
-		auto current = read("SELECT \"phys\" FROM " + catalog->Tbl("relations") + where(vname));
-		had_record = current->RowCount() > 0;
-		if (had_record && old_phys) {
-			auto phys = ResultRows(*current).GetValue(0, 0);
-			*old_phys = phys.IsNull() ? string() : phys.ToString();
-		}
+		had_record = read("SELECT 1 FROM " + catalog->Tbl("relations") + where(vname))->RowCount() > 0;
 		if (!had_record) {
 			return; // a live alias's object: nothing recorded, the physical rename is the whole of it
 		}
@@ -1969,7 +2105,11 @@ bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 			statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                     " AND \"path\" = " + Lit(parent) + " AND \"name\" = " + Lit(leaf));
 		}
-	});
+	};
+	auto version = catalog->WriteWithReads(body, CaptureAfter(*catalog, write, vcat));
+	if (write) {
+		write->version = version;
+	}
 	// lineage (spec 107/113): the old name ends, the new one begins - the backend follows a swap. The
 	// rename itself is also a run (the worker's), from the old name to the new, field by field
 	NoteDefinitionLineage(vcat, vname, "DROP");
@@ -2497,7 +2637,7 @@ void DropGrantRowsFor(CatalogBackend &catalog, const string &vcat, const NamePre
 
 } // namespace
 
-void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
+void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname, optional_ptr<RecordWrite> write) {
 	RequireCatalog(catalog, "acl_drop_relation");
 	// dropping something that is not there is an error, not a silent success (spec 010) - the other
 	// kinds already said so; the relation drop was the one that stayed quiet. DROP … IF EXISTS is
@@ -2508,43 +2648,201 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	// One transaction for the reads that decide and every row that goes (the 2026-09-03 review): a
 	// drop that read outside and wrote twice could leave the object's grants live after its record
 	// was gone - access the admin believed revoked. The other writers already use this shape.
-	auto pred = ExactName(vname);
-	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		statements.push_back("DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"vname\" = " + Lit(vname));
-		statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
-		statements.push_back("DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"vname\" = " + Lit(vname));
-		statements.push_back("DELETE FROM " + catalog->Tbl("relation_types") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"vname\" = " + Lit(vname));
-		statements.push_back("DELETE FROM " + catalog->Tbl("column_comments") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"vname\" = " + Lit(vname));
-		statements.push_back("DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
-		// a function of the same name keeps the grant, because the grant row cannot tell them apart
-		auto same_named_function =
-		    read("SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
-		         " AND \"vname\" = " + Lit(vname) + " LIMIT 1");
-		if (same_named_function->RowCount() == 0) {
-			DropGrantRowsFor(*catalog, vcat, pred, statements);
+	auto version = catalog->WriteWithReads(
+	    [&](const ReadFn &read, vector<string> &statements) {
+		    CaptureBefore(read, *catalog, write, vcat, {vname});
+		    // a function of the same name keeps the grant, because the grant row cannot tell them apart
+		    auto same_named_function =
+		        read("SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		             " AND \"vname\" = " + Lit(vname) + " LIMIT 1")
+		            ->RowCount() > 0;
+		    // spec 154: the same tables a record's undo reads, so neither can miss one the other has
+		    for (auto &source : RelationRowSources(*catalog, vcat, vname)) {
+			    if (!source.mark && !(source.grants && same_named_function)) {
+				    statements.push_back("DELETE FROM " + catalog->Tbl(source.table) + source.where);
+			    }
+		    }
+		    // a record an expansion produced is remembered as dropped, so the next REFRESH does not
+		    // bring it back: excluding one object is the whole reason to expand a schema instead of
+		    // aliasing it
+		    auto origin = read("SELECT \"origin\" FROM " + catalog->Tbl("relations") +
+		                       " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		    if (origin->RowCount() > 0 && !origin->Collection().GetValue(0, 0).IsNull()) {
+			    string parent, leaf;
+			    NamePath::SplitLeaf(vname, parent, leaf);
+			    if (!parent.empty()) {
+				    statements.push_back("INSERT OR IGNORE INTO " + catalog->Tbl("schema_dropped") +
+				                         " (\"vcat\", \"path\", \"name\") VALUES (" + Lit(vcat) + ", " + Lit(parent) +
+				                         ", " + Lit(leaf) + ")");
+			    }
+		    }
+	    },
+	    CaptureAfter(*catalog, write, vcat));
+	if (write) {
+		write->version = version;
+	}
+	NoteDefinitionLineage(vcat, vname, "DROP");
+}
+
+namespace {
+
+//! The record `now` is still the one an image shows: its form, physical name and body, and its own facts - what
+//! somebody who wrote the record again (the operator, another node after its commit's probes) would not leave equal
+bool SameRecord(const vector<RelationRowSource> &sources, const PolicyStore::RelationRows &now,
+                const PolicyStore::RelationRows &image) {
+	if (now.record.empty() || now.record != image.record) {
+		return false;
+	}
+	for (idx_t table = 0; table < sources.size(); table++) {
+		if (sources[table].own && now.tables[table].rows != image.tables[table].rows) {
+			return false;
 		}
-		DropReferencesNaming(*catalog, vcat, pred, statements);
-		// a record an expansion produced is remembered as dropped, so the next REFRESH does not
-		// bring it back: excluding one object is the whole reason to expand a schema instead of
-		// aliasing it
-		auto origin = read("SELECT \"origin\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                   " AND \"vname\" = " + Lit(vname));
-		if (origin->RowCount() > 0 && !origin->Collection().GetValue(0, 0).IsNull()) {
-			string parent, leaf;
-			NamePath::SplitLeaf(vname, parent, leaf);
-			if (!parent.empty()) {
-				statements.push_back("INSERT OR IGNORE INTO " + catalog->Tbl("schema_dropped") + " VALUES (" +
-				                     Lit(vcat) + ", " + Lit(parent) + ", " + Lit(leaf) + ")");
+	}
+	return true;
+}
+
+//! A name's rows taken as a drop takes them (a same-named function keeps the grant rows it shares), then the tables
+//! the change wrote put back as it found them (its mark) - never a row it did not write, which the drop of something
+//! else since may have meant to end
+void TakeName(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname,
+              const PolicyStore::RelationChange &change, vector<string> &statements) {
+	bool same_named_function = read("SELECT 1 FROM " + catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                                " AND \"vname\" = " + Lit(vname) + " LIMIT 1")
+	                               ->RowCount() > 0;
+	auto sources = RelationRowSources(catalog, vcat, vname);
+	for (idx_t table = 0; table < sources.size(); table++) {
+		if (!(sources[table].grants && same_named_function)) {
+			statements.push_back("DELETE FROM " + catalog.Tbl(sources[table].table) + sources[table].where);
+			if (Changed(change, table)) {
+				InsertRows(catalog, sources[table], change.before.tables[table], statements);
 			}
 		}
-	});
-	NoteDefinitionLineage(vcat, vname, "DROP");
+	}
+}
+
+//! A name's tables the change wrote put back as they were before it
+void PutBack(CatalogBackend &catalog, const string &vcat, const string &vname,
+             const PolicyStore::RelationChange &change, vector<string> &statements) {
+	auto sources = RelationRowSources(catalog, vcat, vname);
+	for (idx_t table = 0; table < sources.size(); table++) {
+		if (Changed(change, table)) {
+			statements.push_back("DELETE FROM " + catalog.Tbl(sources[table].table) + sources[table].where);
+			InsertRows(catalog, sources[table], change.before.tables[table], statements);
+		}
+	}
+}
+
+//! The undo of one record write, judged inside its own transaction (`read`): its statements, or UndoRefused
+void UndoStatements(CatalogBackend &catalog, const ReadFn &read, const string &vcat,
+                    const PolicyStore::RecordWrite &write, const vector<int64_t> &own, bool takes_created,
+                    vector<string> &statements) {
+	using Outcome = PolicyStore::RecordUndoOutcome;
+	auto sources = RelationRowSources(catalog, vcat, write.names[0].first);
+	vector<PolicyStore::RelationRows> now;
+	for (auto &name : write.names) {
+		now.push_back(ReadRelationRows(read, catalog, vcat, name.first));
+	}
+	auto &first = write.names[0].second;
+	if (write.names.size() == 1 && first.before.record.empty() && !first.after.record.empty()) {
+		// a record the write created goes as a drop takes it - what was written on it meanwhile too: an object that
+		// never committed holds nothing - but not marked dropped: the rows the write found come back (its mark).
+		// Only while it is still that record: one written again since is not ours
+		if (!SameRecord(sources, now[0], first.after)) {
+			throw UndoRefused {Outcome::CHANGED_SINCE};
+		}
+		TakeName(catalog, read, vcat, write.names[0].first, first, statements);
+		return;
+	}
+	if (takes_created && write.names.size() == 2) {
+		// a rename of a record this transaction created is taken where it is, the same way - else a touched swap
+		// would leave a record of nothing - and goes back to its old name while that is free (the create's own undo
+		// then takes it there; a name somebody took since is theirs)
+		auto &moved = write.names[1];
+		if (!SameRecord(sources, now[1], moved.second.after)) {
+			throw UndoRefused {Outcome::CHANGED_SINCE};
+		}
+		TakeName(catalog, read, vcat, moved.first, moved.second, statements);
+		if (now[0].record.empty()) {
+			PutBack(catalog, vcat, write.names[0].first, first, statements);
+		}
+		return;
+	}
+	if (write.names.size() == 1 && !first.before.record.empty() && first.after.record.empty()) {
+		// a record the write dropped comes back into a store only this transaction wrote since: a cascade elsewhere
+		// (a role, a schema, a catalog dropped; a catalog grant revoked) never touches the name's rows, which the drop
+		// already took, so the comparison below cannot see it - the store's version does
+		auto current =
+		    read("SELECT CAST(\"value\" AS BIGINT) FROM " + catalog.Tbl("meta") + " WHERE \"key\" = 'policy_version'");
+		auto at = ResultRows(*current).GetValue(0, 0).GetValue<int64_t>();
+		int64_t ours = 0;
+		for (auto mine : own) {
+			ours += mine > write.version && mine <= at ? 1 : 0;
+		}
+		if (at - write.version != ours) {
+			throw UndoRefused {Outcome::WRITTEN_SINCE};
+		}
+	}
+	// anything else - a drop that may come back, a replaced view, a rename - while every name's rows are what the
+	// write left: an operator's write, another session's, is never undone over
+	for (idx_t index = 0; index < write.names.size(); index++) {
+		for (idx_t table = 0; table < sources.size(); table++) {
+			if (now[index].tables[table].rows != write.names[index].second.after.tables[table].rows) {
+				throw UndoRefused {Outcome::CHANGED_SINCE};
+			}
+		}
+	}
+	for (auto &name : write.names) {
+		PutBack(catalog, vcat, name.first, name.second, statements);
+	}
+}
+
+} // namespace
+
+PolicyStore::RecordUndoOutcome PolicyStore::CatalogUndoRecordWrite(const string &vcat, const RecordWrite &write,
+                                                                   vector<int64_t> &own, bool takes_created) {
+	if (!catalog || catalog->Tbl("relations") != write.store) {
+		return RecordUndoOutcome::OTHER_STORE; // acl_use_db moved the store since: the write was another store's
+	}
+	auto sources = RelationRowSources(*catalog, vcat, write.names.empty() ? string() : write.names[0].first);
+	bool any = false;
+	for (auto &name : write.names) {
+		if (name.second.before.tables.size() != sources.size() || name.second.after.tables.size() != sources.size()) {
+			return RecordUndoOutcome::CHANGED_SINCE;
+		}
+		for (idx_t table = 0; table < sources.size(); table++) {
+			any = any || Changed(name.second, table);
+		}
+	}
+	if (!any) {
+		return RecordUndoOutcome::UNDONE; // the write changed nothing
+	}
+	int64_t version = 0;
+	try {
+		version = catalog->WriteWithReads(
+		    [&](const ReadFn &read, vector<string> &statements) {
+			    UndoStatements(*catalog, read, vcat, write, own, takes_created, statements);
+		    },
+		    "policy_version", nullptr);
+	} catch (const UndoRefused &refused) {
+		return refused.outcome;
+	}
+	own.push_back(version);
+	return RecordUndoOutcome::UNDONE;
+}
+
+void PolicyStore::NoteDefinitionLineageIfChanged(const string &vcat, const string &vname, bool announced,
+                                                 const string &store) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !lineage_worker || !LineageOn(*db) || catalog->Tbl("relations") != store) {
+		return;
+	}
+	bool exists = catalog
+	                  ->Query("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                          " AND \"vname\" = " + Lit(vname))
+	                  ->RowCount() > 0;
+	if (exists != announced) {
+		NoteDefinitionLineage(vcat, vname, exists ? "CREATE" : "DROP");
+	}
 }
 
 void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,

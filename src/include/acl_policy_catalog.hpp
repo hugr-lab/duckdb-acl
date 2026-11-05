@@ -578,12 +578,21 @@ struct CatalogBackend {
 	//! rewrite silently discards the first - which can drop an RLS predicate or a column mask.
 	void WriteWithReads(const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &,
 	                                             vector<string> &)> &body);
+	//! spec 154: the same, `after_writes` reading the transaction once the writes ran (what they did, for an undo);
+	//! answers the policy version it committed
+	int64_t WriteWithReads(
+	    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)>
+	        &body,
+	    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &)> &after_writes);
 	//! spec 093: the same transaction, bumping `version_key` of meta instead of policy_version, running
 	//! `before_commit` after the writes and before COMMIT (a throw there rolls the write back), and
 	//! answering the counter's new value
-	int64_t WriteWithReads(const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &,
-	                                                vector<string> &)> &body,
-	                       const char *version_key, const std::function<void(int64_t)> &before_commit);
+	int64_t WriteWithReads(
+	    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)>
+	        &body,
+	    const char *version_key, const std::function<void(int64_t)> &before_commit,
+	    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &)> &after_writes =
+	        nullptr);
 
 	//! Run admin write statements + the policy_version bump in one transaction
 	void Write(const vector<string> &statements);

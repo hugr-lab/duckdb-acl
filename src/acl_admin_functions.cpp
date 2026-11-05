@@ -22,6 +22,10 @@
 #include "yyjson.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <set>
+#include <thread>
 
 namespace duckdb {
 namespace acl {
@@ -380,10 +384,192 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_register_created(vcat, vname, phys, origin): the one write a principal's own DDL performs
-//! (spec 016). Deliberately narrow - it can only add an alias-form record for an object that was just
-//! created, with no form, projection or policy to choose - and it is unreachable from a principal's
-//! query, where every acl_* name is denied (spec 009).
+//! spec 113 / 154: a record is written on the store's own connection, so it does not ride the client's transaction -
+//! dbt swaps inside one. Each record write of the transaction keeps what it did (`RecordWrite`: the names' rows before
+//! and after, read in its own transaction) and a ROLLBACK takes them back newest first (CatalogUndoRecordWrite): a
+//! record created goes, a record dropped comes back only into a store nobody else wrote since, a replaced view or a
+//! rename is put back while its rows are what the write left. A step not undone stays as the write left it, with a
+//! `policy` event `record_not_undone` - an operator's write meanwhile is never undone over. A COMMIT keeps them. Only
+//! a record: an operator's own acl_* call commits at once, like every management write. The physical DDL was the
+//! client's, and rolls back with it.
+struct RecordUndo : ClientContextState {
+	struct Step {
+		string vcat;
+		PolicyStore::RecordWrite write;
+		bool rename = false;        // a rename's names: the old, then the new
+		bool takes_created = false; // a rename of a record this transaction created
+	};
+	weak_ptr<PolicyStore> store;
+	vector<Step> steps;
+	vector<int64_t> own;                         // the policy versions this transaction's record writes committed
+	std::set<std::pair<string, string>> created; // the names whose record this transaction created, where it is now
+
+	explicit RecordUndo(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	void Wrote(const string &vcat, PolicyStore::RecordWrite write, bool rename) {
+		own.push_back(write.version);
+		if (write.names.empty()) {
+			return;
+		}
+		Step step;
+		step.vcat = vcat;
+		step.rename = rename;
+		auto &first = write.names[0];
+		auto at = std::make_pair(vcat, first.first);
+		if (rename && write.names.size() == 2) {
+			step.takes_created = created.erase(at) > 0;
+			if (step.takes_created && !write.names[1].second.after.record.empty()) {
+				created.insert(std::make_pair(vcat, write.names[1].first));
+			}
+		} else if (first.second.before.record.empty() && !first.second.after.record.empty()) {
+			created.insert(at);
+		} else if (first.second.after.record.empty()) {
+			created.erase(at);
+		}
+		step.write = std::move(write);
+		steps.push_back(std::move(step));
+	}
+	void Clear() {
+		steps.clear();
+		own.clear();
+		created.clear();
+	}
+	void TransactionBegin(MetaTransaction &, ClientContext &) override {
+		Clear(); // a step belongs to the transaction that wrote it, whatever ended the last one
+	}
+	void TransactionCommit(MetaTransaction &, ClientContext &) override {
+		Clear();
+	}
+	void TransactionRollback(MetaTransaction &, ClientContext &, optional_ptr<ErrorData>) override {
+		auto locked = store.lock();
+		auto undo = std::move(steps);
+		auto versions = std::move(own);
+		Clear();
+		if (!locked) {
+			return;
+		}
+		// spec 107: what lineage was told, per name - before the transaction what its first step found, then each
+		// drop's DROP and each rename's DROP of the old name and CREATE of the new; a register tells nothing
+		std::map<std::pair<string, string>, bool> announced;
+		for (auto &step : undo) {
+			for (auto &name : step.write.names) {
+				announced.emplace(std::make_pair(step.vcat, name.first), !name.second.before.record.empty());
+			}
+			auto &first = step.write.names[0];
+			if (step.rename) {
+				if (!first.second.before.record.empty()) { // a live alias's object moved no record and told nothing
+					announced[std::make_pair(step.vcat, first.first)] = false;
+					announced[std::make_pair(step.vcat, step.write.names[1].first)] = true;
+				}
+			} else if (!first.second.before.record.empty() && first.second.after.record.empty()) {
+				announced[std::make_pair(step.vcat, first.first)] = false;
+			}
+		}
+		for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+			Undo(*locked, *it, versions);
+		}
+		auto store_in_use = undo.empty() ? string() : undo.back().write.store;
+		for (auto &name : announced) {
+			try {
+				locked->NoteDefinitionLineageIfChanged(name.first.first, name.first.second, name.second, store_in_use);
+			} catch (...) {
+				// lineage never fails what the store did
+			}
+		}
+	}
+
+private:
+	static void Undo(PolicyStore &store, const Step &step, vector<int64_t> &versions) {
+		auto &names = step.write.names;
+		auto object = step.vcat + "." + names.back().first; // keys joined by '.' are a key
+		const char *reason = "refused";
+		const char *why = "the policy store refused the undo - the record stays as it was written";
+		try {
+			// spec 116: a name the rows go back to may have been taken meanwhile under another case - then the
+			// step is skipped, never a second spelling
+			for (auto &name : names) {
+				if (!name.second.before.record.empty() && name.second.after.record.empty()) {
+					store.SpellName(step.vcat, name.first, true);
+				}
+			}
+		} catch (...) {
+			store.AuditRecordNotUndone(object, "name_taken",
+			                           "its name is taken in another case since - the record stays as it was written");
+			return;
+		}
+		// a write of the store meanwhile (every write moves its version) conflicts with the undo's: try again
+		for (idx_t attempt = 0; attempt < 5; attempt++) {
+			try {
+				switch (store.CatalogUndoRecordWrite(step.vcat, step.write, versions, step.takes_created)) {
+				case PolicyStore::RecordUndoOutcome::UNDONE:
+					return;
+				case PolicyStore::RecordUndoOutcome::CHANGED_SINCE:
+					reason = "changed_since";
+					why = "another write changed it since - it stays as that write left it";
+					break;
+				case PolicyStore::RecordUndoOutcome::WRITTEN_SINCE:
+					reason = "written_since";
+					why = "the policy store was written since its DROP - the drop stands: add the record and its "
+					      "grants again";
+					break;
+				case PolicyStore::RecordUndoOutcome::OTHER_STORE:
+					reason = "other_store";
+					why = "the policy store was switched since - nothing was written to either";
+					break;
+				}
+				break;
+			} catch (std::exception &ex) {
+				// duckdb's conflicts, a REPEATABLE READ store's serialization failures, a deadlock
+				string text = ex.what();
+				bool transient = StringUtil::Contains(text, "onflict") || StringUtil::Contains(text, "serializ") ||
+				                 StringUtil::Contains(text, "eadlock");
+				if (transient && attempt + 1 < 5) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(20 * (attempt + 1)));
+					continue;
+				}
+				break;
+			} catch (...) {
+				break;
+			}
+		}
+		store.AuditRecordNotUndone(object, reason, why);
+	}
+};
+
+//! spec 154: set while RunRecord runs a record's scalar - nothing else's write is undone at a ROLLBACK
+thread_local bool running_record = false;
+
+//! The undo a record write inside a client's transaction joins - none for any other caller, none in autocommit (the
+//! DDL committed before its record ran)
+optional_ptr<RecordUndo> UndoOf(ExpressionState &state) {
+	auto &context = state.GetContext();
+	if (!running_record || !context.transaction.HasActiveTransaction() || context.transaction.IsAutoCommit()) {
+		return nullptr;
+	}
+	return context.registered_state
+	    ->GetOrCreate<RecordUndo>("acl_record_undo", weak_ptr<PolicyStore>(SharedStoreOf(state)))
+	    .get();
+}
+
+//! Runs one record write and queues what it did for the transaction's ROLLBACK - also when something after its commit
+//! threw (its lineage note): the write is in the store either way
+template <class RUN>
+void RecordWriteStep(ExpressionState &state, const string &vcat, bool rename, RUN &&run) {
+	auto undo = UndoOf(state);
+	PolicyStore::RecordWrite write;
+	try {
+		run(undo ? &write : nullptr);
+	} catch (...) {
+		if (undo && write.version != 0) {
+			undo->Wrote(vcat, std::move(write), rename);
+		}
+		throw;
+	}
+	if (undo) {
+		undo->Wrote(vcat, std::move(write), rename);
+	}
+}
+
 //! spec 151: what a principal's DDL recorded inside a client's transaction, probed again once it committed - the
 //! record's probes (type facts, spec 099; a view's columns, spec 010) run on a connection of the store's, which cannot
 //! see a table made in that transaction. Each record's name is queued; a rename queues its new one (dbt's
@@ -425,13 +611,19 @@ void RefreshRecordAtCommit(ExpressionState &state, const string &vcat, const str
 	later->relations.emplace_back(vcat, vname);
 }
 
+//! acl_register_created(vcat, vname, phys, origin): the one write a principal's own DDL performs
+//! (spec 016). Deliberately narrow - it can only add an alias-form record for an object that was just
+//! created, with no form, projection or policy to choose - and it is unreachable from a principal's
+//! query, where every acl_* name is denied (spec 009).
 void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		AuthorScope author(OptionalArg(args, 4, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_created", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_created", "name"), true);
 		auto phys = StoreOf(state).SpellRelationPhysical(KeyArg(args, 2, row, "acl_register_created", "phys"));
-		StoreOf(state).CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
+		RecordWriteStep(state, vcat, false, [&](optional_ptr<PolicyStore::RecordWrite> write) {
+			StoreOf(state).CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""), write);
+		});
 		RefreshRecordAtCommit(state, vcat, vname);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -445,63 +637,25 @@ void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_view", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_view", "name"), true);
 		auto body = RequiredArg(args, 2, row, "acl_register_view", "body");
-		StoreOf(state).CatalogRegisterView(vcat, vname, body);
+		RecordWriteStep(state, vcat, false, [&](optional_ptr<PolicyStore::RecordWrite> write) {
+			StoreOf(state).CatalogRegisterView(vcat, vname, body, write);
+		});
 		RefreshRecordAtCommit(state, vcat, vname);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! spec 113: the record a RENAME moved is written on the store's own connection, so it does not ride
-//! the client's transaction - dbt swaps inside one. A rollback moves it back (newest first); a commit
-//! keeps it. The physical rename was the client's, and rolls back with it.
-struct RecordRenameUndo : ClientContextState {
-	struct Step {
-		string vcat, from, to, phys;
-	};
-	weak_ptr<PolicyStore> store;
-	vector<Step> steps;
-
-	explicit RecordRenameUndo(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
-	}
-	void TransactionCommit(MetaTransaction &, ClientContext &) override {
-		steps.clear();
-	}
-	void TransactionRollback(MetaTransaction &, ClientContext &, optional_ptr<ErrorData>) override {
-		auto locked = store.lock();
-		auto undo = std::move(steps);
-		steps.clear();
-		if (!locked) {
-			return;
-		}
-		for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
-			try {
-				// spec 116: the name it goes back to may have been taken meanwhile under another case - then
-				// the step is skipped, never a second spelling (acl_check_catalog reports what is left)
-				locked->SpellName(it->vcat, it->to, true);
-				locked->CatalogRenameRelation(it->vcat, it->from, it->to, it->phys);
-			} catch (...) {
-				// the record stays as the rename left it; acl_check_catalog reports it (source_missing)
-			}
-		}
-	}
-};
-
 //! acl_rename_relation(vcat, vname, new_vname[, new_phys]): the write a principal's own RENAME performs
 //! (spec 113), composed by the rewriter after its checks - unreachable from a principal's query
 void AclRenameRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_rename_relation", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_rename_relation", "name"));
 		auto new_vname = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_rename_relation", "new name"), true);
-		auto store = SharedStoreOf(state);
-		string old_phys;
-		if (store->CatalogRenameRelation(vcat, vname, new_vname, OptionalArg(args, 3, row, ""), &old_phys) &&
-		    context.transaction.HasActiveTransaction() && !context.transaction.IsAutoCommit()) {
-			auto undo = context.registered_state->GetOrCreate<RecordRenameUndo>("acl_record_rename_undo",
-			                                                                    weak_ptr<PolicyStore>(store));
-			undo->steps.push_back({vcat, new_vname, vname, old_phys});
-		}
+		// a live alias's object moves no record: its step writes nothing back
+		RecordWriteStep(state, vcat, true, [&](optional_ptr<PolicyStore::RecordWrite> write) {
+			StoreOf(state).CatalogRenameRelation(vcat, vname, new_vname, OptionalArg(args, 3, row, ""), write);
+		});
 		RefreshRecordAtCommit(state, vcat, new_vname);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -521,7 +675,9 @@ void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &re
 			                      "(VIRTUAL ONLY)",
 			                      phys);
 		}
-		store.CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
+		RecordWriteStep(state, vcat, false, [&](optional_ptr<PolicyStore::RecordWrite> write) {
+			store.CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""), write);
+		});
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -715,7 +871,9 @@ void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_drop_relation", "name"));
 		auto &store = StoreOf(state);
 		if (AllowDrop(store, vcat, vname, "relation", OptionalArg(args, 2, row, ""))) {
-			store.CatalogDropRelation(vcat, vname);
+			RecordWriteStep(state, vcat, false, [&](optional_ptr<PolicyStore::RecordWrite> write) {
+				store.CatalogDropRelation(vcat, vname, write);
+			});
 		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -2249,6 +2407,15 @@ void RunRecord(ClientContext &context, const FunctionParameters &parameters, con
 	if (!call) {
 		error.Throw();
 	}
+	struct Recording {
+		bool was = running_record;
+		Recording() {
+			running_record = true;
+		}
+		~Recording() {
+			running_record = was;
+		}
+	} recording;
 	auto written = ExpressionExecutor::EvaluateScalar(context, *call, true);
 	if (nothing_written && !written.IsNull() && !written.GetValue<bool>()) {
 		throw InvalidInputException("acl: %s", nothing_written);

@@ -46,7 +46,11 @@ parent, a read that reads nothing is not a run either:
 
 A write always emits its run, approximate when its sources could not be derived.
 
-A physical definition the operator rolls back with its transaction sends nothing.
+A physical definition the operator rolls back with its transaction sends nothing. A principal's `DROP` or
+`RENAME` of a recorded object writes the record at once and sends its `DATASET` events then (`DROP`; a
+rename's `DROP` of the old name and `CREATE` of the new). At a `ROLLBACK` each name the transaction touched is
+told what the catalog then holds - a `CREATE` for a record that came back, a `DROP` for one that went - so a
+view made and dropped inside a rolled-back transaction ends as dropped (spec 154).
 
 Not yet emitted:
 

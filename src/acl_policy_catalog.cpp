@@ -57,7 +57,14 @@ void CatalogBackend::WriteWithReads(
 
 int64_t CatalogBackend::WriteWithReads(
     const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)> &body,
-    const char *version_key, const std::function<void(int64_t)> &before_commit) {
+    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &)> &after_writes) {
+	return WriteWithReads(body, "policy_version", nullptr, after_writes);
+}
+
+int64_t CatalogBackend::WriteWithReads(
+    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)> &body,
+    const char *version_key, const std::function<void(int64_t)> &before_commit,
+    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &)> &after_writes) {
 	if (function_mode) {
 		throw BinderException("acl catalog: the function-driver policy source is read-only");
 	}
@@ -71,15 +78,15 @@ int64_t CatalogBackend::WriteWithReads(
 		con.Query("ROLLBACK");
 	};
 	vector<string> statements;
+	auto read = [&](const string &sql) {
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			throw BinderException("acl catalog: query failed: %s", result->GetError());
+		}
+		return result;
+	};
 	try {
 		RequireWritableSchema(con);
-		auto read = [&](const string &sql) {
-			auto result = con.Query(sql);
-			if (result->HasError()) {
-				throw BinderException("acl catalog: query failed: %s", result->GetError());
-			}
-			return result;
-		};
 		body(read, statements);
 	} catch (...) {
 		rollback();
@@ -90,6 +97,14 @@ int64_t CatalogBackend::WriteWithReads(
 		if (result->HasError()) {
 			rollback();
 			throw BinderException("acl catalog: write failed: %s", result->GetError());
+		}
+	}
+	if (after_writes) {
+		try {
+			after_writes(read);
+		} catch (...) {
+			rollback();
+			throw;
 		}
 	}
 	auto bump = con.Query("UPDATE " + Tbl("meta") +

@@ -164,7 +164,9 @@ dbt does not need it (it qualifies every name), which is why it is not part of t
   - **a rolled-back RENAME** left the record moved (it is written on the store's connection) while the
     physical rename went back - the record is moved back at the client's ROLLBACK
     (`RecordRenameUndo`, a ClientContextState, newest first); a commit keeps it. CREATE's record has
-    the same split (pre-existing: a dangling record after a rollback, fail closed).
+    the same split (pre-existing: a dangling record after a rollback, fail closed). Superseded by spec 154:
+    every record follows the ROLLBACK (`RecordUndo`, guarded by the write's own images), and only a record does -
+    an operator's own `acl_rename_relation` call commits at once.
 - **Lineage**: a RENAME is a **run** of the client's job (the worker's: the old name in, the new name
   out, each field `DIRECT/IDENTITY`; the fields from the physical object in the DDL home, because the
   record moves in the follow-up statement after the run is handed on), plus `DATASET` `DROP` of the

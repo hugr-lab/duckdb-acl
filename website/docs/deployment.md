@@ -72,7 +72,10 @@ authentication) is a separate product; nodes are identical either way, which is 
   - Anything not carried refuses the call once and names all of it: `acl: the session moved to another
     node and lost its temp tables; the statement did not run, the connection works on`. The next call
     works on the new session, with whatever context did carry.
-  - A lost transaction stays aborted on the new node until the client's `ROLLBACK` (or `EndTransaction`).
+  - A lost transaction stays aborted on the new node until the client's `ROLLBACK` (or `EndTransaction`). The
+    catalog records its DDL wrote stay in the policy store until the old node ends that session and takes
+    them back (spec 154) - a created record then goes, but a dropped one usually stays dropped: other
+    writes reached the store meanwhile.
     Every statement in between is refused (`… ROLLBACK to go on`), the catalog RPCs that run SQL on the
     connection fail too, and a `COMMIT` is answered `… nothing of it was committed`. No part of it runs in
     autocommit. A cookie the node cannot read is treated the same way.
