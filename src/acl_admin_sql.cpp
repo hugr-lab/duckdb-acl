@@ -270,7 +270,7 @@ bool IsMgmtHead(const vector<HeadToken> &head) {
 	if (first == "add" || first == "grant" || first == "revoke" || first == "map") {
 		return true;
 	}
-	if (FindMgmtGrammar(first)) {
+	if (FindMgmtGrammar(first) || MgmtRulesKeyword(first)) {
 		return true; // a linked module's form (spec 126: CLUSTER - duckdb has no CLUSTER statement)
 	}
 	auto second = word(1);
@@ -672,6 +672,11 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
 	if (auto parse = FindMgmtGrammar(keyword)) {
 		return parse(s); // spec 126: a linked module's form
+	}
+	string usage;
+	if (MgmtRulesKeyword(keyword, &usage)) {
+		// spec 150 3g-3: a linked module's statement its rules did not read - said in the module's words
+		RefuseMovedForm(usage);
 	}
 	// spec 150, stage 3: the operations of a node are rules (acl_mgmt_grammar.cpp); one that reaches here did not
 	// read as its rule - said in the form's own words

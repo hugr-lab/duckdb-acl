@@ -394,7 +394,21 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       set earlier in the batch would drop what the parse declared), so a dialect's own ATTACH whose text reads so
       there names its NAMESPACE event by that literal - lineage naming only.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
-    `AdminScanner` and the compiler go, hugr-node re-pins.
+    `AdminScanner` and the compiler go, hugr-node re-pins. In three steps, so neither repository is ever left
+    without its forms:
+    - 3g-3a (built): the seam - `RegisterMgmtRules(keyword, statement, changes, usage)` and `MgmtCall`
+      (`acl_mgmt_rules.hpp`, public: a module includes it). A module's rules are compiled into the management
+      grammar beside acl's own (its statement an alternative ahead of `AclMgmtLegacy`; the shared rules -
+      `AclQuotedValue`, `AclNameValue`, `AclWordToken`, ... - are acl's); its transform builds the acl_* call through
+      `MgmtCall` (`Quoted` / `NameValue` checked against their tokens as acl's are, `Word`, `Keyword`, `Part`,
+      `MgmtStart<F>`); the keyword makes a statement management (`IsMgmtHead`, `MgmtRulesKeyword`), and one the
+      rules do not read reaches the compiler, which refuses it with the module's `usage` (a tokenizer refusal wins,
+      as for acl's moved forms). `RegisterMgmtGrammar` works beside it until hugr-node has moved. Test
+      `test_acl_mgmt_rules.cpp` (a toy module).
+    - 3g-3b: hugr-node re-pins and writes its CLUSTER forms as rules (an option list and DEPENDS ON read by rules,
+      not split as text).
+    - 3g-3c: `RegisterMgmtGrammar`, `AdminScanner`, the compiler and `AclMgmtLegacy` go - a moved form's refusal in
+      its own words kept - and hugr-node re-pins again.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
   rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 

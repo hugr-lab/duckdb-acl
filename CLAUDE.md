@@ -493,8 +493,9 @@ platform's point grants, sources, resource groups (`TextKind::LIMITS`) - after i
 registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`;
 `SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). 3g-2a: GRANT / REVOKE SECRET as
 rules (`MgmtParsed::secrets`). 3g-2b: `USE [SCHEMA]` on duckdb's tokens. 3g-2c: `ATTACH … LINEAGE` on duckdb's
-tokens (the identity judged at parse, the sugar off under a dialect). Then 3g-3 (modules' rules, hugr-node), spec
-151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
+tokens (the identity judged at parse, the sugar off under a dialect). 3g-3a: a module's statements as rules
+(`RegisterMgmtRules` / `MgmtCall`, `acl_mgmt_rules.hpp` - public, hugr-node includes it). Then 3g-3b (hugr-node's
+CLUSTER forms as rules), 3g-3c (the old seam, `AdminScanner` and the compiler go), spec 151, stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an

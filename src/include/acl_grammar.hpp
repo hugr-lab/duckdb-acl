@@ -107,6 +107,9 @@ struct HeadToken {
 //! token last (`unterminated`), and its own reader refuses either; `open`, when given, says whether it does (a
 //! comment never becomes a token, so no head shows one)
 vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open = nullptr, idx_t tail = 0);
+//! spec 150 3g-3: whether `word` heads a linked module's statements (RegisterMgmtRules, acl_mgmt_rules.hpp), and how
+//! the module says what they are when its rules do not read one
+bool MgmtRulesKeyword(const string &word, string *usage = nullptr);
 
 //! The grammars the override compiles, one per set of the caller's grammar extensions
 class AclGrammarCache {

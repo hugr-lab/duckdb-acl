@@ -7,6 +7,7 @@
 #include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
 #include "acl_grammar_util.hpp"
+#include "acl_mgmt_rules.hpp"
 #include "acl_name_path.hpp"
 #include "acl_platform.hpp"
 
@@ -2154,6 +2155,25 @@ arena_ptr<TransformResultValue> FinalizeStatement(PEGTransformer &transformer, P
 	    transformer.Transform<unique_ptr<SQLStatement>>(node.get()));
 }
 
+// --- a linked module's statements (spec 150 3g-3: RegisterMgmtRules) ------------------------------------------------
+
+struct MgmtRulesEntry {
+	string keyword;
+	string statement;
+	vector<GrammarChange> changes;
+	string usage;
+};
+
+mutex &MgmtRulesLock() {
+	static mutex lock;
+	return lock;
+}
+
+vector<MgmtRulesEntry> &MgmtRulesRegistry() {
+	static vector<MgmtRulesEntry> entries;
+	return entries;
+}
+
 class AclMgmtGrammar final : public GrammarExtension {
 public:
 	AclMgmtGrammar() : GrammarExtension("acl_management", "acl: the management statements (spec 150)") {
@@ -2561,6 +2581,17 @@ public:
 			    return make_uniq<PassthroughTokenMatcher>();
 		    }));
 		changes.push_back(GrammarChange::AddRule("AclMgmtLegacy <- AclTailToken+", Start<FinalizeLegacy>));
+		// a linked module's statements, read like ours (their shared rules are the ones above)
+		string modules;
+		{
+			lock_guard<mutex> guard(MgmtRulesLock());
+			for (auto &entry : MgmtRulesRegistry()) {
+				for (auto &change : entry.changes) {
+					changes.push_back(change);
+				}
+				modules += entry.statement + " / ";
+			}
+		}
 		changes.push_back(GrammarChange::AddRule(
 		    "AclMgmtStatement <- AclKillSession / AclSessionAuditLevel / AclProfileSession / AclNodeOperation / "
 		    "AclMigrateCatalog / AclCreateRole / AclAlterRoleComment / AclAlterRoleClaims / AclDropRole / "
@@ -2577,7 +2608,8 @@ public:
 		    "AclRevokeFunctionCategory / AclRevokeFunction / AclDenyView / AclCreateFunctionCategory / "
 		    "AclAlterFunctionCategory / AclDropFunctionCategory / AclGrantSource / AclRevokeSource / "
 		    "AclCreateResourceGroup / AclAlterResourceGroup / AclDropResourceGroup / AclGrantResourceGroup / "
-		    "AclRevokeResourceGroup / AclGrantSecret / AclRevokeSecret / AclMgmtLegacy"));
+		    "AclRevokeResourceGroup / AclGrantSecret / AclRevokeSecret / " +
+		    modules + "AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
@@ -2976,6 +3008,77 @@ string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text)
 	auto outside = first <= last ? text.substr(0, first) + text.substr(last) : text;
 	StringUtil::Trim(outside);
 	return outside.empty() ? string() : "a comment";
+}
+
+void RegisterMgmtRules(const string &keyword, const string &statement, vector<GrammarChange> changes,
+                       const string &usage) {
+	lock_guard<mutex> guard(MgmtRulesLock());
+	for (auto &entry : MgmtRulesRegistry()) {
+		if (StringUtil::CIEquals(entry.keyword, keyword)) {
+			return;
+		}
+	}
+	MgmtRulesRegistry().push_back({StringUtil::Lower(keyword), statement, std::move(changes), usage});
+}
+
+bool MgmtRulesKeyword(const string &word, string *usage) {
+	lock_guard<mutex> guard(MgmtRulesLock());
+	for (auto &entry : MgmtRulesRegistry()) {
+		if (StringUtil::CIEquals(entry.keyword, word)) {
+			if (usage) {
+				*usage = entry.usage;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+struct MgmtCall::Impl {
+	PEGTransformer &transformer;
+	unique_ptr<MgmtParseData> data;
+};
+
+MgmtCall::MgmtCall(PEGTransformer &transformer, string function)
+    : impl(make_uniq<Impl>(Impl {transformer, Call(std::move(function))})) {
+}
+
+MgmtCall::~MgmtCall() {
+}
+
+string MgmtCall::Quoted(ParseResult &result, const char *what) {
+	QuotedValue entry;
+	entry.value = ValueOf(impl->transformer, Strip(result), entry.offset);
+	entry.what = what;
+	impl->data->quoted.push_back(entry);
+	return entry.value;
+}
+
+string MgmtCall::NameValue(ParseResult &result, const char *what) {
+	return NameValueOf(impl->transformer, result, what, *impl->data);
+}
+
+string MgmtCall::Word(ParseResult &result) {
+	return TokenOf(result).text;
+}
+
+string MgmtCall::Keyword(ParseResult &result) {
+	return KeywordOf(Strip(result));
+}
+
+ParseResult &MgmtCall::Part(ParseResult &result) {
+	return Strip(result);
+}
+
+void MgmtCall::Arg(Value value) {
+	impl->data->args.push_back(std::move(value));
+}
+
+arena_ptr<TransformResultValue> MgmtCall::Result() {
+	if (!impl->data) {
+		throw InternalException("acl admin: a management call answered twice");
+	}
+	return MgmtResult(impl->transformer, std::move(impl->data));
 }
 
 shared_ptr<GrammarExtension> MakeMgmtGrammar() {
