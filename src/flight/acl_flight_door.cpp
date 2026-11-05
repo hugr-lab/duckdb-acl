@@ -1886,6 +1886,7 @@ public:
 				    }
 				    reservation->ddl_text = true;
 				    reservation->owner = owner;
+				    reservation->conn.reset(); // each execution runs on its caller's connection: none is pinned
 				    flightsql::ActionCreatePreparedStatementResult result;
 				    result.dataset_schema = arrow::schema(arrow::FieldVector {});
 				    result.parameter_schema = arrow::schema(arrow::FieldVector {});
@@ -2036,8 +2037,9 @@ public:
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
 			    if (reservation->ddl_text) {
-				    // spec 153: a DoGet no GetFlightInfo preceded runs the DDL now, on the calling session, through a
-				    // single-use reservation of its own - the handle's is never written
+				    // spec 153: a DoGet on the handle itself runs the DDL now, on the calling session, through a
+				    // single-use reservation of its own - the handle's is never written. A client redeems the ticket
+				    // its GetFlightInfo answered (that run's result); one that DoGets the handle after it runs it again
 				    auto once = make_shared_ptr<FlightDoorState::Reservation>();
 				    once->conn = state->ConnFor(caller);
 				    once->query = reservation->query;

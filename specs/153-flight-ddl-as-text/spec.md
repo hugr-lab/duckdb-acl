@@ -40,14 +40,16 @@ client's DDL the same way: as text, through `Query`, on the session's connection
     profile for the run (a reviewer counted them on each path).
   - `Query` answers the error alone when a statement fails. Otherwise its answer is the last statement's result: the
     DDL's own `Success`, or its record's (spec 151).
-- **Where**: a reservation of kind `ddl_text`. It has no `PreparedStatement`; `executed` holds the answer.
+- **Where**: a reservation of kind `ddl_text`. It has no `PreparedStatement`; a single-use ticket's `executed` holds
+  the answer.
   - Ad hoc `GetFlightInfo` (`DdlTicketInfo`) runs it, as spec 111 runs every count, and its DoGet answers the kept
     result.
   - `ExecuteUpdate` (DoPut) runs it and answers its count: 0 for a DDL with a record.
   - `CreatePreparedStatement` keeps only the text and announces an update (an empty dataset and parameter schema).
-    Nothing is decided at that point.
-  - Each execution decides the DDL again, under the policy of that moment (`RunPreparedDdl`). That means a
-    `GetFlightInfo` on the handle, its DoPut update, or a DoGet that no `GetFlightInfo` preceded.
+    Nothing is decided at that point, and the handle pins no connection.
+  - Each execution decides the DDL again, under the policy of that moment: a `GetFlightInfo` on the handle, its DoPut
+    update (`RunPreparedDdl`), or a DoGet on the handle itself. A client redeems the ticket its `GetFlightInfo`
+    answered; one that DoGets the handle after a `GetFlightInfo` runs the DDL a second time.
   - It runs on the session that executes it: `ConnFor(caller)`. A handle belongs to the principal, and another session
     of it may run it, such as a cookie-less client's next call. The prefix and the connection are therefore always
     one session's.
@@ -56,7 +58,9 @@ client's DDL the same way: as text, through `Query`, on the session's connection
     its own, as the ad hoc path does; a DoGet with no `GetFlightInfo` before it streams through a reservation of its
     own.
   - Binding parameters to it is refused: "a DDL statement takes no parameters".
-- **A single-use ticket is no prepared handle**: `FindReservation` skips it. Before this spec it accepted a ticket's
+- **A single-use ticket is no prepared handle**: `FindReservation` skips it.
+- A reviewer ran 8 threads over one prepared DDL handle (GetFlightInfo + DoGet and bare DoGet mixed): no failure but
+  duckdb's own catalog conflicts between the racing sessions. Before this spec it accepted a ticket's
   id as a handle; a DDL ticket would now run again through it.
 
 ## Enforcement & security
@@ -84,7 +88,8 @@ client's DDL the same way: as text, through `Query`, on the session's connection
   - a prepared DDL's empty dataset schema;
   - a foreign transaction id refused on a DDL;
   - a prepared `DROP` refused at execution once `drop` was revoked after its creation;
-  - an ad hoc `DROP`.
+  - an ad hoc `DROP`;
+  - a DoGet on a prepared DDL's handle with no `GetFlightInfo` before it (`@prepared_doget`).
 - `test/e2e/flight/adbc_client.py` (the real ADBC driver; its DBAPI prepares every text):
   - `CREATE TABLE … AS`, `ALTER TABLE … RENAME` and a read of the new name;
   - `DROP TABLE` through `execute_update` answers 0 and takes the record with it;

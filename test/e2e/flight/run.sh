@@ -791,6 +791,13 @@ echo "$got" | grep -q "drop on schema \"made\" is not allowed" || fail "a prepar
 server_says regrant "SELECT acl_grant_schema('analyst', 'c', 'made', '{\"select\": true, \"create\": true, \"drop\": true}')::VARCHAR" >/dev/null
 got="$(ask "DROP TABLE made.adhoc")"
 case "$got" in *rror*|*refused*) fail "an ad hoc DROP TABLE in an expansion failed: $got";; esac
+# a DoGet on a prepared DDL's handle with no GetFlightInfo before it runs the DDL there
+got="$(ask "@prepared_doget:CREATE TABLE made.doget AS SELECT 2 AS v")"
+case "$got" in *rror*|*refused*) fail "a prepared DDL's DoGet did not run it: $got";; esac
+got="$(ask "SELECT v FROM made.doget")"
+echo "$got" | grep -q "'v': \[2\]" || fail "the prepared DDL's DoGet did not make the table: $got"
+got="$(ask "DROP TABLE made.doget")"
+case "$got" in *rror*|*refused*) fail "the DoGet's table did not drop: $got";; esac
 
 # --- spec 143: a live alias schema's object written in another case than its own is the same object - described,
 # and labelled as the listing names it

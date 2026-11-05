@@ -445,6 +445,16 @@ if ask.startswith("@prepared_run:"):  # execute a held prepared statement, fetch
                                         command("ActionClosePreparedStatementRequest", field(1, _handle))), options))
     print(_rows)
     raise SystemExit(0)
+if ask.startswith("@prepared_doget:"):  # spec 153: prepare, DoGet the handle itself (no GetFlightInfo), close
+    _result = list(client.do_action(flight.Action("CreatePreparedStatement", command(
+        "ActionCreatePreparedStatementRequest", text(1, ask[len("@prepared_doget:"):]))), options))[0].body.to_pybytes()
+    _handle = _pb_fields(_pb_fields(_result)[2]).get(1, b"")
+    _ticket = flight.Ticket(command("CommandPreparedStatementQuery", field(1, _handle)))
+    _rows = client.do_get(_ticket, options).read_all().to_pydict()
+    list(client.do_action(flight.Action("ClosePreparedStatement",
+                                        command("ActionClosePreparedStatementRequest", field(1, _handle))), options))
+    print(_rows)
+    raise SystemExit(0)
 if ask.startswith("@prepared:"):  # spec 117: prepare, execute, fetch, close
     print(prepared_execute(client, options, ask[len("@prepared:"):]))
     raise SystemExit(0)
