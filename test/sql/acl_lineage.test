@@ -1288,7 +1288,12 @@ SET errors_as_json = true;
 statement error
 ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432'; SELECT * FROM (;
 ----
-"position":"68","location":"[68,1]"
+<REGEX>:.*"position":"68".*
+
+statement error
+ATTACH ':memory:' AS m9 LINEAGE 'postgres://m9:5432'; SELECT * FROM (;
+----
+<REGEX>:.*"location":"\[68,1\]".*
 
 statement ok
 RESET errors_as_json;

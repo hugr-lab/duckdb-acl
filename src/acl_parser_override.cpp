@@ -198,6 +198,8 @@ void ParseSegment(Parser &parser, const AttachLineageSegment &segment) {
 				length = 0;
 			}
 		}
+		extra_info.erase("position"); // a location past what QueryLocation holds is none, never the segment's
+		extra_info.erase("location");
 		Exception::SetQueryLocation(QueryLocation(at + segment.offset, length), extra_info);
 		throw ParserException(extra_info, error.RawMessage());
 	}

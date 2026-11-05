@@ -385,11 +385,14 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       (`LineageIdentityRefusal`, one judgment for both), so a refused one attaches nothing (the ATTACH used to run
       first); the call is built as an AST (`MakeAdminCall`, declared in acl_admin_sql.hpp), never SQL text; a statement
       parsed on its own reports its error where it is in the batch (`ParseSegment`: `position` and `location`; under
-      `ACL NATIVE` drawn against the rest); and under a dialect or CONNECT the sugar is off, the runtime's reader too
-      (the connection owner's grammar reads the text by its own tokenizer - as a prefix there is refused, nothing of
-      ours is added to it). Known: a native `ATTACH DATABASE lineage '<path>'` (a typed literal of a user type
-      `lineage`) reads as the marker, as it did; a grammar extension's rule that reads a `;` splits otherwise than
-      the statements here (refused, nothing runs - the connection owner's grammar on an operator's path).
+      `ACL NATIVE` drawn against the rest); and under a dialect or CONNECT the sugar is off (the connection owner's
+      grammar reads the text by its own tokenizer - as a prefix there is refused, nothing of ours is added to it).
+      Known: a native `ATTACH DATABASE lineage '<path>'` (a typed literal of a user type `lineage`) reads as the
+      marker, as it did; a grammar extension's rule that reads a `;` splits otherwise than the statements here
+      (refused, nothing runs - the connection owner's grammar on an operator's path); the runtime's hook reads an
+      ATTACH's text on the default tokens whatever the connection's grammar (judged where the plan is made, a dialect
+      set earlier in the batch would drop what the parse declared), so a dialect's own ATTACH whose text reads so
+      there names its NAMESPACE event by that literal - lineage naming only.
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the

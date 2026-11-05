@@ -22,7 +22,6 @@
 #include "acl_rewriter.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -1270,11 +1269,7 @@ void CapturePhysical(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 				}
 			}
 			captured->source_type = StringUtil::Lower(type);
-			// the marker is the default grammar's: under a dialect or CONNECT its text means what that grammar says
-			auto &config = ClientConfig::GetConfig(input.context);
-			if (!config.connected_grammar && !config.current_dialect) {
-				captured->declared_identity = AttachLineageIdentity(input.context.GetCurrentQuery());
-			}
+			captured->declared_identity = AttachLineageIdentity(input.context.GetCurrentQuery());
 			captured->namespace_event = true;
 			captured->lifecycle = "CREATE";
 			break;

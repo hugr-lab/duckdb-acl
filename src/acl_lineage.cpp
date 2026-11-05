@@ -205,8 +205,8 @@ string LineageIdentityRefusal(const string &identity) {
 		return "the identity is a source's address, <scheme>://<host:port>[/<database>] (OpenLineage's naming)";
 	}
 	if (!LineageIdentityClean(identity)) {
-		return "the identity names a source, never a credential: <scheme>://<host[:port]>[/<path>], with no "
-		       "user:password@, ?, #, %, \\ or spaces";
+		return "the identity is a source's name, <scheme>://<host[:port]>[/<path>] - never a credential: no "
+		       "user:password@, ?, #, %, \\, spaces or control characters";
 	}
 	return string();
 }
