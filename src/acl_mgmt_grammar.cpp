@@ -113,8 +113,7 @@ unique_ptr<MgmtParseData> Call(string function) {
 //! Whether a part read through its helper rules is a string or an identifier - what a quoted value is read from
 bool IsQuotedPart(ParseResult &result) {
 	auto &base = Strip(result);
-	return base.type == ParseResultType::STRING || base.type == ParseResultType::IDENTIFIER ||
-	       base.Name() == "StringLiteral" || base.Name() == "Identifier";
+	return base.Name() == "StringLiteral" || base.Name() == "Identifier";
 }
 
 //! A quoted value, kept for the check against its token
@@ -2242,7 +2241,10 @@ arena_ptr<TransformResultValue> FinalizeStatement(PEGTransformer &transformer, P
 
 class AclMgmtGrammar final : public GrammarExtension {
 public:
-	AclMgmtGrammar() : GrammarExtension("acl_management", "acl: the management statements (spec 150)") {
+	//! `candidate`: a module's registration compiled beside the registered ones, before it is registered
+	explicit AclMgmtGrammar(vector<MgmtRulesEntry> candidate_p = {})
+	    : GrammarExtension("acl_management", "acl: the management statements (spec 150)"),
+	      candidate(std::move(candidate_p)) {
 	}
 
 	vector<GrammarChange> GetChanges() const override {
@@ -2655,7 +2657,9 @@ public:
 		string modules;
 		{
 			lock_guard<mutex> guard(MgmtRulesLock());
-			for (auto &entry : MgmtRulesRegistry()) {
+			auto entries = MgmtRulesRegistry();
+			entries.insert(entries.end(), candidate.begin(), candidate.end());
+			for (auto &entry : entries) {
 				for (auto &change : entry.changes) {
 					changes.push_back(change);
 				}
@@ -2686,6 +2690,9 @@ public:
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
 	}
+
+private:
+	vector<MgmtRulesEntry> candidate;
 };
 
 const char *const TILING_REFUSAL = "acl admin: a list or a body does not read as written - its tokens do not tile it";
@@ -3095,7 +3102,10 @@ bool ReservedMgmtKeyword(const string &word) {
 	    "select", "with", "from", "values", "table", "insert", "update", "delete", "merge", "upsert", "copy", "attach",
 	    "detach", "pragma", "call", "describe", "desc", "show", "summarize", "explain", "begin", "start", "commit",
 	    "end", "rollback", "abort", "checkpoint", "force", "vacuum", "load", "install", "export", "import", "prepare",
-	    "execute", "deallocate", "pivot", "unpivot", "truncate", "connect", "disconnect"};
+	    "execute", "deallocate", "pivot", "unpivot", "pivot_wider", "pivot_longer", "truncate", "connect", "disconnect",
+	    "analyse", "register", "destroy",
+	    // the prefix's marker parts
+	    "root", "job"};
 	return reserved.count(word) > 0;
 }
 
@@ -3111,12 +3121,12 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 	auto refuse = [&](const string &why) {
 		throw InvalidInputException("acl: RegisterMgmtRules(\"%s\"): %s", keyword_p, why);
 	};
-	bool plain = !keyword.empty() && keyword[0] >= 'a' && keyword[0] <= 'z';
+	bool plain = !keyword.empty();
 	for (auto c : keyword) {
-		plain = plain && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_');
+		plain = plain && c >= 'a' && c <= 'z';
 	}
 	if (!plain) {
-		refuse("the keyword is one plain word");
+		refuse("the keyword is one plain word of letters");
 	}
 	if (ReservedMgmtKeyword(keyword)) {
 		refuse("the keyword heads acl's or duckdb's own statements - a module's are its own");
@@ -3125,15 +3135,15 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 		refuse(
 		    "the keyword is registered through the older seam (RegisterMgmtGrammar) - one reader for its statements");
 	}
-	// only rules of its own, in its own names: acl's and duckdb's rules stay as they are, and none collides with them
+	// only rules of its own, in its own names: acl's and duckdb's rules stay as they are
 	auto prefix = "Acl" + string(1, StringUtil::CharacterToUpper(keyword[0])) + keyword.substr(1);
-	case_insensitive_set_t added;
+	case_insensitive_map_t<string> added; // a rule's name -> its definition
 	for (auto &change : changes) {
 		if (change.Type() == GrammarChangeType::ADD_RULE) {
 			if (!StringUtil::StartsWith(StringUtil::Lower(change.RuleName()), StringUtil::Lower(prefix))) {
 				refuse("its rules are named " + prefix + "… (not \"" + change.RuleName() + "\")");
 			}
-			added.insert(change.RuleName());
+			added[change.RuleName()] = change.Definition();
 		}
 	}
 	for (auto &change : changes) {
@@ -3147,12 +3157,27 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 	if (forms.empty()) {
 		refuse("it reads at least one statement form");
 	}
+	case_insensitive_set_t verbs;
 	for (auto &form : forms) {
-		if (!added.count(form.statement)) {
+		auto rule = added.find(form.statement);
+		if (rule == added.end()) {
 			refuse("a form's statement is one of the rules it adds (not \"" + form.statement + "\")");
+		}
+		// a form reads a statement headed by the keyword - never one of acl's, duckdb's or another module's
+		auto arrow = rule->second.find("<-");
+		auto body = arrow == string::npos ? string() : rule->second.substr(arrow + 2);
+		StringUtil::Trim(body);
+		auto head = "'" + keyword + "'";
+		if (body.size() < head.size() || !StringUtil::CIEquals(body.substr(0, head.size()), head) ||
+		    (body.size() > head.size() && !StringUtil::CharacterIsSpace(body[head.size()]))) {
+			refuse("a form's rule begins with its keyword (" + StringUtil::Upper(head) + " ...): \"" + form.statement +
+			       "\" does not");
 		}
 		for (auto &verb : form.verbs) {
 			verb = StringUtil::Lower(verb);
+			if (!verbs.insert(verb).second) {
+				refuse("the verb \"" + verb + "\" is two forms'");
+			}
 		}
 	}
 	auto same_forms = [&](const vector<MgmtStatementForm> &other) {
@@ -3166,12 +3191,12 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 		}
 		return true;
 	};
-	{
-		lock_guard<mutex> guard(MgmtRulesLock());
+	// judged under the lock, then again once compiled: a registration in between is never both
+	auto judge = [&]() {
 		for (auto &entry : MgmtRulesRegistry()) {
 			if (entry.keyword == keyword) {
 				if (same_forms(entry.forms)) {
-					return; // the module's load again (another instance)
+					return false; // the module's load again (another instance)
 				}
 				refuse("the keyword is registered already, with other forms");
 			}
@@ -3179,27 +3204,27 @@ void RegisterMgmtRules(const string &keyword_p, vector<MgmtStatementForm> forms,
 		if (MgmtGrammarCompiledFlag()) {
 			refuse("registered after the first management statement was read - a module registers at load");
 		}
-		MgmtRulesRegistry().push_back({keyword, std::move(forms), std::move(changes), usage});
+		return true;
+	};
+	{
+		lock_guard<mutex> guard(MgmtRulesLock());
+		if (!judge()) {
+			return;
+		}
 	}
-	// compiled now, at load: a rule that does not read, or names a rule nobody defines, is refused here - never at the
-	// first statement, where it would fail every management statement
+	MgmtRulesEntry entry {keyword, std::move(forms), std::move(changes), usage};
+	// compiled now, at load and before it is registered: a rule that collides with one acl (or another module)
+	// defines, or does not read, is refused here - never at the first statement, where it would fail every one
 	try {
-		auto grammar = MakeMgmtGrammar();
+		auto grammar = make_shared_ptr<AclMgmtGrammar>(vector<MgmtRulesEntry> {entry});
 		vector<reference<GrammarExtension>> extensions {*grammar};
 		CompiledGrammar::Create(extensions);
 	} catch (std::exception &ex) {
-		ErrorData error(ex);
-		{
-			lock_guard<mutex> guard(MgmtRulesLock());
-			auto &entries = MgmtRulesRegistry();
-			for (idx_t i = 0; i < entries.size(); i++) {
-				if (entries[i].keyword == keyword) {
-					entries.erase(entries.begin() + NumericCast<int64_t>(i));
-					break;
-				}
-			}
-		}
-		refuse("its rules do not compile into the management grammar: " + error.RawMessage());
+		refuse("its rules do not compile into the management grammar: " + ErrorData(ex).RawMessage());
+	}
+	lock_guard<mutex> guard(MgmtRulesLock());
+	if (judge()) {
+		MgmtRulesRegistry().push_back(std::move(entry));
 	}
 }
 
@@ -3249,19 +3274,19 @@ string MgmtCall::NameValue(ParseResult &result, const char *what) {
 }
 
 string MgmtCall::Name(ParseResult &result, const char *what) {
-	try {
-		return NameOf(result, what);
-	} catch (ParserException &) {
+	auto &node = Strip(result);
+	if (node.Name() != "AclName" && node.Name() != "AclNameToken") {
 		throw BinderException("acl admin: %s is read where no name is (a module's rule)", what);
 	}
+	return NameOf(node, what);
 }
 
 string MgmtCall::Word(ParseResult &result) {
-	try {
-		return TokenOf(result).text;
-	} catch (ParserException &) {
+	auto &node = Strip(result);
+	if (node.Name() != "AclWordToken") {
 		throw BinderException("acl admin: a word is read where no word is (a module's rule)");
 	}
+	return TokenOf(node).text;
 }
 
 string MgmtCall::Keyword(ParseResult &result) {
@@ -3294,17 +3319,43 @@ ParseResult &MgmtCall::Part(ParseResult &result) {
 	return Strip(result);
 }
 
+//! Through the choices and one-part helper rules around an optional or a repetition, down to it
+ParseResult &Unwrapped(ParseResult &result) {
+	reference<ParseResult> node = result;
+	while (true) {
+		auto &current = node.get();
+		if (current.type == ParseResultType::CHOICE) {
+			node = current.Cast<ChoiceParseResult>().GetResult();
+		} else if (current.type == ParseResultType::LIST && StringUtil::StartsWith(current.Name(), "Acl") &&
+		           current.Cast<ListParseResult>().GetChildren().size() == 1) {
+			node = current.Cast<ListParseResult>().GetChild(0);
+		} else {
+			return current;
+		}
+	}
+}
+
 optional_ptr<ParseResult> MgmtCall::Optional(ParseResult &result) {
-	if (result.type == ParseResultType::OPTIONAL) {
-		auto &optional = result.Cast<OptionalParseResult>();
+	auto &node = Unwrapped(result);
+	if (node.type == ParseResultType::OPTIONAL) {
+		auto &optional = node.Cast<OptionalParseResult>();
 		return optional.HasResult() ? &Strip(optional.GetResult()) : nullptr;
 	}
-	return &Strip(result);
+	return &Strip(node);
 }
 
 vector<reference<ParseResult>> MgmtCall::Each(ParseResult &result) {
+	auto &node = Unwrapped(result);
 	vector<reference<ParseResult>> parts;
-	grammar::Collect(result, parts);
+	if (node.type == ParseResultType::OPTIONAL) {
+		auto &optional = node.Cast<OptionalParseResult>();
+		if (optional.HasResult()) {
+			auto &inner = Unwrapped(optional.GetResult());
+			grammar::Collect(inner, parts);
+		}
+		return parts;
+	}
+	grammar::Collect(node, parts);
 	return parts;
 }
 
@@ -3388,6 +3439,18 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			if (head >= tokens.Size() || !StringUtil::CIEquals(tokens.GetToken(head).text, data.module_keyword)) {
 				throw BinderException("acl admin: the \"%s\" module reads only statements headed by %s",
 				                      data.module_keyword, StringUtil::Upper(data.module_keyword));
+			}
+			// ... and only one: its rules never read past a `;` (a terminal override of its own could)
+			auto tail = cursor.Position();
+			while (tail > head && tokens.GetToken(tail - 1).type == TokenType::TERMINATOR) {
+				tail--;
+			}
+			for (auto index = head; index < tail; index++) {
+				if (tokens.GetToken(index).type == TokenType::TERMINATOR) {
+					throw BinderException("acl admin: the \"%s\" module's statement reads past a ';' - its rules read "
+					                      "one statement",
+					                      data.module_keyword);
+				}
 			}
 		}
 		for (auto &quoted : data.quoted) {

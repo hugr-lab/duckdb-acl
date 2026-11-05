@@ -13,7 +13,8 @@
 // that is a value: quoted either way, or words joined by `.`), AclName (one SQL identifier), AclWordToken (a word as
 // written - the run of tokens the tokenizer split at a leading digit, `4GB`), AclDottedToken, AclValue (AclNameValue
 // or AclSignedNumber, `-1`, `0.5`), AclComment (`COMMENT '…'`). A module's own rules are named `Acl<Keyword>…`
-// (`AclCluster…` for CLUSTER): acl never names one of its rules so, and a helper rule of one part is read through.
+// (`AclCluster…` for CLUSTER), a form's rule begins with the keyword's literal, and a helper rule of one part is read
+// through; a name acl also defines is refused at registration (its rules are compiled then, against acl's).
 //
 // Built against duckdb's includes and its third_party/utf8proc/include (parse_result.hpp needs it).
 //===----------------------------------------------------------------------===//
@@ -37,12 +38,13 @@ struct MgmtStatementForm {
 	string usage;
 };
 
-//! The statements headed by `keyword` (one plain word acl and duckdb have no statement for: `cluster`) are management,
-//! read by `forms` - each an alternative in the management grammar's choice, ahead of the statements no rule reads -
-//! and the rules `changes` adds (new rules only, named `Acl<Keyword>…`, and terminal overrides of them). A statement
-//! headed by the keyword whose verb no form names is told `usage`. Registered at load, before the first statement is
-//! read: the rules are compiled then, and a registration that does not compile - or comes later - is refused here.
-//! Idempotent by keyword; the keyword with other forms, or registered through the older seam too, is refused.
+//! The statements headed by `keyword` (one word of letters acl and duckdb have no statement for: `cluster`) are
+//! management, read by `forms` - each an alternative in the management grammar's choice, ahead of the statements no
+//! rule reads - and the rules `changes` adds (new rules only, named `Acl<Keyword>…`, and terminal overrides of them). A
+//! statement headed by the keyword whose verb no form names is told `usage`. Registered at load, before the first
+//! statement is read: the rules are compiled then, and a registration that does not compile - or comes later - is
+//! refused here. Idempotent by keyword; the keyword with other forms, or registered through the older seam too, is
+//! refused.
 void RegisterMgmtRules(const string &keyword, vector<MgmtStatementForm> forms, vector<GrammarChange> changes,
                        const string &usage);
 
@@ -66,7 +68,7 @@ public:
 	string NameValue(ParseResult &result, const char *what);
 	//! `AclName`: one SQL identifier - a word, or a double-quoted name with `""` for a quote; never empty
 	string Name(ParseResult &result, const char *what);
-	//! `AclValue`: a name that is a value, or a signed number as written (`-0.5`)
+	//! `AclValue`: a name that is a value, or a signed number (`-0.5`)
 	string Text(ParseResult &result, const char *what);
 	//! `AclWordToken`: a word as written - the run of tokens the tokenizer split at a leading digit (`4GB`)
 	static string Word(ParseResult &result);

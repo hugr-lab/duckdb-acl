@@ -681,7 +681,9 @@ string ResourceLimitsJson(const string &inside) {
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
 	string usage;
-	if (MgmtRulesKeyword(keyword, &usage, s.PeekWord())) {
+	auto heads = ReadStatementHeads(s.text, 2);
+	auto verb = !heads.empty() && heads[0].size() > 1 ? heads[0][1].word : string();
+	if (MgmtRulesKeyword(keyword, &usage, verb)) {
 		// spec 150 3g-3: a linked module's statement its rules did not read - said in the module's words
 		RefuseMovedForm(usage);
 	}

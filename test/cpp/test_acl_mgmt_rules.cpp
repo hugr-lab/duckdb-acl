@@ -9,6 +9,7 @@
 #include "acl_admin_scanner.hpp"
 #include "acl_admin_sql.hpp"
 #include "acl_mgmt_rules.hpp"
+#include "duckdb/parser/peg/matcher.hpp"
 
 using namespace duckdb;
 using namespace acl_test;
@@ -42,6 +43,17 @@ arena_ptr<TransformResultValue> FinalizeToy(PEGTransformer &transformer, ParseRe
 		for (auto &more : MgmtCall::Each(form.GetChild(2))) {
 			value += "+" + call.NameValue(MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1), "a name");
 		}
+	} else if (target.Name() == "AclToykillScoped") {
+		auto &form = target.Cast<ListParseResult>();
+		value = call.Quoted(form.GetChild(1), "a session id");
+		if (auto group = MgmtCall::Optional(form.GetChild(2))) {
+			value += "@" + call.NameValue(group->Cast<ListParseResult>().GetChild(2), "a group");
+		}
+	} else if (target.Name() == "AclToykillItems") {
+		value = "items";
+		for (auto &item : MgmtCall::Each(target.Cast<ListParseResult>().GetChild(1))) {
+			value += ":" + call.Quoted(MgmtCall::Part(item.get()).Cast<ListParseResult>().GetChild(1), "an item");
+		}
 	} else if (target.Name() == "AclToykillNamed") {
 		auto &form = target.Cast<ListParseResult>();
 		value = call.Name(form.GetChild(1), "a name");
@@ -73,12 +85,53 @@ unique_ptr<SQLStatement> OldSeam(acl::AdminScanner &) {
 	return nullptr;
 }
 
+//! A module's matcher that takes any token - a `;` too (duckdb's own passthrough stops there)
+class GreedyTokenMatcher : public AtomicMatcher {
+public:
+	GreedyTokenMatcher() : AtomicMatcher(MatcherType::CUSTOM) {
+	}
+	MatcherResult MatchAtomic(MatchState &state) const override {
+		auto current = state.token_iterator.Current();
+		if (!current || current->type == TokenType::END_OF_INPUT ||
+		    current->type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+			return MatcherResult::Failure();
+		}
+		auto text = current->text;
+		auto offset = current->offset;
+		auto length = current->length;
+		state.token_iterator.Advance();
+		state.UpdateMaxTokenIndex();
+		return state.AllocateParseResult<TokenParseResult>(std::move(text), offset, length);
+	}
+	SuggestionType AddSuggestionInternal(MatchState &state) const override {
+		return SuggestionType::MANDATORY;
+	}
+	string ToString() const override {
+		return "GreedyToken";
+	}
+};
+
+// TOYSEMI <anything>: compiled to acl_session_kill('semi') - its matcher would read past a `;`
+arena_ptr<TransformResultValue> FinalizeToySemi(PEGTransformer &transformer, ParseResult &) {
+	MgmtCall call(transformer, "acl_session_kill");
+	call.Arg(Value("semi"));
+	return call.Result();
+}
+
 void RegisterToy() {
 	vector<GrammarChange> rules;
 	rules.push_back(
 	    GrammarChange::AddRule("AclToykillStatement <- 'TOYKILL' AclToykillTarget", acl::MgmtStart<FinalizeToy>));
 	rules.push_back(GrammarChange::AddRule("AclToykillTarget <- AclToykillWord / AclToykillNumber / AclToykillValue / "
-	                                       "AclToykillList / AclToykillNamed / AclQuotedValue"));
+	                                       "AclToykillList / AclToykillScoped / AclToykillItems / AclToykillNamed / "
+	                                       "AclQuotedValue"));
+	// an optional and a repetition behind helper rules of their own (CLUSTER's shared IN GROUP)
+	rules.push_back(GrammarChange::AddRule("AclToykillGroup <- 'IN' 'GROUP' AclNameValue"));
+	rules.push_back(GrammarChange::AddRule("AclToykillScope <- AclToykillGroup?"));
+	rules.push_back(GrammarChange::AddRule("AclToykillScoped <- 'SCOPED' AclQuotedValue AclToykillScope"));
+	rules.push_back(GrammarChange::AddRule("AclToykillItem <- ',' AclQuotedValue"));
+	rules.push_back(GrammarChange::AddRule("AclToykillItemList <- AclToykillItem*"));
+	rules.push_back(GrammarChange::AddRule("AclToykillItems <- 'ITEMS' AclToykillItemList"));
 	rules.push_back(GrammarChange::AddRule("AclToykillWord <- 'WORD' AclWordToken AclToykillNote?"));
 	rules.push_back(GrammarChange::AddRule("AclToykillNote <- 'NOTE' AclNameValue"));
 	rules.push_back(GrammarChange::AddRule("AclToykillNumber <- 'NUMBER' NumberLiteral"));
@@ -92,10 +145,15 @@ void RegisterToy() {
 	bad.push_back(
 	    GrammarChange::AddRule("AclToybadStatement <- 'TOYBAD' AclQuotedValue", acl::MgmtStart<FinalizeToyBad>));
 	acl::RegisterMgmtRules("toybad", {{"AclToybadStatement", {}, ""}}, std::move(bad), "TOYBAD expects '<value>'");
-	vector<GrammarChange> hijack;
-	hijack.push_back(GrammarChange::AddRule("AclToyhlStatement <- 'KILL' 'SESSION' AclWordToken",
-	                                        acl::MgmtStart<FinalizeToyHijack>));
-	acl::RegisterMgmtRules("toyhl", {{"AclToyhlStatement", {}, ""}}, std::move(hijack), "TOYHL expects nothing");
+	vector<GrammarChange> semi;
+	semi.push_back(
+	    GrammarChange::AddRule("AclToysemiStatement <- 'TOYSEMI' AclToysemiToken+", acl::MgmtStart<FinalizeToySemi>));
+	semi.push_back(GrammarChange::AddRule("AclToysemiToken <- Identifier"));
+	semi.push_back(
+	    GrammarChange::AddTerminalRuleOverride("AclToysemiToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+		    return make_uniq<GreedyTokenMatcher>();
+	    }));
+	acl::RegisterMgmtRules("toysemi", {{"AclToysemiStatement", {}, ""}}, std::move(semi), "TOYSEMI expects anything");
 }
 
 //! Why a registration is refused ('' when it is not)
@@ -146,8 +204,31 @@ int main(int argc, char *argv[]) {
 		Check(Has(Refusal("kill", "AclKillStatement", One("AclKillStatement <- 'KILL' AclQuotedValue")),
 		          "heads acl's or duckdb's own statements"),
 		      "a keyword acl's statements begin with");
+		Check(Has(Refusal("analyse", "AclAnalyseStatement", One("AclAnalyseStatement <- 'ANALYSE' AclQuotedValue")),
+		          "heads acl's or duckdb's own statements"),
+		      "duckdb's ANALYSE (ANALYZE's other spelling)");
 		Check(Has(Refusal("to y", "AclToyStatement", One("AclToyStatement <- 'TO' AclQuotedValue")), "one plain word"),
 		      "a keyword that is no word");
+		Check(Has(Refusal("toy_x", "AclToy_xStatement", One("AclToyxStatement <- 'TOYX' AclQuotedValue")),
+		          "one plain word"),
+		      "a keyword with an underscore (no rule name holds one)");
+		vector<GrammarChange> hijack;
+		hijack.push_back(GrammarChange::AddRule("AclToyhlStatement <- 'KILL' 'SESSION' AclWordToken",
+		                                        acl::MgmtStart<FinalizeToyHijack>));
+		Check(Has(Refusal("toyhl", "AclToyhlStatement", std::move(hijack)), "begins with its keyword"),
+		      "a form headed by acl's words (KILL SESSION)");
+		vector<GrammarChange> twice;
+		twice.push_back(
+		    GrammarChange::AddRule("AclToytStatement <- 'TOYT' AclQuotedValue", acl::MgmtStart<FinalizeToyBad>));
+		twice.push_back(
+		    GrammarChange::AddRule("AclToytOther <- 'TOYT' 'X' AclQuotedValue", acl::MgmtStart<FinalizeToyBad>));
+		try {
+			acl::RegisterMgmtRules("toyt", {{"AclToytStatement", {"a"}, "u1"}, {"AclToytOther", {"A"}, "u2"}},
+			                       std::move(twice), "usage");
+			Check(false, "a verb two forms name");
+		} catch (std::exception &ex) {
+			Check(Has(ErrorData(ex).Message(), "is two forms'"), "a verb two forms name");
+		}
 		vector<GrammarChange> replace;
 		replace.push_back(GrammarChange::ReplaceRule("AclQuotedValue <- StringLiteral"));
 		replace.push_back(
@@ -205,6 +286,14 @@ int main(int argc, char *argv[]) {
 		}
 		auto each = Compiled(con, "ACL ADMIN TOYKILL LIST a, \"b c\", d.e");
 		Check(Has(each, "acl_session_kill('a+b c+d.e')"), "a repetition read in order: " + each);
+		auto scoped = Compiled(con, "ACL ADMIN TOYKILL SCOPED 'a' IN GROUP g");
+		Check(Has(scoped, "acl_session_kill('a@g')"), "an optional behind a helper rule, present: " + scoped);
+		auto unscoped = Compiled(con, "ACL ADMIN TOYKILL SCOPED 'a'");
+		Check(Has(unscoped, "acl_session_kill('a')"), "...and absent: " + unscoped);
+		auto items = Compiled(con, "ACL ADMIN TOYKILL ITEMS , 'a' , 'b'");
+		Check(Has(items, "acl_session_kill('items:a:b')"), "a repetition behind a helper rule: " + items);
+		auto none = Compiled(con, "ACL ADMIN TOYKILL ITEMS");
+		Check(Has(none, "acl_session_kill('items')"), "...and none of it: " + none);
 		auto named = Compiled(con, "ACL ADMIN TOYKILL NAMED \"Q\"\"x\" COMMENT 'c'");
 		Check(Has(named, "acl_session_kill('Q\"x#c')"), "AclName and AclComment: " + named);
 		auto ran = con.Query("ACL ADMIN TOYKILL '0000'");
@@ -228,8 +317,6 @@ int main(int argc, char *argv[]) {
 		Check(Has(joined, "expected a session id, quoted"), "a string joined across a line break: " + joined);
 		auto number = Compiled(con, "ACL ADMIN TOYKILL NUMBER 7");
 		Check(Has(number, "no quoted value is"), "a quoted reader on a number is refused, not internal: " + number);
-		auto empty_name = Compiled(con, "ACL ADMIN TOYKILL NAMED \"\"");
-		Check(Has(empty_name, "error:"), "an empty quoted name: " + empty_name);
 	});
 
 	Scenario("a statement its rules do not read is refused in the module's words", [&] {
@@ -237,16 +324,21 @@ int main(int argc, char *argv[]) {
 		Check(Has(unread, "TOYKILL expects '<id>' or WORD <word> [NOTE <name>]"), "the module's usage: " + unread);
 		auto verb = Compiled(con, "ACL ADMIN TOYKILL WORD x y z");
 		Check(Has(verb, "write TOYKILL WORD <word> [NOTE <name>]"), "the form's own usage, by its verb: " + verb);
+		auto commented = Compiled(con, "ACL ADMIN TOYKILL /* c */ WORD x y z");
+		Check(Has(commented, "write TOYKILL WORD <word> [NOTE <name>]"), "the verb after a comment: " + commented);
 		auto open = Compiled(con, "ACL ADMIN TOYKILL 'never closed");
 		Check(Has(open, "unterminated"), "an unterminated string is the tokenizer's: " + open);
 		auto empty = Compiled(con, "ACL ADMIN KILL SESSION 'a'; TOYKILL \"\"");
 		Check(Has(empty, "zero-length delimited identifier"), "the tokenizer's refusal wins: " + empty);
 	});
 
-	Scenario("a module reads only the statements headed by its keyword", [&] {
-		auto hijack = Compiled(con, "ACL ADMIN KILL SESSION 123");
-		Check(Has(hijack, "error:") && !Has(hijack, "acl_session_kill"),
-		      "acl's KILL SESSION is never the module's: " + hijack);
+	Scenario("a module reads one statement, headed by its keyword", [&] {
+		auto own = Compiled(con, "ACL ADMIN KILL SESSION 123");
+		Check(Has(own, "write KILL SESSION '<id>'"), "acl's KILL SESSION is acl's, refused in its words: " + own);
+		auto semi = Compiled(con, "ACL ADMIN TOYSEMI a; KILL SESSION 'b'");
+		Check(Has(semi, "reads past a ';'"), "a module's matcher that reads past a `;`: " + semi);
+		auto alone = Compiled(con, "ACL ADMIN TOYSEMI a b");
+		Check(Has(alone, "acl_session_kill('semi')"), "...while one statement reads: " + alone);
 	});
 
 	Scenario("the compiled call is judged by the one authorizer", [&] {
@@ -277,6 +369,9 @@ int main(int argc, char *argv[]) {
 		Check(Has(Refusal("toylate", "AclToylateStatement", One("AclToylateStatement <- 'TOYLATE' AclQuotedValue")),
 		          "after the first management statement"),
 		      "a late registration");
+		// hugr-node's test runner: many databases in one process, the module registering at each load
+		Check(Refusal("toybad", "AclToybadStatement", One("AclToybadStatement <- 'TOYBAD' AclQuotedValue")).empty(),
+		      "the module's load again, after the grammar was compiled, is a no-op");
 		DuckDB second(nullptr, &config);
 		Connection other(second);
 		Exec(other, "LOAD acl");

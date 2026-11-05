@@ -407,11 +407,14 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       "not read". The keyword makes a statement management (`IsMgmtHead`, `MgmtRulesKeyword`), and one the rules do
       not read reaches the compiler, which refuses it with the usage of the form its verb names, else the keyword's
       (a tokenizer refusal wins, as for acl's moved forms). A module reads only the statements headed by its keyword
-      (`module_keyword`, checked against the statement's first token). Refused at registration - at load, never at
-      the first statement: a keyword that is no plain word or heads acl's or duckdb's statements (or the prefix's),
-      a change that is not a new rule (or a terminal override of one), a rule not named `Acl<Keyword>…`, a form whose
-      statement it does not add, the keyword again with other forms, the keyword on both seams, a registration after
-      an instance compiled its management grammar, and rules that do not compile (a trial compile). Test
+      (`module_keyword`, checked against the statement's first token), one statement (a `;` its matcher read past is
+      refused). Refused at registration - at load, never at the first statement: a keyword that is not one word of
+      letters or heads acl's or duckdb's statements (or the prefix's markers), a change that is not a new rule (or a
+      terminal override of one), a rule not named `Acl<Keyword>…`, a form whose statement it does not add or whose
+      rule does not begin with the keyword's literal, a verb two forms name, the keyword again with other forms, the
+      keyword on both seams, a registration after an instance compiled its management grammar, and rules that do not
+      compile (a trial compile with the candidate, before it is registered). `Optional` / `Each` read through the
+      helper rules around an optional or a repetition (CLUSTER's shared `IN GROUP`). Test
       `test_acl_mgmt_rules.cpp` (a toy module: its forms, readers, refusals, the authorizer, Flight's command
       detection, a second instance).
     - 3g-3b: hugr-node re-pins and writes its CLUSTER forms as rules (an option list and DEPENDS ON read by rules,
