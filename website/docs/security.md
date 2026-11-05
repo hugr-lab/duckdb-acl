@@ -118,6 +118,11 @@ share sessions" (spec 040).
   no amount of DDL produces one".
 - A principal's `CREATE VIEW` is "resolved once, with its author's rights, and reading it is decided
   by the grant on the view" (spec 018).
+- The record runs as a `PRAGMA` in the DDL's own query and answers `Success` with no row (spec 151).
+  Before, it was a `SELECT acl_…(…)` answered to the client under its call as the column's name: the
+  physical name, and for a view the rewritten body - the physical relation, the author's RLS and
+  column list. An `EXPLAIN` of such a DDL ran the record in its place (`EXPLAIN CREATE VIEW` made the
+  view) and is refused.
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).
@@ -297,7 +302,7 @@ mode of default-deny is a refusal, and the refusal names the function.
 | statement type | under a principal |
 | --- | --- |
 | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE INTO` | rewritten (sections above) |
-| `EXPLAIN [ANALYZE]` | needs the explicit `explain` capability on the MAIN grant, then the inner statement is rewritten (spec 052) |
+| `EXPLAIN [ANALYZE]` | needs the explicit `explain` capability on the MAIN grant, then the inner statement is rewritten (spec 052); refused over a DDL that writes the virtual catalog's record - a view, a recorded table, a rename or drop of one (spec 151) |
 | `CREATE`, `DROP` | tables and views under `create`/`drop`/`temp` (above); `SECRET` under the explicit `secrets` capability, constant parameters only - kept in the attached secrets service, never `TEMPORARY` there (spec 082); with no service attached (a standalone node, spec 118) kept by the node itself, `PERSISTENT` in its secret files on disk - there `secrets` administers every secret of the node, the operator's included; on a platform node (hugr-node's `hugr_node`, a cluster node by construction) only in the service |
 | `PRAGMA` | `table_info`, `show_tables` answered; the rest denied by name (spec 031) |
 | `SET` / `RESET` | `TimeZone`, `Calendar` only, session scope, constant value, only on an `ACL SESSION` connection (spec 068) |

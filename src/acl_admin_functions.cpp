@@ -5,14 +5,20 @@
 #include "acl_connection.hpp"
 #include "acl_node_load.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
@@ -2182,6 +2188,56 @@ void AclSessionUseFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
+//! spec 151: the record a principal's DDL / USE writes, as the rewriter emits it - `PRAGMA <record>(…)`, the system
+//! catalog's own scalar of that name called once where duckdb runs a PRAGMA. The statement answers what the DDL
+//! answers (`Success`, no rows): a `SELECT acl_…(…)` answered its call as its column's name - the physical name, a
+//! view's whole rewritten body - and took a quack batch's one result. Looked up in `system`, never by the search
+//! path, so a macro of that name elsewhere is not what runs. A record that wrote nothing - USE for a session gone
+//! since - is an error, as no answer carries the scalar's false any more.
+void RunRecord(ClientContext &context, const FunctionParameters &parameters, const char *name,
+               const char *nothing_written) {
+	auto &entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(
+	    context, QualifiedName(Identifier::SystemCatalog(), Identifier::DefaultSchema(), Identifier(name)));
+	vector<unique_ptr<Expression>> children;
+	for (auto &value : parameters.values) {
+		children.push_back(make_uniq<BoundConstantExpression>(value));
+	}
+	ErrorData error;
+	auto call = FunctionBinder(context).BindScalarFunction(entry, std::move(children), error);
+	if (!call) {
+		error.Throw();
+	}
+	auto written = ExpressionExecutor::EvaluateScalar(context, *call, true);
+	if (nothing_written && !written.IsNull() && !written.GetValue<bool>()) {
+		throw InvalidInputException("acl: %s", nothing_written);
+	}
+}
+
+void RegisterCreatedRecord(ClientContext &context, const FunctionParameters &parameters) {
+	RunRecord(context, parameters, "acl_register_created", nullptr);
+}
+void RegisterExistingRecord(ClientContext &context, const FunctionParameters &parameters) {
+	RunRecord(context, parameters, "acl_register_existing", nullptr);
+}
+void RegisterViewRecord(ClientContext &context, const FunctionParameters &parameters) {
+	RunRecord(context, parameters, "acl_register_view", nullptr);
+}
+void RenameRelationRecord(ClientContext &context, const FunctionParameters &parameters) {
+	RunRecord(context, parameters, "acl_rename_relation", nullptr);
+}
+void DropRelationRecord(ClientContext &context, const FunctionParameters &parameters) {
+	RunRecord(context, parameters, "acl_drop_relation", nullptr);
+}
+void SessionUseRecord(ClientContext &context, const FunctionParameters &parameters) {
+	RunRecord(context, parameters, "acl_session_use", "USE: the session is no longer open - nothing was recorded");
+}
+
+const std::pair<const char *, pragma_function_t> RECORD_PRAGMAS[] = {
+    {"acl_register_created", RegisterCreatedRecord}, {"acl_register_existing", RegisterExistingRecord},
+    {"acl_register_view", RegisterViewRecord},       {"acl_rename_relation", RenameRelationRecord},
+    {"acl_drop_relation", DropRelationRecord},       {"acl_session_use", SessionUseRecord},
+};
+
 //! acl_session_view_as(role) (spec 120.3): the session the statement runs under (its AclConnection - the caller's
 //! own, never one named by an argument) is from now on rewritten as `role`, metadata only; '' leaves the mode.
 //! Compiled from `SET SESSION VIEW AS ROLE` / `RESET SESSION VIEW AS`, judged by the authorizer (POLICY)
@@ -2260,6 +2316,15 @@ void AclDefineRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 }
 
 } // namespace
+
+bool IsAclRecordPragma(const string &name) {
+	for (auto &record : RECORD_PRAGMAS) {
+		if (StringUtil::CIEquals(name, record.first)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	// register an admin setup function, attaching the shared store via its function_info
@@ -2438,6 +2503,11 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		ScalarFunction use(Identifier("acl_session_use"), {v, v, v}, LogicalType::BOOLEAN, AclSessionUseFunc);
 		MarkAclScalar(use, store);
 		loader.RegisterFunction(use);
+	}
+	// spec 151: the records the rewriter emits after a principal's DDL / USE - each the scalar above of its name
+	// (its arity checked there), run as a PRAGMA
+	for (auto &record : RECORD_PRAGMAS) {
+		loader.RegisterFunction(PragmaFunction::PragmaCall(Identifier(record.first), record.second, {}, v));
 	}
 	{
 		ScalarFunction kill(Identifier("acl_session_kill"), {v}, LogicalType::BOOLEAN, AclSessionKillFunc);

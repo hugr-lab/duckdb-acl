@@ -250,6 +250,22 @@ int main(int argc, char *argv[]) {
 		Exec(con, "SELECT acl_session_close('" + other + "')");
 	});
 
+	Scenario("a USE whose session ended before it ran is an error, not a silent false (spec 151)", [&]() {
+		auto other = OpenSession(con);
+		if (!Check(!other.empty(), "a session opens")) {
+			return;
+		}
+		auto use = con.Prepare("ACL SESSION '" + other + "' USE mart");
+		if (!CheckOk(*use, "a USE prepares")) {
+			return;
+		}
+		Exec(con, "SELECT acl_session_close('" + other + "')");
+		// the record answered `false` as its one row, which nobody read; it answers no row now (spec 151)
+		auto ran = use->Execute();
+		Check(ran->HasError() && Contains(ran->GetError(), "the session is no longer open"),
+		      "the record refuses: " + (ran->HasError() ? ran->GetError() : std::string("no error")));
+	});
+
 	Scenario("lineage names what the session read and wrote", [&]() {
 		Exec(con, "SET GLOBAL acl_lineage_namespace = 'acl://test'");
 		Exec(con, "SET GLOBAL acl_lineage_level = 'on'");

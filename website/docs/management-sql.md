@@ -575,7 +575,11 @@ decision: `INTO <phys schema>` names the physical schema (checked to exist); `VI
 role only register objects that already exist physically; neither follows the schema declaration (an
 alias creates in what it aliases, an expansion in its origin). A principal's own DDL then records the
 object through `acl_register_created` / `acl_register_existing` / `acl_register_view`, which a
-principal cannot call directly.
+principal cannot call directly. The record runs as `PRAGMA acl_register_…(…)` in the same query as the
+DDL (spec 151): the DDL answers what a native one does - `Success`, no row, nothing of the physical name
+or of a view's rewritten body - a record that fails takes the `CREATE` back, a prepared DDL works, and in
+a quack batch (`CREATE TABLE …; SELECT …`) the `SELECT` answers. An `EXPLAIN` of a DDL that writes a
+record is refused; one that writes none (a live alias's schema) explains.
 
 ```sql
 ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select) COMMENT 'raw zone, read only';

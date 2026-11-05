@@ -317,6 +317,21 @@ PATCHES = {
             "\treturn false;\n",
         ),
     ],
+    # spec 151: the record a principal's DDL / USE writes (`PRAGMA acl_…`) is no result of the client's batch -
+    # the stream goes to the next statement that returns one (`CREATE TABLE …; SELECT …` answers the SELECT), or,
+    # with none, the driver sends the last statement's Success
+    "quack_fetch_collector.cpp": [
+        (
+            '#include "quack_fetch_collector.hpp"\n',
+            '#include "quack_fetch_collector.hpp"\n'
+            '#include "acl_quack_embed.hpp"\n',
+        ),
+        (
+            "\tif (data.properties.return_type != StatementReturnType::QUERY_RESULT || stream->Bound()) {\n",
+            "\tif (data.properties.return_type != StatementReturnType::QUERY_RESULT || stream->Bound() ||\n"
+            "\t    acl::AclQuackRecordStatement(data)) {\n",
+        ),
+    ],
 }
 
 # Text that must stay as it is in quack's PRISTINE sources, because acl repeats it: the empty batch
