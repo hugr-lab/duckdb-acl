@@ -3,6 +3,7 @@
 #include "acl_door_common.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_connection.hpp"
+#include "acl_node_load.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -2084,9 +2085,11 @@ void AclSessionSweepFunc(DataChunk &args, ExpressionState &state, Vector &result
 }
 
 //! acl_session_count(): how many sessions are live. Denied to a principal like the rest of this
-//! surface - a client may not learn how many others there are.
+//! surface - a client may not learn how many others there are. A session of the calling call alone is no session
+//! of the node's (spec 066's addendum): platform.drain reads this.
 void AclSessionCountFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto live = Value::BIGINT(NumericCast<int64_t>(StoreOf(state).SessionCount()));
+	auto live = Value::BIGINT(
+	    NumericCast<int64_t>(StoreOf(state).SessionTallyBesides(CallingSession(state.GetContext())).live));
 	result.Reference(live, count_t(args.size()));
 }
 
@@ -2102,14 +2105,7 @@ void AclDrainFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	store.SessionSweep();
 	// what remains to be drained: a session of this one call (a console's DRAIN NODE, spec 066's addendum) ends with
 	// it, so it is not among them - the watch loop reaches 0 from a console too. Counted and left out at one look.
-	AclSessionView current;
-	string why;
-	auto connection = AclConnection::Reach(state.GetContext(), why);
-	string own;
-	if (connection && connection->Current(current)) {
-		own = current.session_id;
-	}
-	auto live = NumericCast<int64_t>(store.SessionTallyBesides(own).live);
+	auto live = NumericCast<int64_t>(store.SessionTallyBesides(CallingSession(state.GetContext())).live);
 	result.Reference(Value::BIGINT(live), count_t(args.size()));
 }
 

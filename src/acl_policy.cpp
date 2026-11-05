@@ -654,13 +654,21 @@ idx_t PolicyStore::SessionCount() {
 }
 
 PolicyStore::SessionTally PolicyStore::SessionTallyBesides(const string &besides) {
+	return Tally(besides, true);
+}
+
+PolicyStore::SessionTally PolicyStore::Tally(const string &besides, bool judge_live) {
 	// The live total, not the map size: a dead session lingers until the next sweep now that resolving
 	// one no longer erases it (spec 054), and "how many sessions are live right now" must not count
 	// the not-yet-swept dead. Judged read-only, like SessionAlive. The doors and groups count every record.
-	auto now = NowSeconds();
-	auto skew = JwtClockSkew();
-	auto idle = SessionIdleTimeout();
-	auto exp_binds = SessionExpEveryUse();
+	int64_t now = 0, skew = 0, idle = 0;
+	bool exp_binds = false;
+	if (judge_live) {
+		now = NowSeconds();
+		skew = JwtClockSkew();
+		idle = SessionIdleTimeout();
+		exp_binds = SessionExpEveryUse();
+	}
 	// the doors of the base are always listed, at zero when idle: a gauge that vanishes at zero is
 	// one a dashboard cannot tell from a node that stopped reporting
 	std::map<string, int64_t> doors {{"flight", 0}, {"quack", 0}, {"session", 0}};
@@ -675,7 +683,7 @@ PolicyStore::SessionTally PolicyStore::SessionTallyBesides(const string &besides
 			}
 			bool expired = exp_binds && session.expires_at > 0 && session.expires_at + skew < now;
 			bool stale = idle > 0 && session.last_used + idle < now;
-			if (!expired && !stale) {
+			if (judge_live && !expired && !stale) {
 				tally.live++;
 			}
 			doors[session.door]++;
@@ -841,10 +849,6 @@ bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
 	out.expires_at = entry->second.expires_at;
 	out.limits = entry->second.limits;
 	return true;
-}
-
-vector<std::pair<string, std::pair<idx_t, idx_t>>> PolicyStore::SessionCountsByGroup() {
-	return SessionTallyBesides(string()).by_group;
 }
 
 bool PolicyStore::SetSessionProfile(const string &id, int8_t level) {
@@ -1170,7 +1174,7 @@ string TraceMarkers(const string &correlation_id, const string &traceparent) {
 }
 
 vector<std::pair<string, int64_t>> PolicyStore::SessionCountsByDoor() {
-	return SessionTallyBesides(string()).by_door;
+	return Tally(string(), false).by_door;
 }
 
 void PolicyStore::NoteSessionDrain(const string &id, const string &stream) {

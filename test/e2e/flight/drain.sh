@@ -165,6 +165,9 @@ got="$("$PYBIN" "$HERE/client.py" "$URI" "SELECT draining, sessions_live FROM pl
 	fail "an operator's read of the draining node: $got"
 echo "$got" | grep -q "'draining': \[True\]" || fail "the load report does not say draining: $got"
 echo "$got" | grep -q "'sessions_live': \[1\]" || fail "the load report counted the call's own session: $got"
+got="$("$PYBIN" "$HERE/client.py" "$URI" "SELECT draining, sessions FROM platform.drain" "$OPS_TOKEN" 2>&1)" ||
+	fail "an operator's drain view: $got"
+echo "$got" | grep -q "'sessions': \[1\]" || fail "the drain view counted the call's own session: $got"
 got="$("$PYBIN" "$HERE/client.py" "$URI" "SELECT count(*) AS n FROM platform.sessions" "$OPS_TOKEN" 2>&1)" ||
 	fail "an operator's sessions list: $got"
 echo "$got" | grep -q "'n': \[1\]" || fail "the sessions list shows the call's own session: $got"

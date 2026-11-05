@@ -4,6 +4,7 @@
 
 #include "acl_node_load.hpp"
 
+#include "acl_connection.hpp"
 #include "acl_door_common.hpp"
 #include "acl_node_label.hpp"
 #include "acl_rewriter.hpp"
@@ -32,10 +33,17 @@ idx_t SettingOf(DatabaseInstance &db, const char *name, idx_t fallback) {
 
 void AclNodeLoadFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = DatabaseInstance::GetDatabase(state.GetContext());
-	result.Reference(Value(NodeLoadJson(db, StoreOf(state))), count_t(args.size()));
+	result.Reference(Value(NodeLoadJson(db, StoreOf(state), CallingSession(state.GetContext()))), count_t(args.size()));
 }
 
 } // namespace
+
+string CallingSession(ClientContext &context) {
+	AclSessionView current;
+	string why;
+	auto connection = AclConnection::Reach(context, why);
+	return connection && connection->Current(current) ? current.session_id : string();
+}
 
 bool NodeLoadServed(DatabaseInstance &db) {
 	Value on;
@@ -150,7 +158,7 @@ ObserveVerdict ObserveAuthorize(DatabaseInstance &db, PolicyStore &store, const 
 
 string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besides) {
 	auto draining = store.Draining();
-	// every count at one look, the calling call's own session left out of each (so they agree)
+	// every count at one look, the calling call's own session left out of each
 	auto tally = store.SessionTallyBesides(besides);
 	auto live = tally.live;
 	auto max_sessions = SettingOf(db, "acl_max_sessions", 1000);

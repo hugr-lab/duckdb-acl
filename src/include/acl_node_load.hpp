@@ -24,6 +24,9 @@ namespace acl {
 //! `besides`: the ops id of a session left out of the counts - the calling call's own, when it is a session of that
 //! one call (spec 066's addendum: a console reads the node with such calls, and is no load of the node's)
 string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besides = string());
+//! The ops id of the session the calling statement runs under (its AclConnection, spec 078), '' for none - what the
+//! node's counts leave out when it is a session of that one call (`SessionTallyBesides` judges that)
+string CallingSession(ClientContext &context);
 
 //! Whether the pull surfaces exist at all (`acl_metrics_endpoint`).
 bool NodeLoadServed(DatabaseInstance &db);

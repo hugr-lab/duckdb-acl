@@ -2,8 +2,8 @@
 // cookie-less Flight call). The load report read them at several looks - the live total, then that session's door and
 // group from the list - so a call's session that ended between two of them was counted by the first and found by
 // none after: the drain e2e's `sessions_live 2` (a DoGet's session ends while the statement it submitted already
-// runs). One look now, `PolicyStore::SessionTallyBesides`. Here: what the tally leaves out, and many calls' sessions
-// ending while the report is read.
+// runs). One look now, `PolicyStore::SessionTallyBesides`. Here: what the tally leaves out (the door's and the
+// resource group's counts too), and many calls' sessions ending while the report is read.
 // Build + run via `GEN=ninja make test-cpp`.
 
 #include "acl_test_util.hpp"
@@ -11,6 +11,7 @@
 #include "acl_node_load.hpp"
 #include "acl_policy.hpp"
 
+#include <atomic>
 #include <thread>
 
 using namespace duckdb;
@@ -73,6 +74,8 @@ int main(int argc, char *argv[]) {
 	Exec(con, "SELECT acl_define_issuer('test/idp/s', '{\"url\": \"test/idp/s\", \"client\": {\"audiences\": "
 	          "[\"api://acl-test\"], \"roles_from\": [\"roles\"], \"attributes\": {\"tid\": \"tenant\"}}}')");
 	Exec(con, "ACL ADMIN CREATE ROLE analyst");
+	Exec(con, "ACL ADMIN CREATE RESOURCE GROUP g (max_sessions 5)");
+	Exec(con, "ACL ADMIN GRANT RESOURCE GROUP g TO ROLE analyst");
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 	auto store = acl::PolicyStore::Of(*db.instance);
 	if (!Check(store != nullptr, "the instance has a policy store")) {
@@ -92,28 +95,71 @@ int main(int argc, char *argv[]) {
 				Check(door.second == 1, "...nor at its door: " + std::to_string(door.second));
 			}
 		}
+		Check(besides_call.by_group.size() == 1 && besides_call.by_group[0].first == "g" &&
+		          besides_call.by_group[0].second.first == 1 && besides_call.by_group[0].second.second == 5,
+		      "...nor in its resource group's");
 		auto besides_durable = store->SessionTallyBesides(OpsId(*store, durable));
 		Check(besides_durable.live == 2,
 		      "a connection-long session is somebody connected, whoever asks: " + std::to_string(besides_durable.live));
 		auto report = acl::NodeLoadJson(*db.instance, *store, OpsId(*store, call));
 		Check(NumberAfter(report, "\"sessions\":{\"live\":") == 1 && NumberAfter(report, "\"flight\":") == 1,
 		      "the load report agrees: " + report);
-		store->SessionClose(call);
 		store->SessionClose(durable);
+		auto alone = store->SessionTallyBesides(OpsId(*store, call));
+		Check(alone.live == 0 && alone.by_group.empty(), "a group whose only session is the call's own is not listed");
+		Check(store->SessionTallyBesides(std::string()).by_group.size() == 1, "...and is, when nothing is left out");
+		store->SessionClose(call);
 	});
 
 	Scenario("a call's session that ends while the report is read is in no count", [&] {
-		// the race of the drain e2e: the report is asked for by the call whose session closes meanwhile. Read at
-		// several looks it was off a few times in a thousand here, so 20000 rounds fail it every run
-		const idx_t rounds = 20000;
+		// the race of the drain e2e: the report is asked for by the call whose session closes meanwhile. One closer
+		// thread, released per round, waits a different while each round, so the close sweeps across the report's
+		// looks (a thread per round lands where its start takes it; read at several looks, the old report was off in
+		// a few hundred of these rounds)
+		const idx_t rounds = 2000;
+		std::atomic<idx_t> go {0}, done {0};
+		std::atomic<int> delay {0};
+		std::atomic<bool> stop {false};
+		std::string target;
+		std::thread closer([&]() {
+			for (idx_t seen = 0;;) {
+				idx_t round;
+				while ((round = go.load(std::memory_order_acquire)) == seen) {
+					if (stop.load(std::memory_order_acquire)) {
+						return;
+					}
+				}
+				seen = round;
+				for (volatile int spin = 0; spin < delay.load(std::memory_order_relaxed); spin = spin + 1) {
+				}
+				store->SessionClose(target);
+				done.store(seen, std::memory_order_release);
+			}
+		});
+		struct Joined { // the closer is joined whatever the rounds throw
+			std::atomic<bool> &stop;
+			std::thread &closer;
+			~Joined() {
+				stop.store(true, std::memory_order_release);
+				closer.join();
+			}
+		} joined {stop, closer};
 		idx_t wrong = 0;
 		std::string example;
 		for (idx_t i = 0; i < rounds; i++) {
 			auto call = OpenCallSession(*store);
 			auto id = OpsId(*store, call);
-			std::thread closer([&]() { store->SessionClose(call); });
+			if (call.empty() || id.empty()) {
+				wrong++;
+				example = "no session opened";
+				continue;
+			}
+			target = call;
+			delay.store(static_cast<int>(i * 37 % 4000), std::memory_order_relaxed);
+			go.store(i + 1, std::memory_order_release);
 			auto report = acl::NodeLoadJson(*db.instance, *store, id);
-			closer.join();
+			while (done.load(std::memory_order_acquire) != i + 1) {
+			}
 			if (NumberAfter(report, "\"sessions\":{\"live\":") != 0 || NumberAfter(report, "\"flight\":") != 0) {
 				wrong++;
 				example = report;
