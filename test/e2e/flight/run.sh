@@ -771,6 +771,27 @@ echo "SET GLOBAL acl_audit_level = 'decisions';" >&3
 # (spec 096's node-group refusal at the door - UNAVAILABLE, the swap kept - is the platform part's: it moved to
 # hugr-node with the code, duckdb-acl spec 127)
 
+# --- spec 153: a table's DDL in an expansion - the DDL and its catalog record, two statements, which the door prepared
+# and duckdb refused - runs as text (the ad hoc path here; adbc_client.py takes the prepared and DoPut ones)
+got="$(ask "CREATE TABLE made.adhoc AS SELECT 1 AS v")"
+case "$got" in *rror*|*refused*) fail "an ad hoc CREATE TABLE in an expansion failed: $got";; esac
+got="$(ask "SELECT v FROM made.adhoc")"
+echo "$got" | grep -q "'v': \[1\]" || fail "the ad hoc CREATE TABLE did not make the table: $got"
+got="$(ask "@prepared_fields:DROP TABLE made.adhoc")"
+echo "$got" | grep -q "'fields': 0" || fail "a prepared DDL did not announce an empty dataset schema: $got"
+got="$(ask "@txnq:deadbeefdeadbeefdeadbeefdeadbeef:DROP TABLE made.adhoc")"
+echo "$got" | grep -q "unknown transaction" || fail "a DDL carried a foreign transaction id: $got"
+# a prepared DDL is decided at each execution: prepared while `drop` was held, it is refused once it is not
+got="$(ask "@prepare_out:DROP TABLE made.adhoc")"
+handle="$(echo "$got" | sed -n "s/.*'prepared': '\([0-9a-f]*\)'.*/\1/p")"
+[ -n "$handle" ] || fail "no prepared DDL handle: $got"
+server_says nodrop "SELECT acl_grant_schema('analyst', 'c', 'made', '{\"select\": true, \"create\": true}')::VARCHAR" >/dev/null
+got="$(ask "@prepared_run:$handle")"
+echo "$got" | grep -q "drop on schema \"made\" is not allowed" || fail "a prepared DDL ran with a right revoked since: $got"
+server_says drop "SELECT acl_grant_schema('analyst', 'c', 'made', '{\"select\": true, \"create\": true, \"drop\": true}')::VARCHAR" >/dev/null
+got="$(ask "DROP TABLE made.adhoc")"
+case "$got" in *rror*|*refused*) fail "an ad hoc DROP TABLE in an expansion failed: $got";; esac
+
 # --- spec 143: a live alias schema's object written in another case than its own is the same object - described,
 # and labelled as the listing names it
 echo "CREATE TABLE staging.events(kind VARCHAR, secret VARCHAR); COMMENT ON COLUMN staging.events.kind IS 'what happened';" >&3

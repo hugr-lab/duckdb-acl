@@ -132,18 +132,21 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   - **DoPut.** It is the main path for DML and DDL: one RPC, nothing left behind on the node.
     - A prepared DML or DDL is announced with an **empty dataset schema**, which JDBC reads as an update
       and executes through `DoPut`.
-  - **DDL runs as text** (spec 153). A `CREATE` (not a secret), `DROP` or `ALTER` with no parameter is not
-    prepared: the door runs it through `Query` on the session's connection, as quack and a gateway do. A
-    principal's table DDL in a schema that records its objects is the DDL and its catalog record, two
-    statements, which no prepared path takes.
-    - A prepared one keeps its text and is decided at each execution.
-    - A parameter bound to it is refused: "a DDL statement takes no parameters".
-    - `executeUpdate` of a DDL with a record answers 0.
       - JDBC's `executeQuery("INSERT …")` therefore writes the row and then throws `Statement did not
         return a result set`, as JDBC defines for a statement that is not a query. The exception does
         not mean nothing was written.
     - Flight SQL's `is_update` flag (Arrow ≥ the release carrying apache/arrow#49498) will be set too,
       once the Arrow pin carries it.
+  - **DDL runs as text** (spec 153). A `CREATE` (not of a secret, which answers a row), `DROP` or `ALTER`
+    with no placeholder is not prepared: the door runs it through `Query` on the session's connection, as
+    quack and a gateway do. A principal's table DDL in a schema that records its objects is the DDL and its
+    catalog record, two statements, which no prepared path takes.
+    - A prepared one keeps its text and is decided at each execution, on the session that executes it.
+    - A parameter bound to it is refused: "a DDL statement takes no parameters". A DDL whose text has a
+      placeholder (`AS SELECT ?`) stays prepared - in a schema that records its objects it still fails.
+    - `executeUpdate` of a DDL with a record answers 0 (its answer is the record's).
+    - Inside a client's transaction, a `ROLLBACK` does not yet take back the catalog record of a `CREATE`
+      or a `DROP` in such a schema (a follow-up of spec 151).
 - **The catalog RPCs** (spec 046): `GetCatalogs`, `GetDbSchemas`, `GetTables` (with
   `include_schema`), `GetTableTypes`, `GetPrimaryKeys` (declared virtual keys, spec 048),
   `GetImportedKeys`/`GetExportedKeys`/`GetCrossReference` (declared references, spec 022). Every one

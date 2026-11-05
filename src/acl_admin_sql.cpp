@@ -19,6 +19,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -1082,6 +1083,37 @@ bool ClientTextIsMgmt(const string &query, string &rest) {
 	// the markers alone, then `;` (an empty statement)
 	rest = heads.size() > 1 && !heads[1].empty() ? normalized.substr(heads[1][0].offset) : string();
 	return heads.size() > 1 && IsMgmtHead(heads[1]);
+}
+
+bool ClientTextIsDdl(const string &query) {
+	string rest;
+	if (ClientTextIsMgmt(query, rest)) {
+		return false;
+	}
+	try {
+		Parser parser(ParserOptions::Builtin());
+		parser.ParseQuery(rest);
+		if (parser.statements.size() != 1) {
+			return false;
+		}
+		auto &statement = *parser.statements[0];
+		if (!statement.named_param_map.empty() || statement.has_anonymous_parameters) {
+			return false;
+		}
+		switch (statement.type) {
+		case StatementType::DROP_STATEMENT:
+		case StatementType::ALTER_STATEMENT:
+			return true;
+		case StatementType::CREATE_STATEMENT: {
+			auto &info = statement.Cast<CreateStatement>().info;
+			return info && info->type != CatalogType::SECRET_ENTRY;
+		}
+		default:
+			return false;
+		}
+	} catch (std::exception &) {
+		return false; // not ours to judge: the prepared path refuses it in duckdb's words
+	}
 }
 
 //===--------------------------------------------------------------------===//

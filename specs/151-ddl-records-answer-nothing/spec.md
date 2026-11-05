@@ -114,8 +114,8 @@ The reviews found three more problems on the same path, all older than this spec
 ## Testing
 
 - `test/sql/acl_ddl_records.test`:
-  - every DDL that writes a record answers no row: `CREATE TABLE`, `… AS`, `CREATE VIEW`, `ALTER TABLE|VIEW … RENAME`,
-    `DROP VIEW|TABLE` and a `VIRTUAL ONLY` register. Each record is written;
+  - every DDL that writes a record answers no row: `CREATE TABLE`, `… AS`, `CREATE VIEW`,
+    `ALTER TABLE|VIEW … RENAME`, `DROP VIEW|TABLE` and a `VIRTUAL ONLY` register. Each record is written;
   - a principal's own `PRAGMA acl_register_created` is refused;
   - `EXPLAIN [ANALYZE]` of a recorded `CREATE VIEW`, `CREATE TABLE [AS]` and `DROP` is refused and makes nothing:
     `orders` is still listed after the refused `EXPLAIN DROP`. The file failed on `EXPLAIN CREATE VIEW` before the
@@ -172,9 +172,10 @@ The reviews found three more problems on the same path, all older than this spec
   reports it (`expansion_stale`).
 - **A `CREATE TABLE … AS` with a record** answers `Success`, not the native `Count`. Before this spec it answered the
   record's `true`.
-- **`DROP` and `CREATE OR REPLACE` of a physical table with no record**, in an expansion and with `drop` held, destroy
-  a table the expansion does not show. That is how they behaved before (`DROP TABLE IF EXISTS` of an unrecorded table
-  is tested in test_acl_session_use.cpp). Whether `drop` on an expansion covers such tables is the owner's decision.
+- **`DROP` and `CREATE OR REPLACE` of a physical table with no record**, in an expansion and with `drop` held, act on a
+  table the expansion does not show. Decided by the owner, 2026-11-05: with `drop` on an expansion schema or catalog,
+  the drop is physical. It stays as it was (`DROP TABLE IF EXISTS` of an unrecorded table is tested in
+  test_acl_session_use.cpp).
 - **The binder's "Did you mean"**: a principal's `DROP TABLE vs.nothing` answers `Did you mean
   "aclcat.acl.function_grants"?`. duckdb's suggestion names objects of other catalogs, the policy store's included.
   This is older than this spec, and the next spec takes it.

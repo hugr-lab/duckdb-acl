@@ -79,7 +79,7 @@ ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
 ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage2 AS memory.staging2;
 ACL ADMIN GRANT SCHEMA c.stage2 TO ROLE analyst WITH (select, insert, create);
--- kept empty outside adbc_client.py's create + drop: run.sh asserts GetDbSchemas exactly, and lists no empty expansion
+-- empty outside the DDL checks (after run.sh's GetDbSchemas, adbc_client.py): GetDbSchemas lists no empty expansion
 ACL ADMIN CREATE VIRTUAL SCHEMA c.made FROM memory.made_home;
 ACL ADMIN GRANT SCHEMA c.made TO ROLE analyst WITH (select, create, drop);
 SET GLOBAL acl_allow_anonymous_admin=false;

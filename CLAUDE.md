@@ -769,15 +769,20 @@ the SELECT. Found by its reviews, fixed: `EXPLAIN` of a statement with a record 
 `EXPLAIN CREATE VIEW` made the view); `CREATE TABLE IF NOT EXISTS` with no record turns ERROR_ON_CONFLICT (it adopted a
 physical table the expansion did not show); what a record probes inside a client's transaction is probed again at
 commit (`RefreshAtCommit` -> `CatalogRefreshSchema`; a rename queues its new name); `ACL INGEST` creates only where no
-record is kept. A one-query DDL + record (MultiStatement) was tried and dropped - the spec says why. Next: a record follows the client's ROLLBACK (only a rename does), and the
-binder's "Did you mean" in a principal's DROP. Tests `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
-**Spec 153 — a client's DDL over Flight runs as text**: `RunsAsText` (past the client's markers, ONE CREATE - not a
-SECRET -, DROP or ALTER, no parameter) -> `RunAsText`: `Connection::Query` on the session's connection under its lock
-and guards (the parse decides it, as on a gateway: one audit event, one note, one lineage run), the answer the last
-result. A reservation `text_command` (no `stmt`): ad hoc GetFlightInfo runs it, DoPut update runs it (counts summed -
-0 for a DDL with a record), a prepared one keeps its text and is decided at each execution, a bound parameter refused.
-So a table's CREATE / DROP / RENAME in an expansion (DDL + record = two statements, which Prepare refused) works over
-Flight. e2e `test/e2e/flight/adbc_client.py` (expansion `c.made`).
+record is kept. A one-query DDL + record (MultiStatement) was tried and dropped - the spec says why. With `drop` on an
+expansion the drop is physical, an unrecorded table included (the owner, 2026-11-05). Next: a record follows the
+client's ROLLBACK (only a rename does), and the binder's "Did you mean" in a principal's DROP. Tests
+`acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
+
+**Spec 153 — a client's DDL over Flight runs as text**: `acl::ClientTextIsDdl` (acl_admin_sql, beside
+`ClientTextIsMgmt`: past the client's markers, ONE CREATE - not a SECRET, which answers a row -, DROP or ALTER, no
+placeholder) -> `RunDdlText`: `Connection::Query` on the session's connection under its lock and guards (the parse
+decides it once, as on a gateway). A reservation `ddl_text` (no `stmt`): ad hoc GetFlightInfo runs it
+(`DdlTicketInfo`), DoPut update runs it (0 for a DDL with a record), a prepared one keeps its text and is decided at
+each execution on the CALLING session (`RunPreparedDdl`: `ConnFor(caller)`, the old answer reset first), a bound
+parameter refused; `FindReservation` skips a single-use ticket. So a table's CREATE / DROP / RENAME in an expansion
+(DDL + record = two statements, which Prepare refused) works over Flight. Tests `test_acl_client_mgmt.cpp`, e2e
+run.sh + adbc_client.py (expansion `c.made`).
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a

@@ -111,6 +111,38 @@ int main(int argc, char *argv[]) {
 				    Check(got == entry.second, entry.first + " -> " + got);
 			    }
 		    });
+		Scenario("a client's DDL runs as text over Flight, the rest stays prepared (spec 153)", [&] {
+			std::vector<std::string> ddl = {
+			    "CREATE TABLE t AS SELECT 1",
+			    "DROP TABLE t",
+			    "ALTER TABLE t RENAME TO u",
+			    "CREATE VIEW v AS SELECT 1",
+			    "TRACE 'x' CREATE TABLE t (a INT)",
+			    "ACL NATIVE DROP TABLE t",
+			    "DROP SECRET s",
+			    "CREATE" + nbsp + "TABLE t (a INT)",
+			    "/* lead */ CREATE TABLE t (a INT);",
+			};
+			for (auto &text : ddl) {
+				Check(duckdb::acl::ClientTextIsDdl(text), "DDL: " + text);
+			}
+			std::vector<std::string> prepared = {
+			    "CREATE SECRET s (TYPE http)",      // answers a row
+			    "CREATE TABLE t AS SELECT $1",      // a parameter
+			    "CREATE TABLE t AS SELECT ?",       //
+			    "CREATE TABLE t (a INT); SELECT 1", // two statements
+			    "CREATE ROLE r",                    // management
+			    "ACL CREATE VIRTUAL CATALOG c",     //
+			    "SELECT 1",                         // a query
+			    "INSERT INTO t VALUES (1)",         // DML
+			    "SET TimeZone = 'UTC'",             // a setting
+			    "CREATE TABLE (",                   // what the plain parser cannot read
+			};
+			for (auto &text : prepared) {
+				Check(!duckdb::acl::ClientTextIsDdl(text), "not DDL: " + text);
+			}
+		});
+
 		Scenario("the rest past the markers is what the door's other checks read", [&] {
 			std::string rest;
 			Check(!duckdb::acl::ClientTextIsMgmt("TRACE 'x' SELECT platform.create_role('z')", rest) &&
