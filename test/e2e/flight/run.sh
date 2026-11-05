@@ -788,7 +788,7 @@ handle="$(echo "$got" | sed -n "s/.*'prepared': '\([0-9a-f]*\)'.*/\1/p")"
 server_says nodrop "SELECT acl_grant_schema('analyst', 'c', 'made', '{\"select\": true, \"create\": true}')::VARCHAR" >/dev/null
 got="$(ask "@prepared_run:$handle")"
 echo "$got" | grep -q "drop on schema \"made\" is not allowed" || fail "a prepared DDL ran with a right revoked since: $got"
-server_says drop "SELECT acl_grant_schema('analyst', 'c', 'made', '{\"select\": true, \"create\": true, \"drop\": true}')::VARCHAR" >/dev/null
+server_says regrant "SELECT acl_grant_schema('analyst', 'c', 'made', '{\"select\": true, \"create\": true, \"drop\": true}')::VARCHAR" >/dev/null
 got="$(ask "DROP TABLE made.adhoc")"
 case "$got" in *rror*|*refused*) fail "an ad hoc DROP TABLE in an expansion failed: $got";; esac
 

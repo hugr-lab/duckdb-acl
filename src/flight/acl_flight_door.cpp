@@ -1956,7 +1956,9 @@ public:
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
 			    if (reservation->ddl_text) {
+				    // spec 153: nothing to bind, and a DDL's reservation is never written
 				    ARROW_RETURN_NOT_OK(RefuseDdlParameters(rows));
+				    return true;
 			    }
 			    auto execution = state->LockForStatement(*reservation->conn);
 			    reservation->parameter_rows = std::move(rows);
@@ -1979,14 +1981,19 @@ public:
 			    if (!reservation) {
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
+			    if (reservation->ddl_text) {
+				    // spec 153: the DDL runs now, decided now, on the calling session, and answers through a
+				    // single-use ticket of its own: the handle's reservation holds the text alone and is never written
+				    auto conn = state->ConnFor(handle);
+				    string traceparent;
+				    ARROW_ASSIGN_OR_RAISE(auto prefixed,
+				                          Composed(context, handle, *conn, reservation->query, traceparent));
+				    return DdlTicketInfo(handle, owner, conn, reservation->query, prefixed, traceparent, string(),
+				                         descriptor);
+			    }
 			    std::shared_ptr<arrow::Schema> dataset_schema;
 			    std::shared_ptr<arrow::Schema> parameter_schema;
-			    if (reservation->ddl_text) {
-				    // spec 153: the DDL runs now, decided now, on the calling session; its DoGet answers what it kept
-				    ARROW_ASSIGN_OR_RAISE(auto answered, RunPreparedDdl(context, handle, *reservation));
-				    ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(answered->GetTypes(), answered->GetNames()));
-				    reservation->executed = std::move(answered);
-			    } else {
+			    {
 				    auto execution = state->LockForStatement(*reservation->conn);
 				    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
 				    auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
@@ -2028,8 +2035,23 @@ public:
 			    if (!reservation) {
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
-			    if (reservation->ddl_text && !reservation->executed) {
-				    reservation->conn = state->ConnFor(caller); // spec 153: it runs where it is decided
+			    if (reservation->ddl_text) {
+				    // spec 153: a DoGet no GetFlightInfo preceded runs the DDL now, on the calling session, through a
+				    // single-use reservation of its own - the handle's is never written
+				    auto once = make_shared_ptr<FlightDoorState::Reservation>();
+				    once->conn = state->ConnFor(caller);
+				    once->query = reservation->query;
+				    once->ddl_text = true;
+				    once->owner = owner;
+				    once->single_use = true;
+				    string traceparent;
+				    ARROW_ASSIGN_OR_RAISE(auto prefixed,
+				                          Composed(context, caller, *once->conn, once->query, traceparent));
+				    auto execution = state->LockForStatement(*once->conn);
+				    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*once->conn, once->query));
+				    ARROW_ASSIGN_OR_RAISE(once->executed, RunDdlText(caller, *once->conn, prefixed, traceparent));
+				    vector<Value> values;
+				    return StreamStatement(context, std::move(once), values, caller);
 			    }
 			    auto execution = state->LockForStatement(*reservation->conn);
 			    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
@@ -2063,7 +2085,8 @@ public:
 			    if (reservation->ddl_text) {
 				    // spec 153: the DDL runs once, decided now, on the calling session - no parameter row to run it per
 				    ARROW_RETURN_NOT_OK(RefuseDdlParameters(rows));
-				    ARROW_ASSIGN_OR_RAISE(auto answered, RunPreparedDdl(context, caller, *reservation));
+				    auto conn = state->ConnFor(caller);
+				    ARROW_ASSIGN_OR_RAISE(auto answered, RunPreparedDdl(context, caller, *conn, reservation->query));
 				    return CountOf(*answered);
 			    }
 			    auto execution = state->LockForStatement(*reservation->conn);
@@ -2313,18 +2336,14 @@ public:
 	}
 
 	//! spec 153: a prepared DDL at an execution - on the CALLING session and its connection (a handle is the
-	//! principal's, and another session of it - a cookie-less client's next call - may run it), decided now. A failure
-	//! leaves nothing kept for a DoGet to answer
+	//! principal's, and another session of it - a cookie-less client's next call - may run it), decided now
 	arrow::Result<unique_ptr<QueryResult>> RunPreparedDdl(const flight::ServerCallContext &context,
-	                                                      const string &caller,
-	                                                      FlightDoorState::Reservation &reservation) {
-		reservation.executed.reset();
-		reservation.conn = state->ConnFor(caller);
-		auto &conn = *reservation.conn;
+	                                                      const string &caller, FlightDoorState::SessionConn &conn,
+	                                                      const string &query) {
 		string traceparent;
-		ARROW_ASSIGN_OR_RAISE(auto prefixed, Composed(context, caller, conn, reservation.query, traceparent));
+		ARROW_ASSIGN_OR_RAISE(auto prefixed, Composed(context, caller, conn, query, traceparent));
 		auto execution = state->LockForStatement(conn);
-		ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(conn, reservation.query));
+		ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(conn, query));
 		return RunDdlText(caller, conn, prefixed, traceparent);
 	}
 
@@ -2506,14 +2525,6 @@ public:
 		bool retained = false;
 		if (reservation->executed) {
 			result = std::move(reservation->executed); // spec 111: it ran at GetFlightInfo
-			retained = true;
-		} else if (reservation->ddl_text) {
-			// spec 153: a prepared DDL's DoGet that no GetFlightInfo ran - it runs now; DoGetPreparedStatement holds
-			// `exec` of the reservation's connection, the caller's own
-			string traceparent;
-			ARROW_ASSIGN_OR_RAISE(auto prefixed,
-			                      Composed(context, handle, *reservation->conn, reservation->query, traceparent));
-			ARROW_ASSIGN_OR_RAISE(result, RunDdlText(handle, *reservation->conn, prefixed, traceparent));
 			retained = true;
 		} else {
 			auto &stmt = *reservation->stmt;

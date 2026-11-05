@@ -51,10 +51,13 @@ client's DDL the same way: as text, through `Query`, on the session's connection
   - It runs on the session that executes it: `ConnFor(caller)`. A handle belongs to the principal, and another session
     of it may run it, such as a cookie-less client's next call. The prefix and the connection are therefore always
     one session's.
-  - A failed run leaves nothing kept for a DoGet to answer.
+  - The handle's reservation holds the text alone and is never written after its creation. Concurrent calls on one
+    handle (two per-call sessions) share nothing to race on. A `GetFlightInfo` answers through a single-use ticket of
+    its own, as the ad hoc path does; a DoGet with no `GetFlightInfo` before it streams through a reservation of its
+    own.
   - Binding parameters to it is refused: "a DDL statement takes no parameters".
-- **A single-use ticket is no prepared handle**: `FindReservation` skips it. Before this spec the same rule held for
-  every ticket's statement; a DDL ticket would now run again.
+- **A single-use ticket is no prepared handle**: `FindReservation` skips it. Before this spec it accepted a ticket's
+  id as a handle; a DDL ticket would now run again through it.
 
 ## Enforcement & security
 
@@ -87,8 +90,9 @@ client's DDL the same way: as text, through `Query`, on the session's connection
   - `DROP TABLE` through `execute_update` answers 0 and takes the record with it;
   - a prepared `CREATE TABLE … AS` through `execute_update`;
   - a DDL with a bound parameter refused;
-  - a `CREATE TABLE` committed inside a manual-commit transaction.
-- Before the change, each DDL check failed with "Cannot prepare multiple statements at once!".
+  - a `CREATE TABLE` accepted inside a manual-commit transaction, and committed.
+- Before the change, each DDL check that runs a DDL failed with "Cannot prepare multiple statements at once!"; the
+  transaction-id refusal held before too (it is checked ahead of the Prepare), and is kept on the new path.
 - The rest of `make test-flight` passes unchanged: tls, certificate_reload, auth, ca_bundle, drain, stream, admin.
 
 ## Alternatives considered
