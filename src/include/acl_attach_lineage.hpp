@@ -73,7 +73,9 @@ inline vector<AttachLineageSegment> SplitAttachLineage(const string &text, bool 
 		segment.offset = start;
 		if (marked(tokens)) {
 			auto &word = tokens[tokens.size() - 2];
+			// trimmed once, here: the parse judges, the call declares and the hook reads back one value
 			segment.identity = StringUtil::Replace(last.text.substr(1, last.text.size() - 2), "''", "'");
+			StringUtil::Trim(segment.identity);
 			segment.marked = true;
 			segment.text = text.substr(start, word.offset - start);
 			segment.original = text.substr(start, end - start);

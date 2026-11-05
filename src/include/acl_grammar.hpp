@@ -103,8 +103,9 @@ struct HeadToken {
 //! A batch's statements, as duckdb's tokenizer ends them (`;` outside a literal or a comment), each by its first
 //! `count` tokens - what decides whose statement it is (the management grammar's or duckdb's) - and, past them, its
 //! last `tail` (what ends it: `ATTACH … LINEAGE '<x>'`; a token's `index` says where a gap is). Never throws: a text
-//! that ends inside a block comment or a string has the heads before it, and its own reader refuses it; `open`, when
-//! given, says whether it does (a comment never becomes a token, so no head shows one)
+//! that ends inside a block comment has the heads before it, one ending inside a string or a quoted name has that
+//! token last (`unterminated`), and its own reader refuses either; `open`, when given, says whether it does (a
+//! comment never becomes a token, so no head shows one)
 vector<vector<HeadToken>> ReadStatementHeads(const string &text, idx_t count, bool *open = nullptr, idx_t tail = 0);
 
 //! The grammars the override compiles, one per set of the caller's grammar extensions

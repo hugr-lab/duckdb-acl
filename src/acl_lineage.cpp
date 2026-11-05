@@ -200,6 +200,17 @@ bool LineageIdentityClean(const string &identity) {
 	return identity[scheme + 3] != '/';
 }
 
+string LineageIdentityRefusal(const string &identity) {
+	if (identity.find("://") == string::npos) {
+		return "the identity is a source's address, <scheme>://<host:port>[/<database>] (OpenLineage's naming)";
+	}
+	if (!LineageIdentityClean(identity)) {
+		return "the identity names a source, never a credential: <scheme>://<host[:port]>[/<path>], with no "
+		       "user:password@, ?, #, %, \\ or spaces";
+	}
+	return string();
+}
+
 bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const string &schema, const string &name,
                           string &out_ns, string &out_name, const string &declared) {
 	auto attached = DatabaseManager::Get(db).GetDatabase(Identifier(catalog));
@@ -773,15 +784,9 @@ void LineageSourceFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		auto identity_value = args.data[1].GetValue(row);
 		string identity = identity_value.IsNull() ? string() : identity_value.ToString();
 		StringUtil::Trim(identity);
-		if (!identity.empty()) {
-			if (identity.find("://") == string::npos) {
-				throw InvalidInputException("acl_lineage_source: the identity is a source's address, "
-				                            "<scheme>://<host:port>[/<database>] (OpenLineage's naming)");
-			}
-			if (!LineageIdentityClean(identity)) {
-				throw InvalidInputException("acl_lineage_source: the identity names a source, never a credential - "
-				                            "no user:password@ in it");
-			}
+		auto refusal = identity.empty() ? string() : LineageIdentityRefusal(identity);
+		if (!refusal.empty()) {
+			throw InvalidInputException("acl_lineage_source: %s", refusal);
 		}
 		{
 			lock_guard<mutex> guard(store->lineage_sources_lock);

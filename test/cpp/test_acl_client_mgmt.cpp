@@ -3,12 +3,14 @@
 // GetFlightInfo) reads a client's text as the override does behind the door's prefix - duckdb's normalized text, the
 // markers a client writes itself (TRACE / PARENT / LINEAGE parts, a value '…' or "…"), its `ACL` marker, comments
 // gone - and hands the door's other checks the text past them. A statement the override compiles as management that the
-// door missed ran only at DoGet, and a client that never fetched lost the write. Build + run via `GEN=ninja make
-// test-cpp`.
+// door missed ran only at DoGet, and a client that never fetched lost the write. Also the batch of an
+// `ATTACH … LINEAGE` (3g-2c) where a sqllogictest cannot write it - a `--` comment ended by a carriage return. Build +
+// run via `GEN=ninja make test-cpp`.
 
 #include "acl_test_util.hpp"
 
 #include "acl_admin_sql.hpp"
+#include "acl_attach_lineage.hpp"
 #include "acl_parser_override.hpp"
 
 using namespace acl_test;
@@ -119,6 +121,25 @@ int main(int argc, char *argv[]) {
 			      "a native statement behind the markers: " + rest);
 			Check(!duckdb::acl::ClientTextIsMgmt("USE SCHEMA s", rest) && rest == "USE SCHEMA s",
 			      "no marker: the text itself: " + rest);
+		});
+		Scenario("ATTACH … LINEAGE: a `--` comment ends at a carriage return, as duckdb's tokenizer ends it", [&] {
+			bool found = false;
+			// the splitter ran the comment on to a line feed: the ATTACH behind it was none, the SELECT after it
+			// dropped
+			auto behind =
+			    duckdb::acl::SplitAttachLineage("SELECT 1; -- c\rATTACH ':memory:' AS m LINEAGE 'pg://m:1'", found);
+			Check(found && behind.size() == 2 && behind[1].marked && behind[1].identity == "pg://m:1" &&
+			          behind[1].text == "ATTACH ':memory:' AS m ",
+			      "an ATTACH after a comment ended by \\r is marked");
+			auto after =
+			    duckdb::acl::SplitAttachLineage("ATTACH ':memory:' AS m LINEAGE 'pg://m:1' -- c\r; SELECT 42", found);
+			Check(found && after.size() == 2 && after[0].marked && after[1].text == "SELECT 42",
+			      "the statement after a comment ended by \\r is kept");
+			auto padded = duckdb::acl::SplitAttachLineage("ATTACH ':memory:' AS m LINEAGE ' pg://m:1 '", found);
+			Check(found && padded.size() == 1 && padded[0].identity == "pg://m:1",
+			      "the identity is read trimmed: '" + (padded.empty() ? std::string() : padded[0].identity) + "'");
+			Check(duckdb::acl::AttachLineageIdentity("ATTACH ':memory:' AS m LINEAGE ' pg://m:1 '") == "pg://m:1",
+			      "...and read back the same by the hook");
 		});
 	});
 }

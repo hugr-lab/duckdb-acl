@@ -380,13 +380,16 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       a block comment is the native parser's, which refuses it, and one ending inside a literal or a name is split as
       read, its own parse refusing it - nothing of the batch runs either way (the splitter ran what came before an
       open comment). A statement's text no longer carries the comments around it (a view's SQL is re-rendered, a
-      note's hash is its own `query`). Review fixes: the identity is judged at parse as `acl_lineage_source` judges it
-      (an address, `LineageIdentityClean`), so a refused one attaches nothing (the ATTACH used to run first); the call
-      is built as an AST (`MakeAdminCall`), never SQL text; a statement parsed on its own reports its error where it
-      is in the batch (`ParseSegment`); and under a dialect or CONNECT the sugar is off (the connection owner's grammar
-      reads the text by its own tokenizer - as a prefix there is refused, nothing of ours is added to it). Known: a
-      native `ATTACH DATABASE lineage '<path>'` (a typed literal of a user type `lineage`) reads as the marker, as it
-      did.
+      note's hash is its own `query`). Review fixes: the identity, read trimmed once (the parse,
+      the call and the hook read one value), is judged at parse as `acl_lineage_source` judges it
+      (`LineageIdentityRefusal`, one judgment for both), so a refused one attaches nothing (the ATTACH used to run
+      first); the call is built as an AST (`MakeAdminCall`, declared in acl_admin_sql.hpp), never SQL text; a statement
+      parsed on its own reports its error where it is in the batch (`ParseSegment`: `position` and `location`; under
+      `ACL NATIVE` drawn against the rest); and under a dialect or CONNECT the sugar is off, the runtime's reader too
+      (the connection owner's grammar reads the text by its own tokenizer - as a prefix there is refused, nothing of
+      ours is added to it). Known: a native `ATTACH DATABASE lineage '<path>'` (a typed literal of a user type
+      `lineage`) reads as the marker, as it did; a grammar extension's rule that reads a `;` splits otherwise than
+      the statements here (refused, nothing runs - the connection owner's grammar on an operator's path).
   - 3g-3: a linked module registers rules (`RegisterMgmtGrammar` becomes rules - hugr-node's CLUSTER forms),
     `AdminScanner` and the compiler go, hugr-node re-pins.
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the

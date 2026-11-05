@@ -57,6 +57,8 @@ bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const str
 AuditLineageField LineageFieldOf(const string &name, const LogicalType &type);
 //! An identity has no userinfo (`user:pass@`): it is a name, never a credential.
 bool LineageIdentityClean(const string &identity);
+//! Why an identity cannot name a source ('' = it can) - acl_lineage_source's judgment and ATTACH … LINEAGE's alike
+string LineageIdentityRefusal(const string &identity);
 
 //! The client's lineage context of one statement: the job and the external run it is a step of.
 struct LineageContext {

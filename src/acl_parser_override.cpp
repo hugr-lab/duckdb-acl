@@ -1,6 +1,5 @@
 #include "acl_parser_override.hpp"
 
-#include "acl_admin_scanner.hpp"
 #include "acl_admin_sql.hpp"
 #include "acl_platform.hpp"
 #include "acl_attach_lineage.hpp"
@@ -12,6 +11,7 @@
 #include "acl_scan_util.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/query_location.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -187,7 +187,18 @@ void ParseSegment(Parser &parser, const AttachLineageSegment &segment) {
 		    !TryCast::Operation(string_t(entry->second), at, false)) {
 			throw;
 		}
-		extra_info["position"] = to_string(at + segment.offset);
+		// `location` is `[start,length]`: the length is kept, the start moves with `position`
+		idx_t length = 0;
+		auto location = extra_info.find("location");
+		if (location != extra_info.end()) {
+			auto &range = location->second;
+			auto comma = range.find(',');
+			if (comma == string::npos || range.size() < comma + 2 ||
+			    !TryCast::Operation(string_t(range.substr(comma + 1, range.size() - comma - 2)), length, false)) {
+				length = 0;
+			}
+		}
+		Exception::SetQueryLocation(QueryLocation(at + segment.offset, length), extra_info);
 		throw ParserException(extra_info, error.RawMessage());
 	}
 }
@@ -232,18 +243,12 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 			throw ParserException("ATTACH … LINEAGE names the source it describes: write AS <alias>");
 		}
 		// judged as acl_lineage_source judges it, before the ATTACH runs: a refused identity attaches nothing
-		auto identity = segment.identity;
-		StringUtil::Trim(identity);
-		if (identity.empty()) {
+		if (segment.identity.empty()) {
 			throw ParserException("ATTACH … LINEAGE: the identity is empty - leave LINEAGE out instead");
 		}
-		if (identity.find("://") == string::npos) {
-			throw ParserException("ATTACH … LINEAGE: the identity is a source's address, "
-			                      "<scheme>://<host:port>[/<database>] (OpenLineage's naming)");
-		}
-		if (!LineageIdentityClean(identity)) {
-			throw ParserException("ATTACH … LINEAGE: the identity names a source, never a credential - "
-			                      "no user:password@ in it");
+		auto refusal = LineageIdentityRefusal(segment.identity);
+		if (!refusal.empty()) {
+			throw ParserException("ATTACH … LINEAGE: %s", refusal);
 		}
 		// the ATTACH keeps its text as written: the lineage hook reads the identity back from it, so the
 		// ATTACH's own NAMESPACE event already names the source as itself
@@ -869,7 +874,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	vector<unique_ptr<SQLStatement>> statements;
 	bool attach_lineage = false;
 	if (mode == AclPrefix::Mode::NATIVE) {
-		ParseOfRest(nullptr, ErrorsAsJson(options),
+		ParseOfRest(&prefix.rest, ErrorsAsJson(options),
 		            [&]() { attach_lineage = ParseAttachLineage(prefix.rest, inner, statements); });
 	}
 	if (!attach_lineage) {
