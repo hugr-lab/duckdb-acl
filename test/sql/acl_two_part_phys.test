@@ -123,7 +123,7 @@ ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_name = '
 query TTTT
 SELECT object, problem, detail, repair FROM acl_check_catalog('c') WHERE problem = 'phys_incomplete';
 ----
-old	phys_incomplete	the physical name "src.t3" has two parts: it is read, but the listings join an object to its source by three, so it is not listed - it binds to "src.main.t3"	ALTER VIRTUAL TABLE c.old SET PHYS src.main.t3
+old	phys_incomplete	the physical name "src.t3" has two parts: it is read, but the listings join an object to its source by three, so it is not listed - it binds to "src.main.t3"	ALTER VIRTUAL TABLE c."old" SET PHYS src.main.t3
 
 # the check rewrote nothing
 query T
@@ -132,7 +132,7 @@ SELECT phys FROM store.acl.relations WHERE vname = 'old';
 src.t3
 
 statement ok
-ACL ADMIN ALTER VIRTUAL TABLE c.old SET PHYS src.main.t3;
+ACL ADMIN ALTER VIRTUAL TABLE c."old" SET PHYS src.main.t3;
 
 query T
 ACL ROLE "r" SELECT table_name FROM information_schema.tables WHERE table_name = 'old';

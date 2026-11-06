@@ -389,7 +389,7 @@ function	skus	NULL	definition_broken	acl_alter_function('c', 'skus', 'table', 'm
 function	twice	NULL	definition_broken	acl_alter_function('c', 'twice', 'scalar', 'alias', '<target>')
 reference	cust_items	NULL	reference_dangling	DROP VIRTUAL REFERENCE c.cust_items
 schema	ext	NULL	expansion_stale	ALTER VIRTUAL SCHEMA c.ext REFRESH
-schema	old	NULL	schema_missing	ALTER VIRTUAL SCHEMA c.old SET PHYS <path>  -- or DROP VIRTUAL SCHEMA c.old
+schema	old	NULL	schema_missing	ALTER VIRTUAL SCHEMA c."old" SET PHYS <path>  -- or DROP VIRTUAL SCHEMA c."old"
 table	customers	NULL	source_missing	ALTER VIRTUAL TABLE c.customers SET PHYS <path>  -- or DROP VIRTUAL TABLE c.customers
 view	secrets	NULL	definition_broken	CREATE OR REPLACE VIRTUAL VIEW c.secrets AS '<sql>'
 view	stock	NULL	schema_stale	ANALYZE VIRTUAL VIEW c.stock

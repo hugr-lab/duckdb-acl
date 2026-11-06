@@ -66,6 +66,10 @@ bool PlainColumnName(const string &text) {
 	// spec 150 4a: duckdb's own reading - one column reference of one part (a bare word in any script, a quoted name),
 	// never a constant (NULL, TRUE), a keyword or anything computed
 	try {
+		// one token: `(b)` reads as the column b too, but it is written as an expression
+		if (Parser::Tokenize(text).size() != 1) {
+			return false;
+		}
 		auto list = Parser(ParserOptions::Builtin()).ParseExpressionList(text);
 		return list.size() == 1 && list[0]->GetExpressionType() == ExpressionType::COLUMN_REF &&
 		       list[0]->Cast<ColumnRefExpression>().ColumnNames().size() == 1;

@@ -440,23 +440,27 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
 **Stage 4 - policy texts read by rules where they are written, one family per PR** (the owner's decisions of
 2026-11-06 in Decided below):
 
-- 4a (built): a bare word is Unicode letters (with their combining marks), decimal digits and `_` - one predicate,
-  `WhyNoWord` / `IsWordText` (acl_word.hpp, utf8proc's categories L*, Mn, Mc, Nd) for the rules' matcher, a name
-  offered back to paste (`NamePath::ToGrammar`: `кат.заказы` bare) and the refusal: `CREATE ROLE größe`, `CREATE
-  VIRTUAL CATALOG продажи`, a bare word the same key as its quoted spelling. Refused bare (taken quoted): a
-  default-ignorable character (U+202E, U+200D, U+034F, U+FE0F, the Hangul fillers - Unicode's own list of what shows
-  nothing or reorders invisibly), any format / control character, a combining mark first in a word or a dotted part,
-  a spelling not in NFC (`o` + U+0308 is not `ö` - two looks-alike names). duckdb itself turns U+00A0, U+2000-U+200B,
-  U+202F, U+205F, U+2060, U+3000 and U+FEFF outside quotes into a space before the override reads the text. The
-  refusal says what it saw as a code point (`a bare name is letters, digits and _ - U+202E is an invisible
-  character; double-quote the name`, `RefuseUnreadStatement`), never the character. Found by its reviews:
-  `REVOKE CATALOG … FROM ROLE <a name that only looks like the role's>` answered success and left the grant - a
-  revoke of nothing is refused now, as REVOKE TABLE / ADMIN were; whether a column expression is a plain rename
-  (`RenameOnlyColumns`) and a key column (`BareIdentifier`) are duckdb's parser's reading (`PlainColumnName`: one
-  column reference of one part - `x = größe` stays a writable rename; a quoted `x = "b"` stays read-only, as it was); the listings' by-name test reads
-  `\p{L}` words. Look-alikes (Cyrillic `а`, a modifier letter like `ʼ`) are different names - every rights check
-  compares names exactly, so one never reaches another's rights; security.md says what an operator should look for.
-  hugr-node's rules use the same matchers.
+- 4a (built): a NAME in a management statement - a catalog, schema, object, role, issuer, client, group, secret, a
+  path's parts - is read exactly as duckdb reads an identifier (`IdentifierMatcher`'s rule, `DuckdbIdentifier` in
+  the rules' matcher with duckdb's literal table and identifier mask): `"…"` or a backtick name quoted; bare, a word
+  that does not start with a digit, its first character one duckdb's tokenizer keeps in a word (a letter, `_`, any
+  byte past ASCII), a keyword only when duckdb lets it name a column (`user`, `schema` bare; `from`, `select`,
+  `full` quoted); after a dot any word. No check of ours on top (Decided 3): `CREATE ROLE größe`, `CREATE VIRTUAL
+  CATALOG продажи` read bare, and so does whatever duckdb itself keeps in a bare identifier (an invisible
+  character too - duckdb turns U+00A0, U+2000-U+200B, U+202F, U+205F, U+2060, U+3000 and U+FEFF outside quotes into
+  a space first). Newly refused bare, as duckdb refuses them: a reserved keyword (`CREATE ROLE "full"`) and a leading
+  digit (`ISSUER "v1.2"`, `objects."9t"`) - what is stored under such a name keeps working, only its statement
+  quotes it. A VALUE (a scope, a level, a setting's value, a capability) stays the scanner's word (`true`, `v1.0`,
+  `4GB`; a capability a word or a quoted one - `select` is a keyword). A name offered back to paste is quoted as
+  duckdb's writer quotes it (`NamePath::ToGrammar` = `KeywordHelper::RequiresQuotes`, capitals allowed: `c."old"`,
+  `"größe"`). Found by its reviews: `REVOKE CATALOG … FROM ROLE <a name that only looks like the role's>` answered
+  success and left the grant - a revoke of nothing is refused now, as REVOKE TABLE / ADMIN were; whether a column
+  expression is a plain rename (`RenameOnlyColumns`) and a key column (`BareIdentifier`) are duckdb's parser's
+  reading (`PlainColumnName`: one token, one column reference of one part - `x = größe` stays a writable rename,
+  `x = (b)` and a quoted `x = "b"` stay read-only, as they were); the listings' by-name test reads a word as duckdb
+  does (any byte past ASCII). Look-alikes (Cyrillic `а`, a modifier letter like `ʼ`, a decomposed `ö`) are different
+  names - every rights check compares names exactly, so one never reaches another's rights; security.md says what
+  an operator should look for. hugr-node's rules use the same matchers.
 - 4b: resource group limits as rules (`ResourceLimitsJson` and `TextKind::LIMITS` go).
 - 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
   ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
@@ -465,8 +469,7 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
   the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what
   the stored text reads back as. The other readers of a stored list follow (`acl_platform_list`, the lineage tags,
-  the listings' copy of `ParseFieldPath`), and `ParseFieldPath`'s bare word becomes 4a's (it takes any byte past
-  ASCII today).
+  the listings' copy of `ParseFieldPath`), and `ParseFieldPath`'s bare word is duckdb's identifier, as 4a's.
 - 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
   `ScannerUnreadable` go.
 
@@ -486,7 +489,7 @@ an inventory of `src/`, each with its verdict; the REPLACE ones are the next wor
 | `GetTableNames` output cut at ` as ` (acl_catalog_admin.cpp) | a body's table names | replace: `BodyTables` (the AST walk) |
 | `SplitProjectionItem` (lineage) | our own `expr AS "name"` | replace: carry the pairs |
 | `TextNamesPolicyStore`, `SqlNamesSource` | view / macro bodies | keep: they over-read on purpose, string literals too (`query_table('acl.admins')`) |
-| `ParseFieldPath` | `a.b`, `items[].x` | keep (duckdb has no `[]` path); its word becomes 4a's in 4e |
+| `ParseFieldPath` | `a.b`, `items[].x` | keep (duckdb has no `[]` path); its word reads as duckdb's identifier in 4e |
 | the first-word ACL check, `MayCarryAttachLineage`, `CallsFunctionNamed` | every query | keep: prefilters before the real read on tokens |
 | keys (`NamePath`), JWT, base64, URLs, `\x1f` serializations, JSON | not SQL | keep |
 
@@ -499,7 +502,9 @@ an inventory of `src/`, each with its verdict; the REPLACE ones are the next wor
    and it must split one list alike, which stage 4's tests pin.
 2. A mask with a list / struct literal (`COLUMNS (tags = ['a', 'b'])`, `{'k': 1}`) works as in duckdb (the owner,
    2026-11-06: "что бы работало так же") - by duckdb's own grammar and tokenizer, not a second hand-written one.
-3. A bare word is Unicode letters and digits only (the owner, 2026-11-06); a format character is refused bare.
+3. A name in a management statement is read exactly as duckdb reads an identifier (the owner, 2026-11-06: "Ровно
+   как duckdb") - no check of ours on top. It replaces the same day's "Unicode letters and digits only", which
+   refused what duckdb reads (a format character, a decomposed spelling) and read what duckdb refuses (`full`, `9t`).
 
 ## Enforcement & security
 

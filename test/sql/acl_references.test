@@ -100,10 +100,10 @@ ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers ON
 # --- what a role sees -------------------------------------------------------------------------------
 
 statement ok
-ACL ADMIN CREATE ROLE full;
+ACL ADMIN CREATE ROLE "full";
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE full MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE "full" MAIN;
 
 query IIIIII
 ACL ROLE "full" SELECT name, from_object, to_object, from_columns, to_columns, comment

@@ -27,9 +27,12 @@ SET GLOBAL acl_allow_anonymous_admin=true;
 
 # rebuild the policy from scratch so reruns stay deterministic (the catalog db persists). The drops
 # pass 'skip' - the DROP ... IF EXISTS mode of spec 013 - because on a fresh catalog there is nothing
-# to drop, and a plain drop reports a missing target.
-statement ok
+# to drop, and a plain drop reports a missing target. A revoke of nothing is refused (spec 150 4a), so
+# on a fresh catalog the revoke may answer that.
+statement maybe
 SELECT acl_revoke_catalog('analyst', 'mslive');
+----
+holds no grant on catalog
 
 statement ok
 SELECT acl_drop_relation('mslive', 'orders', 'skip');

@@ -71,10 +71,10 @@ statement ok
 ACL ADMIN GRANT TABLE c.vault TO ROLE r WITH (select) COLUMNS (secret);
 
 statement ok
-ACL ADMIN CREATE ROLE full;
+ACL ADMIN CREATE ROLE "full";
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE full WITH (select) MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE "full" WITH (select) MAIN;
 
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=false;

@@ -86,17 +86,17 @@ int main(int argc, char *argv[]) {
 			Check(NamePath::FromKey("c.Raw Data.select.\"a.b\"").ToSql() == "c.\"Raw Data\".\"select\".\"a.b\"",
 			      "ToSql quotes as duckdb does (a keyword too)");
 			Check(NamePath::FromKey("c.Raw Data.t_1").ToGrammar() == "c.\"Raw Data\".t_1",
-			      "ToGrammar quotes only what the grammar cannot read bare");
-			// spec 150 4a: a Unicode word is read bare; an invisible character or a decomposed spelling is not
-			Check(NamePath::FromKey("\xd0\xba\xd0\xb0\xd1\x82.gr\xc3\xb6\xc3\x9f"
-			                        "e")
-			              .ToGrammar() == "\xd0\xba\xd0\xb0\xd1\x82.gr\xc3\xb6\xc3\x9f"
-			                              "e",
-			      "ToGrammar leaves Unicode letters bare");
-			Check(NamePath::FromKey("c.admin\xcd\x8f").ToGrammar() == "c.\"admin\xcd\x8f\"",
-			      "ToGrammar quotes a part with an invisible character (U+034F)");
-			Check(NamePath::FromKey("c.go\xcc\x88").ToGrammar() == "c.\"go\xcc\x88\"",
-			      "ToGrammar quotes a decomposed spelling (o + U+0308)");
+			      "ToGrammar quotes a part with a space, leaves a plain word bare");
+			// spec 150 4a: a name is quoted as duckdb's own writer quotes it (KeywordHelper::RequiresQuotes, capitals
+			// allowed) - a keyword, a leading digit, anything outside [A-Za-z0-9_]; the grammar reads it back either
+			// way
+			Check(NamePath::FromKey("Sales.select.9t.user").ToGrammar() == "Sales.\"select\".\"9t\".\"user\"",
+			      "ToGrammar quotes a keyword and a leading digit, leaves capitals bare");
+			Check(NamePath::FromKey("c.gr\xc3\xb6\xc3\x9f"
+			                        "e.admin\xcd\x8f")
+			              .ToGrammar() == "c.\"gr\xc3\xb6\xc3\x9f"
+			                              "e\".\"admin\xcd\x8f\"",
+			      "ToGrammar quotes a part outside ASCII, an invisible character too (U+034F)");
 			Check(NamePath::Display("Raw Data") == "Raw Data" && NamePath::Display("\"q\"\"uote\"") == "q\"uote" &&
 			          NamePath::Display("\"a.b\"") == "\"a.b\"" && NamePath::Display("a.\"b.c\"") == "a.\"b.c\"",
 			      "Display: one part unquoted unless it holds a dot, a path as its key");

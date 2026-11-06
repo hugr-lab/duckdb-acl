@@ -11,10 +11,10 @@
 
 #pragma once
 
-#include "acl_word.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 
 namespace duckdb {
@@ -138,8 +138,9 @@ public:
 		string out;
 		for (idx_t i = 0; i < parts.size(); i++) {
 			auto &part = parts[i];
-			// spec 150 4a: a bare word as the rules read one - a Unicode letter needs no quotes
-			bool word = IsWordText(part);
+			// spec 150 4a: quoted where duckdb's own SQL quotes an identifier (a keyword, a character past [a-z0-9_]) -
+			// the rules read either spelling as the same name
+			bool word = !part.empty() && !KeywordHelper::RequiresQuotes(part, true);
 			out += (i ? "." : "") + (word ? part : "\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"");
 		}
 		return out;

@@ -306,9 +306,10 @@ SELECT comment FROM aclcat.acl.roles WHERE role = 'tenant_reader';
 ----
 reads one tenant
 
-# a role named like a keyword, bare or quoted; a quoted name keeps its case and its dot
+# a role named like a keyword: a reserved one quoted (as duckdb reads names, spec 150 4a), an unreserved one bare; a
+# quoted name keeps its case and its dot
 statement ok
-ACL ADMIN CREATE ROLE select; CREATE ROLE "Mixed.Case";
+ACL ADMIN CREATE ROLE "select"; CREATE ROLE "Mixed.Case";
 
 query I
 SELECT count(*) FROM aclcat.acl.roles WHERE role IN ('select', 'Mixed.Case');
@@ -419,9 +420,14 @@ SELECT count(*) FROM aclcat.acl.roles WHERE role = 'split_list';
 ----
 0
 
-# a name with a leading digit is one word, as the scanner read it - the tokenizer splits it (`9abc` is `9` `abc`)
+# a name with a leading digit is quoted, as duckdb reads a name (spec 150 4a: `9abc` bare is refused)
+statement error
+ACL ADMIN CREATE ROLE 9abc;
+----
+write CREATE [OR REPLACE] ROLE
+
 statement ok
-ACL ADMIN CREATE ROLE 9abc; CREATE ROLE 0x1F;
+ACL ADMIN CREATE ROLE "9abc"; CREATE ROLE "0x1F";
 
 query I
 SELECT role FROM aclcat.acl.roles WHERE role IN ('9abc', '0x1F') ORDER BY role;
@@ -430,7 +436,7 @@ SELECT role FROM aclcat.acl.roles WHERE role IN ('9abc', '0x1F') ORDER BY role;
 9abc
 
 statement ok
-ACL ADMIN DROP ROLE 9abc;
+ACL ADMIN DROP ROLE "9abc";
 
 # ... and a word apart is another word
 statement error
@@ -438,12 +444,13 @@ ACL ADMIN CREATE ROLE 9 abc;
 ----
 write CREATE [OR REPLACE] ROLE
 
-# a role mapping, both ways; an issuer's name of words joined by dots, `.2` too
+# a role mapping, both ways; an issuer's name with a dot and a leading digit after it is quoted (spec 150 4a: as duckdb
+# reads a name, `v1.2` bare is `v1` and the number `.2`)
 statement ok
 ACL ADMIN CREATE ISSUER "v1.2" URL 'test/idp/two';
 
 statement ok
-ACL ADMIN MAP GROUP 'g-read' FROM ISSUER v1.2 TO ROLE tenant_reader; MAP CLAIM "ops" FROM ISSUER v1 . 2 TO ROLE 0x1F;
+ACL ADMIN MAP GROUP 'g-read' FROM ISSUER "v1.2" TO ROLE tenant_reader; MAP CLAIM "ops" FROM ISSUER "v1.2" TO ROLE "0x1F";
 
 query IIIII
 SELECT scope_kind, scope_name, source, external_value, role FROM aclcat.acl.role_mappings ORDER BY role;
@@ -451,17 +458,22 @@ SELECT scope_kind, scope_name, source, external_value, role FROM aclcat.acl.role
 issuer	v1.2	claim-value	ops	0x1F
 issuer	v1.2	group	g-read	tenant_reader
 
-# a dotted name the tokenizer reads as numbers is the name as written (`v2.0.1` is `v2` `.0.1`): the mapping reaches
-# the issuer's own check, every part a word
+# a dotted name the tokenizer reads as numbers (`v2.0.1` is `v2` `.0.1`) is no name bare, as in duckdb: the form's
+# words; quoted it is the name, and reaches the issuer's own check
 statement error
 ACL ADMIN MAP GROUP 'g' FROM ISSUER v2.0.1 TO ROLE tenant_reader;
+----
+write MAP GROUP | CLAIM
+
+statement error
+ACL ADMIN MAP GROUP 'g' FROM ISSUER "v2.0.1" TO ROLE tenant_reader;
 ----
 issuer "v2.0.1" does not exist
 
 statement error
 ACL ADMIN MAP GROUP 'g' FROM ISSUER 9.x TO ROLE tenant_reader;
 ----
-issuer "9.x" does not exist
+write MAP GROUP | CLAIM
 
 statement error
 ACL ADMIN MAP GROUP 'g' FROM ISSUER a..b TO ROLE tenant_reader;
@@ -469,7 +481,7 @@ ACL ADMIN MAP GROUP 'g' FROM ISSUER a..b TO ROLE tenant_reader;
 write MAP GROUP | CLAIM
 
 statement ok
-ACL ADMIN DROP MAP GROUP 'g-read' FROM ISSUER v1.2 TO ROLE tenant_reader;
+ACL ADMIN DROP MAP GROUP 'g-read' FROM ISSUER "v1.2" TO ROLE tenant_reader;
 
 query I
 SELECT count(*) FROM aclcat.acl.role_mappings;
@@ -579,9 +591,10 @@ SELECT template FROM aclcat.acl.functions WHERE vcat = 'objects' AND vname = 'ta
 ----
 concat('tag:', acl_arg(1))
 
-# a name with a leading digit, a part the tokenizer reads as a number, spaces around a dot
+# a part with a leading digit or one the tokenizer reads as a number is quoted, as duckdb reads a name; spaces may
+# stand around a dot
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE objects.9t AS phys . main . t; ADD TABLE phys.main.t AS objects.v1.2;
+ACL ADMIN CREATE VIRTUAL TABLE objects."9t" AS phys . main . t; ADD TABLE phys.main.t AS objects.v1."2";
 
 query II
 SELECT vname, phys FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname IN ('9t', 'v1.2') ORDER BY vname;
@@ -2081,9 +2094,14 @@ ACL ADMIN SET SESSION /* c */ 'nosuch' AUDIT LEVEL all;
 ----
 false
 
-# a name the tokenizer reads as a number then a word (`1x`) is a name after FUNCTION CATEGORY
+# a name with a leading digit (`1x`) is quoted after FUNCTION CATEGORY, as duckdb reads a name (spec 150 4a)
+statement error
+ACL ADMIN CREATE FUNCTION CATEGORY 1x;
+----
+write CREATE [OR REPLACE] FUNCTION CATEGORY
+
 statement ok
-ACL ADMIN CREATE FUNCTION CATEGORY 1x; DROP FUNCTION CATEGORY 1x;
+ACL ADMIN CREATE FUNCTION CATEGORY "1x"; DROP FUNCTION CATEGORY "1x";
 
 # duckdb's own forms that open like ours stay duckdb's: a macro named category, its DROP, a table named virtual
 statement ok
@@ -2203,7 +2221,7 @@ ACL ADMIN GRANT SOURCE; KILL SESSION E'x';
 ----
 <REGEX>:.*write GRANT SOURCE <database>\[\.<schema>\] TO ROLE <role>.*
 
-# --- stage 4a: a bare word is Unicode letters and digits (the owner, 2026-11-06) ------------------------------------
+# --- stage 4a: a name is read as duckdb reads an identifier (the owner, 2026-11-06) ---------------------------------
 
 statement ok
 ACL ADMIN CREATE ROLE größe;
@@ -2226,23 +2244,21 @@ ACL ADMIN CREATE VIRTUAL CATALOG продажи;
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE продажи.заказы AS memory.main.phys_4a;
 
-# the bare word and the quoted name are one key
+# the bare word and the quoted name are one key - a dot may have space around it, as in duckdb
 statement ok
-ACL ADMIN GRANT TABLE продажи."заказы" TO ROLE größe WITH (select);
+ACL ADMIN GRANT TABLE продажи . "заказы" TO ROLE größe WITH (select);
 
 query T
 SELECT vname FROM aclcat.acl.role_object_caps WHERE vcat = 'продажи' AND role = 'größe';
 ----
 заказы
 
-# a role named in another script holds an admin scope like any other
 statement ok
 ACL ADMIN GRANT ADMIN observe TO ROLE größe;
 
 statement ok
 ACL ADMIN REVOKE ADMIN FROM ROLE größe;
 
-# a dotted name with parts in another script, the same key as quoted
 statement ok
 ACL ADMIN COMMENT ON VIRTUAL TABLE продажи.заказы IS 'orders';
 
@@ -2251,9 +2267,44 @@ SELECT comment FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname
 ----
 orders
 
-# a word the tokenizer splits at a leading digit is joined whole
+# a reserved word and a leading digit need quotes, as in duckdb; an unreserved keyword does not
+statement error
+ACL ADMIN CREATE ROLE from;
+----
+
 statement ok
+ACL ADMIN CREATE ROLE "from";
+
+statement error
 ACL ADMIN CREATE ROLE 9ö;
+----
+
+statement ok
+ACL ADMIN CREATE ROLE "9ö";
+
+statement ok
+ACL ADMIN CREATE ROLE user;
+
+# backticks quote a name, as in duckdb
+statement ok
+ACL ADMIN CREATE ROLE `back tick`;
+
+query T
+SELECT role FROM aclcat.acl.roles WHERE role IN ('from', '9ö', 'user', 'back tick') ORDER BY 1;
+----
+9ö
+back tick
+from
+user
+
+# whatever duckdb's tokenizer keeps in a word is a bare name (an invisible U+034F too) - another name than without it
+statement ok
+ACL ADMIN CREATE ROLE admin͏;
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'admin͏';
+----
+1
 
 # a revoke of nothing is refused: a name that only looks like the role's would answer success
 statement error
@@ -2261,68 +2312,37 @@ ACL ADMIN REVOKE CATALOG продажи FROM ROLE отдел2;
 ----
 <REGEX>:.*role "отдел2" holds no grant on catalog "продажи".*
 
-# a renamed column in another script stays a rename (the relation writable), and may be the key
+# a renamed column in another script stays a rename (the relation writable), and may be the key; a parenthesised one
+# is written as an expression and is not
 statement ok
-CREATE TABLE phys_4a_u(a INT, "größe" INT);
+CREATE TABLE phys_4a_u(a INT, "größe" INT, b INT);
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE продажи.u AS memory.main.phys_4a_u COLUMNS (a = a, x = größe) PRIMARY KEY (x);
 
-query T
-SELECT form FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname = 'u';
-----
-alias
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE продажи.p AS memory.main.phys_4a_u COLUMNS (a = a, y = (b));
 
-# what is no word is said for what it is, as a code point - quoted, the same text is a name
-statement error
-ACL ADMIN CREATE ROLE ab‮cd;
+query TT
+SELECT vname, form FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname IN ('u', 'p') ORDER BY 1;
 ----
-<REGEX>:.*a bare name is letters, digits and _ - U\+202E is an invisible character; double-quote the name.*
-
-statement error
-ACL ADMIN CREATE ROLE zero‍joiner;
-----
-<REGEX>:.*U\+200D is an invisible character.*
-
-statement error
-ACL ADMIN CREATE ROLE soft­hyphen;
-----
-<REGEX>:.*U\+00AD.*
-
-statement error
-ACL ADMIN CREATE ROLE admin͏;
-----
-<REGEX>:.*U\+034F is an invisible character.*
-
-statement error
-ACL ADMIN CREATE ROLE ㅤ;
-----
-<REGEX>:.*U\+3164 is an invisible character.*
-
-statement error
-ACL ADMIN CREATE ROLE admin️;
-----
-<REGEX>:.*U\+FE0F is an invisible character.*
-
-statement error
-ACL ADMIN CREATE ROLE ̈x;
-----
-<REGEX>:.*U\+0308 is a combining mark, which cannot start a name.*
-
-# o followed by U+0308 looks like ö: one spelling only, the composed one
-statement error
-ACL ADMIN CREATE ROLE grösse;
-----
-<REGEX>:.*not written in Unicode's composed form \(NFC\).*
+p	subquery
+u	alias
 
 statement ok
-ACL ADMIN CREATE ROLE "ab‮cd";
+ACL ADMIN DROP ROLE "from";
 
 statement ok
-ACL ADMIN DROP ROLE "ab‮cd";
+ACL ADMIN DROP ROLE "9ö";
 
 statement ok
-ACL ADMIN DROP ROLE 9ö;
+ACL ADMIN DROP ROLE user;
+
+statement ok
+ACL ADMIN DROP ROLE `back tick`;
+
+statement ok
+ACL ADMIN DROP ROLE admin͏;
 
 statement ok
 ACL ADMIN DROP ROLE größe;
