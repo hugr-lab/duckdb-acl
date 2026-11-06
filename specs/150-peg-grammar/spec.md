@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stages 1-3 implemented (stage 3: 3a-3g), stage 4 to come
+- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a implemented)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -92,7 +92,8 @@ quack does (the same collector), and Flight refuses a batch at Prepare. Owner, 2
    open questions below and measures the parse; the owner decides the shape.
 2. The prefix and its markers move; the scanner goes. Built (below).
 3. The management statements move, one statement family per PR; the compiled calls stay unchanged.
-4. Policy texts become rules and stored rows are emitted from trees; `ParseColumnList` / `SplitTopLevel` go.
+4. Policy texts become rules where they are written (the owner, 2026-11-06: stored rows stay the text as written,
+   see Decided); the statement's list readers on `AdminScanner` go.
 
 **Stage 1, the prototype (2026-10-23, #259)** - the role prefix as a rule taking the statement inside it, behind
 `acl_peg_prefix`, beside the scanner. Measured with the rule on by default: the whole suite and `make test-cpp` pass;
@@ -436,10 +437,33 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
   rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 
-**Open questions**
+**Stage 4 - policy texts read by rules where they are written, one family per PR** (the owner's decisions of
+2026-11-06 in Decided below):
 
-1. Stored policy rows are text by contract (read back and pasted). Either parse them with the rule at read and emit
-   the tree, or keep spec 148's check.
+- 4a (built): a bare word is Unicode letters (with their combining marks), decimal digits and `_`
+  (`IsWordText`, utf8proc's categories L*, Mn, Mc, Nd) - `CREATE ROLE größe`, `CREATE VIRTUAL CATALOG продажи`; a
+  format or control character (U+202E reverses the text around it, U+200B shows nothing) is no letter: refused bare,
+  taken quoted. A bare word is the same name as its quoted spelling. hugr-node's rules use the same matchers.
+- 4b: resource group limits as rules (`ResourceLimitsJson` and `TextKind::LIMITS` go).
+- 4c: a client's REQUIRE / ATTRIBUTES / claim map as rules (`AdminScanner` goes).
+- 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
+- 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
+  takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
+  the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what
+  the stored text reads back as.
+- 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
+  `ScannerUnreadable` go.
+
+**Decided**
+
+1. Stored policy rows are text by contract (read back and pasted). The owner, 2026-11-06: the rules read a policy
+   text where it is WRITTEN (the statement's lists, the function forms' text arguments); the stored row stays the
+   text as written - no parse at read, no row emitted from a tree - and spec 148's check stays. So the read side keeps
+   reading the stored text (`ParseColumnList`) - split on duckdb's tokens since 4e (decision 2); a write-side rule
+   and it must split one list alike, which stage 4's tests pin.
+2. A mask with a list / struct literal (`COLUMNS (tags = ['a', 'b'])`, `{'k': 1}`) works as in duckdb (the owner,
+   2026-11-06: "что бы работало так же") - by duckdb's own grammar and tokenizer, not a second hand-written one.
+3. A bare word is Unicode letters and digits only (the owner, 2026-11-06); a format character is refused bare.
 
 ## Enforcement & security
 

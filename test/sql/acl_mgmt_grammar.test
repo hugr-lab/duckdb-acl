@@ -2203,3 +2203,53 @@ ACL ADMIN GRANT SOURCE; KILL SESSION E'x';
 ----
 <REGEX>:.*write GRANT SOURCE <database>\[\.<schema>\] TO ROLE <role>.*
 
+# --- stage 4a: a bare word is Unicode letters and digits (the owner, 2026-11-06) ------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE größe;
+
+statement ok
+ACL ADMIN CREATE ROLE отдел2;
+
+query T
+SELECT role FROM aclcat.acl.roles WHERE role IN ('größe', 'отдел2') ORDER BY 1;
+----
+größe
+отдел2
+
+statement ok
+CREATE TABLE phys_4a(x INT);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG продажи;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE продажи.заказы AS memory.main.phys_4a;
+
+# the bare word and the quoted name are one key
+statement ok
+ACL ADMIN GRANT TABLE продажи."заказы" TO ROLE größe WITH (select);
+
+query T
+SELECT vname FROM aclcat.acl.role_object_caps WHERE vcat = 'продажи' AND role = 'größe';
+----
+заказы
+
+# a format character - it reverses the text around it, or shows nothing - is no letter: refused bare, taken quoted
+statement error
+ACL ADMIN CREATE ROLE ab‮cd;
+----
+
+statement error
+ACL ADMIN CREATE ROLE zero​width;
+----
+
+statement ok
+ACL ADMIN CREATE ROLE "ab‮cd";
+
+statement ok
+ACL ADMIN DROP ROLE größe;
+
+statement ok
+ACL ADMIN DROP ROLE отдел2;
+

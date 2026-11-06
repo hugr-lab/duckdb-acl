@@ -25,6 +25,8 @@
 #include "duckdb/parser/peg/tokenizer/parser_tokenizer.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 
+#include "utf8proc.hpp"
+
 #include <atomic>
 #include <mutex>
 
@@ -149,7 +151,50 @@ string UnquoteName(const string &text) {
 	return StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"");
 }
 
-//! One token of a kind the management compiler's scanner read: a word (ASCII letters, digits, `_` - a keyword too),
+//! spec 150 stage 4a: the characters of a bare word - ASCII letters, digits and `_`, and past ASCII the Unicode
+//! letters (with their combining marks) and decimal digits (the owner, 2026-11-06: `größe`, `отдел`); never a format
+//! or control character (U+202E reverses the text around it, U+200B shows nothing) - a quoted name still takes
+//! anything. `dot` also lets a `.` through (a dotted name's run). Bytes that are no UTF-8 are no word.
+bool IsWordText(const string &text, bool dot) {
+	if (text.empty()) {
+		return false;
+	}
+	auto bytes = reinterpret_cast<const utf8proc_uint8_t *>(text.data());
+	idx_t at = 0;
+	while (at < text.size()) {
+		auto c = text[at];
+		if (static_cast<unsigned char>(c) < 0x80) {
+			if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_' &&
+			    !(dot && c == '.')) {
+				return false;
+			}
+			at++;
+			continue;
+		}
+		utf8proc_int32_t codepoint = 0;
+		auto length = utf8proc_iterate(bytes + at, utf8proc_ssize_t(text.size() - at), &codepoint);
+		if (length <= 0) {
+			return false;
+		}
+		switch (utf8proc_category(codepoint)) {
+		case UTF8PROC_CATEGORY_LU:
+		case UTF8PROC_CATEGORY_LL:
+		case UTF8PROC_CATEGORY_LT:
+		case UTF8PROC_CATEGORY_LM:
+		case UTF8PROC_CATEGORY_LO:
+		case UTF8PROC_CATEGORY_MN:
+		case UTF8PROC_CATEGORY_MC:
+		case UTF8PROC_CATEGORY_ND:
+			break;
+		default:
+			return false;
+		}
+		at += idx_t(length);
+	}
+	return true;
+}
+
+//! One token of a kind the management compiler's scanner read: a word (letters, digits, `_` - a keyword too),
 //! a double-quoted name, either, words joined by `.`, a path (identifiers joined by `.`) - or, inside a parenthesised
 //! list, any token but a parenthesis.
 //! The scanner read a word whole where duckdb's tokenizer splits it at a leading digit (`9abc` is `9` `abc`, `0x1F` is
@@ -204,15 +249,7 @@ public:
 
 private:
 	static bool IsDottedText(const MatcherToken &token) {
-		if (token.type == TokenType::STRING_LITERAL || token.text.empty()) {
-			return false;
-		}
-		for (auto c : token.text) {
-			if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_' && c != '.') {
-				return false;
-			}
-		}
-		return true;
+		return token.type != TokenType::STRING_LITERAL && IsWordText(token.text, true);
 	}
 
 	MatcherResult MatchDotted(MatchState &state) const {
@@ -316,15 +353,7 @@ private:
 	}
 
 	static bool IsWord(const string &text) {
-		if (text.empty()) {
-			return false;
-		}
-		for (auto c : text) {
-			if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_') {
-				return false;
-			}
-		}
-		return true;
+		return IsWordText(text, false);
 	}
 
 	bool Accepts(const MatcherToken &token) const {

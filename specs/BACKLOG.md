@@ -105,6 +105,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
 
 ## Later
 
+- **A rolled-back DROP that stands, made recoverable** (spec 154; the owner, 2026-11-06: after the release). A
+  principal's DROP rolled back after any other write to the policy store stands, fail closed - only the
+  `record_not_undone` event names it. The owner's model: keep the DROP's before-image durably, report it in
+  `acl_check_catalog` (a finding with the statement to paste) and restore it on an operator's explicit command - a
+  schema step (a table of images) and a management statement.
+
 - **Write-time shape inference for views and table functions** (parse + PREPARE at save, read the
   result columns) so they opt into spec 065's clean refusals without a hand-typed list.
 - **Nested virtual schemas are presented flat** (`parent_schema_oid` NULL); fine until a virtual
