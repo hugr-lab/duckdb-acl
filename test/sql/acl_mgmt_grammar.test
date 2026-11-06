@@ -1844,12 +1844,12 @@ SELECT count(*) FROM aclcat.acl.resource_groups WHERE "group" = 'rg_grammar';
 ----
 0
 
-# a limit is a value: a string continued on the next line is refused (duckdb joins it, the reader would not)
+# a limit is a value: a string continued on the next line is refused (duckdb joins it - not one plain literal)
 statement error
 ACL ADMIN CREATE RESOURCE GROUP rg_never (batch_bytes '4'
 'MiB');
 ----
-a string continued on the next line
+expected a limit's value, quoted
 
 # a form that does not read as its rule says how it is written
 statement error
@@ -2631,3 +2631,62 @@ ACL ADMIN REVOKE SOURCE Phys FROM ROLE inh4a;
 
 statement ok
 ACL ADMIN DROP VIRTUAL SCHEMA продажи.raw4a.eu; DROP VIRTUAL SCHEMA продажи.raw4a; DROP ROLE inh4a;
+
+# --- stage 4b: a resource group's limits are a rule (a word, `=` or not, a value) ----------------------------------
+
+# a comment is a space, a comma inside it no separator; a value quoted either way, bare (`32MiB`), signed
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP lim4b (window_max 8 /* a, b */, batch_bytes = 32MiB, queue_priority -1, max_sessions "3");
+
+query IIII
+SELECT window_max, batch_bytes, queue_priority, max_sessions FROM aclcat.acl.resource_groups WHERE "group" = 'lim4b';
+----
+8	33554432	-1	3
+
+# an empty item is none, as before; SET names only what changes
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP lim4b SET (, window_start `4`,);
+
+query II
+SELECT window_start, window_max FROM aclcat.acl.resource_groups WHERE "group" = 'lim4b';
+----
+4	8
+
+statement ok
+ACL ADMIN CREATE OR REPLACE RESOURCE GROUP lim4b ();
+
+query I
+SELECT window_max IS NULL FROM aclcat.acl.resource_groups WHERE "group" = 'lim4b';
+----
+true
+
+# a limit is a word and a value: anything else is refused in the form's words
+statement error
+ACL ADMIN CREATE RESOURCE GROUP lim4b2 (window_max);
+----
+write CREATE
+
+statement error
+ACL ADMIN CREATE RESOURCE GROUP lim4b2 (window_max 8 16);
+----
+write CREATE
+
+statement error
+ACL ADMIN CREATE RESOURCE GROUP lim4b2 ('window_max' 8);
+----
+write CREATE
+
+# a value with a space is quoted (one value)
+statement error
+ACL ADMIN CREATE RESOURCE GROUP lim4b2 (batch_bytes 32 MiB);
+----
+write CREATE
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP lim4b2 (batch_bytes '32 MiB');
+
+statement ok
+ACL ADMIN DROP RESOURCE GROUP lim4b2;
+
+statement ok
+ACL ADMIN DROP RESOURCE GROUP lim4b;

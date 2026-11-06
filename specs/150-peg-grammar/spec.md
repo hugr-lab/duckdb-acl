@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a implemented)
+- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a, 4b implemented)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -476,7 +476,14 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   names exactly, so one never reaches another's rights; a GRANT or DENY to a role nobody defined is accepted (a role
   may come from claims alone); security.md says what an operator should look for. hugr-node's rules use the same
   matchers; the DBeaver plugin's composer quotes the same words (acl-clients).
-- 4b: resource group limits as rules (`ResourceLimitsJson` and `TextKind::LIMITS` go).
+- 4b (built): resource group limits as rules - `AclLimits <- '(' AclLimitEntry AclLimitMore* ')'`, an item
+  `AclWordToken '='? AclValue` (the limit's name a word; its value a number, a word like `32MiB`, a quoted one),
+  `LimitsJson` in the transform (a name once in any case, lower-cased; an empty item none, as the text reader took
+  it); `ResourceLimitsJson` and `TextKind::LIMITS` go, and `MgmtCall::Text` shares the value reader
+  (`ValueTextOf`). What it reads differently: a value is one value, so one with a space is quoted (`batch_bytes
+  '32 MiB'`; the text reader took `32 MiB` bare as the rest of the item), a backtick value reads (it was refused),
+  and a string continued on the next line is refused as no plain literal (duckdb joins `'4'` and `'MiB'`), as it was
+  refused before in other words.
 - 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
   ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
 - 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
