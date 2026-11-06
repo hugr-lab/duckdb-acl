@@ -10,6 +10,7 @@
 #include "acl_mgmt_rules.hpp"
 #include "acl_name_path.hpp"
 #include "acl_platform.hpp"
+#include "acl_word.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -24,8 +25,6 @@
 #include "duckdb/parser/peg/special_string_utils.hpp"
 #include "duckdb/parser/peg/tokenizer/parser_tokenizer.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
-
-#include "utf8proc.hpp"
 
 #include <atomic>
 #include <mutex>
@@ -149,49 +148,6 @@ string LevelWord(PEGTransformer &transformer, ParseResult &result, const char *w
 //! A double-quoted name's text, `""` a quote - what the compiler's scanner took
 string UnquoteName(const string &text) {
 	return StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"");
-}
-
-//! spec 150 stage 4a: the characters of a bare word - ASCII letters, digits and `_`, and past ASCII the Unicode
-//! letters (with their combining marks) and decimal digits (the owner, 2026-11-06: `größe`, `отдел`); never a format
-//! or control character (U+202E reverses the text around it, U+200B shows nothing) - a quoted name still takes
-//! anything. `dot` also lets a `.` through (a dotted name's run). Bytes that are no UTF-8 are no word.
-bool IsWordText(const string &text, bool dot) {
-	if (text.empty()) {
-		return false;
-	}
-	auto bytes = reinterpret_cast<const utf8proc_uint8_t *>(text.data());
-	idx_t at = 0;
-	while (at < text.size()) {
-		auto c = text[at];
-		if (static_cast<unsigned char>(c) < 0x80) {
-			if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_' &&
-			    !(dot && c == '.')) {
-				return false;
-			}
-			at++;
-			continue;
-		}
-		utf8proc_int32_t codepoint = 0;
-		auto length = utf8proc_iterate(bytes + at, utf8proc_ssize_t(text.size() - at), &codepoint);
-		if (length <= 0) {
-			return false;
-		}
-		switch (utf8proc_category(codepoint)) {
-		case UTF8PROC_CATEGORY_LU:
-		case UTF8PROC_CATEGORY_LL:
-		case UTF8PROC_CATEGORY_LT:
-		case UTF8PROC_CATEGORY_LM:
-		case UTF8PROC_CATEGORY_LO:
-		case UTF8PROC_CATEGORY_MN:
-		case UTF8PROC_CATEGORY_MC:
-		case UTF8PROC_CATEGORY_ND:
-			break;
-		default:
-			return false;
-		}
-		at += idx_t(length);
-	}
-	return true;
 }
 
 //! One token of a kind the management compiler's scanner read: a word (letters, digits, `_` - a keyword too),

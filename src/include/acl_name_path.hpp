@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "acl_word.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -137,10 +138,8 @@ public:
 		string out;
 		for (idx_t i = 0; i < parts.size(); i++) {
 			auto &part = parts[i];
-			bool word = !part.empty();
-			for (auto c : part) {
-				word = word && (StringUtil::CharacterIsAlpha(c) || StringUtil::CharacterIsDigit(c) || c == '_');
-			}
+			// spec 150 4a: a bare word as the rules read one - a Unicode letter needs no quotes
+			bool word = IsWordText(part);
 			out += (i ? "." : "") + (word ? part : "\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"");
 		}
 		return out;

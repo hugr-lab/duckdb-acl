@@ -2585,6 +2585,17 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 
 void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 	RequireCatalog(catalog, "acl_revoke_catalog");
+	// spec 150 4a: a revoke of nothing is refused, as REVOKE TABLE / ADMIN are - a name that only looks like the
+	// role's (another script's letter, another spelling) would answer success and leave the grant in place
+	auto held = [&](const char *table) {
+		return catalog
+		           ->Query("SELECT 1 FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role) +
+		                   " AND \"vcat\" = " + Lit(vcat) + " LIMIT 1")
+		           ->RowCount() > 0;
+	};
+	if (!held("role_catalogs") && !held("role_object_caps") && !held("grant_columns")) {
+		throw BinderException("acl admin: role \"%s\" holds no grant on catalog \"%s\"", role, vcat);
+	}
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat),
 	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +

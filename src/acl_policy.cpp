@@ -24,6 +24,7 @@
 #include <map>
 #include <set>
 #include <random>
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parser.hpp"
 
 namespace duckdb {
@@ -55,22 +56,23 @@ namespace {
 //! computes. Anything else (NULL, amount * 2, a function call) has no physical column behind it, so
 //! the relation cannot be written through.
 bool IsPlainColumnReference(const string &expr) {
-	if (expr.empty()) {
-		return false;
-	}
-	for (auto c : expr) {
-		if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_') {
-			return false;
-		}
-	}
-	if (StringUtil::CharacterIsDigit(expr[0])) {
-		return false;
-	}
-	auto lowered = StringUtil::Lower(expr);
-	return lowered != "null" && lowered != "true" && lowered != "false" && lowered != "default";
+	// a quoted physical name stays a computed reading (its relation read-only), as it always was
+	return !expr.empty() && expr.front() != '"' && PlainColumnName(expr);
 }
 
 } // namespace
+
+bool PlainColumnName(const string &text) {
+	// spec 150 4a: duckdb's own reading - one column reference of one part (a bare word in any script, a quoted name),
+	// never a constant (NULL, TRUE), a keyword or anything computed
+	try {
+		auto list = Parser(ParserOptions::Builtin()).ParseExpressionList(text);
+		return list.size() == 1 && list[0]->GetExpressionType() == ExpressionType::COLUMN_REF &&
+		       list[0]->Cast<ColumnRefExpression>().ColumnNames().size() == 1;
+	} catch (std::exception &) {
+		return false;
+	}
+}
 
 bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns) {
 	if (columns.empty()) {

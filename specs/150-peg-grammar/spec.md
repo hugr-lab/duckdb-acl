@@ -440,19 +440,55 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
 **Stage 4 - policy texts read by rules where they are written, one family per PR** (the owner's decisions of
 2026-11-06 in Decided below):
 
-- 4a (built): a bare word is Unicode letters (with their combining marks), decimal digits and `_`
-  (`IsWordText`, utf8proc's categories L*, Mn, Mc, Nd) - `CREATE ROLE größe`, `CREATE VIRTUAL CATALOG продажи`; a
-  format or control character (U+202E reverses the text around it, U+200B shows nothing) is no letter: refused bare,
-  taken quoted. A bare word is the same name as its quoted spelling. hugr-node's rules use the same matchers.
+- 4a (built): a bare word is Unicode letters (with their combining marks), decimal digits and `_` - one predicate,
+  `WhyNoWord` / `IsWordText` (acl_word.hpp, utf8proc's categories L*, Mn, Mc, Nd) for the rules' matcher, a name
+  offered back to paste (`NamePath::ToGrammar`: `кат.заказы` bare) and the refusal: `CREATE ROLE größe`, `CREATE
+  VIRTUAL CATALOG продажи`, a bare word the same key as its quoted spelling. Refused bare (taken quoted): a
+  default-ignorable character (U+202E, U+200D, U+034F, U+FE0F, the Hangul fillers - Unicode's own list of what shows
+  nothing or reorders invisibly), any format / control character, a combining mark first in a word or a dotted part,
+  a spelling not in NFC (`o` + U+0308 is not `ö` - two looks-alike names). duckdb itself turns U+00A0, U+2000-U+200B,
+  U+202F, U+205F, U+2060, U+3000 and U+FEFF outside quotes into a space before the override reads the text. The
+  refusal says what it saw as a code point (`a bare name is letters, digits and _ - U+202E is an invisible
+  character; double-quote the name`, `RefuseUnreadStatement`), never the character. Found by its reviews:
+  `REVOKE CATALOG … FROM ROLE <a name that only looks like the role's>` answered success and left the grant - a
+  revoke of nothing is refused now, as REVOKE TABLE / ADMIN were; whether a column expression is a plain rename
+  (`RenameOnlyColumns`) and a key column (`BareIdentifier`) are duckdb's parser's reading (`PlainColumnName`: one
+  column reference of one part - `x = größe` stays a writable rename; a quoted `x = "b"` stays read-only, as it was); the listings' by-name test reads
+  `\p{L}` words. Look-alikes (Cyrillic `а`, a modifier letter like `ʼ`) are different names - every rights check
+  compares names exactly, so one never reaches another's rights; security.md says what an operator should look for.
+  hugr-node's rules use the same matchers.
 - 4b: resource group limits as rules (`ResourceLimitsJson` and `TextKind::LIMITS` go).
-- 4c: a client's REQUIRE / ATTRIBUTES / claim map as rules (`AdminScanner` goes).
+- 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
+  ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
 - 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
 - 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
   takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
   the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what
-  the stored text reads back as.
+  the stored text reads back as. The other readers of a stored list follow (`acl_platform_list`, the lineage tags,
+  the listings' copy of `ParseFieldPath`), and `ParseFieldPath`'s bare word becomes 4a's (it takes any byte past
+  ASCII today).
 - 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
   `ScannerUnreadable` go.
+
+**Hand-written readers left outside stage 4** (the owner, 2026-11-06: reuse duckdb's grammar wherever it applies -
+an inventory of `src/`, each with its verdict; the REPLACE ones are the next work after stage 4):
+
+| Reader | Text | Verdict |
+|---|---|---|
+| `KeyStatements` (acl_catalog_admin.cpp) | `PRIMARY KEY (…)`, split on `,` | replace: a rule (a quoted key column holding a comma is split) |
+| SET TYPES (acl_catalog_admin.cpp) | `aliases = …, enums = …` | replace: a rule |
+| `ParseDeclaration` / `DeclaredTypes`, `StripDeclarationNullability` | RETURNS TABLE, parameter types | replace: duckdb's `ParseColumnList` (a `,` split breaks `DECIMAL(10, 2)`, `STRUCT(…)`) |
+| `SplitParams` (acl_principal_functions.cpp) | a stored macro's parameters | replace: read once at write (a `CREATE MACRO` probe) |
+| REFERENCE arguments / `ON` pairs (`SplitPair`) | `param => col`, `a = b` | replace: rules |
+| category members (`SplitTopLevel`), the function spec's kind word | `[db.schema.]name [TABLE]` | replace in the statement form (a rule); the function form keeps `QualifiedName::ParseComponents` |
+| `SplitIdentifierPath` (acl_rewriter.cpp) | a USE value | replace: `QualifiedName::ParseComponents` |
+| `ExtractStreamIdFor` (acl_parser_override.cpp) | a drain's raw INSERT | replace: the constant from the AST parsed right after |
+| `GetTableNames` output cut at ` as ` (acl_catalog_admin.cpp) | a body's table names | replace: `BodyTables` (the AST walk) |
+| `SplitProjectionItem` (lineage) | our own `expr AS "name"` | replace: carry the pairs |
+| `TextNamesPolicyStore`, `SqlNamesSource` | view / macro bodies | keep: they over-read on purpose, string literals too (`query_table('acl.admins')`) |
+| `ParseFieldPath` | `a.b`, `items[].x` | keep (duckdb has no `[]` path); its word becomes 4a's in 4e |
+| the first-word ACL check, `MayCarryAttachLineage`, `CallsFunctionNamed` | every query | keep: prefilters before the real read on tokens |
+| keys (`NamePath`), JWT, base64, URLs, `\x1f` serializations, JSON | not SQL | keep |
 
 **Decided**
 

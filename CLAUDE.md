@@ -498,8 +498,10 @@ tokens (the identity judged at parse, the sugar off under a dialect). 3g-3a: a m
 named `Acl<Keyword>…`, a registration that would touch acl's statements refused at load). 3g-3b: hugr-node's CLUSTER
 forms as rules (its spec 020). 3g-3c: the old seam (`RegisterMgmtGrammar`), the compiler and `AclMgmtLegacy` go;
 `AdminScanner` reads only a statement's lists until stage 4. Then spec 151, stage 4 the policy texts (read by rules
-where written - stored rows stay text; 4a built: a bare word is Unicode letters / digits, `IsWordText`, a format
-character refused bare; 4e reads a mask with duckdb's `Expression` and splits a stored list on duckdb's tokens). Tests `acl_prefix_grammar.test`,
+where written - stored rows stay text; 4a built: a bare word is Unicode letters / digits - `WhyNoWord` / `IsWordText`
+(acl_word.hpp: no default-ignorable or format character, no mark first, NFC), the refusal names the code point, a
+revoke of nothing refused, `PlainColumnName` = duckdb's parser; 4e reads a mask with duckdb's `Expression` and splits
+a stored list on duckdb's tokens; spec 150 lists the hand-written readers left, each replace / keep). Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`, `test_acl_mgmt_rules.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an

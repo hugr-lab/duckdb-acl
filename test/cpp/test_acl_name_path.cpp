@@ -87,6 +87,16 @@ int main(int argc, char *argv[]) {
 			      "ToSql quotes as duckdb does (a keyword too)");
 			Check(NamePath::FromKey("c.Raw Data.t_1").ToGrammar() == "c.\"Raw Data\".t_1",
 			      "ToGrammar quotes only what the grammar cannot read bare");
+			// spec 150 4a: a Unicode word is read bare; an invisible character or a decomposed spelling is not
+			Check(NamePath::FromKey("\xd0\xba\xd0\xb0\xd1\x82.gr\xc3\xb6\xc3\x9f"
+			                        "e")
+			              .ToGrammar() == "\xd0\xba\xd0\xb0\xd1\x82.gr\xc3\xb6\xc3\x9f"
+			                              "e",
+			      "ToGrammar leaves Unicode letters bare");
+			Check(NamePath::FromKey("c.admin\xcd\x8f").ToGrammar() == "c.\"admin\xcd\x8f\"",
+			      "ToGrammar quotes a part with an invisible character (U+034F)");
+			Check(NamePath::FromKey("c.go\xcc\x88").ToGrammar() == "c.\"go\xcc\x88\"",
+			      "ToGrammar quotes a decomposed spelling (o + U+0308)");
 			Check(NamePath::Display("Raw Data") == "Raw Data" && NamePath::Display("\"q\"\"uote\"") == "q\"uote" &&
 			          NamePath::Display("\"a.b\"") == "\"a.b\"" && NamePath::Display("a.\"b.c\"") == "a.\"b.c\"",
 			      "Display: one part unquoted unless it holds a dot, a path as its key");

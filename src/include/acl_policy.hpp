@@ -256,6 +256,8 @@ vector<string> SplitTopLevel(const string &text, char delimiter);
 //! it a read-only subquery. Since spec 029 both restrict alike, so this decides writability only -
 //! and it is shared, because ADD and ALTER giving the same list two different forms is a bug.
 bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns);
+//! spec 150 4a: `text` is one column reference of one part, as duckdb's parser reads it
+bool PlainColumnName(const string &text);
 
 //! A small bounded LRU of parsed template prototypes. On a hit it returns a fresh Copy() of the
 //! prototype (so the caller may bake markers into the copy); on a miss it parses via `parse`, caches the

@@ -308,11 +308,12 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " is_generated, generation_expression, NULL::BOOL is_updatable, comment AS COLUMN_COMMENT,"
 	    " tags AS acl_tags FROM acl_physical_columns(" +
 	    sources + "))";
-	// a declared column that reads one source column by name - no expression, or a bare or quoted identifier
-	// that is no special value - and the name it reads: spec 039's broken mark and spec 143's tags alike
+	// a declared column that reads one source column by name - no expression, or a bare (spec 150 4a: in any script)
+	// or quoted identifier that is no special value - and the name it reads: spec 039's broken mark and spec 143's
+	// tags alike
 	auto reads_by_name = [](const string &c) {
 		return "(" + c + ".\"expr\" IS NULL OR " + c + ".\"expr\" = '' OR regexp_matches(" + c +
-		       ".\"expr\", '^[A-Za-z_][A-Za-z0-9_]*$') OR regexp_matches(" + c +
+		       ".\"expr\", '^[\\p{L}_][\\p{L}\\p{Mn}\\p{Mc}\\p{Nd}_]*$') OR regexp_matches(" + c +
 		       ".\"expr\", '^\"[^\"]+\"$'))"
 		       " AND " +
 		       KeyFoldSql("coalesce(" + c + ".\"expr\", '')") +

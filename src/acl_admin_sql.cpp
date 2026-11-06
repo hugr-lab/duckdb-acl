@@ -5,6 +5,7 @@
 // The parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
+#include "acl_word.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "acl_grammar.hpp"
 #include "acl_admin_scanner.hpp"
@@ -648,6 +649,30 @@ string ResourceLimitsJson(const string &inside) {
 //! spec 150 3g-3c: a management statement no rule reads - refused in its form's own words, chosen by its head on
 //! duckdb's tokens (every form is a rule: nothing is compiled from text any more)
 [[noreturn]] void RefuseUnreadStatement(const string &text) {
+	// spec 150 4a: a bare word the rules do not take (a character that shows nothing, a combining mark first, not
+	// NFC) - said for what it is, before any form's words
+	auto tokens = Parser::Tokenize(text);
+	for (idx_t index = 0; index < tokens.size(); index++) {
+		auto type = tokens[index].type;
+		if (type != SimplifiedTokenType::SIMPLIFIED_TOKEN_IDENTIFIER &&
+		    type != SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD) {
+			continue;
+		}
+		auto end = index + 1 < tokens.size() ? tokens[index + 1].start : text.size();
+		auto word = text.substr(tokens[index].start, end - tokens[index].start);
+		StringUtil::Trim(word);
+		bool non_ascii = false;
+		for (auto c : word) {
+			non_ascii = non_ascii || static_cast<unsigned char>(c) >= 0x80;
+		}
+		if (!non_ascii || word.front() == '"') {
+			continue;
+		}
+		auto why = WhyNoWord(word, true);
+		if (!why.empty()) {
+			throw BinderException("acl admin: a bare name is letters, digits and _ - %s; double-quote the name", why);
+		}
+	}
 	HeadWords head;
 	auto heads = ReadStatementHeads(text, 6);
 	if (!heads.empty()) {

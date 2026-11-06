@@ -138,6 +138,11 @@ share sessions" (spec 040).
   operator's own SQL keep duckdb's text. A constraint stays an oracle: whether a write breaks a CHECK over a
   hidden column, or a key the RLS hides, tells the writer something about rows it cannot read - weigh it when
   granting writes.
+- A name in management SQL may be written bare in any script's letters and digits (`CREATE ROLE größe`, spec 150).
+  Names compare exactly - a look-alike (a Cyrillic `а`, a modifier letter `ʼ`) is another name and never reaches
+  another's rights; an invisible or format character, a decomposed spelling, a mark first are refused bare.
+  Read the names you are shown with that in mind; `REVOKE` of a grant nobody holds is refused, not answered with
+  success.
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).

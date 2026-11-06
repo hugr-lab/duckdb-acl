@@ -231,21 +231,8 @@ vector<string> CatalogBackend::TypeFactStatements(const string &vcat, const stri
 bool CatalogBackend::BareIdentifier(const string &expr) {
 	string text = expr;
 	StringUtil::Trim(text);
-	if (text.empty()) {
-		return true;
-	}
-	if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
-		return text.find('"', 1) == text.size() - 1; // one quoted name, nothing after it
-	}
-	if (!isalpha(static_cast<unsigned char>(text[0])) && text[0] != '_') {
-		return false;
-	}
-	for (auto ch : text) {
-		if (!isalnum(static_cast<unsigned char>(ch)) && ch != '_') {
-			return false;
-		}
-	}
-	return true;
+	// spec 150 4a: one column named by itself, as duckdb reads it (a quoted name, a Unicode word)
+	return text.empty() || PlainColumnName(text);
 }
 
 string CatalogBackend::PredicateError(const string &source, const string &rls, bool *checked) {

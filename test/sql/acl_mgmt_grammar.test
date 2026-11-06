@@ -2235,21 +2235,97 @@ SELECT vname FROM aclcat.acl.role_object_caps WHERE vcat = 'продажи' AND 
 ----
 заказы
 
-# a format character - it reverses the text around it, or shows nothing - is no letter: refused bare, taken quoted
+# a role named in another script holds an admin scope like any other
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE größe;
+
+statement ok
+ACL ADMIN REVOKE ADMIN FROM ROLE größe;
+
+# a dotted name with parts in another script, the same key as quoted
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE продажи.заказы IS 'orders';
+
+query T
+SELECT comment FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname = 'заказы';
+----
+orders
+
+# a word the tokenizer splits at a leading digit is joined whole
+statement ok
+ACL ADMIN CREATE ROLE 9ö;
+
+# a revoke of nothing is refused: a name that only looks like the role's would answer success
+statement error
+ACL ADMIN REVOKE CATALOG продажи FROM ROLE отдел2;
+----
+<REGEX>:.*role "отдел2" holds no grant on catalog "продажи".*
+
+# a renamed column in another script stays a rename (the relation writable), and may be the key
+statement ok
+CREATE TABLE phys_4a_u(a INT, "größe" INT);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE продажи.u AS memory.main.phys_4a_u COLUMNS (a = a, x = größe) PRIMARY KEY (x);
+
+query T
+SELECT form FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname = 'u';
+----
+alias
+
+# what is no word is said for what it is, as a code point - quoted, the same text is a name
 statement error
 ACL ADMIN CREATE ROLE ab‮cd;
 ----
+<REGEX>:.*a bare name is letters, digits and _ - U\+202E is an invisible character; double-quote the name.*
 
 statement error
-ACL ADMIN CREATE ROLE zero​width;
+ACL ADMIN CREATE ROLE zero‍joiner;
 ----
+<REGEX>:.*U\+200D is an invisible character.*
+
+statement error
+ACL ADMIN CREATE ROLE soft­hyphen;
+----
+<REGEX>:.*U\+00AD.*
+
+statement error
+ACL ADMIN CREATE ROLE admin͏;
+----
+<REGEX>:.*U\+034F is an invisible character.*
+
+statement error
+ACL ADMIN CREATE ROLE ㅤ;
+----
+<REGEX>:.*U\+3164 is an invisible character.*
+
+statement error
+ACL ADMIN CREATE ROLE admin️;
+----
+<REGEX>:.*U\+FE0F is an invisible character.*
+
+statement error
+ACL ADMIN CREATE ROLE ̈x;
+----
+<REGEX>:.*U\+0308 is a combining mark, which cannot start a name.*
+
+# o followed by U+0308 looks like ö: one spelling only, the composed one
+statement error
+ACL ADMIN CREATE ROLE grösse;
+----
+<REGEX>:.*not written in Unicode's composed form \(NFC\).*
 
 statement ok
 ACL ADMIN CREATE ROLE "ab‮cd";
+
+statement ok
+ACL ADMIN DROP ROLE "ab‮cd";
+
+statement ok
+ACL ADMIN DROP ROLE 9ö;
 
 statement ok
 ACL ADMIN DROP ROLE größe;
 
 statement ok
 ACL ADMIN DROP ROLE отдел2;
-
