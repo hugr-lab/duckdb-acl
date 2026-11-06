@@ -489,7 +489,7 @@ its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW
 list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant a point
 grant, `PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the
 transform, a list inside it a marker its reading replaces (`TextArg::splice`). 3f: function categories and grants,
-platform's point grants, sources, resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's
+platform's point grants, sources, resource groups (their limits a rule since 4b) - after it the compiler reads only hugr-node's
 registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`;
 `SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). 3g-2a: GRANT / REVOKE SECRET as
 rules (`MgmtParsed::secrets`). 3g-2b: `USE [SCHEMA]` on duckdb's tokens. 3g-2c: `ATTACH … LINEAGE` on duckdb's
@@ -502,7 +502,8 @@ where written - stored rows stay text; 4a built: a name is read exactly as duckd
 (`DuckdbIdentifier`: quoted, or bare without a leading digit and no keyword duckdb's identifier mask refuses; a
 function's one part by its function mask; nothing of ours on top; a refusal names the keyword - `NameHint`), a value
 stays the scanner's word, `ToGrammar` quotes as `KeywordHelper::RequiresQuotes`, every revoke of nothing refused
-(`ThrowNothingToRevoke`), `PlainColumnName` = duckdb's parser; 4e reads a mask with duckdb's `Expression` and splits
+(`ThrowNothingToRevoke`), `PlainColumnName` = duckdb's parser; 4b built: a group's limits are a rule (`AclLimits`,
+`LimitsJson`); 4e reads a mask with duckdb's `Expression` and splits
 a stored list on duckdb's tokens; spec 150 lists the hand-written readers left, each replace / keep). Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`, `test_acl_mgmt_rules.cpp`.
 

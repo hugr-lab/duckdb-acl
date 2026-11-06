@@ -597,36 +597,6 @@ string AttributesJson(const string &list) {
 	return "[" + StringUtil::Join(attributes, ",") + "]";
 }
 
-//! `(window_max 64, batch_bytes '32MiB', …)` - a resource group's limits as the JSON the admin functions take
-//! (spec 085; ALTER RESOURCE GROUP … SET (…), spec 120)
-string ResourceLimitsJson(const string &inside) {
-	vector<string> entries;
-	case_insensitive_set_t named;
-	for (auto &item : SplitTopLevel(inside, ',')) {
-		auto text = item;
-		StringUtil::Trim(text);
-		if (text.empty()) {
-			continue;
-		}
-		auto space = text.find_first_of(" \t=");
-		if (space == string::npos) {
-			throw BinderException("acl admin: a limit is written as name value, got \"%s\"", text);
-		}
-		auto name = text.substr(0, space);
-		auto value = text.substr(space + 1);
-		StringUtil::Trim(value);
-		if (!value.empty() && value[0] == '=') {
-			value = value.substr(1);
-		}
-		value = Unquoted(value);
-		if (!named.insert(name).second) {
-			throw BinderException("acl admin: limit \"%s\" is written twice - write each limit once", name);
-		}
-		entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));
-	}
-	return "{" + StringUtil::Join(entries, ", ") + "}";
-}
-
 //! A GRANT / REVOKE SECRET its rule did not read (spec 082 / 150 3g-2a): the form in its own words
 [[noreturn]] void RefuseSecretsForm(bool grant) {
 	RefuseMovedForm(grant
@@ -986,9 +956,6 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				break;
 			case MgmtParsed::TextKind::CLAIM_MAP:
 				read = JsonQuote(ClaimMapToJson(list.text)); // kept as a JSON string, which the spec parses
-				break;
-			case MgmtParsed::TextKind::LIMITS:
-				read = ResourceLimitsJson(list.text);
 				break;
 			}
 			if (list.splice.empty()) {

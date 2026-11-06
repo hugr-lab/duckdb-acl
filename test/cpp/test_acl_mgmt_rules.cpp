@@ -39,6 +39,9 @@ arena_ptr<TransformResultValue> FinalizeToy(PEGTransformer &transformer, ParseRe
 		value = call.Quoted(target.Cast<ListParseResult>().GetChild(1), "a session id");
 	} else if (target.Name() == "AclToykillValue") {
 		value = call.Text(target.Cast<ListParseResult>().GetChild(1), "a value");
+	} else if (target.Name() == "AclToykillTextNum") {
+		// a module that reads a bare number as a value: refused, never an internal error (spec 150 4b)
+		value = call.Text(target.Cast<ListParseResult>().GetChild(1), "a value");
 	} else if (target.Name() == "AclToykillList") {
 		auto &form = target.Cast<ListParseResult>();
 		value = call.NameValue(form.GetChild(1), "a name");
@@ -121,8 +124,9 @@ void RegisterToy() {
 	rules.push_back(
 	    GrammarChange::AddRule("AclToykillStatement <- 'TOYKILL' AclToykillTarget", acl::MgmtStart<FinalizeToy>));
 	rules.push_back(GrammarChange::AddRule("AclToykillTarget <- AclToykillWord / AclToykillNumber / AclToykillValue / "
-	                                       "AclToykillList / AclToykillScoped / AclToykillItems / AclToykillNamed / "
-	                                       "AclQuotedValue"));
+	                                       "AclToykillTextNum / AclToykillList / AclToykillScoped / AclToykillItems / "
+	                                       "AclToykillNamed / AclQuotedValue"));
+	rules.push_back(GrammarChange::AddRule("AclToykillTextNum <- 'TEXTNUM' NumberLiteral"));
 	// an optional and a repetition behind helper rules of their own (CLUSTER's shared IN GROUP)
 	rules.push_back(GrammarChange::AddRule("AclToykillGroup <- 'IN' 'GROUP' AclNameValue"));
 	rules.push_back(GrammarChange::AddRule("AclToykillScope <- AclToykillGroup?"));
@@ -338,6 +342,9 @@ int main(int argc, char *argv[]) {
 		Check(Has(joined, "expected a session id, quoted"), "a string joined across a line break: " + joined);
 		auto number = Compiled(con, "ACL ADMIN TOYKILL NUMBER 7");
 		Check(Has(number, "no quoted value is"), "a quoted reader on a number is refused, not internal: " + number);
+		auto text = Compiled(con, "ACL ADMIN TOYKILL TEXTNUM 7");
+		Check(Has(text, "is read where no value is"),
+		      "a value reader on a bare number is refused, not internal: " + text);
 	});
 
 	Scenario("a statement its rules do not read is refused in the module's words", [&] {

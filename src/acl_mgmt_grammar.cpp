@@ -255,7 +255,9 @@ public:
 	//! WORD_OR_QUOTED: a value's word or a quoted one (a capability: `select`, `create` - keywords, never names)
 	//! FUNCTION_PATH: a function's path - one part read as duckdb reads a function's name (`left`, `glob` bare), a
 	//! qualified one as a path (its first part a catalog or a schema)
-	enum class Kind : uint8_t { WORD, WORD_OR_QUOTED, NAME, DOTTED, PATH, FUNCTION_PATH, NAME_VALUE, LIST_ITEM };
+	//! RUN: a value written as touching tokens - a number and its unit (`32MiB`, `.5GB`, `1e-3GB`), a word - as the
+	//! text reader took a limit's value, never across a space (spec 150 4b)
+	enum class Kind : uint8_t { WORD, WORD_OR_QUOTED, NAME, DOTTED, PATH, FUNCTION_PATH, NAME_VALUE, LIST_ITEM, RUN };
 
 	explicit AclTokenMatcher(Kind kind_p, const PEGKeywordHelper *keywords = nullptr)
 	    : AtomicMatcher(MatcherType::CUSTOM), kind(kind_p) {
@@ -273,6 +275,9 @@ public:
 		}
 		if (kind == Kind::DOTTED) {
 			return MatchDotted(state);
+		}
+		if (kind == Kind::RUN) {
+			return MatchRun(state);
 		}
 		if (kind == Kind::PATH || kind == Kind::FUNCTION_PATH || kind == Kind::NAME_VALUE) {
 			return MatchIdentifierPath(state);
@@ -322,6 +327,34 @@ private:
 			}
 		}
 		return true;
+	}
+
+	//! A token a run is made of: a number or an unquoted word
+	static bool RunPart(const MatcherToken &token) {
+		return !token.text.empty() && (token.type == TokenType::NUMBER_LITERAL ||
+		                               ((token.type == TokenType::KEYWORD || token.type == TokenType::IDENTIFIER) &&
+		                                token.text[0] != '"' && token.text[0] != '`'));
+	}
+
+	MatcherResult MatchRun(MatchState &state) const {
+		auto &tokens = state.token_iterator;
+		auto first = tokens.Position();
+		auto &head = tokens.GetToken(first);
+		string text = head.text;
+		auto end = head.offset + head.length;
+		idx_t count = 1;
+		while (first + count < tokens.Size()) {
+			auto &next = tokens.GetToken(first + count);
+			if (next.offset != end || !RunPart(next)) {
+				break;
+			}
+			text += next.text;
+			end = next.offset + next.length;
+			count++;
+		}
+		tokens.Advance(count);
+		state.UpdateMaxTokenIndex();
+		return state.AllocateParseResult<TokenParseResult>(std::move(text), head.offset, end - head.offset);
 	}
 
 	MatcherResult MatchDotted(MatchState &state) const {
@@ -449,6 +482,8 @@ private:
 			return IsDottedText(token);
 		case Kind::LIST_ITEM:
 			return token.text != "(" && token.text != ")";
+		case Kind::RUN:
+			return RunPart(token);
 		}
 		return false;
 	}
@@ -1484,6 +1519,67 @@ bool ListIsEmpty(PEGTransformer &transformer, ParseResult &result) {
 	return true;
 }
 
+//! `AclValue <- AclDottedToken / AclNameValue / AclSignedNumber`: a name that is a value (NameValueOf), or a signed
+//! number as written (its sign in front)
+string ValueTextOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
+	auto &node = Strip(result);
+	if (node.Name() != "AclSignedNumber") {
+		return NameValueOf(transformer, node, what, data);
+	}
+	// AclSignedNumber <- AclMinus? NumberLiteral: the number's token as written
+	auto &list = node.Cast<ListParseResult>();
+	reference<ParseResult> number = list.GetChild(1);
+	while (number.get().type != ParseResultType::NUMBER) {
+		if (number.get().type == ParseResultType::CHOICE) {
+			number = number.get().Cast<ChoiceParseResult>().GetResult();
+		} else if (number.get().type == ParseResultType::LIST &&
+		           number.get().Cast<ListParseResult>().GetChildren().size() == 1) {
+			number = number.get().Cast<ListParseResult>().GetChild(0);
+		} else {
+			throw BinderException("acl admin: %s is read where no number is (a module's rule)", what);
+		}
+	}
+	auto sign = list.Child<OptionalParseResult>(0).HasResult() ? "-" : "";
+	return sign + number.get().Cast<NumberParseResult>().number;
+}
+
+//! `AclLimits <- '(' AclLimitEntry AclLimitMore* ')'` (AclLimitEntry <- AclLimitItem?, AclLimitItem <- AclWordToken
+//! '='? AclLimitValue; spec 150 4b - a value a run of touching tokens, a signed number or a quoted one): a resource
+//! group's limits `(window_max 64, batch_bytes '32MiB', …)` as the JSON the admin functions take (spec 085; ALTER
+//! RESOURCE GROUP … SET (…), spec 120) - each name once in any case, lower-cased, its value as written (a quoted one
+//! unquoted); the functions judge both
+string LimitsJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
+	vector<reference<ParseResult>> items;
+	auto &list = Strip(result).Cast<ListParseResult>();
+	auto collect = [&items](ParseResult &entry) {
+		auto &part = Strip(entry);
+		if (part.type != ParseResultType::OPTIONAL) {
+			items.push_back(part);
+		}
+	};
+	collect(list.GetChild(1));
+	vector<reference<ParseResult>> more;
+	grammar::Collect(list.GetChild(2), more);
+	for (auto &next : more) {
+		collect(next.get().Cast<ListParseResult>().GetChild(1));
+	}
+	vector<string> entries;
+	case_insensitive_set_t named;
+	for (auto &item : items) {
+		auto &parts = item.get().Cast<ListParseResult>();
+		auto name = TokenOf(parts.GetChild(0)).text;
+		if (!named.insert(name).second) {
+			throw BinderException("acl admin: limit \"%s\" is written twice - write each limit once", name);
+		}
+		auto &value_node = Strip(parts.GetChild(2));
+		auto value = value_node.Name() == "AclLimitRunToken"
+		                 ? TokenOf(value_node).text
+		                 : ValueTextOf(transformer, value_node, "a limit's value", data);
+		entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
 //! `AclCapsList <- '(' AclCapsEntry AclCapsMore* ')'` (AclCapsEntry <- AclWordOrQuotedToken?): the capabilities named,
 //! as the stored JSON - the list form is what a person writes, JSON the storage format and the admin functions' input.
 //! Each a word or a double-quoted name, lower-cased, quoted as JSON (the compiler pasted the text between the commas
@@ -2143,7 +2239,7 @@ arena_ptr<TransformResultValue> FinalizeSourceGrant(PEGTransformer &transformer,
 	return MgmtResult(transformer, std::move(data));
 }
 
-// AclCreateResourceGroup <- 'CREATE' AclOrReplace? 'RESOURCE' 'GROUP' AclName 'WITH'? AclParenList? AclGroupClause*
+// AclCreateResourceGroup <- 'CREATE' AclOrReplace? 'RESOURCE' 'GROUP' AclName 'WITH'? AclLimits? AclGroupClause*
 // (spec 085) - a re-create replaces the limits, the roles bound to it stay; DEFAULT (spec 096: the principals bound to
 // no group are its members) and COMMENT in any order, each once
 arena_ptr<TransformResultValue> FinalizeCreateResourceGroup(PEGTransformer &transformer, ParseResult &parse_result) {
@@ -2152,8 +2248,7 @@ arena_ptr<TransformResultValue> FinalizeCreateResourceGroup(PEGTransformer &tran
 	data->args = {Value(NameOf(list.GetChild(4), "a group name")), Value("{}"), Value(string()), Value(string())};
 	auto &limits = list.Child<OptionalParseResult>(6);
 	if (limits.HasResult()) {
-		// the limits `(window_max 64, batch_bytes '32MiB', …)`, read once the tokens are known (ResourceLimitsJson)
-		ParensInto(limits.GetResult(), 1, MgmtParsed::TextKind::LIMITS, false, *data);
+		data->args[1] = Value(LimitsJson(transformer, limits.GetResult(), *data));
 	}
 	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 7)) {
@@ -2178,8 +2273,8 @@ arena_ptr<TransformResultValue> FinalizeAlterResourceGroup(PEGTransformer &trans
 	auto &change = Strip(list.GetChild(4)).Cast<ListParseResult>();
 	auto name = change.Name();
 	if (name == "AclGroupSetLimits") {
-		data->args[1] = Value("limits"); // AclGroupSetLimits <- 'SET' AclParenList
-		ParensInto(change.GetChild(1), 2, MgmtParsed::TextKind::LIMITS, false, *data);
+		data->args[1] = Value("limits"); // AclGroupSetLimits <- 'SET' AclLimits
+		data->args[2] = Value(LimitsJson(transformer, change.GetChild(1), *data));
 	} else if (name == "AclGroupSetComment") {
 		data->args[1] = Value("comment"); // AclGroupSetComment <- 'SET' AclComment
 		data->args[2] = Value(Quoted(transformer, ClauseList(change.GetChild(1)), 1, "comment", *data));
@@ -2731,12 +2826,23 @@ public:
 		                                         Start<FinalizeSourceGrant>));
 		changes.push_back(GrammarChange::AddRule("AclRevokeSource <- 'REVOKE' 'SOURCE' AclPath 'FROM' 'ROLE' AclName",
 		                                         Start<FinalizeSourceGrant>));
+		// spec 150 4b: a group's limits as a rule - a word, `=` or not, a value (a quoted one, a word, a signed number)
+		changes.push_back(GrammarChange::AddRule("AclLimitRunToken <- Identifier"));
+		changes.push_back(GrammarChange::AddTerminalRuleOverride(
+		    "AclLimitRunToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::RUN);
+		    }));
+		changes.push_back(GrammarChange::AddRule("AclLimitValue <- AclLimitRunToken / AclSignedNumber / AclNameValue"));
+		changes.push_back(GrammarChange::AddRule("AclLimitItem <- AclWordToken '='? AclLimitValue"));
+		changes.push_back(GrammarChange::AddRule("AclLimitEntry <- AclLimitItem?"));
+		changes.push_back(GrammarChange::AddRule("AclLimitMore <- ',' AclLimitEntry"));
+		changes.push_back(GrammarChange::AddRule("AclLimits <- '(' AclLimitEntry AclLimitMore* ')'"));
 		changes.push_back(GrammarChange::AddRule("AclGroupDefault <- 'DEFAULT'"));
 		changes.push_back(GrammarChange::AddRule("AclGroupClause <- AclGroupDefault / AclComment"));
 		changes.push_back(GrammarChange::AddRule("AclCreateResourceGroup <- 'CREATE' AclOrReplace? 'RESOURCE' 'GROUP' "
-		                                         "AclName 'WITH'? AclParenList? AclGroupClause*",
+		                                         "AclName 'WITH'? AclLimits? AclGroupClause*",
 		                                         Start<FinalizeCreateResourceGroup>));
-		changes.push_back(GrammarChange::AddRule("AclGroupSetLimits <- 'SET' AclParenList"));
+		changes.push_back(GrammarChange::AddRule("AclGroupSetLimits <- 'SET' AclLimits"));
 		changes.push_back(GrammarChange::AddRule("AclGroupSetComment <- 'SET' AclComment"));
 		changes.push_back(GrammarChange::AddRule("AclGroupSetDefault <- 'SET' 'DEFAULT'"));
 		changes.push_back(GrammarChange::AddRule("AclGroupDropDefault <- 'DROP' 'DEFAULT'"));
@@ -3003,8 +3109,7 @@ string BodyText(const string &text, const TokenIterator &tokens, idx_t start, id
 			auto value = token.text.size() >= 2 ? token.text.substr(1, token.text.size() - 2) : string();
 			value = StringUtil::Replace(value, string(2, quote), string(1, quote));
 			if (!WrittenPlainly(text, token, value)) {
-				throw BinderException("acl admin: expected %s, quoted ('...', \"...\" or `...`) as one plain literal",
-				                      what);
+				throw BinderException("acl admin: expected %s, quoted ('...' or \"...\") as one plain literal", what);
 			}
 			return value;
 		}
@@ -3429,25 +3534,11 @@ string MgmtCall::Keyword(ParseResult &result) {
 }
 
 string MgmtCall::Text(ParseResult &result, const char *what) {
-	auto &node = Strip(result);
-	if (node.Name() != "AclSignedNumber") {
-		return NameValue(node, what);
+	auto name = Strip(result).Name();
+	if (name != "AclSignedNumber" && name != "AclNameValueToken" && name != "AclDottedToken" && !IsQuotedPart(result)) {
+		throw BinderException("acl admin: %s is read where no value is (a module's rule)", what);
 	}
-	// AclSignedNumber <- AclMinus? NumberLiteral: the number's token as written, its sign in front
-	auto &list = node.Cast<ListParseResult>();
-	reference<ParseResult> number = list.GetChild(1);
-	while (number.get().type != ParseResultType::NUMBER) {
-		if (number.get().type == ParseResultType::CHOICE) {
-			number = number.get().Cast<ChoiceParseResult>().GetResult();
-		} else if (number.get().type == ParseResultType::LIST &&
-		           number.get().Cast<ListParseResult>().GetChildren().size() == 1) {
-			number = number.get().Cast<ListParseResult>().GetChild(0);
-		} else {
-			throw BinderException("acl admin: %s is read where no number is (a module's rule)", what);
-		}
-	}
-	auto sign = list.Child<OptionalParseResult>(0).HasResult() ? "-" : "";
-	return sign + number.get().Cast<NumberParseResult>().number;
+	return ValueTextOf(impl->transformer, result, what, *impl->data);
 }
 
 ParseResult &MgmtCall::Part(ParseResult &result) {
@@ -3590,7 +3681,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			auto index = quoted.offset.IsValid() ? TokenIndexAt(tokens, quoted.offset.GetIndex()) : optional_idx();
 			if (!index.IsValid() ||
 			    !WrittenPlainlyOrBackticked(text, tokens.GetToken(index.GetIndex()), quoted.value)) {
-				throw BinderException("acl admin: expected %s, quoted ('...' or \"...\") as one plain literal",
+				throw BinderException("acl admin: expected %s, quoted ('...', \"...\" or `...`) as one plain literal",
 				                      quoted.what);
 			}
 		}
@@ -3628,11 +3719,10 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 					value = ClaimsListText(text, tokens, span.start, span.end);
 				} else {
 					auto kind = span.kind;
-					value =
-					    ListText(text, tokens, span.start, span.end, span.sql,
-					             kind == MgmtParsed::TextKind::ITEMS || kind == MgmtParsed::TextKind::REQUIRE ||
-					                 kind == MgmtParsed::TextKind::ATTRIBUTES ||
-					                 kind == MgmtParsed::TextKind::CLAIM_MAP || kind == MgmtParsed::TextKind::LIMITS);
+					value = ListText(text, tokens, span.start, span.end, span.sql,
+					                 kind == MgmtParsed::TextKind::ITEMS || kind == MgmtParsed::TextKind::REQUIRE ||
+					                     kind == MgmtParsed::TextKind::ATTRIBUTES ||
+					                     kind == MgmtParsed::TextKind::CLAIM_MAP);
 				}
 				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind, span.splice});
 			}
