@@ -26,11 +26,13 @@
 #include "duckdb/main/profiler/profiling_utils.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <deque>
+#include <unordered_map>
 
 namespace duckdb {
 namespace acl {
@@ -241,40 +243,159 @@ struct NullSink : BaseTreeRenderer {
 	}
 };
 
-//! spec 155: what a principal's error may not say - a name it was not shown. duckdb answers a missing catalog entry
-//! with the closest names it finds in the lookup's own schemas and in every attached database's ("Did you mean
-//! "aclcat.acl.relations"?" - the policy store's table; a table an expansion does not show), naming the physical
-//! object it looked for; other errors append the same "Did you mean" line. Every error loses its suggestion lines; a
-//! missing entry keeps its name only when the client wrote it (a physical name it was never shown - a record's source
-//! named otherwise - becomes a sentence that names nothing). The text is rebuilt as duckdb finalized it (its location
-//! in the statement, or JSON). Answers whether it changed anything.
-bool ScrubPrincipalError(ErrorData &error, const string &query, bool as_json) {
-	auto extra = error.ExtraInfo();
-	auto text = error.RawMessage();
-	const string suggestion = "\nDid you mean";
-	for (auto at = text.find(suggestion); at != string::npos; at = text.find(suggestion, at)) {
-		auto end = text.find('\n', at + 1);
-		text.erase(at, end == string::npos ? string::npos : end - at);
-	}
-	auto subtype = extra.find("error_subtype");
-	auto name = extra.find("name");
-	if (error.Type() == ExceptionType::CATALOG && subtype != extra.end() && subtype->second == "MISSING_ENTRY" &&
-	    name != extra.end() && !StringUtil::Contains(StringUtil::Lower(query), StringUtil::Lower(name->second))) {
-		auto type = extra.find("type");
-		text = "acl: the " + (type == extra.end() ? string("object") : StringUtil::Lower(type->second)) +
-		       " this statement names does not exist";
-		extra.erase(name);
-	}
-	if (text == error.RawMessage()) {
+//! spec 155: whether the client's own text names `name` - an identifier or keyword token of it (or a part of one),
+//! never a string constant or a comment, compared in duckdb's ASCII fold
+bool ClientWrote(const string &query, const string &name) {
+	if (name.empty() || query.empty()) {
 		return false;
 	}
+	auto want = StringUtil::Lower(name);
+	auto tokens = Parser::Tokenize(query);
+	for (idx_t index = 0; index < tokens.size(); index++) {
+		auto type = tokens[index].type;
+		if (type != SimplifiedTokenType::SIMPLIFIED_TOKEN_IDENTIFIER &&
+		    type != SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD) {
+			continue;
+		}
+		auto start = tokens[index].start;
+		auto end = index + 1 < tokens.size() ? tokens[index + 1].start : query.size();
+		auto text = query.substr(start, end - start);
+		StringUtil::Trim(text);
+		if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+			if (StringUtil::Lower(StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"")) == want) {
+				return true;
+			}
+			continue;
+		}
+		for (auto &part : StringUtil::Split(text, '.')) {
+			if (StringUtil::Lower(part) == want) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+//! spec 155: every name an error writes in double quotes ("a", "a.b") is one the client wrote, part by part
+bool QuotedNamesWritten(const string &text, const string &query) {
+	for (auto open = text.find('"'); open != string::npos;) {
+		auto close = text.find('"', open + 1);
+		if (close == string::npos) {
+			return false;
+		}
+		for (auto &part : StringUtil::Split(text.substr(open + 1, close - open - 1), '.')) {
+			if (!part.empty() && !ClientWrote(query, part)) {
+				return false;
+			}
+		}
+		open = text.find('"', close + 1);
+	}
+	return true;
+}
+
+//! spec 155: `name` replaced by `with` wherever it stands as a whole name in `text` (bare, or in double quotes)
+string ReplaceName(string text, const string &name, const string &with) {
+	auto is_name_char = [](char c) {
+		return StringUtil::CharacterIsAlphaNumeric(c) || c == '_' || c == '$';
+	};
+	auto lowered = StringUtil::Lower(text);
+	auto want = StringUtil::Lower(name);
+	string out;
+	idx_t from = 0;
+	for (auto at = lowered.find(want); at != string::npos; at = lowered.find(want, at + want.size())) {
+		bool starts = at == 0 || !is_name_char(text[at - 1]);
+		bool ends = at + want.size() >= text.size() || !is_name_char(text[at + want.size()]);
+		if (starts && ends) {
+			out += text.substr(from, at - from) + with;
+			from = at + want.size();
+		}
+	}
+	return out + text.substr(from);
+}
+
+//! spec 155: the kind of constraint a constraint error names - what a principal is told instead of its table, its
+//! columns and its expression (which may read a column the role never saw)
+string ConstraintKind(const string &text) {
+	auto lowered = StringUtil::Lower(text);
+	for (auto kind : {"not null", "check", "primary key", "unique", "foreign key"}) {
+		if (StringUtil::Contains(lowered, kind)) {
+			return StringUtil::Upper(kind) + " ";
+		}
+	}
+	return string();
+}
+
+//! spec 155: what a principal's error may not say - a name it was not shown. duckdb answers a missing catalog entry
+//! with the closest names it finds in the lookup's own schemas and in every attached database ("Did you mean
+//! "aclcat.acl.relations"?" - the policy store's table; a table an expansion does not show), lists a binding's
+//! columns as candidates (inside a rewritten read: the physical ones), names the physical object or column it looked
+//! for, and a write's errors name the physical table it wrote and a constraint's columns and expression. So:
+//! - every "Did you mean" / "Candidate bindings" / "Candidate tables" line goes;
+//! - each physical leaf the rewrite substituted for a virtual name of another spelling (`renamed`) reads as that name;
+//! - a constraint error says only the kind of constraint; a star that expanded to nothing, not what it expanded;
+//! - a catalog error and a column not found keep their sentence only when the client wrote the names they carry
+//!   (an entry's name; every quoted name of another catalog error), else they become a sentence that names nothing.
+//! The location duckdb appended ("LINE 1: ...") is the client's own text and stays; under errors_as_json the JSON is
+//! read and written again. Answers whether it changed anything.
+bool ScrubPrincipalError(ErrorData &error, const string &query, const vector<std::pair<string, string>> &renamed,
+                         bool as_json) {
+	auto working =
+	    as_json && !error.RawMessage().empty() && error.RawMessage()[0] == '{' ? ErrorData(error.RawMessage()) : error;
+	auto type = working.Type();
+	auto extra = working.ExtraInfo();
+	auto text = working.RawMessage();
+	string location;
+	auto at_location = text.find("\n\nLINE ");
+	if (at_location != string::npos) {
+		location = text.substr(at_location);
+		text = text.substr(0, at_location);
+	}
+	for (auto line : {"\nDid you mean", "\nCandidate bindings", "\nCandidate tables"}) {
+		for (auto at = text.find(line); at != string::npos; at = text.find(line, at)) {
+			auto end = text.find('\n', at + 1);
+			text.erase(at, end == string::npos ? string::npos : end - at);
+		}
+	}
+	auto subtype = extra.count("error_subtype") ? extra["error_subtype"] : string();
+	auto name = extra.count("name") ? extra["name"] : string();
+	for (auto &pair : renamed) {
+		text = ReplaceName(text, pair.first, pair.second);
+		if (StringUtil::CIEquals(name, pair.first)) {
+			name = pair.second;
+			extra["name"] = name;
+		}
+	}
+	bool named = ClientWrote(query, name);
+	if (type == ExceptionType::CONSTRAINT) {
+		text = "acl: the write breaks a " + ConstraintKind(text) + "constraint of the table it writes";
+	} else if (type == ExceptionType::CATALOG &&
+	           ((subtype == "MISSING_ENTRY" || subtype == "ENTRY_ALREADY_EXISTS") ? !named
+	                                                                              : !QuotedNamesWritten(text, query))) {
+		if (subtype == "MISSING_ENTRY" && extra.count("type")) {
+			text = "acl: the " + StringUtil::Lower(extra["type"]) + " this statement names does not exist";
+		} else if (StringUtil::Contains(text, "does not exist")) {
+			text = "acl: an object this statement names does not exist";
+		} else {
+			text = "acl: the catalog refused this statement";
+		}
+	} else if (type == ExceptionType::BINDER && subtype == "COLUMN_NOT_FOUND" && !named) {
+		text = "acl: a column this statement reads does not exist in its source";
+	} else if (type == ExceptionType::BINDER && StringUtil::StartsWith(text, "Star expression \"")) {
+		// duckdb renders the star it expanded - a rewritten one lists the source's every column (spec 065's B)
+		text = "acl: a star in this statement selects no column it may read";
+	}
+	if (!named) {
+		extra.erase("name");
+	}
 	extra.erase("candidates");
-	ErrorData rebuilt(Exception(extra, error.Type(), text));
+	text += location;
+	if (text == working.RawMessage() && extra == working.ExtraInfo()) {
+		return false;
+	}
+	ErrorData rebuilt(Exception(extra, type, text));
 	rebuilt.FinalizeError();
 	if (as_json) {
 		rebuilt.ConvertErrorToJSON();
-	} else {
-		rebuilt.AddErrorLocation(query);
 	}
 	error = std::move(rebuilt);
 	return true;
@@ -305,8 +426,17 @@ public:
 	int64_t began_us = 0;
 	//! spec 078: this state put a session on the connection's AclConnection for the running statement
 	bool published_session = false;
-	//! spec 155: the running decided statement's text (QueryEnd may run when duckdb holds no active query)
+	//! spec 155: the texts this connection ran for a principal (not NATIVE, not the anonymous operator), by hash, with
+	//! the physical names their rewrite substituted - an execution of one is a principal's statement whether or not
+	//! its note is still here (a gateway's prepared statement executed after other work on the connection). Bounded,
+	//! the oldest forgotten first.
+	std::unordered_map<uint64_t, vector<std::pair<string, string>>> principal_texts;
+	std::deque<uint64_t> principal_order;
+	static constexpr idx_t PRINCIPAL_TEXTS = 4096;
+	//! The running statement is one of them: its text (QueryEnd may run when duckdb holds no active query) and names
+	bool principal_statement = false;
 	string query_text;
+	vector<std::pair<string, string>> query_renamed;
 	//! spec 123: the running statement's autocommit transaction rolled back with no error - a result
 	//! closed before anything ended it (duckdb aborts it since 664aafa), and duckdb resets the profiler
 	//! at that rollback before any hook: its profile has its outcome and wall time, not the tree
@@ -349,8 +479,23 @@ public:
 		} else if (has_note && note.text_hash != current) {
 			has_note = false;
 		}
-		// spec 155: a principal's error is rebuilt with its location in the text - which QueryEnd cannot read
-		query_text = has_note ? query : string();
+		// spec 155: a principal's statement - decided now, or a text decided earlier on this connection - has its error
+		// judged on its own text, which QueryEnd cannot read
+		if (has_note && note.statement != "native" && note.proto.detail != "anonymous") {
+			if (principal_texts.find(current) == principal_texts.end()) {
+				principal_order.push_back(current);
+				if (principal_order.size() > PRINCIPAL_TEXTS) {
+					principal_texts.erase(principal_order.front());
+					principal_order.pop_front();
+				}
+			}
+			principal_texts[current] = note.renamed;
+		}
+		auto known = principal_texts.find(current);
+		principal_statement = known != principal_texts.end() &&
+		                      !(has_note && (note.statement == "native" || note.proto.detail == "anonymous"));
+		query_text = principal_statement ? query : string();
+		query_renamed = principal_statement ? known->second : vector<std::pair<string, string>>();
 		began_us = NowMicros();
 		preparing = false;
 		physical_lineage.reset();
@@ -414,14 +559,18 @@ public:
 			// spec 155: a principal's statement (not NATIVE, not the anonymous operator) reads no name it was not
 			// shown in its error - this is the result's own error, the one the client reads (a Prepare's too: it
 			// runs as a PREPARE statement and throws its result's error)
-			if (has_note && note.statement != "native" && note.proto.detail != "anonymous" && error->HasError()) {
+			if (principal_statement && error->HasError()) {
 				try {
-					ScrubPrincipalError(*error, query_text, Settings::Get<ErrorsAsJSONSetting>(context));
+					ScrubPrincipalError(*error, query_text, query_renamed, Settings::Get<ErrorsAsJSONSetting>(context));
 				} catch (...) {
-					// the error stays as duckdb wrote it
+					// fails closed: a sentence that names nothing, of the error's own type
+					*error = ErrorData(error->Type(), "acl: the statement failed");
 				}
 			}
 		}
+		principal_statement = false;
+		query_text = string(); // a big statement's text is not held between statements
+		query_renamed.clear();
 	}
 
 	//! spec 107: one run per execution, handed to the worker with its outcome - never waited on; a

@@ -62,6 +62,8 @@ struct ProfileNote {
 	string statement;
 	vector<AuditObject> objects;
 	vector<string> physical;
+	//! spec 155: the physical leaf names the rewrite substituted, with the virtual leaf each stands for
+	vector<std::pair<string, string>> renamed;
 	//! spec 107: the statement's lineage job; each execution of it is a run (QueryEnd)
 	shared_ptr<LineageJob> lineage;
 	//! spec 143: the origin of each result column (a Flight session's top-level SELECT only; empty otherwise)

@@ -61,6 +61,9 @@ struct AuditTrail {
 		//! spec 074: the physical names the rewrite resolved the statement's relations to - what a
 		//! scan in the execution profile is attributed to (its attached database), never emitted
 		vector<string> physical;
+		//! spec 155: the physical leaf names the rewrite put where the client named a virtual object of another name
+		//! (physical leaf, virtual leaf) - what a principal's error says instead
+		vector<std::pair<string, string>> renamed;
 		//! spec 074: whether an execution follows (a dropped statement has none) and the hash of the
 		//! text the executing statement carries - what the profile matches its execution by, so a
 		//! follow-up, a nested query or a later statement never takes this one's note

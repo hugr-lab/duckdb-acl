@@ -133,12 +133,12 @@ SELECT count(*) FROM acl_check_catalog('c');
 statement ok
 ALTER TABLE phys.main.customers DROP COLUMN ssn_raw;
 
-# a role whose grant reads the column is refused with duckdb's error (spec 065 probe A, accepted);
-# the analyst's mask replaces the column and never reads it, so that role still gets its rows
+# a role whose grant reads the column is refused (spec 065 probe A) - without the source's column names since
+# spec 155; the analyst's mask replaces the column and never reads it, so that role still gets its rows
 statement error
 ACL ROLE "poor" SELECT * FROM customers;
 ----
-<REGEX>:.*Referenced column "ssn_raw" not found.*
+<REGEX>:Binder Error: acl: a column this statement reads does not exist in its source.*
 
 query II
 ACL ROLE "analyst" SELECT id, ssn FROM customers ORDER BY id;

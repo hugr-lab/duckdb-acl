@@ -405,6 +405,7 @@ struct StatementAudit {
 			note.statement = stmt.statement;
 			note.objects = stmt.objects;
 			note.physical = stmt.physical;
+			note.renamed = stmt.renamed;
 			note.origins = stmt.origins;
 			if (stmt.lineage) {
 				stmt.lineage->decision_seq = seq; // spec 107: the run names its decision

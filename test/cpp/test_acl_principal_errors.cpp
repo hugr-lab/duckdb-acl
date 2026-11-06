@@ -2,8 +2,9 @@
 // closest names it finds in every attached database ("Did you mean "aclcat.acl.relations"?" - the policy store's
 // own table; a table an expansion does not show) and names the physical object it looked for. The error of a
 // principal's statement is rewritten where the client reads it (QueryEnd, on the result's own error), on every
-// path: a query, a Prepare (which runs as a PREPARE and throws its result's error), an execution. NATIVE and the
-// operator keep duckdb's text. The Prepare path is what sqllogictest cannot take. Build + run via `make test-cpp`.
+// path: a query, a Prepare (which runs as a PREPARE and throws its result's error), an execution; plain and JSON.
+// NATIVE and the operator keep duckdb's text. The Prepare path, JSON errors and a line's absence are what
+// sqllogictest cannot check. Build + run via `make test-cpp`.
 
 #include "acl_test_util.hpp"
 
@@ -41,6 +42,7 @@ void Setup(Connection &con, const std::string &extension) {
 void NamesNothing(const std::string &error, const std::string &what) {
 	Check(!error.empty(), what + ": refused");
 	Check(error.find("Did you mean") == std::string::npos, what + ": no suggestion (" + error + ")");
+	Check(error.find("andidate") == std::string::npos, what + ": no candidates (" + error + ")");
 	Check(error.find("aclcat") == std::string::npos, what + ": not the policy store (" + error + ")");
 	Check(error.find("hidden_thing") == std::string::npos,
 	      what + ": not a table the expansion does not show (" + error + ")");
@@ -77,10 +79,59 @@ int main(int argc, char *argv[]) {
 			      "the source's physical name is not said (" + renamed->GetError() + ")");
 		});
 
+		Scenario("a gateway's prepared statement executed after other work on its connection", [&]() {
+			// the profile note is matched by text and dropped by the next statement's parse; the connection
+			// remembers which texts were a principal's, so the execution is still one
+			Exec(con, "CREATE TABLE phys.lake.later_src(x INT)");
+			Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE sales.later AS phys.lake.later_src");
+			Exec(con, "ACL ADMIN GRANT TABLE sales.later TO ROLE wide WITH (select)");
+			auto prepared = con.Prepare(wide + "SELECT * FROM later");
+			Check(!prepared->HasError(), "the read prepares (" + prepared->GetError() + ")");
+			Exec(con, "SELECT 42");
+			Exec(con, "DROP TABLE phys.lake.later_src");
+			auto error = prepared->Execute()->GetError();
+			NamesNothing(error, "an execution after an interleaved statement");
+			Check(error.find("later_src") == std::string::npos, "the source is not named (" + error + ")");
+			// ...and after a refused batch left its decisions behind on the thread
+			Exec(con, "CREATE TABLE phys.lake.later_src(x INT)");
+			auto again = con.Prepare(wide + "SELECT * FROM later");
+			auto batch = con.Prepare(wide + "SELECT 1; SELECT 2");
+			Check(batch->HasError(), "a batch does not prepare");
+			Exec(con, "DROP TABLE phys.lake.later_src");
+			auto after = again->Execute()->GetError();
+			NamesNothing(after, "an execution after a refused batch");
+			Check(after.find("later_src") == std::string::npos, "the source is not named (" + after + ")");
+		});
+
+		Scenario("a column the client wrote is said, without the read's candidates", [&]() {
+			auto error = con.Query(wide + "SELECT who, secre FROM vs.payroll")->GetError();
+			Check(error.find("Referenced column \"secre\"") != std::string::npos,
+			      "the column is named (" + error + ")");
+			Check(error.find("andidate") == std::string::npos, "no candidates (" + error + ")");
+		});
+
+		Scenario("errors as JSON: the same rules on the JSON duckdb wrote", [&]() {
+			Exec(con, "SET errors_as_json = true");
+			auto error = con.Query(wide + "DROP TABLE vs.relation")->GetError();
+			Check(error.find("Did you mean") == std::string::npos && error.find("aclcat") == std::string::npos &&
+			          error.find("candidates") == std::string::npos,
+			      "no suggestion, no candidates key (" + error + ")");
+			Check(error.find("exception_message") != std::string::npos, "still JSON (" + error + ")");
+			auto renamed = con.Query(wide + "SELECT * FROM pay")->GetError();
+			Check(renamed.find("salaries_2024") == std::string::npos &&
+			          renamed.find("Table with name pay does not exist") != std::string::npos,
+			      "a source named otherwise reads as the record (" + renamed + ")");
+			Exec(con, "SET errors_as_json = false");
+		});
+
 		Scenario("the operator and NATIVE keep duckdb's text", [&]() {
 			auto plain = con.Query("DROP TABLE phys.lake.hidden_thin")->GetError();
 			Check(plain.find("Did you mean") != std::string::npos,
 			      "the operator's own SQL: duckdb's suggestion (" + plain + ")");
+			Exec(con, "ACL ADMIN GRANT ADMIN passthrough TO ROLE wide");
+			auto native = con.Query(wide + "ACL NATIVE DROP TABLE phys.lake.hidden_thin")->GetError();
+			Check(native.find("Did you mean") != std::string::npos, "ACL NATIVE: duckdb's suggestion (" + native + ")");
+			Exec(con, "ACL ADMIN REVOKE ADMIN passthrough FROM ROLE wide");
 		});
 	});
 }

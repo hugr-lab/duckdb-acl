@@ -27,7 +27,8 @@ Binder Error: Referenced column "ssn_raw" not found in FROM clause!
 Candidate bindings: "internal_tenant"
 ```
 
-Two physical names, from an ordinary `SELECT *`.
+Two physical names, from an ordinary `SELECT *`. (Since spec 155 the principal reads `acl: a column this statement
+reads does not exist in its source`.)
 
 **B. An empty grant intersection leaks the object's whole physical shape.** A catalog grant
 `COLUMNS (nothing_here)` over a bare alias:

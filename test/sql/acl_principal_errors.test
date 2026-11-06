@@ -1,9 +1,11 @@
 # name: test/sql/acl_principal_errors.test
 # description: spec 155 - a principal's error names nothing it was not shown. duckdb answers a missing catalog entry
 #   with the closest names in every attached database ("Did you mean "aclcat.acl.relations"?" - the policy store's own
-#   table; a table the expansion does not show) and names the physical object it looked for. Under a principal every
-#   error loses its "Did you mean" line, and a missing entry keeps its name only when the client wrote it. NATIVE and
-#   the operator keep duckdb's text. (test/cpp/test_acl_principal_errors.cpp takes the Prepare path.)
+#   table; a table the expansion does not show), lists a rewritten read's physical columns as candidates and names
+#   the physical object or column it looked for. Under a principal every error loses its "Did you mean" and
+#   "Candidate ..." lines, and a catalog error or a column not found keeps its sentence only when the client wrote
+#   the name (a token of its text, not a string). NATIVE and the operator keep duckdb's text.
+#   (test/cpp/test_acl_principal_errors.cpp takes the Prepare path, JSON errors and the lines' absence.)
 # group: [sql]
 
 require acl
@@ -79,7 +81,7 @@ ACL ROLE "wide" SELECT * FROM vs.gone;
 ----
 <REGEX>:Catalog Error: Table with name gone does not exist!.*
 
-# ...and a physical name the client never wrote is not: a record whose source is named otherwise
+# ...and a physical name the client never wrote is not: a record whose source is named otherwise reads as itself
 statement ok
 CREATE TABLE phys.lake.salaries_2024(who VARCHAR);
 
@@ -95,14 +97,130 @@ DROP TABLE phys.lake.salaries_2024;
 statement error
 ACL ROLE "wide" SELECT * FROM pay;
 ----
-<REGEX>:Catalog Error: acl: the table this statement names does not exist.*
+<REGEX>:Catalog Error: Table with name pay does not exist!.*
 
-# --- what the principal was shown stays in the error: a column of its own read ------------------------------------
+# a guess written as a string or an alias changes nothing - no yes/no answer for it
+statement error
+ACL ROLE "wide" SELECT 'salaries_2024' AS guess, 1 AS salaries_2024, * FROM pay;
+----
+<REGEX>:Catalog Error: Table with name pay does not exist!.*
+
+# under errors_as_json the same rules hold on the JSON duckdb wrote
+statement ok
+SET errors_as_json = true;
+
+statement error
+ACL ROLE "wide" DROP TABLE vs.relation;
+----
+<REGEX>:\{"exception_type":"Catalog","exception_message":"Table with name relation does not exist!".*
+
+statement ok
+SET errors_as_json = false;
+
+# --- a record over a database detached since: the full physical path is not said ---------------------------------
+
+statement ok
+ATTACH ':memory:' AS otherdb;
+
+statement ok
+CREATE TABLE otherdb.main.secret_src(x INT);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.other AS otherdb.main.secret_src;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.other TO ROLE wide WITH (select);
+
+statement ok
+DETACH otherdb;
+
+statement error
+ACL ROLE "wide" SELECT * FROM other;
+----
+<REGEX>:Catalog Error: acl: an object this statement names does not exist.*
+
+# --- a declared column whose source column is gone: neither it nor the source's other columns are said -----------
+
+statement ok
+CREATE TABLE phys.lake.decl_src(id INT, ssn_raw VARCHAR, internal_note VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.decl AS phys.lake.decl_src COLUMNS (id, ssn = ssn_raw);
+
+statement ok
+ACL ADMIN GRANT TABLE sales.decl TO ROLE wide WITH (select);
+
+statement ok
+ALTER TABLE phys.lake.decl_src DROP COLUMN ssn_raw;
+
+statement error
+ACL ROLE "wide" SELECT * FROM decl;
+----
+<REGEX>:Binder Error: acl: a column this statement reads does not exist in its source.*
+
+# --- a column the client wrote is said - without candidates (inside a rewritten read they are the source's) --------
 
 statement error
 ACL ROLE "wide" SELECT secre FROM vs.payroll;
 ----
-<REGEX>:.*Candidate bindings: "who".*
+<REGEX>:Binder Error: Referenced column "secre" not found in FROM clause!.*
+
+# --- an implicit PIVOT runs as one query under its first part's text: still the principal's -----------------------
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.pivsrc AS SELECT 'a' AS who, 1 AS amount;
+
+statement ok
+DROP TABLE phys.lake.pivsrc;
+
+statement error
+ACL ROLE "wide" PIVOT vs.pivsrc ON who USING sum(amount);
+----
+<REGEX>:Catalog Error: Table with name pivsrc does not exist!.*
+
+# --- a write to a writable object over a source named otherwise: the source is not named, a constraint says its kind
+
+statement ok
+CREATE TABLE phys.lake.wpay(id INT, who VARCHAR NOT NULL, amount INT CHECK (amount > 0));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.money AS phys.lake.wpay;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.money TO ROLE wide WITH (select, insert, update);
+
+statement error
+ACL ROLE "wide" INSERT INTO money (nope) VALUES (1);
+----
+<REGEX>:Binder Error: Table "money" does not have a column with name "nope".*
+
+statement error
+ACL ROLE "wide" INSERT INTO money VALUES (1, 'a', 2, 3);
+----
+<REGEX>:Binder Error: table "money" has 3 columns but 4 values were supplied.*
+
+statement error
+ACL ROLE "wide" INSERT INTO money (id, amount) VALUES (1, 2);
+----
+Constraint Error: acl: the write breaks a NOT NULL constraint of the table it writes
+
+statement error
+ACL ROLE "wide" INSERT INTO money VALUES (1, 'a', -1);
+----
+Constraint Error: acl: the write breaks a CHECK constraint of the table it writes
+
+# --- a grant whose column list meets nothing: the star duckdb expanded (the source's every column) is not said ----
+
+statement ok
+ACL ADMIN CREATE ROLE narrow;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE narrow WITH (select) MAIN COLUMNS (nothing_here);
+
+statement error
+ACL ROLE "narrow" SELECT * FROM money;
+----
+Binder Error: acl: a star in this statement selects no column it may read
 
 # --- the operator's own SQL and NATIVE keep duckdb's text ---------------------------------------------------------
 

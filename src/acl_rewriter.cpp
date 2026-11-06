@@ -488,6 +488,11 @@ public:
 		// through its own dispatch, admitted or refused as it would be standing alone
 		auto &last = *multi.statements.back();
 		RewriteStatement(last);
+		// spec 155 / 074: duckdb runs the parts as one query under the first part's text - each carries the
+		// statement's own, which is what its decision (the note) is found by
+		for (auto &part : multi.statements) {
+			part->query = multi.query;
+		}
 		if (replacement || drop_statement || !follow_ups.empty()) {
 			// a statement the rewrite would replace, drop or follow up (a PRAGMA answered as a SELECT,
 			// a DDL with a catalog record) has no place behind the parser's enum steps: they would be
@@ -2111,7 +2116,7 @@ private:
 				// Keep the virtual name as an alias so qualified references (vname.col) still resolve.
 				auto virtual_name = base.Table();
 				base.SetQualifiedName(ParsePhysName(policy.phys));
-				NotePhysical(policy.phys);
+				NotePhysical(policy.phys, NamePath::ChildKey("", virtual_name.GetIdentifierName()));
 				if (base.alias.empty()) {
 					base.alias = virtual_name;
 				}
@@ -2599,7 +2604,7 @@ private:
 			}
 			sql = "SELECT " + items + policy.ReadFrom();
 		}
-		NotePhysical(policy.phys);
+		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr);
 
@@ -2616,7 +2621,7 @@ private:
 		auto items =
 		    policy.renames.empty() ? string("*") : "* RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ")";
 		auto sql = "SELECT " + items + policy.ReadFrom();
-		NotePhysical(policy.phys);
+		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
 		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
@@ -3924,7 +3929,7 @@ private:
 			dml_read_policy = VerbReadScope(key, capability, policy, restricted);
 		}
 		auto phys = ParsePhysName(policy.phys);
-		NotePhysical(policy.phys);
+		NotePhysical(policy.phys, key);
 		if (target_ref && target_ref->type == TableReferenceType::BASE_TABLE) {
 			// Keep the virtual name as an alias, exactly as the read path does: a statement that
 			// qualifies its own columns still resolves after the swap, and MERGE's ON clause has no
@@ -4494,10 +4499,27 @@ public:
 		}
 		trail->objects.push_back(AuditObject {name, capability});
 	}
-	//! spec 074: the physical name a relation resolved to, for the profile's attribution of scans
-	void NotePhysical(const string &phys) {
+	//! spec 074: the physical name a relation resolved to, for the profile's attribution of scans; spec 155: with the
+	//! virtual name it stands for, when their leaves differ - a principal's error says the virtual one
+	void NotePhysical(const string &phys, const string &vname) {
 		if (!trail || phys.empty()) {
 			return;
+		}
+		string parent, phys_leaf, virtual_leaf;
+		NamePath::SplitLeaf(phys, parent, phys_leaf);
+		NamePath::SplitLeaf(vname, parent, virtual_leaf);
+		auto unquote = [](const string &part) {
+			return part.size() >= 2 && part.front() == '"' && part.back() == '"'
+			           ? StringUtil::Replace(part.substr(1, part.size() - 2), "\"\"", "\"")
+			           : part;
+		};
+		phys_leaf = unquote(phys_leaf);
+		virtual_leaf = unquote(virtual_leaf);
+		if (!phys_leaf.empty() && !virtual_leaf.empty() && !StringUtil::CIEquals(phys_leaf, virtual_leaf)) {
+			auto pair = std::make_pair(phys_leaf, virtual_leaf);
+			if (std::find(trail->renamed.begin(), trail->renamed.end(), pair) == trail->renamed.end()) {
+				trail->renamed.push_back(std::move(pair));
+			}
 		}
 		for (auto &known : trail->physical) {
 			if (known == phys) {

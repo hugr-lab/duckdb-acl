@@ -803,15 +803,17 @@ Conflicts retried; a step not undone is a `policy` event `record_not_undone` + `
 (`NoteDefinitionLineageIfChanged`: what a drop / rename announced vs what the catalog holds). Test
 `acl_record_rollback.test`.
 
-**Spec 155 — a principal's error suggests nothing**: duckdb answers a missing catalog entry with the closest names in
-the lookup's schemas and in every attached database (`Did you mean "aclcat.acl.relations"?` - the policy store's
-table; a table an expansion does not show) and names the physical object. `AclProfileState::QueryEnd` rewrites the
-RESULT's own error (`previous_error` = `result->GetErrorObject()`; a Prepare runs as a PREPARE and throws its result's
-error, so it passes there too) of a decided statement that is neither `native` nor the anonymous operator's
-(`ScrubPrincipalError`): every `\nDid you mean` line cut; a `MISSING_ENTRY` keeps its name only when the client's text
-holds it, else `acl: the <type> this statement names does not exist`; rebuilt as ProcessError did (location in the
-statement text the state copied at QueryBegin - QueryEnd may run with no active query, `GetCurrentQuery` throws - or
-JSON). Tests `acl_principal_errors.test`, `test_acl_principal_errors.cpp` (the Prepare path).
+**Spec 155 — a principal's error suggests nothing**: `AclProfileState::QueryEnd` rewrites the RESULT's own error
+(`previous_error` = `result->GetErrorObject()`; a Prepare runs as a PREPARE and throws its result's error) of a
+principal's statement - judged by `principal_texts` (the text hashes this connection ran for a principal, ≤ 4096,
+with the physical leaves each rewrite substituted - `NotePhysical(phys, vname)` → `renamed`), never the note alone
+(lost by the next parse or a refused batch; an implicit PIVOT's parts carry the statement's text). `ScrubPrincipalError`:
+`Did you mean` / `Candidate bindings|tables` lines cut; a substituted physical leaf reads as its virtual name; a
+CONSTRAINT error says its kind; a `Star expression` says nothing it expanded; a CATALOG error / COLUMN_NOT_FOUND keeps
+its sentence only when the client wrote its names (duckdb's tokens, never a string - `ClientWrote`,
+`QuotedNamesWritten`), else a sentence naming nothing; location kept, JSON re-read and re-written, a throw fails closed.
+The text is copied at QueryBegin (QueryEnd may run with no active query). Tests `acl_principal_errors.test`,
+`test_acl_principal_errors.cpp`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
