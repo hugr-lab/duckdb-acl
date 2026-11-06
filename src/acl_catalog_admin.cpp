@@ -2165,8 +2165,18 @@ void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, con
 
 void PolicyStore::CatalogRevokeSchema(const string &role, const string &vcat, const string &path) {
 	RequireCatalog(catalog, "acl_revoke_schema");
-	catalog->Write({"DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
-	                " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path)});
+	auto where =
+	    " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path);
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		// a row inherited from a parent schema's grant is that grant's - the rematerialization below puts it back
+		if (read("SELECT 1 FROM " + catalog->Tbl("role_schemas") + where + " AND NOT \"inherited\"")->RowCount() == 0) {
+			bool inherits = read("SELECT 1 FROM " + catalog->Tbl("role_schemas") + where)->RowCount() > 0;
+			ThrowNothingToRevoke(role,
+			                     "grant on schema \"" + vcat + "." + path + "\"" +
+			                         (inherits ? string(" (it inherits a parent schema's - revoke that one)") : ""));
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + where);
+	});
 	// the subtree now inherits from whatever ancestor still states capabilities - or from nothing
 	CatalogRematerializeSchemaCaps(vcat, path);
 }
@@ -2583,8 +2593,24 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 	NoteGrantLineage(vcat); // spec 107: what the role sees changed
 }
 
+void ThrowNothingToRevoke(const string &role, const string &what) {
+	// spec 150 4a: a revoke of nothing is refused - a name that only looks like the role's (another script's letter,
+	// another spelling) would answer success and leave the grant in place
+	throw BinderException("acl admin: %s holds no %s - nothing to revoke",
+	                      role.empty() ? string("ALL ROLES") : "role \"" + role + "\"", what);
+}
+
 void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 	RequireCatalog(catalog, "acl_revoke_catalog");
+	auto held = [&](const char *table) {
+		return catalog
+		           ->Query("SELECT 1 FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role) +
+		                   " AND \"vcat\" = " + Lit(vcat) + " LIMIT 1")
+		           ->RowCount() > 0;
+	};
+	if (!held("role_catalogs") && !held("role_object_caps") && !held("grant_columns")) {
+		ThrowNothingToRevoke(role, "grant on catalog \"" + vcat + "\"");
+	}
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat),
 	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
@@ -3369,7 +3395,7 @@ static void RequireNoOtherDefault(CatalogBackend &catalog, const ReadFn &read, c
 		auto other = current->Collection().GetValue(0, 0).ToString();
 		throw BinderException("acl admin: resource group \"%s\" is already the default - ALTER RESOURCE GROUP %s DROP "
 		                      "DEFAULT first (moving every principal without a group is a change made on purpose)",
-		                      other, other);
+		                      other, NamePath(vector<string> {other}).ToGrammar());
 	}
 }
 
@@ -3462,8 +3488,11 @@ void PolicyStore::CatalogBindResourceGroup(const string &role, const string &gro
 				throw BinderException("acl admin: role \"%s\" does not exist", role);
 			}
 		}
-		statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + " WHERE \"role\" = " + Lit(role) +
-		                     " AND \"group\" = " + Lit(group));
+		auto where = " WHERE \"role\" = " + Lit(role) + " AND \"group\" = " + Lit(group);
+		if (remove && read("SELECT 1 FROM " + catalog->Tbl("role_resource_groups") + where)->RowCount() == 0) {
+			ThrowNothingToRevoke(role, "resource group \"" + group + "\"");
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + where);
 		if (!remove) {
 			statements.push_back("INSERT INTO " + catalog->Tbl("role_resource_groups") + " VALUES (" + Lit(role) +
 			                     ", " + Lit(group) + ")");
@@ -3490,6 +3519,11 @@ void PolicyStore::CatalogWriteFunctionGrant(const string &role, const string &ca
 			if (exists->RowCount() == 0) {
 				throw BinderException("acl admin: function category \"%s\" does not exist", category);
 			}
+		}
+		if (remove && read("SELECT 1 FROM " + catalog->Tbl("function_grants") + where)->RowCount() == 0) {
+			ThrowNothingToRevoke(role, key ? StringUtil::Format("grant of %s function \"%s\"",
+			                                                    FunctionKindName(key->kind), key->ToString())
+			                               : "grant of function category \"" + category + "\"");
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("function_grants") + where);
 		if (!remove) {
@@ -3865,13 +3899,19 @@ void PolicyStore::CatalogGrantAdmin(const string &role, const string &scope) {
 void PolicyStore::CatalogWritePlatformGrant(const string &role, const string &kind, const string &object, bool allowed,
                                             bool remove) {
 	RequireCatalog(catalog, remove ? "acl_revoke_platform" : "acl_grant_platform");
-	vector<string> statements = {"DELETE FROM " + catalog->Tbl("platform_grants") + " WHERE \"role\" = " + Lit(role) +
-	                             " AND \"object\" = " + Lit(object) + " AND \"kind\" = " + Lit(kind)};
-	if (!remove) {
-		statements.push_back("INSERT INTO " + catalog->Tbl("platform_grants") + " VALUES (" + Lit(role) + ", " +
-		                     Lit(object) + ", " + Lit(kind) + ", " + (allowed ? "true" : "false") + ")");
-	}
-	catalog->Write(statements);
+	// the object and the kind in any case, as the rights read them (a source as written - `PHYS` admits `phys`)
+	auto where = " WHERE \"role\" = " + Lit(role) + " AND " + KeyFoldSql("\"object\"") + " = " +
+	             KeyFoldSql(Lit(object)) + " AND " + KeyFoldSql("\"kind\"") + " = " + KeyFoldSql(Lit(kind));
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		if (remove && read("SELECT 1 FROM " + catalog->Tbl("platform_grants") + where)->RowCount() == 0) {
+			ThrowNothingToRevoke(role, "grant on " + kind + " \"" + object + "\"");
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("platform_grants") + where);
+		if (!remove) {
+			statements.push_back("INSERT INTO " + catalog->Tbl("platform_grants") + " VALUES (" + Lit(role) + ", " +
+			                     Lit(object) + ", " + Lit(kind) + ", " + (allowed ? "true" : "false") + ")");
+		}
+	});
 }
 
 void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
@@ -3913,12 +3953,18 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 	ResultRows grants_rows(*grants);
 	vector<string> statements = {"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role),
 	                             "DELETE FROM " + catalog->Tbl("platform_grants") + " WHERE \"role\" = " + Lit(role)};
+	auto holds_row = [&](const char *table) {
+		return catalog->Query("SELECT 1 FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role) + " LIMIT 1")
+		           ->RowCount() > 0;
+	};
+	bool holds = holds_row("admins") || holds_row("platform_grants");
 	for (idx_t row = 0; row < grants->RowCount(); row++) {
 		auto caps_value = grants_rows.GetValue(1, row);
 		auto caps = acl_detail::ParseCaps(caps_value.IsNull() ? string() : caps_value.ToString());
 		if (!caps.erase("manage")) {
 			continue;
 		}
+		holds = true;
 		vector<string> kept;
 		for (auto &cap : caps) {
 			kept.push_back(JsonQuote(cap) + ": true"); // the name as JSON - pasted, `\u006danage` read as manage
@@ -3926,6 +3972,9 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 		statements.push_back("UPDATE " + catalog->Tbl("role_catalogs") + " SET \"caps\" = " +
 		                     Lit("{" + StringUtil::Join(kept, ", ") + "}") + " WHERE \"role\" = " + Lit(role) +
 		                     " AND \"vcat\" = " + Lit(grants_rows.GetValue(0, row).ToString()));
+	}
+	if (!holds) {
+		ThrowNothingToRevoke(role, "administration");
 	}
 	catalog->Write(statements);
 }

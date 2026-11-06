@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stages 1-3 implemented (stage 3: 3a-3g), stage 4 to come
+- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a implemented)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -92,7 +92,8 @@ quack does (the same collector), and Flight refuses a batch at Prepare. Owner, 2
    open questions below and measures the parse; the owner decides the shape.
 2. The prefix and its markers move; the scanner goes. Built (below).
 3. The management statements move, one statement family per PR; the compiled calls stay unchanged.
-4. Policy texts become rules and stored rows are emitted from trees; `ParseColumnList` / `SplitTopLevel` go.
+4. Policy texts become rules where they are written (the owner, 2026-11-06: stored rows stay the text as written,
+   see Decided); the statement's list readers on `AdminScanner` go.
 
 **Stage 1, the prototype (2026-10-23, #259)** - the role prefix as a rule taking the statement inside it, behind
 `acl_peg_prefix`, beside the scanner. Measured with the rule on by default: the whole suite and `make test-cpp` pass;
@@ -436,10 +437,89 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
 - Spec 151 comes between stage 3 and stage 4 (the owner, 2026-11-04); stage 4 also takes the bare non-ASCII words the
   rules refuse since 3b (`CREATE ROLE größe` - a word is ASCII to `IsWord` / `IsDottedText`; quoted works).
 
-**Open questions**
+**Stage 4 - policy texts read by rules where they are written, one family per PR** (the owner's decisions of
+2026-11-06 in Decided below):
 
-1. Stored policy rows are text by contract (read back and pasted). Either parse them with the rule at read and emit
-   the tree, or keep spec 148's check.
+- 4a (built): a NAME in a management statement - a catalog, schema, object, role, issuer, client, group, secret, a
+  path's parts - is read exactly as duckdb reads an identifier (`IdentifierMatcher`'s rule, `DuckdbIdentifier` in
+  the rules' matcher with duckdb's literal table and identifier mask): `"…"` or a backtick name quoted; bare, a word
+  that does not start with a digit, its first character one duckdb's tokenizer keeps in a word (a letter, `_`, any
+  byte past ASCII), a keyword only when duckdb lets it name a column (`user`, `schema` bare; a reserved word -
+  `select`, `default` - and a word only a function or a type may be - `full`, `left`, `join` - quoted); after a dot
+  any word; a function's path (`AclFunctionPath`: GRANT / DENY / REVOKE FUNCTION, ALIAS OF) reads its one part as
+  duckdb's `FunctionName` does (`left`, `glob` bare). No check of ours on top (Decided 3): `CREATE ROLE größe`,
+  `CREATE VIRTUAL CATALOG продажи` read bare, and so does whatever duckdb itself keeps in a bare identifier (an
+  invisible character too - duckdb turns U+00A0, U+2000-U+200B, U+202F, U+205F, U+2060, U+3000 and U+FEFF outside
+  quotes into a space first). A name is taken as written: a connection's `preserve_identifier_case` folds duckdb's
+  identifiers, never a management statement's (a role compares exactly, and a node's policy must not depend on the
+  connection that wrote it). Newly refused bare, as duckdb refuses them: such a keyword (`CREATE ROLE "full"`, the
+  legacy wrappers' catalog `"default"`) and a leading digit (`ISSUER "v1.2"`, `objects."9t"`) - what is stored
+  under such a name keeps working, only its statement quotes it, and the refusal says so (`NameHint`: the token the
+  parse stopped at, right after a word a name follows - `ROLE`, `TABLE`, `OF`, `EXISTS` … -, `… - full is an SQL
+  keyword: as a name it is written in double quotes ("full")`). A name that is a value (an issuer, client, group, secret, `AclNameValue`) keeps stage 3's reading of bare words joined by
+  dots as one name (`kc.local`), never a word, a dot and a quoted part (`a."b"` is no name); a backtick one is a
+  quoted one there too. A VALUE (a scope, a level, a setting's value, a capability) stays the scanner's word
+  (`true`, `v1.0`, `4GB`; a capability a word or a quoted one - `select` is a keyword). A name offered back to paste
+  is quoted as duckdb's writer quotes it (`NamePath::ToGrammar` = `KeywordHelper::RequiresQuotes`, capitals allowed:
+  `c."old"`, `"größe"`; the same in a message that suggests a statement). Found by its reviews: `REVOKE CATALOG …
+  FROM ROLE <a name that only looks like the role's>` answered success and left the grant - EVERY revoke of nothing
+  is refused now (`ThrowNothingToRevoke`: catalog, schema, resource group, function, function category, platform's
+  point grants and sources, `REVOKE ADMIN` without a scope; REVOKE TABLE and a scoped REVOKE ADMIN were already; a
+  schema row inherited from a parent's grant is that grant's - its revoke is refused, naming it; a point grant's
+  object and a source compare in any case, as the rights read them);
+  whether a column expression is a plain rename (`RenameOnlyColumns`) and a key column (`BareIdentifier`) are
+  duckdb's parser's reading (`PlainColumnName`: one token of the text the parser reads, one column reference of one
+  part, no alias - `x = größe` stays a writable rename, `x = (b)`, `x = "b"` and `` x = `b` `` stay read-only; duckdb's
+  special values `current_date`, `user` parse as column references and stay renames, as before 4a); the listings'
+  by-name test reads a word as duckdb's tokenizer does (no ASCII punctuation but `_`, `$` not first). Look-alikes
+  (Cyrillic `а`, a modifier letter like `ʼ`, a decomposed `ö`) are different names - every rights check compares
+  names exactly, so one never reaches another's rights; a GRANT or DENY to a role nobody defined is accepted (a role
+  may come from claims alone); security.md says what an operator should look for. hugr-node's rules use the same
+  matchers; the DBeaver plugin's composer quotes the same words (acl-clients).
+- 4b: resource group limits as rules (`ResourceLimitsJson` and `TextKind::LIMITS` go).
+- 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
+  ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
+- 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
+- 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
+  takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
+  the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what
+  the stored text reads back as. The other readers of a stored list follow (`acl_platform_list`, the lineage tags,
+  the listings' copy of `ParseFieldPath`), and `ParseFieldPath`'s bare word is duckdb's identifier, as 4a's.
+- 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
+  `ScannerUnreadable` go.
+
+**Hand-written readers left outside stage 4** (the owner, 2026-11-06: reuse duckdb's grammar wherever it applies -
+an inventory of `src/`, each with its verdict; the REPLACE ones are the next work after stage 4):
+
+| Reader | Text | Verdict |
+|---|---|---|
+| `KeyStatements` (acl_catalog_admin.cpp) | `PRIMARY KEY (…)`, split on `,` | replace: a rule (a quoted key column holding a comma is split) |
+| SET TYPES (acl_catalog_admin.cpp) | `aliases = …, enums = …` | replace: a rule |
+| `ParseDeclaration` / `DeclaredTypes`, `StripDeclarationNullability` | RETURNS TABLE, parameter types | replace: duckdb's `ParseColumnList` (a `,` split breaks `DECIMAL(10, 2)`, `STRUCT(…)`) |
+| `SplitParams` (acl_principal_functions.cpp) | a stored macro's parameters | replace: read once at write (a `CREATE MACRO` probe) |
+| REFERENCE arguments / `ON` pairs (`SplitPair`) | `param => col`, `a = b` | replace: rules |
+| category members (`SplitTopLevel`), the function spec's kind word | `[db.schema.]name [TABLE]` | replace in the statement form (a rule); the function form keeps `QualifiedName::ParseComponents` |
+| `SplitIdentifierPath` (acl_rewriter.cpp) | a USE value | replace: `QualifiedName::ParseComponents` |
+| `ExtractStreamIdFor` (acl_parser_override.cpp) | a drain's raw INSERT | replace: the constant from the AST parsed right after |
+| `GetTableNames` output cut at ` as ` (acl_catalog_admin.cpp) | a body's table names | replace: `BodyTables` (the AST walk) |
+| `SplitProjectionItem` (lineage) | our own `expr AS "name"` | replace: carry the pairs |
+| `TextNamesPolicyStore`, `SqlNamesSource` | view / macro bodies | keep: they over-read on purpose, string literals too (`query_table('acl.admins')`) |
+| `ParseFieldPath` | `a.b`, `items[].x` | keep (duckdb has no `[]` path); its word reads as duckdb's identifier in 4e |
+| the first-word ACL check, `MayCarryAttachLineage`, `CallsFunctionNamed` | every query | keep: prefilters before the real read on tokens |
+| keys (`NamePath`), JWT, base64, URLs, `\x1f` serializations, JSON | not SQL | keep |
+
+**Decided**
+
+1. Stored policy rows are text by contract (read back and pasted). The owner, 2026-11-06: the rules read a policy
+   text where it is WRITTEN (the statement's lists, the function forms' text arguments); the stored row stays the
+   text as written - no parse at read, no row emitted from a tree - and spec 148's check stays. So the read side keeps
+   reading the stored text (`ParseColumnList`) - split on duckdb's tokens since 4e (decision 2); a write-side rule
+   and it must split one list alike, which stage 4's tests pin.
+2. A mask with a list / struct literal (`COLUMNS (tags = ['a', 'b'])`, `{'k': 1}`) works as in duckdb (the owner,
+   2026-11-06: "что бы работало так же") - by duckdb's own grammar and tokenizer, not a second hand-written one.
+3. A name in a management statement is read exactly as duckdb reads an identifier (the owner, 2026-11-06: "Ровно
+   как duckdb") - no check of ours on top. It replaces the same day's "Unicode letters and digits only", which
+   refused what duckdb reads (a format character, a decomposed spelling) and read what duckdb refuses (`full`, `9t`).
 
 ## Enforcement & security
 

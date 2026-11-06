@@ -948,13 +948,16 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			// a statement no rule reads: refused in its form's own words (or, when the tokenizer refused it, in its)
 			try {
 				RefuseUnreadStatement(entry.text);
-			} catch (MovedFormRefusal &) {
+			} catch (MovedFormRefusal &refusal) {
 				if (piece.refused) {
 					// the tokenizer's words - its position counts in the piece, not in the batch, so it goes
 					auto info = piece.refused->ExtraInfo();
 					info.erase("position");
 					info.erase("location");
 					throw ParserException(info, piece.refused->RawMessage());
+				}
+				if (!entry.hint.empty()) {
+					throw BinderException(ErrorData(refusal).RawMessage() + entry.hint);
 				}
 				throw;
 			}

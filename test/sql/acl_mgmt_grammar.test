@@ -306,9 +306,10 @@ SELECT comment FROM aclcat.acl.roles WHERE role = 'tenant_reader';
 ----
 reads one tenant
 
-# a role named like a keyword, bare or quoted; a quoted name keeps its case and its dot
+# a role named like a keyword: a reserved one quoted (as duckdb reads names, spec 150 4a), an unreserved one bare; a
+# quoted name keeps its case and its dot
 statement ok
-ACL ADMIN CREATE ROLE select; CREATE ROLE "Mixed.Case";
+ACL ADMIN CREATE ROLE "select"; CREATE ROLE "Mixed.Case";
 
 query I
 SELECT count(*) FROM aclcat.acl.roles WHERE role IN ('select', 'Mixed.Case');
@@ -419,9 +420,14 @@ SELECT count(*) FROM aclcat.acl.roles WHERE role = 'split_list';
 ----
 0
 
-# a name with a leading digit is one word, as the scanner read it - the tokenizer splits it (`9abc` is `9` `abc`)
+# a name with a leading digit is quoted, as duckdb reads a name (spec 150 4a: `9abc` bare is refused)
+statement error
+ACL ADMIN CREATE ROLE 9abc;
+----
+write CREATE [OR REPLACE] ROLE
+
 statement ok
-ACL ADMIN CREATE ROLE 9abc; CREATE ROLE 0x1F;
+ACL ADMIN CREATE ROLE "9abc"; CREATE ROLE "0x1F";
 
 query I
 SELECT role FROM aclcat.acl.roles WHERE role IN ('9abc', '0x1F') ORDER BY role;
@@ -430,7 +436,7 @@ SELECT role FROM aclcat.acl.roles WHERE role IN ('9abc', '0x1F') ORDER BY role;
 9abc
 
 statement ok
-ACL ADMIN DROP ROLE 9abc;
+ACL ADMIN DROP ROLE "9abc";
 
 # ... and a word apart is another word
 statement error
@@ -438,12 +444,13 @@ ACL ADMIN CREATE ROLE 9 abc;
 ----
 write CREATE [OR REPLACE] ROLE
 
-# a role mapping, both ways; an issuer's name of words joined by dots, `.2` too
+# a role mapping, both ways; an issuer's name with a dot and a leading digit after it is quoted (spec 150 4a: as duckdb
+# reads a name, `v1.2` bare is `v1` and the number `.2`)
 statement ok
 ACL ADMIN CREATE ISSUER "v1.2" URL 'test/idp/two';
 
 statement ok
-ACL ADMIN MAP GROUP 'g-read' FROM ISSUER v1.2 TO ROLE tenant_reader; MAP CLAIM "ops" FROM ISSUER v1 . 2 TO ROLE 0x1F;
+ACL ADMIN MAP GROUP 'g-read' FROM ISSUER "v1.2" TO ROLE tenant_reader; MAP CLAIM "ops" FROM ISSUER "v1.2" TO ROLE "0x1F";
 
 query IIIII
 SELECT scope_kind, scope_name, source, external_value, role FROM aclcat.acl.role_mappings ORDER BY role;
@@ -451,17 +458,22 @@ SELECT scope_kind, scope_name, source, external_value, role FROM aclcat.acl.role
 issuer	v1.2	claim-value	ops	0x1F
 issuer	v1.2	group	g-read	tenant_reader
 
-# a dotted name the tokenizer reads as numbers is the name as written (`v2.0.1` is `v2` `.0.1`): the mapping reaches
-# the issuer's own check, every part a word
+# a dotted name the tokenizer reads as numbers (`v2.0.1` is `v2` `.0.1`) is no name bare, as in duckdb: the form's
+# words; quoted it is the name, and reaches the issuer's own check
 statement error
 ACL ADMIN MAP GROUP 'g' FROM ISSUER v2.0.1 TO ROLE tenant_reader;
+----
+write MAP GROUP | CLAIM
+
+statement error
+ACL ADMIN MAP GROUP 'g' FROM ISSUER "v2.0.1" TO ROLE tenant_reader;
 ----
 issuer "v2.0.1" does not exist
 
 statement error
 ACL ADMIN MAP GROUP 'g' FROM ISSUER 9.x TO ROLE tenant_reader;
 ----
-issuer "9.x" does not exist
+write MAP GROUP | CLAIM
 
 statement error
 ACL ADMIN MAP GROUP 'g' FROM ISSUER a..b TO ROLE tenant_reader;
@@ -469,7 +481,7 @@ ACL ADMIN MAP GROUP 'g' FROM ISSUER a..b TO ROLE tenant_reader;
 write MAP GROUP | CLAIM
 
 statement ok
-ACL ADMIN DROP MAP GROUP 'g-read' FROM ISSUER v1.2 TO ROLE tenant_reader;
+ACL ADMIN DROP MAP GROUP 'g-read' FROM ISSUER "v1.2" TO ROLE tenant_reader;
 
 query I
 SELECT count(*) FROM aclcat.acl.role_mappings;
@@ -579,9 +591,10 @@ SELECT template FROM aclcat.acl.functions WHERE vcat = 'objects' AND vname = 'ta
 ----
 concat('tag:', acl_arg(1))
 
-# a name with a leading digit, a part the tokenizer reads as a number, spaces around a dot
+# a part with a leading digit or one the tokenizer reads as a number is quoted, as duckdb reads a name; spaces may
+# stand around a dot
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE objects.9t AS phys . main . t; ADD TABLE phys.main.t AS objects.v1.2;
+ACL ADMIN CREATE VIRTUAL TABLE objects."9t" AS phys . main . t; ADD TABLE phys.main.t AS objects.v1."2";
 
 query II
 SELECT vname, phys FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname IN ('9t', 'v1.2') ORDER BY vname;
@@ -2081,9 +2094,14 @@ ACL ADMIN SET SESSION /* c */ 'nosuch' AUDIT LEVEL all;
 ----
 false
 
-# a name the tokenizer reads as a number then a word (`1x`) is a name after FUNCTION CATEGORY
+# a name with a leading digit (`1x`) is quoted after FUNCTION CATEGORY, as duckdb reads a name (spec 150 4a)
+statement error
+ACL ADMIN CREATE FUNCTION CATEGORY 1x;
+----
+write CREATE [OR REPLACE] FUNCTION CATEGORY
+
 statement ok
-ACL ADMIN CREATE FUNCTION CATEGORY 1x; DROP FUNCTION CATEGORY 1x;
+ACL ADMIN CREATE FUNCTION CATEGORY "1x"; DROP FUNCTION CATEGORY "1x";
 
 # duckdb's own forms that open like ours stay duckdb's: a macro named category, its DROP, a table named virtual
 statement ok
@@ -2203,3 +2221,413 @@ ACL ADMIN GRANT SOURCE; KILL SESSION E'x';
 ----
 <REGEX>:.*write GRANT SOURCE <database>\[\.<schema>\] TO ROLE <role>.*
 
+# --- stage 4a: a name is read as duckdb reads an identifier (the owner, 2026-11-06) ---------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE größe;
+
+statement ok
+ACL ADMIN CREATE ROLE отдел2;
+
+query T
+SELECT role FROM aclcat.acl.roles WHERE role IN ('größe', 'отдел2') ORDER BY 1;
+----
+größe
+отдел2
+
+statement ok
+CREATE TABLE phys_4a(x INT);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG продажи;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE продажи.заказы AS memory.main.phys_4a;
+
+# the bare word and the quoted name are one key - a dot may have space around it, as in duckdb
+statement ok
+ACL ADMIN GRANT TABLE продажи . "заказы" TO ROLE größe WITH (select);
+
+query T
+SELECT vname FROM aclcat.acl.role_object_caps WHERE vcat = 'продажи' AND role = 'größe';
+----
+заказы
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE größe;
+
+statement ok
+ACL ADMIN REVOKE ADMIN FROM ROLE größe;
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE продажи.заказы IS 'orders';
+
+query T
+SELECT comment FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname = 'заказы';
+----
+orders
+
+# a reserved word and a leading digit need quotes, as in duckdb; an unreserved keyword does not
+statement error
+ACL ADMIN CREATE ROLE from;
+----
+
+statement ok
+ACL ADMIN CREATE ROLE "from";
+
+statement error
+ACL ADMIN CREATE ROLE 9ö;
+----
+
+statement ok
+ACL ADMIN CREATE ROLE "9ö";
+
+statement ok
+ACL ADMIN CREATE ROLE user;
+
+# backticks quote a name, as in duckdb
+statement ok
+ACL ADMIN CREATE ROLE `back tick`;
+
+query T
+SELECT role FROM aclcat.acl.roles WHERE role IN ('from', '9ö', 'user', 'back tick') ORDER BY 1;
+----
+9ö
+back tick
+from
+user
+
+# whatever duckdb's tokenizer keeps in a word is a bare name (an invisible U+034F too) - another name than without it
+statement ok
+ACL ADMIN CREATE ROLE admin͏;
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'admin͏';
+----
+1
+
+# a revoke of nothing is refused: a name that only looks like the role's would answer success
+statement error
+ACL ADMIN REVOKE CATALOG продажи FROM ROLE отдел2;
+----
+<REGEX>:.*role "отдел2" holds no grant on catalog "продажи".*
+
+# a renamed column in another script stays a rename (the relation writable), and may be the key; a parenthesised one
+# is written as an expression and is not
+statement ok
+CREATE TABLE phys_4a_u(a INT, "größe" INT, b INT);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE продажи.u AS memory.main.phys_4a_u COLUMNS (a = a, x = größe) PRIMARY KEY (x);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE продажи.p AS memory.main.phys_4a_u COLUMNS (a = a, y = (b));
+
+query TT
+SELECT vname, form FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname IN ('u', 'p') ORDER BY 1;
+----
+p	subquery
+u	alias
+
+statement ok
+ACL ADMIN DROP ROLE "from";
+
+statement ok
+ACL ADMIN DROP ROLE "9ö";
+
+statement ok
+ACL ADMIN DROP ROLE user;
+
+statement ok
+ACL ADMIN DROP ROLE `back tick`;
+
+statement ok
+ACL ADMIN DROP ROLE admin͏;
+
+statement ok
+ACL ADMIN DROP ROLE größe;
+
+statement ok
+ACL ADMIN DROP ROLE отдел2;
+
+# nested schemas: a path of any depth, each part bare or quoted (a dot inside a quoted part is part of the name), a
+# keyword after the first part as duckdb reads one; the keys, the read, the grants, the listing and the repair text
+statement ok
+CREATE SCHEMA phys."Raw.Data";
+
+statement ok
+CREATE TABLE phys."Raw.Data"."Order.Items"(id INT, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys."Raw.Data"."Order.Items" VALUES (1, 'acme'), (2, 'other');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG "nn.catalog"; CREATE VIRTUAL CATALOG catalog; CREATE ROLE nest;
+
+statement ok
+ACL ADMIN GRANT CATALOG "nn.catalog" TO ROLE nest WITH (select) MAIN; GRANT CATALOG catalog TO ROLE nest WITH (select);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "nn.catalog"."parent.schema".child.sub."table.name" AS phys."Raw.Data"."Order.Items";
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE catalog.parent.child.sub.table AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE catalog . select . from . "x y" AS phys . main . t;
+
+query TTT
+SELECT vcat, vname, phys FROM aclcat.acl.relations WHERE vcat IN ('"nn.catalog"', 'catalog') ORDER BY ALL;
+----
+"nn.catalog"	"parent.schema".child.sub."table.name"	phys."Raw.Data"."Order.Items"
+catalog	parent.child.sub.table	phys.main.t
+catalog	select.from.x y	phys.main.t
+
+# a reserved word first is refused, as duckdb refuses `FROM select.a.t`
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE select.a.t AS phys.main.t;
+----
+
+query IT
+ACL ROLE "nest" SELECT * FROM "nn.catalog"."parent.schema".child.sub."table.name" ORDER BY id;
+----
+1	acme
+2	other
+
+query I
+ACL ROLE "nest" SELECT count(*) FROM catalog.parent.child.sub.table;
+----
+0
+
+query TTT
+ACL ROLE "nest" SELECT table_catalog, table_schema, table_name FROM information_schema.tables ORDER BY ALL;
+----
+catalog	parent.child.sub	table
+catalog	select.from	x y
+nn.catalog	"parent.schema".child.sub	table.name
+
+statement ok
+ACL ADMIN GRANT TABLE "nn.catalog"."parent.schema".child.sub."table.name" TO ROLE nest RLS (tenant = 'acme');
+
+query IT
+ACL ROLE "nest" SELECT * FROM "nn.catalog"."parent.schema".child.sub."table.name";
+----
+1	acme
+
+statement ok
+ACL ADMIN REVOKE TABLE "nn.catalog"."parent.schema".child.sub."table.name" FROM ROLE nest;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA "nn.catalog"."parent.schema".alias AS phys."Raw.Data";
+
+statement ok
+ACL ADMIN GRANT SCHEMA "nn.catalog"."parent.schema".alias TO ROLE nest WITH (select);
+
+query I
+ACL ROLE "nest" SELECT count(*) FROM "nn.catalog"."parent.schema".alias."Order.Items";
+----
+2
+
+statement ok
+ACL ADMIN REVOKE SCHEMA "nn.catalog"."parent.schema".alias FROM ROLE nest;
+
+# the repair text names the object as it must be written back
+statement ok
+ALTER TABLE phys."Raw.Data"."Order.Items" RENAME TO gone;
+
+query T
+SELECT repair FROM acl_check_catalog('"nn.catalog"') WHERE problem = 'source_missing';
+----
+ALTER VIRTUAL TABLE "nn.catalog"."parent.schema".child.sub."table.name" SET PHYS <path>  -- or DROP VIRTUAL TABLE "nn.catalog"."parent.schema".child.sub."table.name"
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE "nn.catalog"."parent.schema".child.sub."table.name"; DROP VIRTUAL SCHEMA "nn.catalog"."parent.schema".alias;
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE catalog.parent.child.sub.table; DROP VIRTUAL TABLE catalog.select.from."x y";
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG "nn.catalog" CASCADE; DROP VIRTUAL CATALOG catalog CASCADE; DROP ROLE nest;
+
+# --- 4a's reviews: names that are values, function names, renames, a revoke of nothing -----------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE rev4a;
+
+# a backtick name where a name is a value, as duckdb quotes one
+statement ok
+ACL ADMIN MAP GROUP 'g4a' FROM ISSUER `v1.2` TO ROLE rev4a;
+
+statement ok
+ACL ADMIN DROP MAP GROUP 'g4a' FROM ISSUER `v1.2` TO ROLE rev4a;
+
+# words joined by dots, or one quoted name - never a word, a dot and a quoted part
+statement error
+ACL ADMIN MAP GROUP 'g4a' FROM ISSUER v1."2" TO ROLE rev4a;
+----
+write MAP GROUP | CLAIM
+
+# a function's name as duckdb reads one: a keyword a function may have (`left`, `glob`) bare; as a qualifier it is
+# no identifier
+statement ok
+ACL ADMIN GRANT FUNCTION left TO ROLE rev4a; GRANT FUNCTION glob TABLE TO ROLE rev4a;
+
+query TT
+SELECT name, kind FROM aclcat.acl.function_grants WHERE role = 'rev4a' ORDER BY name;
+----
+glob	table
+left	scalar
+
+statement ok
+ACL ADMIN REVOKE FUNCTION left FROM ROLE rev4a; REVOKE FUNCTION glob TABLE FROM ROLE rev4a;
+
+statement error
+ACL ADMIN GRANT FUNCTION left.f TO ROLE rev4a;
+----
+
+statement ok
+ACL ADMIN ADD SCALAR продажи.l ALIAS OF left;
+
+# a backtick-quoted physical name is a computed reading, as a double-quoted one (a write would map the column to the
+# name as written)
+statement ok
+SELECT acl_add_relation('продажи', 'bt', 'memory.main.phys_4a_u', 'a = a, x = `b`', '');
+
+query T
+SELECT form FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname = 'bt';
+----
+subquery
+
+# a revoke of nothing is refused for every grant: a name that only looks like the role's would answer success
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA продажи.s4a AS memory.main; CREATE RESOURCE GROUP g4a (window_max 8);
+
+statement ok
+ACL ADMIN CREATE FUNCTION CATEGORY c4a;
+
+statement error
+ACL ADMIN REVOKE SCHEMA продажи.s4a FROM ROLE rev4a;
+----
+<REGEX>:.*role "rev4a" holds no grant on schema "продажи.s4a" - nothing to revoke.*
+
+statement error
+ACL ADMIN REVOKE RESOURCE GROUP g4a FROM ROLE rev4a;
+----
+<REGEX>:.*role "rev4a" holds no resource group "g4a" - nothing to revoke.*
+
+statement error
+ACL ADMIN REVOKE FUNCTION CATEGORY c4a FROM ROLE rev4a;
+----
+<REGEX>:.*holds no grant of function category "c4a" - nothing to revoke.*
+
+statement error
+ACL ADMIN REVOKE FUNCTION lower FROM ROLE rev4a;
+----
+<REGEX>:.*holds no grant of scalar function "system.main.lower" - nothing to revoke.*
+
+statement error
+ACL ADMIN REVOKE VIEW platform.roles FROM ROLE rev4a;
+----
+<REGEX>:.*holds no grant on view "roles" - nothing to revoke.*
+
+statement error
+ACL ADMIN REVOKE SOURCE phys FROM ROLE rev4a;
+----
+<REGEX>:.*holds no grant on source "phys" - nothing to revoke.*
+
+statement error
+ACL ADMIN REVOKE ADMIN FROM ROLE rev4a;
+----
+<REGEX>:.*role "rev4a" holds no administration - nothing to revoke.*
+
+# what is held is revoked as before
+statement ok
+ACL ADMIN GRANT SCHEMA продажи.s4a TO ROLE rev4a WITH (select); GRANT RESOURCE GROUP g4a TO ROLE rev4a;
+
+statement ok
+ACL ADMIN GRANT FUNCTION CATEGORY c4a TO ROLE rev4a; GRANT VIEW platform.roles TO ROLE rev4a; GRANT SOURCE phys TO ROLE rev4a;
+
+statement ok
+ACL ADMIN REVOKE SCHEMA продажи.s4a FROM ROLE rev4a; REVOKE RESOURCE GROUP g4a FROM ROLE rev4a;
+
+statement ok
+ACL ADMIN REVOKE FUNCTION CATEGORY c4a FROM ROLE rev4a; REVOKE VIEW platform.roles FROM ROLE rev4a;
+
+statement ok
+ACL ADMIN REVOKE SOURCE phys FROM ROLE rev4a;
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE rev4a;
+
+statement ok
+ACL ADMIN REVOKE ADMIN FROM ROLE rev4a;
+
+query I
+SELECT (SELECT count(*) FROM aclcat.acl.role_schemas WHERE role = 'rev4a') + (SELECT count(*) FROM aclcat.acl.role_resource_groups WHERE role = 'rev4a') + (SELECT count(*) FROM aclcat.acl.function_grants WHERE role = 'rev4a') + (SELECT count(*) FROM aclcat.acl.platform_grants WHERE role = 'rev4a') + (SELECT count(*) FROM aclcat.acl.admins WHERE role = 'rev4a');
+----
+0
+
+statement ok
+ACL ADMIN DROP FUNCTION CATEGORY c4a; DROP RESOURCE GROUP g4a; DROP VIRTUAL SCHEMA продажи.s4a; DROP ROLE rev4a;
+
+# a refusal at a name that does not read bare says how it reads
+statement error
+ACL ADMIN CREATE ROLE full;
+----
+full is an SQL keyword: as a name it is written in double quotes ("full")
+
+statement error
+ACL ADMIN CHECK VIRTUAL CATALOG default;
+----
+default is an SQL keyword: as a name it is written in double quotes ("default")
+
+statement error
+ACL ADMIN CREATE ROLE 9abc;
+----
+as a name, a word that starts with a digit is written in double quotes ("9abc")
+
+# no hint where no name was expected: the parse stopped at a keyword for another reason
+statement error
+ACL ADMIN CREATE ROLE r4a FULL;
+----
+<!REGEX>:.*SQL keyword.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE 9cat.t AS phys.main.t;
+----
+as a name, a word that starts with a digit is written in double quotes ("9cat")
+
+# an inherited schema row is its parent grant's: revoking it is refused, the parent's revoke takes it
+statement ok
+ACL ADMIN CREATE ROLE inh4a; CREATE VIRTUAL SCHEMA продажи.raw4a AS memory.main; GRANT SCHEMA продажи.raw4a TO ROLE inh4a WITH (select);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA продажи.raw4a.eu AS memory.main;
+
+statement error
+ACL ADMIN REVOKE SCHEMA продажи.raw4a.eu FROM ROLE inh4a;
+----
+it inherits a parent schema's - revoke that one
+
+statement ok
+ACL ADMIN REVOKE SCHEMA продажи.raw4a FROM ROLE inh4a;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_schemas WHERE role = 'inh4a';
+----
+0
+
+# a source compares in any case, as the rights read it
+statement ok
+ACL ADMIN GRANT SOURCE PHYS TO ROLE inh4a; GRANT SOURCE phys TO ROLE inh4a;
+
+query I
+SELECT count(*) FROM aclcat.acl.platform_grants WHERE role = 'inh4a';
+----
+1
+
+statement ok
+ACL ADMIN REVOKE SOURCE Phys FROM ROLE inh4a;
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA продажи.raw4a.eu; DROP VIRTUAL SCHEMA продажи.raw4a; DROP ROLE inh4a;

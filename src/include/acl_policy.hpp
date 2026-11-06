@@ -256,6 +256,8 @@ vector<string> SplitTopLevel(const string &text, char delimiter);
 //! it a read-only subquery. Since spec 029 both restrict alike, so this decides writability only -
 //! and it is shared, because ADD and ALTER giving the same list two different forms is a bug.
 bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns);
+//! spec 150 4a: `text` is one column reference of one part, as duckdb's parser reads it
+bool PlainColumnName(const string &text);
 
 //! A small bounded LRU of parsed template prototypes. On a hit it returns a fresh Copy() of the
 //! prototype (so the caller may bake markers into the copy); on a miss it parses via `parse`, caches the
@@ -1511,11 +1513,15 @@ struct AclParserInfo : ParserExtensionInfo {
 	shared_ptr<AclGrammarCache> grammar;
 };
 
+//! spec 150 4a: a revoke that finds nothing to remove is refused, naming the role and what it held not
+[[noreturn]] void ThrowNothingToRevoke(const string &role, const string &what);
+
 //! The store's entry in the instance's object cache (spec 069): what `PolicyStore::Of(db)` reads.
 //! A weak reference - the cache must not keep the store alive past the extension's own ownership.
 //! Its destruction is also the audit's shutdown seam: the instance resets its object cache early in
 //! its own teardown, while the file system and the sinks are still whole, so the pipeline drains
 //! there - not from whatever destructor happens to release the store last.
+
 class PolicyStoreHandle : public ObjectCacheEntry {
 public:
 	~PolicyStoreHandle() override;

@@ -1303,9 +1303,10 @@ void FunctionCategoryGrant(DataChunk &args, ExpressionState &state, Vector &resu
 			continue;
 		}
 		bool known = true;
+		bool removed = false;
 		store.EditMemoryFunctions([&](FunctionCategoryModel &model) {
 			if (remove) {
-				model.RemoveCategoryGrant(role, category);
+				removed = model.RemoveCategoryGrant(role, category);
 				return;
 			}
 			if (!model.HasCategory(category)) {
@@ -1316,6 +1317,9 @@ void FunctionCategoryGrant(DataChunk &args, ExpressionState &state, Vector &resu
 		});
 		if (!known) {
 			throw BinderException("acl admin: function category \"%s\" does not exist", category);
+		}
+		if (remove && !removed) {
+			ThrowNothingToRevoke(role, "grant of function category \"" + category + "\"");
 		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -1347,13 +1351,18 @@ void FunctionNameGrant(DataChunk &args, ExpressionState &state, Vector &result, 
 			store.CatalogWriteFunctionGrant(role, string(), &key, verdict, remove);
 			continue;
 		}
+		bool removed = false;
 		store.EditMemoryFunctions([&](FunctionCategoryModel &model) {
 			if (remove) {
-				model.RemoveNameGrant(role, key);
+				removed = model.RemoveNameGrant(role, key);
 			} else {
 				model.AddNameGrant(role, key, verdict);
 			}
 		});
+		if (remove && !removed) {
+			ThrowNothingToRevoke(
+			    role, StringUtil::Format("grant of %s function \"%s\"", FunctionKindName(key.kind), key.ToString()));
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
