@@ -103,6 +103,20 @@ int main(int argc, char *argv[]) {
 			Check(after.find("later_src") == std::string::npos, "the source is not named (" + after + ")");
 		});
 
+		Scenario("a statement parsed on one connection and run on it after another's parse", [&]() {
+			// a gateway that parses before it executes: the decision is the instance's, not the thread's note
+			Exec(con, "CREATE TABLE phys.lake.parsed_src(x INT)");
+			Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE sales.parsed AS phys.lake.parsed_src");
+			Exec(con, "ACL ADMIN GRANT TABLE sales.parsed TO ROLE wide WITH (select)");
+			Connection other(db);
+			auto statements = con.ExtractStatements(wide + "SELECT * FROM parsed");
+			auto elsewhere = other.ExtractStatements(wide + "SELECT * FROM vs.payroll");
+			Exec(con, "DROP TABLE phys.lake.parsed_src");
+			auto error = con.Query(std::move(statements[0]))->GetError();
+			NamesNothing(error, "a statement run after another connection's parse");
+			Check(error.find("parsed_src") == std::string::npos, "the source is not named (" + error + ")");
+		});
+
 		Scenario("a column the client wrote is said, without the read's candidates", [&]() {
 			auto error = con.Query(wide + "SELECT who, secre FROM vs.payroll")->GetError();
 			Check(error.find("Referenced column \"secre\"") != std::string::npos,

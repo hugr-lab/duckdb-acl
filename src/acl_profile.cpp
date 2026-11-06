@@ -276,15 +276,22 @@ bool ClientWrote(const string &query, const string &name) {
 	return false;
 }
 
-//! spec 155: every name an error writes in double quotes ("a", "a.b") is one the client wrote, part by part
-bool QuotedNamesWritten(const string &text, const string &query) {
+//! spec 155: a part of a virtual object the statement names - what a catalog error may say back
+bool ObjectPart(const PrincipalText &info, const string &name) {
+	auto want = StringUtil::Lower(name);
+	return !want.empty() &&
+	       std::find(info.object_parts.begin(), info.object_parts.end(), want) != info.object_parts.end();
+}
+
+//! spec 155: every name an error writes in double quotes ("a", "a.b") is, part by part, one of the statement's own
+bool QuotedNamesWritten(const string &text, const PrincipalText &info) {
 	for (auto open = text.find('"'); open != string::npos;) {
 		auto close = text.find('"', open + 1);
 		if (close == string::npos) {
 			return false;
 		}
 		for (auto &part : StringUtil::Split(text.substr(open + 1, close - open - 1), '.')) {
-			if (!part.empty() && !ClientWrote(query, part)) {
+			if (!part.empty() && !ObjectPart(info, part)) {
 				return false;
 			}
 		}
@@ -293,24 +300,28 @@ bool QuotedNamesWritten(const string &text, const string &query) {
 	return true;
 }
 
-//! spec 155: `name` replaced by `with` wherever it stands as a whole name in `text` (bare, or in double quotes)
-string ReplaceName(string text, const string &name, const string &with) {
-	auto is_name_char = [](char c) {
-		return StringUtil::CharacterIsAlphaNumeric(c) || c == '_' || c == '$';
-	};
+//! spec 155: `from` replaced by `to` in `text`, matched in duckdb's ASCII fold
+string ReplaceFolded(const string &text, const string &from, const string &to) {
 	auto lowered = StringUtil::Lower(text);
-	auto want = StringUtil::Lower(name);
+	auto want = StringUtil::Lower(from);
 	string out;
-	idx_t from = 0;
-	for (auto at = lowered.find(want); at != string::npos; at = lowered.find(want, at + want.size())) {
-		bool starts = at == 0 || !is_name_char(text[at - 1]);
-		bool ends = at + want.size() >= text.size() || !is_name_char(text[at + want.size()]);
-		if (starts && ends) {
-			out += text.substr(from, at - from) + with;
-			from = at + want.size();
-		}
+	idx_t at = 0;
+	for (auto found = lowered.find(want); !want.empty() && found != string::npos; found = lowered.find(want, at)) {
+		out += text.substr(at, found - at) + to;
+		at = found + want.size();
 	}
-	return out + text.substr(from);
+	return out + text.substr(at);
+}
+
+//! spec 155: a substituted physical leaf read as the virtual name it stands for - only in the sentences where duckdb
+//! names the entry it looked for or wrote (an entry missing or existing, the table a write's columns are judged
+//! against): anywhere else the name is one the client wrote, and a rewritten echo would confirm a guess
+string ReadAsVirtual(string text, const string &phys, const string &virt) {
+	for (auto shape :
+	     {"with name %s ", "with name %s!", "with name \"%s\"", "Table \"%s\" does not have", "table \"%s\" has "}) {
+		text = ReplaceFolded(text, StringUtil::Format(shape, phys), StringUtil::Format(shape, virt));
+	}
+	return text;
 }
 
 //! spec 155: the kind of constraint a constraint error names - what a principal is told instead of its table, its
@@ -337,8 +348,7 @@ string ConstraintKind(const string &text) {
 //!   (an entry's name; every quoted name of another catalog error), else they become a sentence that names nothing.
 //! The location duckdb appended ("LINE 1: ...") is the client's own text and stays; under errors_as_json the JSON is
 //! read and written again. Answers whether it changed anything.
-bool ScrubPrincipalError(ErrorData &error, const string &query, const vector<std::pair<string, string>> &renamed,
-                         bool as_json) {
+bool ScrubPrincipalError(ErrorData &error, const string &query, const PrincipalText &info, bool as_json) {
 	auto working =
 	    as_json && !error.RawMessage().empty() && error.RawMessage()[0] == '{' ? ErrorData(error.RawMessage()) : error;
 	auto type = working.Type();
@@ -358,19 +368,22 @@ bool ScrubPrincipalError(ErrorData &error, const string &query, const vector<std
 	}
 	auto subtype = extra.count("error_subtype") ? extra["error_subtype"] : string();
 	auto name = extra.count("name") ? extra["name"] : string();
-	for (auto &pair : renamed) {
-		text = ReplaceName(text, pair.first, pair.second);
-		if (StringUtil::CIEquals(name, pair.first)) {
+	for (auto &pair : info.renamed) {
+		text = ReadAsVirtual(text, pair.first, pair.second);
+		if (StringUtil::CIEquals(name, pair.first) &&
+		    (subtype == "MISSING_ENTRY" || subtype == "ENTRY_ALREADY_EXISTS")) {
 			name = pair.second;
 			extra["name"] = name;
 		}
 	}
-	bool named = ClientWrote(query, name);
+	// an entry's name is said back when it is part of an object the statement names; a column's when the client's
+	// text holds it (a column is no object of the trail)
+	bool named = subtype == "COLUMN_NOT_FOUND" ? ClientWrote(query, name) : ObjectPart(info, name);
 	if (type == ExceptionType::CONSTRAINT) {
 		text = "acl: the write breaks a " + ConstraintKind(text) + "constraint of the table it writes";
 	} else if (type == ExceptionType::CATALOG &&
 	           ((subtype == "MISSING_ENTRY" || subtype == "ENTRY_ALREADY_EXISTS") ? !named
-	                                                                              : !QuotedNamesWritten(text, query))) {
+	                                                                              : !QuotedNamesWritten(text, info))) {
 		if (subtype == "MISSING_ENTRY" && extra.count("type")) {
 			text = "acl: the " + StringUtil::Lower(extra["type"]) + " this statement names does not exist";
 		} else if (StringUtil::Contains(text, "does not exist")) {
@@ -380,6 +393,16 @@ bool ScrubPrincipalError(ErrorData &error, const string &query, const vector<std
 		}
 	} else if (type == ExceptionType::BINDER && subtype == "COLUMN_NOT_FOUND" && !named) {
 		text = "acl: a column this statement reads does not exist in its source";
+	} else if (type == ExceptionType::BINDER && StringUtil::StartsWith(text, "Catalog ") &&
+	           text.find(" does not exist") != string::npos) {
+		// a physical path deeper than duckdb's three parts names its catalog this way, unquoted
+		auto catalog = text.substr(8, text.find(" does not exist") - 8);
+		if (catalog.size() >= 2 && catalog.front() == '"' && catalog.back() == '"') {
+			catalog = catalog.substr(1, catalog.size() - 2);
+		}
+		if (!ObjectPart(info, catalog)) {
+			text = "acl: an object this statement names does not exist";
+		}
 	} else if (type == ExceptionType::BINDER && StringUtil::StartsWith(text, "Star expression \"")) {
 		// duckdb renders the star it expanded - a rewritten one lists the source's every column (spec 065's B)
 		text = "acl: a star in this statement selects no column it may read";
@@ -430,13 +453,12 @@ public:
 	//! the physical names their rewrite substituted - an execution of one is a principal's statement whether or not
 	//! its note is still here (a gateway's prepared statement executed after other work on the connection). Bounded,
 	//! the oldest forgotten first.
-	std::unordered_map<uint64_t, vector<std::pair<string, string>>> principal_texts;
-	std::deque<uint64_t> principal_order;
-	static constexpr idx_t PRINCIPAL_TEXTS = 4096;
-	//! The running statement is one of them: its text (QueryEnd may run when duckdb holds no active query) and names
+	//! The running statement is a principal's (the instance's PrincipalTextRegistry knows its text, or its note says
+	//! so): its text (QueryEnd may run when duckdb holds no active query) and what its error may say
 	bool principal_statement = false;
 	string query_text;
-	vector<std::pair<string, string>> query_renamed;
+	PrincipalText query_info;
+	weak_ptr<PolicyStore> store_ref;
 	//! spec 123: the running statement's autocommit transaction rolled back with no error - a result
 	//! closed before anything ended it (duckdb aborts it since 664aafa), and duckdb resets the profiler
 	//! at that rollback before any hook: its profile has its outcome and wall time, not the tree
@@ -479,23 +501,26 @@ public:
 		} else if (has_note && note.text_hash != current) {
 			has_note = false;
 		}
-		// spec 155: a principal's statement - decided now, or a text decided earlier on this connection - has its error
-		// judged on its own text, which QueryEnd cannot read
-		if (has_note && note.statement != "native" && note.proto.detail != "anonymous") {
-			if (principal_texts.find(current) == principal_texts.end()) {
-				principal_order.push_back(current);
-				if (principal_order.size() > PRINCIPAL_TEXTS) {
-					principal_texts.erase(principal_order.front());
-					principal_order.pop_front();
-				}
+		// spec 155: a principal's statement - decided now, or a text the instance decided for a principal before (a
+		// gateway's prepared statement, a statement parsed on another connection) - has its error judged on its own
+		// text, which QueryEnd cannot read. Only a note that says NATIVE or the operator makes it the operator's.
+		principal_statement = false;
+		query_info = PrincipalText();
+		bool decided_principal = has_note && note.statement != "native" && note.proto.detail != "anonymous";
+		if (decided_principal || !has_note) {
+			auto store = store_ref.lock();
+			if (!store) {
+				store = PolicyStore::Of(DatabaseInstance::GetDatabase(context));
+				store_ref = store;
 			}
-			principal_texts[current] = note.renamed;
+			if (store && store->principal_texts.Find(current, query_info)) {
+				principal_statement = true;
+			} else if (decided_principal) {
+				principal_statement = true;
+				query_info.renamed = note.renamed;
+			}
 		}
-		auto known = principal_texts.find(current);
-		principal_statement = known != principal_texts.end() &&
-		                      !(has_note && (note.statement == "native" || note.proto.detail == "anonymous"));
 		query_text = principal_statement ? query : string();
-		query_renamed = principal_statement ? known->second : vector<std::pair<string, string>>();
 		began_us = NowMicros();
 		preparing = false;
 		physical_lineage.reset();
@@ -561,7 +586,7 @@ public:
 			// runs as a PREPARE statement and throws its result's error)
 			if (principal_statement && error->HasError()) {
 				try {
-					ScrubPrincipalError(*error, query_text, query_renamed, Settings::Get<ErrorsAsJSONSetting>(context));
+					ScrubPrincipalError(*error, query_text, query_info, Settings::Get<ErrorsAsJSONSetting>(context));
 				} catch (...) {
 					// fails closed: a sentence that names nothing, of the error's own type
 					*error = ErrorData(error->Type(), "acl: the statement failed");
@@ -570,7 +595,7 @@ public:
 		}
 		principal_statement = false;
 		query_text = string(); // a big statement's text is not held between statements
-		query_renamed.clear();
+		query_info = PrincipalText();
 	}
 
 	//! spec 107: one run per execution, handed to the worker with its outcome - never waited on; a

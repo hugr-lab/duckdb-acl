@@ -805,15 +805,17 @@ Conflicts retried; a step not undone is a `policy` event `record_not_undone` + `
 
 **Spec 155 — a principal's error suggests nothing**: `AclProfileState::QueryEnd` rewrites the RESULT's own error
 (`previous_error` = `result->GetErrorObject()`; a Prepare runs as a PREPARE and throws its result's error) of a
-principal's statement - judged by `principal_texts` (the text hashes this connection ran for a principal, ≤ 4096,
-with the physical leaves each rewrite substituted - `NotePhysical(phys, vname)` → `renamed`), never the note alone
-(lost by the next parse or a refused batch; an implicit PIVOT's parts carry the statement's text). `ScrubPrincipalError`:
-`Did you mean` / `Candidate bindings|tables` lines cut; a substituted physical leaf reads as its virtual name; a
-CONSTRAINT error says its kind; a `Star expression` says nothing it expanded; a CATALOG error / COLUMN_NOT_FOUND keeps
-its sentence only when the client wrote its names (duckdb's tokens, never a string - `ClientWrote`,
-`QuotedNamesWritten`), else a sentence naming nothing; location kept, JSON re-read and re-written, a throw fails closed.
-The text is copied at QueryBegin (QueryEnd may run with no active query). Tests `acl_principal_errors.test`,
-`test_acl_principal_errors.cpp`.
+principal's statement - one the override recorded where it decided it (`StatementAudit::Decided` →
+`PolicyStore::principal_texts`, a `PrincipalTextRegistry` LRU of 65536 text hashes, each with the physical leaves the
+rewrite substituted - `NotePhysical(phys, vname)` → `renamed` - and its objects' parts), unless its own note says
+NATIVE / the operator; never the note alone (lost by the next parse, a refused batch, another connection's parse; an
+implicit PIVOT's parts carry the statement's text). `ScrubPrincipalError`: `Did you mean` / `Candidate bindings|tables`
+lines cut; a substituted leaf reads as its virtual name only where duckdb names the entry (`ReadAsVirtual`); a
+CONSTRAINT error says its kind; a `Star expression` nothing it expanded; a CATALOG error (and `Catalog x does not
+exist!`) keeps its names only when they are parts of the statement's objects, a COLUMN_NOT_FOUND only when the client's
+tokens hold it (`ClientWrote` - never a string), else a sentence naming nothing; location kept, JSON re-read and
+re-written, a throw fails closed. The text is copied at QueryBegin (QueryEnd may run with no active query). Tests
+`acl_principal_errors.test`, `test_acl_principal_errors.cpp`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a

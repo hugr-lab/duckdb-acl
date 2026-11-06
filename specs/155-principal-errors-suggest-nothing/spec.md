@@ -58,32 +58,39 @@ home (spec 151), so this is not a name the role was denied.
     `RunStatementInternal` → `ThrowIfError`).
   - So the seam covers the gateway's queries and prepared statements, quack's statements, the Flight door's Prepare
     and its DDL as text (spec 153), every execution and a stream's failure.
-- **Whose statement** (`AclProfileState`): the decided statement's note (spec 074) is matched by its text's hash and
-  is lost easily. The next parse drops it, and a refused batch leaves stale notes on the thread. So the connection
-  remembers the hashes of the texts it ran for a principal (`principal_texts`, at most 4096, the oldest forgotten
-  first), together with the physical names each text's rewrite substituted.
-  - A principal is anything but `native` and the anonymous operator.
-  - An execution of such a text is a principal's statement whether or not its note is still there: a gateway's
-    prepared statement executed after other work.
-  - An implicit PIVOT's parts carry the statement's own text (`RewriteMultiStatement`), because duckdb runs them as
-    one query under the first part's text.
-  - An operator's statement of an identical text is treated the same way. That only removes text from its error.
+- **Whose statement**: the decided statement's note (spec 074) is matched by its text's hash and is lost easily. The
+  next parse drops it; a refused batch leaves stale notes on the thread; a gateway may parse on one connection and run
+  later. So the override records every statement it decides for a principal (anything but `native` and the anonymous
+  operator) where it decides it, in `Decided`, whatever the audit level: `PolicyStore::principal_texts`, a
+  `PrincipalTextRegistry` of the instance.
+  - It is keyed by the hash of the text the statement executes under.
+  - Each entry keeps the physical leaves the rewrite substituted (`renamed`, from `NotePhysical(phys, vname)`) and the
+    parts of the virtual objects the statement names.
+  - It holds at most 65536 entries; the least recently used is forgotten first, and a hit refreshes an entry.
+  - `AclProfileState::QueryBegin` asks it for every statement. A statement it knows is a principal's, unless the
+    statement's own note says NATIVE or the operator.
+  - An implicit PIVOT's parts carry the statement's own text (`RewriteMultiStatement`), because duckdb runs them as one
+    query under the first part's text.
+  - An operator's statement of an identical text is treated as a principal's. That only removes text from its error.
 - **The rewrite** (`ScrubPrincipalError`):
   - every `Did you mean`, `Candidate bindings` and `Candidate tables` line is cut;
-  - each physical leaf the rewrite substituted for a virtual name of another spelling (`renamed`, noted by
-    `NotePhysical`) reads as that virtual name, in the text and in the error's `name`;
+  - each physical leaf the rewrite substituted for a virtual name of another spelling reads as that virtual name -
+    only in the sentences where duckdb names the entry it looked for or wrote (`with name …`, `Table "…" does not
+    have a column`, `table "…" has N columns`, `ReadAsVirtual`). Anywhere else the name is one the client wrote, and a
+    rewritten echo would confirm a guess (`SELECT <physical leaf> FROM t` would answer the virtual name);
   - a `CONSTRAINT` error becomes `acl: the write breaks a <NOT NULL | CHECK | PRIMARY KEY | UNIQUE | FOREIGN KEY>
     constraint of the table it writes`;
   - a `BINDER` star error (`Star expression "…"`) becomes `acl: a star in this statement selects no column it may
     read`;
-  - a `CATALOG` error keeps its sentence only when the client wrote the names it carries. For `MISSING_ENTRY` /
+  - a `CATALOG` error keeps its sentence only when the names it carries are parts of the virtual objects the
+    statement names (the trail's objects - never an alias or a string the client wrote). For `MISSING_ENTRY` /
     `ENTRY_ALREADY_EXISTS` that is the entry's name; for any other catalog error, every name it writes in double
-    quotes, part by part. Otherwise it becomes `acl: the <type> this statement names does not exist`, `acl: an object
-    this statement names does not exist`, or `acl: the catalog refused this statement`;
-  - a `BINDER` `COLUMN_NOT_FOUND` whose name the client did not write becomes `acl: a column this statement reads does
-    not exist in its source`;
-  - "The client wrote it" means an identifier or keyword token of the client's text (duckdb's tokenizer), never a
-    string constant or a comment, compared in the ASCII fold;
+    quotes, part by part; for duckdb's `Catalog x does not exist!` (a BINDER error), the catalog. Otherwise it becomes
+    `acl: the <type> this statement names does not exist`, `acl: an object this statement names does not exist`, or
+    `acl: the catalog refused this statement`;
+  - a `BINDER` `COLUMN_NOT_FOUND` keeps its name only when the client's text holds it as an identifier or keyword token
+    (duckdb's tokenizer - never a string constant or a comment, in the ASCII fold); otherwise it becomes `acl: a column
+    this statement reads does not exist in its source`;
   - the location duckdb appended (`LINE 1: …`) is the client's own text and stays. Under `errors_as_json` the JSON is
     read, rewritten and written again;
   - a rewrite that throws fails closed: `acl: the statement failed`, of the error's type.
@@ -96,11 +103,17 @@ home (spec 151), so this is not a name the role was denied.
   or a constraint. This holds whatever `catalog_error_max_schemas` says and on every door.
 - A guess cannot be confirmed. A physical name the rewrite substituted always reads as the virtual one, whatever the
   client wrote. A name in a string or a comment does not count as written.
-- **Residual**: the "client wrote it" test for a missing column is a token test. An alias written as the guess
-  (`SELECT 1 AS ssn_raw …`) keeps a drifted source column's name, so a principal can confirm a guessed name of a
-  column that no longer exists. A constraint is still an oracle: whether a write breaks a CHECK over a hidden column,
-  or a key the RLS hides, says something about rows the role cannot read. That is the operator's to weigh when
-  granting writes (security.md).
+- **Residuals**:
+  - A missing column's name is judged by token: an alias written as the guess (`SELECT 1 AS ssn_raw …`) keeps a
+    drifted source column's name, so a principal can confirm a guessed name of a column that no longer exists.
+  - The registry is bounded: a statement prepared, then left unexecuted while more than 65536 other principal
+    statements are decided on the node, and then executed with no note, is the operator's again. Flight and quack
+    re-arm or re-parse every execution; an embedding gateway's prepared-statement cache is the exposure.
+  - A passthrough principal's `ACL NATIVE` of the same text as a prepared principal statement, whose note is current
+    when that statement executes, makes the execution the operator's.
+  - A constraint is still an oracle: whether a write breaks a CHECK over a hidden column, or a key the RLS hides,
+    says something about rows the role cannot read. That is the operator's to weigh when granting writes
+    (security.md).
 - The rewrite only removes text or replaces it with a fixed sentence, and fails closed.
 
 ## Testing
@@ -110,6 +123,8 @@ home (spec 151), so this is not a name the role was denied.
   - `IF EXISTS` stays a no-op;
   - a record of nothing;
   - a record whose source is named otherwise reads as itself, even with the guess written as a string or an alias;
+  - a healthy object's physical leaf written as a column is echoed as written, like any other guess;
+  - the source's database and schema written as aliases after a DETACH say nothing;
   - JSON errors;
   - a record over a DETACHed database;
   - a declared column whose source column is gone;
@@ -121,6 +136,7 @@ home (spec 151), so this is not a name the role was denied.
 - `test/cpp/test_acl_principal_errors.cpp`:
   - the `Prepare` path;
   - a gateway's prepared statement executed after an interleaved statement, and after a refused batch;
+  - a statement parsed on one connection, then another statement parsed on another, then the first run;
   - JSON errors;
   - the absence of every suggestion and candidate line.
 - `acl_catalog_maintenance.test` (spec 039 / 065 probe A): the drifted declared column now reads the sentence.
