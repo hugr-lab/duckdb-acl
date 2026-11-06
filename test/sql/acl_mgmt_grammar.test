@@ -2672,10 +2672,10 @@ SELECT window_start, batch_bytes FROM aclcat.acl.resource_groups WHERE "group" =
 statement ok
 ACL ADMIN CREATE OR REPLACE RESOURCE GROUP lim4b ();
 
-query I
-SELECT window_max IS NULL FROM aclcat.acl.resource_groups WHERE "group" = 'lim4b';
+query II
+SELECT window_start IS NULL, batch_bytes IS NULL FROM aclcat.acl.resource_groups WHERE "group" = 'lim4b';
 ----
-true
+true	true
 
 # a limit is a word and a value: anything else is refused in the form's words
 statement error
@@ -2733,6 +2733,28 @@ statement error
 ACL ADMIN ALTER RESOURCE GROUP lim4b2 SET (window_max 99999999999999999999);
 ----
 window_max is out of range
+
+# a size past int64 is refused naming the limit (a checked cast's internal error invalidated the database), and so is
+# a JSON integer past int64 (it wrapped)
+statement error
+ACL ADMIN ALTER RESOURCE GROUP lim4b2 SET (batch_bytes 10000000TB);
+----
+batch_bytes is out of range
+
+statement error
+SELECT acl_alter_resource_group('lim4b2', 'limits', '{"queue_priority": 18446744073709551615}');
+----
+queue_priority is out of range
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP lim4b2 SET (batch_bytes 'none');
+----
+batch_bytes is a size
+
+query I
+SELECT batch_bytes FROM aclcat.acl.resource_groups WHERE "group" = 'lim4b2';
+----
+33554432
 
 statement ok
 ACL ADMIN DROP RESOURCE GROUP lim4b2;

@@ -1384,15 +1384,20 @@ void AclRevokeFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! every value a non-negative integer (a priority may be negative); `batch_bytes` also takes a size.
 //! A memory size in bytes. duckdb's `DBConfig::ParseMemoryLimit` answers an idx_t at our pin and an
 //! optional_idx (none = unlimited) on the 2.0 branch's head; a limit is a size either way
-int64_t MemoryLimitBytes(idx_t bytes) {
-	return NumericCast<int64_t>(bytes);
+int64_t MemoryLimitBytes(idx_t bytes, const char *fn, const string &text) {
+	// a size past int64 is refused here: duckdb's parser takes it up to 2^64, and a checked cast throws an internal
+	// error, which invalidates the database (spec 150 4b's review)
+	if (bytes > idx_t(NumericLimits<int64_t>::Maximum())) {
+		throw BinderException("%s: batch_bytes is out of range, got \"%s\"", fn, text);
+	}
+	return int64_t(bytes);
 }
 
-int64_t MemoryLimitBytes(optional_idx bytes) {
+int64_t MemoryLimitBytes(optional_idx bytes, const char *fn, const string &text) {
 	if (!bytes.IsValid()) {
-		throw InvalidInputException("a size, not unlimited");
+		throw BinderException("%s: batch_bytes is a size, got \"%s\"", fn, text);
 	}
-	return NumericCast<int64_t>(bytes.GetIndex());
+	return MemoryLimitBytes(bytes.GetIndex(), fn, text);
 }
 
 case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const char *fn) {
@@ -1425,7 +1430,9 @@ case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const ch
 				continue; // unset: the node's setting applies
 			}
 			int64_t value = 0;
-			if (yyjson_is_int(val)) {
+			if (yyjson_is_uint(val) && yyjson_get_uint(val) > uint64_t(NumericLimits<int64_t>::Maximum())) {
+				throw BinderException("%s: %s is out of range", fn, name); // a JSON integer past int64 wraps
+			} else if (yyjson_is_int(val)) {
 				value = yyjson_get_sint(val);
 			} else if (yyjson_is_str(val)) {
 				string text = yyjson_get_str(val);
@@ -1441,7 +1448,7 @@ case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const ch
 						throw BinderException("%s: %s is out of range, got \"%s\"", fn, name, text);
 					}
 				} else if (name == "batch_bytes") {
-					value = MemoryLimitBytes(DBConfig::ParseMemoryLimit(text));
+					value = MemoryLimitBytes(DBConfig::ParseMemoryLimit(text), fn, text);
 				} else {
 					throw BinderException("%s: %s is a number, got \"%s\"", fn, name, text);
 				}

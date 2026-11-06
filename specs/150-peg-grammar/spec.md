@@ -486,8 +486,10 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   '32 MiB'`; the text reader took `32 MiB` bare as the rest of the item, and a comment inside a value as a space), a
   backtick value reads (it was refused), a value may touch its name or `=` (`window_max=8`, `window_max'8'`), and a
   string continued on the next line is refused as no plain literal (duckdb joins `'4'` and `'MiB'`), as it was
-  refused before in other words. Found by its reviews: the admin function's number parse let `std::stoll`'s
-  exceptions out (a quoted `'-'`, 20 digits) - a refusal naming the limit now.
+  refused before in other words. Found by its reviews (all on main too): the admin function's number parse let
+  `std::stoll`'s exceptions out (a quoted `'-'`, 20 digits), a size past int64 (`batch_bytes 10000000TB`) threw an
+  internal error that invalidated the database, and a JSON integer past int64 wrapped (`18446744073709551615` stored
+  -1) - each a refusal naming the limit now.
 - 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
   ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
 - 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
