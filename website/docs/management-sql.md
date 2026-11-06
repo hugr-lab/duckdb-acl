@@ -48,10 +48,15 @@ catalog forms refuse.
 - `<catalog>.<name>` - a virtual name. The first component is the virtual catalog, the rest the
   path inside it: `sales.raw.orders` is object `raw.orders` of catalog `sales`. Each part is an
   identifier as duckdb reads one (specs 116, 150): a bare word - letters of any script, digits, `_`,
-  not starting with a digit and not a reserved keyword (`größe`, `user`; `"full"`, `"9t"` quoted) - or
-  a double-quoted identifier with `""` for a quote - any case, spaces, a dot inside: `"Sales Mart"."Order Items"`,
+  not starting with a digit and not a keyword duckdb takes as no name (a reserved word like `select`,
+  `default`, or a word only a function or a type may be, like `full`, `left`, `join`; `user`, `schema`
+  are names) - or a double-quoted (or backtick) identifier with `""` for a quote - any case, spaces, a
+  dot inside: `"Sales Mart"."Order Items"`,
   `c."Raw Data".sub."T"`, `"a.b"` (one schema, never the path `a.b`). A double-quoted name is always
-  ONE identifier.
+  ONE identifier. After a dot any word is a name (`c.select.t`), and a function's own name may be a
+  word only a function may be (`GRANT FUNCTION left TO ROLE r`). A name is taken as written - a
+  connection's `preserve_identifier_case` does not fold it. A statement refused at such a name says
+  so: `… - full is an SQL keyword: a name spelled so is written in double quotes ("full")`.
 - `<phys>` - a physical path such as `phys.main.orders` or `pg."Raw Data"."Order Items"`, written
   like a virtual name, or as the legacy single-quoted string holding the whole path
   (`'pg."Raw Data".orders'`).
@@ -1362,7 +1367,8 @@ section.
 
 **Legacy wrappers** - the pre-catalog API, kept for dev and test scripts. Without a policy source
 they fill the in-memory store; with a catalog they write the same content into the implicit virtual
-catalog `default`, granted to the role as its main catalog.
+catalog `default`, granted to the role as its main catalog. `default` is an SQL keyword, so a
+statement names it in double quotes: `CHECK VIRTUAL CATALOG "default"`, `"default".orders`.
 
 | Function                                                        | Purpose                                                          |
 | --------------------------------------------------------------- | ---------------------------------------------------------------- |

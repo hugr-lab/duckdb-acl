@@ -143,7 +143,9 @@ share sessions" (spec 040).
   duckdb, a bare name keeps whatever characters it holds - an invisible one or a decomposed spelling too. Names
   compare exactly - a look-alike (a Cyrillic `а`, a modifier letter `ʼ`, `o` + a combining mark) is another name
   and never reaches another's rights. Read the names you are shown with that in mind (the listings show them as
-  stored); `REVOKE` of a grant nobody holds is refused, not answered with success.
+  stored); every `REVOKE` of a grant the role does not hold is refused (`… holds no … - nothing to revoke`), not
+  answered with success. A `GRANT` or a `DENY` to a role nobody defined is accepted - a role may come from a
+  token's claims alone - so check a deny's role name against the roles you see.
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).

@@ -51,6 +51,9 @@ struct MgmtParsed {
 	bool unread = false;
 	//! unread: the statement as written, its first token to its last
 	string text;
+	//! unread: why a name in it may not read (spec 150 4a) - a keyword or a leading digit the rules read no name in,
+	//! with the quoting that reads it; '' when the parse stopped at nothing so
+	string hint;
 	//! a rule's: the acl_* function and its arguments
 	string function;
 	vector<Value> args;

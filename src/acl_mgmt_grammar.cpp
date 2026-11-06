@@ -114,6 +114,15 @@ bool IsQuotedPart(ParseResult &result) {
 	return base.Name() == "StringLiteral" || base.Name() == "Identifier";
 }
 
+//! WrittenPlainly, or a backtick name (spec 150 4a: duckdb quotes a name with backticks too) written as its value
+bool WrittenPlainlyOrBackticked(const string &query, const MatcherToken &token, const string &value) {
+	if (token.text.empty() || token.text[0] != '`') {
+		return grammar::WrittenPlainly(query, token, value);
+	}
+	return token.offset + token.length <= query.size() && query.compare(token.offset, token.length, token.text) == 0 &&
+	       token.text == "`" + StringUtil::Replace(value, "`", "``") + "`";
+}
+
 //! A quoted value, kept for the check against its token
 string QuotedOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
 	QuotedValue entry;
@@ -175,6 +184,54 @@ bool DuckdbIdentifier(const MatcherToken &token, bool after_dot, optional_ptr<co
 	return !info.IsKeyword() || info.HasAnyFlags(mask);
 }
 
+//! spec 150 4a: why a statement no rule reads may hold a name that does not read - the parse stopped at a keyword
+//! duckdb takes as no name (`full`, `select`), or at a number a word touches (`9abc`): said with the quoting that reads
+//! it
+string NameHint(const ErrorData &error, const TokenIterator &tokens, const PEGKeywordHelper &keywords) {
+	auto &info = error.ExtraInfo();
+	auto entry = info.find("position");
+	if (entry == info.end()) {
+		return string();
+	}
+	optional_idx index;
+	try {
+		index = TokenIndexAt(tokens, std::stoull(entry->second));
+	} catch (std::exception &) {
+		return string();
+	}
+	if (!index.IsValid()) {
+		return string();
+	}
+	auto &token = tokens.GetToken(index.GetIndex());
+	if (token.type == TokenType::NUMBER_LITERAL) {
+		auto written = token.text;
+		auto end = token.offset + token.length;
+		for (auto next = index.GetIndex() + 1; next < tokens.Size(); next++) {
+			auto &part = tokens.GetToken(next);
+			if (part.offset != end || (part.type != TokenType::KEYWORD && part.type != TokenType::IDENTIFIER &&
+			                           part.type != TokenType::NUMBER_LITERAL)) {
+				break;
+			}
+			written += part.text;
+			end = part.offset + part.length;
+		}
+		if (written.size() == token.text.size() || !Tokenizer::CharacterIsInitialNumber(written[0]) ||
+		    written[0] == '.') {
+			return string();
+		}
+		return " - a name that starts with a digit is written in double quotes (\"" + written + "\")";
+	}
+	if (token.type != TokenType::KEYWORD && token.type != TokenType::IDENTIFIER) {
+		return string();
+	}
+	auto literal = keywords.GetLiteralTable().Lookup(token.text);
+	if (!literal.IsKeyword() || literal.HasAnyFlags(keywords.GetIdentifierMask(SuggestionState::SUGGEST_VARIABLE))) {
+		return string();
+	}
+	return " - " + token.text + " is an SQL keyword: a name spelled so is written in double quotes (\"" + token.text +
+	       "\")";
+}
+
 //! One token or run of them: a name or a path of names, read as duckdb reads an identifier (DuckdbIdentifier); a
 //! value as the old compiler's scanner read it - a word (ASCII letters, digits, `_` - a keyword too), words joined
 //! by `.`, a word or a double-quoted one - or, inside a parenthesised list, any token but a parenthesis.
@@ -187,13 +244,16 @@ public:
 	//! WORD, DOTTED: a value (a scope, a level, a setting's value - the scanner's words); NAME, PATH, NAME_VALUE: a
 	//! name, read as duckdb reads an identifier (spec 150 4a); LIST_ITEM: a list's token
 	//! WORD_OR_QUOTED: a value's word or a quoted one (a capability: `select`, `create` - keywords, never names)
-	enum class Kind : uint8_t { WORD, WORD_OR_QUOTED, NAME, DOTTED, PATH, NAME_VALUE, LIST_ITEM };
+	//! FUNCTION_PATH: a function's path - one part read as duckdb reads a function's name (`left`, `glob` bare), a
+	//! qualified one as a path (its first part a catalog or a schema)
+	enum class Kind : uint8_t { WORD, WORD_OR_QUOTED, NAME, DOTTED, PATH, FUNCTION_PATH, NAME_VALUE, LIST_ITEM };
 
 	explicit AclTokenMatcher(Kind kind_p, const PEGKeywordHelper *keywords = nullptr)
 	    : AtomicMatcher(MatcherType::CUSTOM), kind(kind_p) {
 		if (keywords) {
 			literals = &keywords->GetLiteralTable();
 			mask = keywords->GetIdentifierMask(SuggestionState::SUGGEST_VARIABLE);
+			function_mask = keywords->GetIdentifierMask(SuggestionState::SUGGEST_SCALAR_FUNCTION_NAME);
 		}
 	}
 
@@ -205,7 +265,7 @@ public:
 		if (kind == Kind::DOTTED) {
 			return MatchDotted(state);
 		}
-		if (kind == Kind::PATH || kind == Kind::NAME_VALUE) {
+		if (kind == Kind::PATH || kind == Kind::FUNCTION_PATH || kind == Kind::NAME_VALUE) {
 			return MatchIdentifierPath(state);
 		}
 		if (kind == Kind::NAME) {
@@ -288,8 +348,9 @@ private:
 	}
 
 	//! A name of parts joined by `.`, each an identifier as duckdb reads it (the first no reserved word), with any
-	//! space or comment around a dot as duckdb allows: a path's canonical key (PATH, spec 116), or a name that is a
-	//! value as written, its parts unquoted words (NAME_VALUE - a quoted one is the rule's next alternative)
+	//! space or comment around a dot as duckdb allows: a path's canonical key (PATH, spec 116; FUNCTION_PATH, whose
+	//! one part may be a keyword duckdb takes as a function's name), or a name that is a value as written, its parts
+	//! unquoted words (NAME_VALUE - a quoted one first is the rule's next alternative, one after a dot no name)
 	MatcherResult MatchIdentifierPath(MatchState &state) const {
 		auto &tokens = state.token_iterator;
 		auto first = tokens.Position();
@@ -297,13 +358,22 @@ private:
 		string written;
 		idx_t index = first;
 		idx_t end = 0;
+		bool function_name_only = false;
 		while (index < tokens.Size()) {
 			auto &token = tokens.GetToken(index);
 			if (!DuckdbIdentifier(token, !parts.empty(), literals, mask)) {
-				break;
+				// duckdb's `FunctionName` takes what a qualifier does not (`left`, `glob`): then it is the whole name
+				if (kind != Kind::FUNCTION_PATH || !parts.empty() ||
+				    !DuckdbIdentifier(token, false, literals, function_mask)) {
+					break;
+				}
+				function_name_only = true;
 			}
 			bool quoted = token.text.front() == '"' || token.text.front() == '`';
 			if (kind == Kind::NAME_VALUE && quoted) {
+				if (!parts.empty()) {
+					return MatcherResult::Failure(); // `a."b"`: words joined by dots, or one quoted name
+				}
 				break;
 			}
 			auto part = quoted ? UnquoteName(token.text) : token.text;
@@ -317,6 +387,9 @@ private:
 			if (index + 1 >= tokens.Size() || tokens.GetToken(index).text != ".") {
 				break;
 			}
+			if (function_name_only) {
+				return MatcherResult::Failure(); // `left.f`: a qualifier is an identifier
+			}
 			index++; // the dot - an identifier must follow it
 			if (!DuckdbIdentifier(tokens.GetToken(index), true, literals, mask)) {
 				return MatcherResult::Failure(); // a dot last
@@ -328,7 +401,7 @@ private:
 		auto &head = tokens.GetToken(first);
 		tokens.Advance(index - first);
 		state.UpdateMaxTokenIndex();
-		auto text = kind == Kind::PATH ? NamePath(std::move(parts)).ToKey() : written;
+		auto text = kind == Kind::NAME_VALUE ? written : NamePath(std::move(parts)).ToKey();
 		return state.AllocateParseResult<TokenParseResult>(std::move(text), head.offset, end - head.offset);
 	}
 
@@ -360,6 +433,9 @@ private:
 		case Kind::PATH:
 		case Kind::NAME_VALUE:
 			return DuckdbIdentifier(token, false, literals, mask);
+		case Kind::FUNCTION_PATH:
+			return DuckdbIdentifier(token, false, literals, mask) ||
+			       DuckdbIdentifier(token, false, literals, function_mask);
 		case Kind::DOTTED:
 			return IsDottedText(token);
 		case Kind::LIST_ITEM:
@@ -370,7 +446,8 @@ private:
 
 	Kind kind;
 	optional_ptr<const GrammarLiteralTable> literals;
-	keyword_categories_t mask;
+	keyword_categories_t mask {};
+	keyword_categories_t function_mask {};
 };
 
 //! A token's text under a rule part (our token rules have no transform: the token is read here)
@@ -530,11 +607,11 @@ void SplitVirtualName(const string &key, string &vcat, string &vname) {
 	}
 }
 
-//! `AclPathName <- StringLiteral / AclPathToken`: a path as SQL writes one, or the legacy single-quoted whole path
-//! read with the key rules - its canonical key
+//! `AclPathName <- StringLiteral / AclPathToken` (or AclFunctionPathToken): a path as SQL writes one, or the legacy
+//! single-quoted whole path read with the key rules - its canonical key
 string PathNameOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
 	auto &node = Strip(result);
-	if (node.Name() == "AclPathToken") {
+	if (node.Name() == "AclPathToken" || node.Name() == "AclFunctionPathToken") {
 		return TokenOf(node).text;
 	}
 	QuotedValue entry;
@@ -945,7 +1022,7 @@ arena_ptr<TransformResultValue> FinalizeCreateFunction(PEGTransformer &transform
 	auto &definition = Strip(list.GetChild(10)).Cast<ListParseResult>();
 	auto mode = CreateMode(list, 1, 4);
 	if (KeywordOf(definition.GetChild(0)) == "alias") {
-		// AclAliasOf <- 'ALIAS' 'OF' AclPathName AclComment? - an alias keeps no parameters, result or key: its
+		// AclAliasOf <- 'ALIAS' 'OF' AclFunctionPathName AclComment? - an alias keeps no parameters, result or key: its
 		// result's shape and a quoted key are judged as the body form judges them, a parenthesised list only with the
 		// batch's tokens
 		ReturnsInto(list, 7, scalar, optional_idx(), *data);
@@ -1048,7 +1125,7 @@ arena_ptr<TransformResultValue> FinalizeAddFunction(PEGTransformer &transformer,
 	data->args = {Value(vcat), Value(vname)};
 	auto &definition = Strip(list.GetChild(5)).Cast<ListParseResult>();
 	if (KeywordOf(definition.GetChild(0)) == "alias") {
-		// AclAddAlias <- 'ALIAS' 'OF'? AclPathName - the result is judged, not kept
+		// AclAddAlias <- 'ALIAS' 'OF'? AclFunctionPathName - the result is judged, not kept
 		ReturnsInto(list, 4, scalar, optional_idx(), *data);
 		data->function = scalar ? "acl_add_scalar_alias" : "acl_add_table_function_alias";
 		data->args.emplace_back(PathNameOf(transformer, definition.GetChild(2), "a target function", *data));
@@ -1141,7 +1218,7 @@ void ObjectChangeInto(PEGTransformer &transformer, ParseResult &result, const ch
 		return;
 	}
 	if (name == "AclSetMacro" || name == "AclSetAlias") {
-		// AclSetMacro <- 'SET' 'MACRO' AclBody; AclSetAlias <- 'SET' 'ALIAS' 'OF'? AclPathName
+		// AclSetMacro <- 'SET' 'MACRO' AclBody; AclSetAlias <- 'SET' 'ALIAS' 'OF'? AclFunctionPathName
 		data.function = "acl_alter_function";
 		data.args.emplace_back(function_kind);
 		bool macro = name == "AclSetMacro";
@@ -1915,9 +1992,9 @@ arena_ptr<TransformResultValue> FinalizeDropIdentity(PEGTransformer &transformer
 // --- function grants and categories (spec 072), platform's point grants (spec 117), sources (spec 118.3), resource
 // groups (spec 085) ---------------------------------------------------------------------------------------------
 
-//! `AclFunctionSpec <- AclPath AclGrantFunctionKind?` as the spec the admin functions parse (ParseFunctionSpec): each
-//! part of the path double-quoted (`""` a quote) - the reader takes a quoted part as written and a kind only outside
-//! quotes - then the kind written; `key` the path's key
+//! `AclFunctionSpec <- AclFunctionPath AclGrantFunctionKind?` as the spec the admin functions parse
+//! (ParseFunctionSpec): each part of the path double-quoted (`""` a quote) - the reader takes a quoted part as written
+//! and a kind only outside quotes - then the kind written; `key` the path's key
 string FunctionSpecOf(ParseResult &result, string &key, bool &kind_written) {
 	auto &spec = Strip(result).Cast<ListParseResult>();
 	key = PathOf(spec.GetChild(0));
@@ -2311,6 +2388,12 @@ public:
 		    "AclPathToken", [](const PEGKeywordHelper &keywords) -> unique_ptr<Matcher> {
 			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::PATH, &keywords);
 		    }));
+		// a function's path: its one part read as duckdb reads a function's name (`left`), a qualified one as a path
+		changes.push_back(GrammarChange::AddRule("AclFunctionPathToken <- Identifier"));
+		changes.push_back(GrammarChange::AddTerminalRuleOverride(
+		    "AclFunctionPathToken", [](const PEGKeywordHelper &keywords) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::FUNCTION_PATH, &keywords);
+		    }));
 		changes.push_back(GrammarChange::AddRule("AclListToken <- Identifier"));
 		changes.push_back(
 		    GrammarChange::AddTerminalRuleOverride("AclListToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
@@ -2356,6 +2439,8 @@ public:
 		// the virtual catalog's objects: paths, lists and bodies as the compiler's Path / List / Body read them
 		changes.push_back(GrammarChange::AddRule("AclPath <- AclPathToken"));
 		changes.push_back(GrammarChange::AddRule("AclPathName <- StringLiteral / AclPathToken"));
+		changes.push_back(GrammarChange::AddRule("AclFunctionPath <- AclFunctionPathToken"));
+		changes.push_back(GrammarChange::AddRule("AclFunctionPathName <- StringLiteral / AclFunctionPathToken"));
 		changes.push_back(GrammarChange::AddRule("AclList <- AclParenList / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclBody <- AclTailToken+"));
 		changes.push_back(GrammarChange::AddRule("AclComment <- 'COMMENT' AclQuotedValue"));
@@ -2399,7 +2484,7 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclReturnsTable <- 'TABLE'? AclParenList"));
 		changes.push_back(GrammarChange::AddRule("AclReturnType <- AclReturnsTable / AclWordToken"));
 		changes.push_back(GrammarChange::AddRule("AclReturns <- 'RETURNS' AclReturnType"));
-		changes.push_back(GrammarChange::AddRule("AclAliasOf <- 'ALIAS' 'OF' AclPathName AclComment?"));
+		changes.push_back(GrammarChange::AddRule("AclAliasOf <- 'ALIAS' 'OF' AclFunctionPathName AclComment?"));
 		changes.push_back(GrammarChange::AddRule("AclAsBody <- 'AS' AclBody"));
 		changes.push_back(GrammarChange::AddRule("AclFunctionDefinition <- AclAliasOf / AclAsBody"));
 		changes.push_back(GrammarChange::AddRule(
@@ -2416,7 +2501,7 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclAddSchema <- 'ADD' 'SCHEMA' AclPathName 'AS' AclPath",
 		                                         Start<FinalizeAddSchema>));
 		changes.push_back(GrammarChange::AddRule("AclAddMacro <- 'MACRO' AclBody"));
-		changes.push_back(GrammarChange::AddRule("AclAddAlias <- 'ALIAS' 'OF'? AclPathName"));
+		changes.push_back(GrammarChange::AddRule("AclAddAlias <- 'ALIAS' 'OF'? AclFunctionPathName"));
 		changes.push_back(GrammarChange::AddRule("AclAddDefinition <- AclAddMacro / AclAddAlias"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclAddFunction <- 'ADD' AclFunctionKind AclPath AclParenList? AclReturns? AclAddDefinition",
@@ -2441,7 +2526,7 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclSetColumns <- 'SET' AclColumnsClause"));
 		changes.push_back(GrammarChange::AddRule("AclSetRls <- 'SET' AclRlsClause"));
 		changes.push_back(GrammarChange::AddRule("AclSetMacro <- 'SET' 'MACRO' AclBody"));
-		changes.push_back(GrammarChange::AddRule("AclSetAlias <- 'SET' 'ALIAS' 'OF'? AclPathName"));
+		changes.push_back(GrammarChange::AddRule("AclSetAlias <- 'SET' 'ALIAS' 'OF'? AclFunctionPathName"));
 		changes.push_back(GrammarChange::AddRule("AclViewChange <- AclDropKey / AclSetKey / AclSetTypes / AclSetBody"));
 		changes.push_back(GrammarChange::AddRule("AclAlterView <- 'ALTER' 'VIRTUAL' 'VIEW' AclPath AclViewChange",
 		                                         Start<FinalizeAlterRelation>));
@@ -2604,7 +2689,7 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclOneRole <- 'ROLE' AclName"));
 		changes.push_back(GrammarChange::AddRule("AclRoleTarget <- AclAllRoles / AclOneRole"));
 		changes.push_back(GrammarChange::AddRule("AclGrantFunctionKind <- 'TABLE' / 'SCALAR'"));
-		changes.push_back(GrammarChange::AddRule("AclFunctionSpec <- AclPath AclGrantFunctionKind?"));
+		changes.push_back(GrammarChange::AddRule("AclFunctionSpec <- AclFunctionPath AclGrantFunctionKind?"));
 		changes.push_back(GrammarChange::AddRule("AclFunctionGrantVerb <- 'GRANT' / 'DENY'"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclGrantFunctionCategory <- AclFunctionGrantVerb 'FUNCTION' 'CATEGORY' AclName 'TO' AclRoleTarget",
@@ -3437,7 +3522,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 		unique_ptr<SQLStatement> statement;
 		try {
 			statement = parser.ParseTopLevelStatement(cursor);
-		} catch (ParserException &) {
+		} catch (ParserException &refusal) {
 			// a statement no rule reads - or a form a rule began with more following it before its `;` (PEG keeps the
 			// rule that matched): its tokens up to its `;`, refused in its form's words
 			auto end = start;
@@ -3451,6 +3536,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			auto &last = tokens.GetToken(end - 1);
 			MgmtParsed parsed;
 			parsed.unread = true;
+			parsed.hint = NameHint(ErrorData(refusal), tokens, compiled->GetKeywordHelper());
 			parsed.text =
 			    text.substr(tokens.GetToken(start).offset, last.offset + last.length - tokens.GetToken(start).offset);
 			result.push_back(std::move(parsed));
@@ -3492,7 +3578,8 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 		}
 		for (auto &quoted : data.quoted) {
 			auto index = quoted.offset.IsValid() ? TokenIndexAt(tokens, quoted.offset.GetIndex()) : optional_idx();
-			if (!index.IsValid() || !WrittenPlainly(text, tokens.GetToken(index.GetIndex()), quoted.value)) {
+			if (!index.IsValid() ||
+			    !WrittenPlainlyOrBackticked(text, tokens.GetToken(index.GetIndex()), quoted.value)) {
 				throw BinderException("acl admin: expected %s, quoted ('...' or \"...\") as one plain literal",
 				                      quoted.what);
 			}

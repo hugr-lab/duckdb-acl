@@ -444,23 +444,36 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   path's parts - is read exactly as duckdb reads an identifier (`IdentifierMatcher`'s rule, `DuckdbIdentifier` in
   the rules' matcher with duckdb's literal table and identifier mask): `"…"` or a backtick name quoted; bare, a word
   that does not start with a digit, its first character one duckdb's tokenizer keeps in a word (a letter, `_`, any
-  byte past ASCII), a keyword only when duckdb lets it name a column (`user`, `schema` bare; `from`, `select`,
-  `full` quoted); after a dot any word. No check of ours on top (Decided 3): `CREATE ROLE größe`, `CREATE VIRTUAL
-  CATALOG продажи` read bare, and so does whatever duckdb itself keeps in a bare identifier (an invisible
-  character too - duckdb turns U+00A0, U+2000-U+200B, U+202F, U+205F, U+2060, U+3000 and U+FEFF outside quotes into
-  a space first). Newly refused bare, as duckdb refuses them: a reserved keyword (`CREATE ROLE "full"`) and a leading
-  digit (`ISSUER "v1.2"`, `objects."9t"`) - what is stored under such a name keeps working, only its statement
-  quotes it. A VALUE (a scope, a level, a setting's value, a capability) stays the scanner's word (`true`, `v1.0`,
-  `4GB`; a capability a word or a quoted one - `select` is a keyword). A name offered back to paste is quoted as
-  duckdb's writer quotes it (`NamePath::ToGrammar` = `KeywordHelper::RequiresQuotes`, capitals allowed: `c."old"`,
-  `"größe"`). Found by its reviews: `REVOKE CATALOG … FROM ROLE <a name that only looks like the role's>` answered
-  success and left the grant - a revoke of nothing is refused now, as REVOKE TABLE / ADMIN were; whether a column
-  expression is a plain rename (`RenameOnlyColumns`) and a key column (`BareIdentifier`) are duckdb's parser's
-  reading (`PlainColumnName`: one token, one column reference of one part - `x = größe` stays a writable rename,
-  `x = (b)` and a quoted `x = "b"` stay read-only, as they were); the listings' by-name test reads a word as duckdb
-  does (any byte past ASCII). Look-alikes (Cyrillic `а`, a modifier letter like `ʼ`, a decomposed `ö`) are different
-  names - every rights check compares names exactly, so one never reaches another's rights; security.md says what
-  an operator should look for. hugr-node's rules use the same matchers.
+  byte past ASCII), a keyword only when duckdb lets it name a column (`user`, `schema` bare; a reserved word -
+  `select`, `default` - and a word only a function or a type may be - `full`, `left`, `join` - quoted); after a dot
+  any word; a function's path (`AclFunctionPath`: GRANT / DENY / REVOKE FUNCTION, ALIAS OF) reads its one part as
+  duckdb's `FunctionName` does (`left`, `glob` bare). No check of ours on top (Decided 3): `CREATE ROLE größe`,
+  `CREATE VIRTUAL CATALOG продажи` read bare, and so does whatever duckdb itself keeps in a bare identifier (an
+  invisible character too - duckdb turns U+00A0, U+2000-U+200B, U+202F, U+205F, U+2060, U+3000 and U+FEFF outside
+  quotes into a space first). A name is taken as written: a connection's `preserve_identifier_case` folds duckdb's
+  identifiers, never a management statement's (a role compares exactly, and a node's policy must not depend on the
+  connection that wrote it). Newly refused bare, as duckdb refuses them: such a keyword (`CREATE ROLE "full"`, the
+  legacy wrappers' catalog `"default"`) and a leading digit (`ISSUER "v1.2"`, `objects."9t"`) - what is stored
+  under such a name keeps working, only its statement quotes it, and the refusal says so (`NameHint`: the token the
+  parse stopped at, `… - full is an SQL keyword: a name spelled so is written in double quotes ("full")`). A name
+  that is a value (an issuer, client, group, secret, `AclNameValue`) keeps stage 3's reading of bare words joined by
+  dots as one name (`kc.local`), never a word, a dot and a quoted part (`a."b"` is no name); a backtick one is a
+  quoted one there too. A VALUE (a scope, a level, a setting's value, a capability) stays the scanner's word
+  (`true`, `v1.0`, `4GB`; a capability a word or a quoted one - `select` is a keyword). A name offered back to paste
+  is quoted as duckdb's writer quotes it (`NamePath::ToGrammar` = `KeywordHelper::RequiresQuotes`, capitals allowed:
+  `c."old"`, `"größe"`; the same in a message that suggests a statement). Found by its reviews: `REVOKE CATALOG …
+  FROM ROLE <a name that only looks like the role's>` answered success and left the grant - EVERY revoke of nothing
+  is refused now (`ThrowNothingToRevoke`: catalog, schema, resource group, function, function category, platform's
+  point grants and sources, `REVOKE ADMIN` without a scope; REVOKE TABLE and a scoped REVOKE ADMIN were already);
+  whether a column expression is a plain rename (`RenameOnlyColumns`) and a key column (`BareIdentifier`) are
+  duckdb's parser's reading (`PlainColumnName`: one token of the text the parser reads, one column reference of one
+  part, no alias - `x = größe` stays a writable rename, `x = (b)`, `x = "b"` and `` x = `b` `` stay read-only; duckdb's
+  special values `current_date`, `user` parse as column references and stay renames, as before 4a); the listings'
+  by-name test reads a word as duckdb's tokenizer does (no ASCII punctuation but `_`, `$` not first). Look-alikes
+  (Cyrillic `а`, a modifier letter like `ʼ`, a decomposed `ö`) are different names - every rights check compares
+  names exactly, so one never reaches another's rights; a GRANT or DENY to a role nobody defined is accepted (a role
+  may come from claims alone); security.md says what an operator should look for. hugr-node's rules use the same
+  matchers; the DBeaver plugin's composer quotes the same words (acl-clients).
 - 4b: resource group limits as rules (`ResourceLimitsJson` and `TextKind::LIMITS` go).
 - 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
   ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).

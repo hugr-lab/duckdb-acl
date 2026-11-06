@@ -56,23 +56,28 @@ namespace {
 //! computes. Anything else (NULL, amount * 2, a function call) has no physical column behind it, so
 //! the relation cannot be written through.
 bool IsPlainColumnReference(const string &expr) {
-	// a quoted physical name stays a computed reading (its relation read-only), as it always was
-	return !expr.empty() && expr.front() != '"' && PlainColumnName(expr);
+	// a quoted physical name (either quote) stays a computed reading (its relation read-only), as it always was: a
+	// write maps the virtual column to the physical name as written
+	return !expr.empty() && expr.front() != '"' && expr.front() != '`' && PlainColumnName(expr);
 }
 
 } // namespace
 
 bool PlainColumnName(const string &text) {
 	// spec 150 4a: duckdb's own reading - one column reference of one part (a bare word in any script, a quoted name),
-	// never a constant (NULL, TRUE), a keyword or anything computed
+	// never a constant (NULL, TRUE) or anything computed; duckdb's special values (`current_date`, `user`) parse as
+	// column references too and are read so, as before 4a
 	try {
-		// one token: `(b)` reads as the column b too, but it is written as an expression
-		if (Parser::Tokenize(text).size() != 1) {
+		// one token of the text the parser reads (a Unicode space outside quotes is a space to it): `(b)` reads as the
+		// column b too, but it is written as an expression; `a<NBSP>b` is `a b`
+		string spaced;
+		auto &read = Parser::StripUnicodeSpaces(text, spaced) ? spaced : text;
+		if (Parser::Tokenize(read).size() != 1) {
 			return false;
 		}
-		auto list = Parser(ParserOptions::Builtin()).ParseExpressionList(text);
+		auto list = Parser(ParserOptions::Builtin()).ParseExpressionList(read);
 		return list.size() == 1 && list[0]->GetExpressionType() == ExpressionType::COLUMN_REF &&
-		       list[0]->Cast<ColumnRefExpression>().ColumnNames().size() == 1;
+		       list[0]->GetAlias().empty() && list[0]->Cast<ColumnRefExpression>().ColumnNames().size() == 1;
 	} catch (std::exception &) {
 		return false;
 	}
@@ -1634,13 +1639,17 @@ void PolicyStore::RevokeAdmin(const string &role, const string &scope) {
 	}
 	lock_guard<mutex> guard(lock);
 	if (scope.empty()) {
-		admin_scopes.erase(role);
+		bool held = admin_scopes.erase(role) > 0;
 		// every administration of the role: its point grants on `platform` too (spec 117)
 		vector<PlatformGrantRow> kept;
 		for (auto &grant : platform_grants) {
 			if (!StringUtil::CIEquals(grant.role, role)) {
 				kept.push_back(grant);
 			}
+		}
+		held = held || kept.size() != platform_grants.size();
+		if (!held) {
+			ThrowNothingToRevoke(role, "administration");
 		}
 		platform_grants = std::move(kept);
 		return;
@@ -1700,6 +1709,9 @@ void PolicyStore::RevokePlatform(const string &role, const string &kind, const s
 		      StringUtil::CIEquals(grant.object, object))) {
 			kept.push_back(grant);
 		}
+	}
+	if (kept.size() == platform_grants.size()) {
+		ThrowNothingToRevoke(role, "grant on " + kind + " \"" + object + "\"");
 	}
 	platform_grants = std::move(kept);
 }
