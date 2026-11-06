@@ -1,0 +1,120 @@
+# name: test/sql/acl_principal_errors.test
+# description: spec 155 - a principal's error names nothing it was not shown. duckdb answers a missing catalog entry
+#   with the closest names in every attached database ("Did you mean "aclcat.acl.relations"?" - the policy store's own
+#   table; a table the expansion does not show) and names the physical object it looked for. Under a principal every
+#   error loses its "Did you mean" line, and a missing entry keeps its name only when the client wrote it. NATIVE and
+#   the operator keep duckdb's text. (test/cpp/test_acl_principal_errors.cpp takes the Prepare path.)
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.payroll(who VARCHAR, pay INT);
+
+statement ok
+CREATE TABLE phys.lake.hidden_thing(x INT);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE sales.vs.hidden_thing;
+
+statement ok
+ACL ADMIN CREATE ROLE wide;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE wide CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE wide WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.payroll TO ROLE wide WITH (select) COLUMNS (who);
+
+# --- a name nothing holds: no suggestion of a table the expansion does not show, nor of the policy store's ---------
+
+statement error
+ACL ROLE "wide" DROP TABLE vs.hidden_thin;
+----
+Catalog Error: Table with name hidden_thin does not exist!
+
+statement error
+ACL ROLE "wide" DROP TABLE vs.relation;
+----
+Catalog Error: Table with name relation does not exist!
+
+# IF EXISTS stays a no-op
+statement ok
+ACL ROLE "wide" DROP TABLE IF EXISTS vs.relation;
+
+# --- a record of nothing (the operator dropped its table): a name the client wrote is said, without a suggestion ---
+
+statement ok
+ACL ROLE "wide" CREATE TABLE vs.gone(x INT);
+
+statement ok
+DROP TABLE phys.lake.gone;
+
+statement error
+ACL ROLE "wide" SELECT * FROM vs.gone;
+----
+<REGEX>:Catalog Error: Table with name gone does not exist!.*
+
+# ...and a physical name the client never wrote is not: a record whose source is named otherwise
+statement ok
+CREATE TABLE phys.lake.salaries_2024(who VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.pay AS phys.lake.salaries_2024;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.pay TO ROLE wide WITH (select);
+
+statement ok
+DROP TABLE phys.lake.salaries_2024;
+
+statement error
+ACL ROLE "wide" SELECT * FROM pay;
+----
+<REGEX>:Catalog Error: acl: the table this statement names does not exist.*
+
+# --- what the principal was shown stays in the error: a column of its own read ------------------------------------
+
+statement error
+ACL ROLE "wide" SELECT secre FROM vs.payroll;
+----
+<REGEX>:.*Candidate bindings: "who".*
+
+# --- the operator's own SQL and NATIVE keep duckdb's text ---------------------------------------------------------
+
+statement error
+DROP TABLE phys.lake.hidden_thin;
+----
+<REGEX>:.*Did you mean "hidden_thing".*
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE wide;
+
+statement error
+ACL ROLE "wide" ACL NATIVE DROP TABLE phys.lake.hidden_thin;
+----
+<REGEX>:.*Did you mean.*hidden_thing.*

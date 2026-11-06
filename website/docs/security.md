@@ -131,6 +131,10 @@ share sessions" (spec 040).
   touched meanwhile is left as it is. Each is audited (`record_not_undone`). A crash before the `ROLLBACK`
   leaves the records as written: a created one is reported by `acl_check_catalog` (`source_missing`), a
   dropped one stays dropped.
+- A principal's error suggests nothing (spec 155): duckdb's "Did you mean" - the closest names in every
+  attached database, the policy store's own tables among them - is cut from it, and a missing object keeps
+  its name only when the statement wrote it (a record's physical source is never named). `ACL NATIVE` and
+  the operator's own SQL keep duckdb's text.
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).

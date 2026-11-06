@@ -9,6 +9,7 @@
 #include "acl_policy.hpp"
 
 #include "duckdb/common/enums/physical_operator_type.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/tree_renderer.hpp"
@@ -24,6 +25,7 @@
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/main/profiler/profiling_utils.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 
 #include <algorithm>
@@ -239,6 +241,45 @@ struct NullSink : BaseTreeRenderer {
 	}
 };
 
+//! spec 155: what a principal's error may not say - a name it was not shown. duckdb answers a missing catalog entry
+//! with the closest names it finds in the lookup's own schemas and in every attached database's ("Did you mean
+//! "aclcat.acl.relations"?" - the policy store's table; a table an expansion does not show), naming the physical
+//! object it looked for; other errors append the same "Did you mean" line. Every error loses its suggestion lines; a
+//! missing entry keeps its name only when the client wrote it (a physical name it was never shown - a record's source
+//! named otherwise - becomes a sentence that names nothing). The text is rebuilt as duckdb finalized it (its location
+//! in the statement, or JSON). Answers whether it changed anything.
+bool ScrubPrincipalError(ErrorData &error, const string &query, bool as_json) {
+	auto extra = error.ExtraInfo();
+	auto text = error.RawMessage();
+	const string suggestion = "\nDid you mean";
+	for (auto at = text.find(suggestion); at != string::npos; at = text.find(suggestion, at)) {
+		auto end = text.find('\n', at + 1);
+		text.erase(at, end == string::npos ? string::npos : end - at);
+	}
+	auto subtype = extra.find("error_subtype");
+	auto name = extra.find("name");
+	if (error.Type() == ExceptionType::CATALOG && subtype != extra.end() && subtype->second == "MISSING_ENTRY" &&
+	    name != extra.end() && !StringUtil::Contains(StringUtil::Lower(query), StringUtil::Lower(name->second))) {
+		auto type = extra.find("type");
+		text = "acl: the " + (type == extra.end() ? string("object") : StringUtil::Lower(type->second)) +
+		       " this statement names does not exist";
+		extra.erase(name);
+	}
+	if (text == error.RawMessage()) {
+		return false;
+	}
+	extra.erase("candidates");
+	ErrorData rebuilt(Exception(extra, error.Type(), text));
+	rebuilt.FinalizeError();
+	if (as_json) {
+		rebuilt.ConvertErrorToJSON();
+	} else {
+		rebuilt.AddErrorLocation(query);
+	}
+	error = std::move(rebuilt);
+	return true;
+}
+
 //! Per connection (spec 074): the note of the statement executing, the profiler's ownership, and
 //! the QueryEnd that turns duckdb's tree into the event.
 class AclProfileState : public ClientContextState {
@@ -264,6 +305,8 @@ public:
 	int64_t began_us = 0;
 	//! spec 078: this state put a session on the connection's AclConnection for the running statement
 	bool published_session = false;
+	//! spec 155: the running decided statement's text (QueryEnd may run when duckdb holds no active query)
+	string query_text;
 	//! spec 123: the running statement's autocommit transaction rolled back with no error - a result
 	//! closed before anything ended it (duckdb aborts it since 664aafa), and duckdb resets the profiler
 	//! at that rollback before any hook: its profile has its outcome and wall time, not the tree
@@ -297,7 +340,8 @@ public:
 		// the note is the execution's only when the text is: a follow-up the rewrite appended, a
 		// statement nobody decided (native, a door's own) or another connection's takes none, and a
 		// note kept past its statement serves the executions of that very text alone
-		auto current = StatementTextHash(context.GetCurrentQuery());
+		auto &query = context.GetCurrentQuery();
+		auto current = StatementTextHash(query);
 		if (!batch.empty() && batch.front().text_hash == current) {
 			note = std::move(batch.front());
 			batch.pop_front();
@@ -305,6 +349,8 @@ public:
 		} else if (has_note && note.text_hash != current) {
 			has_note = false;
 		}
+		// spec 155: a principal's error is rebuilt with its location in the text - which QueryEnd cannot read
+		query_text = has_note ? query : string();
 		began_us = NowMicros();
 		preparing = false;
 		physical_lineage.reset();
@@ -365,6 +411,16 @@ public:
 		}
 		if (error) {
 			batch.clear(); // an error ends the batch: the statements after it never run
+			// spec 155: a principal's statement (not NATIVE, not the anonymous operator) reads no name it was not
+			// shown in its error - this is the result's own error, the one the client reads (a Prepare's too: it
+			// runs as a PREPARE statement and throws its result's error)
+			if (has_note && note.statement != "native" && note.proto.detail != "anonymous" && error->HasError()) {
+				try {
+					ScrubPrincipalError(*error, query_text, Settings::Get<ErrorsAsJSONSetting>(context));
+				} catch (...) {
+					// the error stays as duckdb wrote it
+				}
+			}
 		}
 	}
 

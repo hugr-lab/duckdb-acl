@@ -771,7 +771,7 @@ physical table the expansion did not show); what a record probes inside a client
 commit (`RefreshAtCommit` -> `CatalogRefreshSchema`; a rename queues its new name); `ACL INGEST` creates only where no
 record is kept. A one-query DDL + record (MultiStatement) was tried and dropped - the spec says why. With `drop` on an
 expansion the drop is physical, an unrecorded table included (the owner, 2026-11-05). A record follows the client's
-ROLLBACK since spec 154. Next: the binder's "Did you mean" in a principal's DROP (spec 155). Tests
+ROLLBACK since spec 154; the binder's "Did you mean" is cut from a principal's errors since spec 155. Tests
 `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
 
 **Spec 153 — a client's DDL over Flight runs as text**: `acl::ClientTextIsDdl` (acl_admin_sql, beside
@@ -802,6 +802,16 @@ Conflicts retried; a step not undone is a `policy` event `record_not_undone` + `
 (changed_since / written_since / other_store / name_taken / refused). Lineage is reconciled at the end
 (`NoteDefinitionLineageIfChanged`: what a drop / rename announced vs what the catalog holds). Test
 `acl_record_rollback.test`.
+
+**Spec 155 — a principal's error suggests nothing**: duckdb answers a missing catalog entry with the closest names in
+the lookup's schemas and in every attached database (`Did you mean "aclcat.acl.relations"?` - the policy store's
+table; a table an expansion does not show) and names the physical object. `AclProfileState::QueryEnd` rewrites the
+RESULT's own error (`previous_error` = `result->GetErrorObject()`; a Prepare runs as a PREPARE and throws its result's
+error, so it passes there too) of a decided statement that is neither `native` nor the anonymous operator's
+(`ScrubPrincipalError`): every `\nDid you mean` line cut; a `MISSING_ENTRY` keeps its name only when the client's text
+holds it, else `acl: the <type> this statement names does not exist`; rebuilt as ProcessError did (location in the
+statement text the state copied at QueryBegin - QueryEnd may run with no active query, `GetCurrentQuery` throws - or
+JSON). Tests `acl_principal_errors.test`, `test_acl_principal_errors.cpp` (the Prepare path).
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
