@@ -386,10 +386,17 @@ struct StatementAudit {
 			for (auto &object : stmt.objects) {
 				NamePath path;
 				string ignored;
-				if (NamePath::TryFromKey(object.name, path, ignored)) {
-					for (auto &part : path.Parts()) {
-						text.object_parts.push_back(StringUtil::Lower(part));
-					}
+				if (!NamePath::TryFromKey(object.name, path, ignored) || path.Parts().empty()) {
+					continue;
+				}
+				// a name a CREATE / DROP / temp offers is the client's own: its leaf is said back as the table's,
+				// never its parts as a schema or a database the statement resolved
+				if (object.capability == "create" || object.capability == "drop" || object.capability == "temp") {
+					text.target_leaves.push_back(StringUtil::Lower(path.Parts().back()));
+					continue;
+				}
+				for (auto &part : path.Parts()) {
+					text.object_parts.push_back(StringUtil::Lower(part));
 				}
 			}
 			texts.Note(stmt.text_hash, std::move(text));

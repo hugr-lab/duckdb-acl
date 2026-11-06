@@ -810,9 +810,11 @@ principal's statement - one the override recorded where it decided it (`Statemen
 rewrite substituted - `NotePhysical(phys, vname)` → `renamed` - and its objects' parts), unless its own note says
 NATIVE / the operator; never the note alone (lost by the next parse, a refused batch, another connection's parse; an
 implicit PIVOT's parts carry the statement's text). `ScrubPrincipalError`: `Did you mean` / `Candidate bindings|tables`
-lines cut; a substituted leaf reads as its virtual name only where duckdb names the entry (`ReadAsVirtual`); a
+lines cut; a substituted leaf reads as its virtual name only where duckdb names a Table / View entry or the written
+table (`ReadAsVirtual`); a
 CONSTRAINT error says its kind; a `Star expression` nothing it expanded; a CATALOG error (and `Catalog x does not
-exist!`) keeps its names only when they are parts of the statement's objects, a COLUMN_NOT_FOUND only when the client's
+exist!`) keeps its names only when they are parts of the statement's resolved objects (a CREATE / DROP target's leaf
+only as a table's - `target_leaves`), a COLUMN_NOT_FOUND only when the client's
 tokens hold it (`ClientWrote` - never a string), else a sentence naming nothing; location kept, JSON re-read and
 re-written, a throw fails closed. The text is copied at QueryBegin (QueryEnd may run with no active query). Tests
 `acl_principal_errors.test`, `test_acl_principal_errors.cpp`.

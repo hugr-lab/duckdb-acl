@@ -54,6 +54,7 @@ ACL ADMIN GRANT TABLE sales.vs.payroll TO ROLE wide WITH (select) COLUMNS (who);
 
 # --- a name nothing holds: no suggestion of a table the expansion does not show, nor of the policy store's ---------
 
+# (a DROP's target is the table the client asks for: said back as a table, never as a schema or a database)
 statement error
 ACL ROLE "wide" DROP TABLE vs.hidden_thin;
 ----
@@ -184,6 +185,25 @@ ACL ROLE "wide" PIVOT vs.pivsrc ON who USING sum(amount);
 ----
 <REGEX>:Catalog Error: Table with name pivsrc does not exist!.*
 
+# --- a schema a CREATE offers is the client's invention: a missing physical schema of that name is not confirmed ---
+
+statement ok
+CREATE SCHEMA phys.gone;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.gs FROM phys.gone;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.gs TO ROLE wide WITH (select, create);
+
+statement ok
+DROP SCHEMA phys.gone;
+
+statement error
+ACL ROLE "wide" CREATE TABLE gs.gone(x INT);
+----
+<REGEX>:Catalog Error: acl: the schema this statement names does not exist.*
+
 # --- a write to a writable object over a source named otherwise: the source is not named, a constraint says its kind
 
 statement ok
@@ -215,6 +235,20 @@ statement error
 ACL ROLE "wide" SELECT wpax FROM money;
 ----
 <REGEX>:Binder Error: Referenced column "wpax" not found in FROM clause!.*
+
+# ...and so is one named by string to another kind of entry (a sequence): no echo of the virtual name confirms it
+statement ok
+ACL ADMIN GRANT FUNCTION nextval TO ROLE wide;
+
+statement error
+ACL ROLE "wide" SELECT nextval('wpay'), * FROM money;
+----
+<REGEX>:Catalog Error: acl: the sequence this statement names does not exist.*
+
+statement error
+ACL ROLE "wide" SELECT nextval('wpax'), * FROM money;
+----
+<REGEX>:Catalog Error: acl: the sequence this statement names does not exist.*
 
 statement error
 ACL ROLE "wide" INSERT INTO money (id, amount) VALUES (1, 2);

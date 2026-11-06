@@ -354,7 +354,8 @@ struct UnionWidening {
 //! the virtual objects it names. Bounded, the least recently used forgotten first.
 struct PrincipalText {
 	vector<std::pair<string, string>> renamed;
-	vector<string> object_parts; // folded
+	vector<string> object_parts;  // folded: every part of the objects it resolved
+	vector<string> target_leaves; // folded: the name a CREATE / DROP / temp offers - said back as a table's only
 };
 
 class PrincipalTextRegistry {

@@ -75,15 +75,19 @@ home (spec 151), so this is not a name the role was denied.
 - **The rewrite** (`ScrubPrincipalError`):
   - every `Did you mean`, `Candidate bindings` and `Candidate tables` line is cut;
   - each physical leaf the rewrite substituted for a virtual name of another spelling reads as that virtual name -
-    only in the sentences where duckdb names the entry it looked for or wrote (`with name …`, `Table "…" does not
-    have a column`, `table "…" has N columns`, `ReadAsVirtual`). Anywhere else the name is one the client wrote, and a
-    rewritten echo would confirm a guess (`SELECT <physical leaf> FROM t` would answer the virtual name);
+    only in the sentences where duckdb names the relation it looked for or wrote (a Table / View entry's `with name
+    …`, `Table "…" does not have a column`, `table "…" has N columns`, `ReadAsVirtual`). Anywhere else the name is one
+    the client wrote, and a rewritten echo would confirm a guess (`SELECT <physical leaf> FROM t`, or
+    `nextval('<physical leaf>')` - a sequence entry, would answer the virtual name);
   - a `CONSTRAINT` error becomes `acl: the write breaks a <NOT NULL | CHECK | PRIMARY KEY | UNIQUE | FOREIGN KEY>
     constraint of the table it writes`;
   - a `BINDER` star error (`Star expression "…"`) becomes `acl: a star in this statement selects no column it may
     read`;
   - a `CATALOG` error keeps its sentence only when the names it carries are parts of the virtual objects the
-    statement names (the trail's objects - never an alias or a string the client wrote). For `MISSING_ENTRY` /
+    statement resolved (the trail's objects - never an alias or a string the client wrote). The name a `CREATE` /
+    `DROP` / temp offers counts only as a table's or a view's (the object asked for: `Table with name x does not
+    exist!`, `already exists`), never as a schema or a database - `CREATE TABLE vs.lake` must not confirm that the
+    expansion's missing physical schema is `lake`. For `MISSING_ENTRY` /
     `ENTRY_ALREADY_EXISTS` that is the entry's name; for any other catalog error, every name it writes in double
     quotes, part by part; for duckdb's `Catalog x does not exist!` (a BINDER error), the catalog. Otherwise it becomes
     `acl: the <type> this statement names does not exist`, `acl: an object this statement names does not exist`, or

@@ -276,11 +276,17 @@ bool ClientWrote(const string &query, const string &name) {
 	return false;
 }
 
-//! spec 155: a part of a virtual object the statement names - what a catalog error may say back
-bool ObjectPart(const PrincipalText &info, const string &name) {
+//! spec 155: a part of a virtual object the statement names - what a catalog error may say back; with `as_relation`
+//! also the name a CREATE / DROP offers (an entry of a table or a view: the object asked for)
+bool ObjectPart(const PrincipalText &info, const string &name, bool as_relation = false) {
 	auto want = StringUtil::Lower(name);
-	return !want.empty() &&
-	       std::find(info.object_parts.begin(), info.object_parts.end(), want) != info.object_parts.end();
+	if (want.empty()) {
+		return false;
+	}
+	auto in = [&](const vector<string> &names) {
+		return std::find(names.begin(), names.end(), want) != names.end();
+	};
+	return in(info.object_parts) || (as_relation && in(info.target_leaves));
 }
 
 //! spec 155: every name an error writes in double quotes ("a", "a.b") is, part by part, one of the statement's own
@@ -291,7 +297,7 @@ bool QuotedNamesWritten(const string &text, const PrincipalText &info) {
 			return false;
 		}
 		for (auto &part : StringUtil::Split(text.substr(open + 1, close - open - 1), '.')) {
-			if (!part.empty() && !ObjectPart(info, part)) {
+			if (!part.empty() && !ObjectPart(info, part, true)) {
 				return false;
 			}
 		}
@@ -316,9 +322,15 @@ string ReplaceFolded(const string &text, const string &from, const string &to) {
 //! spec 155: a substituted physical leaf read as the virtual name it stands for - only in the sentences where duckdb
 //! names the entry it looked for or wrote (an entry missing or existing, the table a write's columns are judged
 //! against): anywhere else the name is one the client wrote, and a rewritten echo would confirm a guess
-string ReadAsVirtual(string text, const string &phys, const string &virt) {
-	for (auto shape :
-	     {"with name %s ", "with name %s!", "with name \"%s\"", "Table \"%s\" does not have", "table \"%s\" has "}) {
+string ReadAsVirtual(string text, const string &phys, const string &virt, bool relation_entry) {
+	// a catalog entry's sentence only for a relation (a table, a view): another kind of entry of that name (a
+	// sequence a principal names by string) is one the rewrite never put in, and its echo would confirm a guess
+	if (relation_entry) {
+		for (auto shape : {"with name %s ", "with name %s!", "with name \"%s\""}) {
+			text = ReplaceFolded(text, StringUtil::Format(shape, phys), StringUtil::Format(shape, virt));
+		}
+	}
+	for (auto shape : {"Table \"%s\" does not have", "table \"%s\" has "}) {
 		text = ReplaceFolded(text, StringUtil::Format(shape, phys), StringUtil::Format(shape, virt));
 	}
 	return text;
@@ -368,17 +380,19 @@ bool ScrubPrincipalError(ErrorData &error, const string &query, const PrincipalT
 	}
 	auto subtype = extra.count("error_subtype") ? extra["error_subtype"] : string();
 	auto name = extra.count("name") ? extra["name"] : string();
+	auto entry_type = extra.count("type") ? extra["type"] : string();
+	bool relation_entry = (subtype == "MISSING_ENTRY" || subtype == "ENTRY_ALREADY_EXISTS") &&
+	                      (StringUtil::CIEquals(entry_type, "Table") || StringUtil::CIEquals(entry_type, "View"));
 	for (auto &pair : info.renamed) {
-		text = ReadAsVirtual(text, pair.first, pair.second);
-		if (StringUtil::CIEquals(name, pair.first) &&
-		    (subtype == "MISSING_ENTRY" || subtype == "ENTRY_ALREADY_EXISTS")) {
+		text = ReadAsVirtual(text, pair.first, pair.second, relation_entry);
+		if (relation_entry && StringUtil::CIEquals(name, pair.first)) {
 			name = pair.second;
 			extra["name"] = name;
 		}
 	}
 	// an entry's name is said back when it is part of an object the statement names; a column's when the client's
 	// text holds it (a column is no object of the trail)
-	bool named = subtype == "COLUMN_NOT_FOUND" ? ClientWrote(query, name) : ObjectPart(info, name);
+	bool named = subtype == "COLUMN_NOT_FOUND" ? ClientWrote(query, name) : ObjectPart(info, name, relation_entry);
 	if (type == ExceptionType::CONSTRAINT) {
 		text = "acl: the write breaks a " + ConstraintKind(text) + "constraint of the table it writes";
 	} else if (type == ExceptionType::CATALOG &&
