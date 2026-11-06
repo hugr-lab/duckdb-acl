@@ -176,7 +176,7 @@ The reviews found three more problems on the same path, all older than this spec
   test_acl_session_use.cpp).
 - **The binder's "Did you mean"**: a principal's `DROP TABLE vs.nothing` answers `Did you mean
   "aclcat.acl.function_grants"?`. duckdb's suggestion names objects of other catalogs, the policy store's included.
-  This is older than this spec, and the next spec takes it.
+  This is older than this spec. Done by spec 155: a principal's error suggests nothing.
 - **Inside a client's transaction**, a `RENAME`'s definition lineage (`NoteDefinitionLineage(…, "CREATE")`) is queued
   before the commit. The worker may bind the new name before it is visible. This is older than this spec too.
 - `test/e2e/flight/bootstrap.sql`'s `c.made` must stay empty outside adbc_client.py: run.sh asserts GetDbSchemas

@@ -131,6 +131,13 @@ share sessions" (spec 040).
   touched meanwhile is left as it is. Each is audited (`record_not_undone`). A crash before the `ROLLBACK`
   leaves the records as written: a created one is reported by `acl_check_catalog` (`source_missing`), a
   dropped one stays dropped.
+- A principal's error names nothing it was not shown (spec 155): duckdb's "Did you mean" and candidate lines
+  (the closest names in every attached database, the policy store's own tables among them; a rewritten read's
+  physical columns) are cut, a record's physical source reads as the record, a constraint error says only its
+  kind, and a missing object or column keeps its name only when the statement wrote it. `ACL NATIVE` and the
+  operator's own SQL keep duckdb's text. A constraint stays an oracle: whether a write breaks a CHECK over a
+  hidden column, or a key the RLS hides, tells the writer something about rows it cannot read - weigh it when
+  granting writes.
 - `CREATE TEMP TABLE` needs the explicit `temp` capability; a temp name is resolved
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).
@@ -729,7 +736,7 @@ is in force somewhere in the chain:
 | plain alias | whole-table (no `COLUMNS`) | **appears, ungranted** | the object adapts (the rest is readable) |
 | plain alias | `COLUMNS (id, tenant, ssn = NULL)` | invisible - not listed | a bare name intersects away (spec 038); a masked name that vanished **refuses** with duckdb's `Column "ssn" in REPLACE list not found` |
 | plain alias | `COLUMNS (ssn = NULL)` (mask only) | invisible - the list is the masked column alone | refuses, as above |
-| declared object (`COLUMNS (id = pk, tenant = internal_tenant, ssn = ssn_raw)`) | any | invisible until declared | **the object refuses, it does not narrow** - with duckdb's `Referenced column "ssn_raw" not found in FROM clause! Candidate bindings: "ssn_backup", "internal_tenant"` (spec 065 probe A, the accepted name leak); `information_schema.columns` meanwhile lists `id, tenant` |
+| declared object (`COLUMNS (id = pk, tenant = internal_tenant, ssn = ssn_raw)`) | any | invisible until declared | **the object refuses, it does not narrow** - with `acl: a column this statement reads does not exist in its source` (spec 065 probe A; duckdb's own text named the source's columns until spec 155); `information_schema.columns` meanwhile lists `id, tenant` |
 | alias schema (`AS`) | whole-table | a **whole new table** appears and is listed | the table is gone |
 | expansion schema (`FROM`) | whole-table | invisible (`no access to object "cur.newtab"`) until `ALTER VIRTUAL SCHEMA c.cur REFRESH`, which reported `1` and made it readable | `REFRESH PRUNE` removes the record (spec 014) |
 

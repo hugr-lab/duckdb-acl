@@ -347,6 +347,51 @@ struct UnionWidening {
 	static constexpr idx_t REPORTED = 16;
 };
 
+//! spec 155: the statements decided for a principal (not NATIVE, not the anonymous operator) on this instance, by the
+//! hash of the text each executes under - recorded where the override decides, read by every connection's QueryEnd:
+//! a gateway parses on one connection and runs on another, a prepared statement runs long after its note is gone.
+//! With each, what its error may say: the virtual leaf for each physical leaf its rewrite put in, and the parts of
+//! the virtual objects it names. Bounded, the least recently used forgotten first.
+struct PrincipalText {
+	vector<std::pair<string, string>> renamed;
+	vector<string> object_parts;  // folded: every part of the objects it resolved
+	vector<string> target_leaves; // folded: the name a CREATE / DROP / temp offers - said back as a table's only
+};
+
+class PrincipalTextRegistry {
+public:
+	void Note(uint64_t hash, PrincipalText text) {
+		lock_guard<mutex> guard(lock);
+		auto found = texts.find(hash);
+		if (found != texts.end()) {
+			order.erase(found->second.second);
+			texts.erase(found);
+		}
+		order.push_back(hash);
+		texts.emplace(hash, std::make_pair(std::move(text), std::prev(order.end())));
+		while (order.size() > CAPACITY) {
+			texts.erase(order.front());
+			order.pop_front();
+		}
+	}
+	bool Find(uint64_t hash, PrincipalText &out) {
+		lock_guard<mutex> guard(lock);
+		auto found = texts.find(hash);
+		if (found == texts.end()) {
+			return false;
+		}
+		order.splice(order.end(), order, found->second.second); // used: the last to be forgotten
+		out = found->second.first;
+		return true;
+	}
+
+private:
+	static constexpr idx_t CAPACITY = 65536;
+	mutex lock;
+	std::list<uint64_t> order;
+	std::unordered_map<uint64_t, std::pair<PrincipalText, std::list<uint64_t>::iterator>> texts;
+};
+
 struct PolicyStore {
 	mutex lock;
 	// role -> virtual name -> policy (tables and views share one namespace)
@@ -1080,6 +1125,8 @@ struct PolicyStore {
 	//! spec 154: a client's ROLLBACK left a record as its write made it - `reason` a bounded code (the counter's
 	//! attribute), `why` a fixed sentence, never a value
 	void AuditRecordNotUndone(const string &object, const string &reason, const string &why);
+	//! spec 155: the principal's statements this instance decided (see PrincipalTextRegistry)
+	PrincipalTextRegistry principal_texts;
 	//! spec 095: an issuer's or a client's resolved connection changed through its secret
 	void AuditConnection(const string &kind, const string &name, const string &fingerprint);
 	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)

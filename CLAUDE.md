@@ -771,7 +771,7 @@ physical table the expansion did not show); what a record probes inside a client
 commit (`RefreshAtCommit` -> `CatalogRefreshSchema`; a rename queues its new name); `ACL INGEST` creates only where no
 record is kept. A one-query DDL + record (MultiStatement) was tried and dropped - the spec says why. With `drop` on an
 expansion the drop is physical, an unrecorded table included (the owner, 2026-11-05). A record follows the client's
-ROLLBACK since spec 154. Next: the binder's "Did you mean" in a principal's DROP (spec 155). Tests
+ROLLBACK since spec 154; the binder's "Did you mean" is cut from a principal's errors since spec 155. Tests
 `acl_ddl_records.test`, `test_acl_ddl_records.cpp`.
 
 **Spec 153 — a client's DDL over Flight runs as text**: `acl::ClientTextIsDdl` (acl_admin_sql, beside
@@ -802,6 +802,22 @@ Conflicts retried; a step not undone is a `policy` event `record_not_undone` + `
 (changed_since / written_since / other_store / name_taken / refused). Lineage is reconciled at the end
 (`NoteDefinitionLineageIfChanged`: what a drop / rename announced vs what the catalog holds). Test
 `acl_record_rollback.test`.
+
+**Spec 155 — a principal's error suggests nothing**: `AclProfileState::QueryEnd` rewrites the RESULT's own error
+(`previous_error` = `result->GetErrorObject()`; a Prepare runs as a PREPARE and throws its result's error) of a
+principal's statement - one the override recorded where it decided it (`StatementAudit::Decided` →
+`PolicyStore::principal_texts`, a `PrincipalTextRegistry` LRU of 65536 text hashes, each with the physical leaves the
+rewrite substituted - `NotePhysical(phys, vname)` → `renamed` - and its objects' parts), unless its own note says
+NATIVE / the operator; never the note alone (lost by the next parse, a refused batch, another connection's parse; an
+implicit PIVOT's parts carry the statement's text). `ScrubPrincipalError`: `Did you mean` / `Candidate bindings|tables`
+lines cut; a substituted leaf reads as its virtual name only where duckdb names a Table / View entry or the written
+table (`ReadAsVirtual`); a
+CONSTRAINT error says its kind; a `Star expression` nothing it expanded; a CATALOG error (and `Catalog x does not
+exist!`) keeps its names only when they are parts of the statement's resolved objects (a CREATE / DROP target's leaf
+only as a table's - `target_leaves`), a COLUMN_NOT_FOUND only when the client's
+tokens hold it (`ClientWrote` - never a string), else a sentence naming nothing; location kept, JSON re-read and
+re-written, a throw fails closed. The text is copied at QueryBegin (QueryEnd may run with no active query). Tests
+`acl_principal_errors.test`, `test_acl_principal_errors.cpp`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a

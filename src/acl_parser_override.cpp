@@ -343,7 +343,7 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 //! statement it stopped at and what had been decided up to it. Every event is emitted whatever the
 //! level (the counters are a state of the node) and recorded only where the level says so.
 struct StatementAudit {
-	explicit StatementAudit(AuditPipeline *audit) : audit(audit) {
+	StatementAudit(AuditPipeline *audit, PrincipalTextRegistry &texts) : audit(audit), texts(texts) {
 		TakeDenyReason();    // a stale note from a refusal nobody audited must not name this one
 		ClearProfileNotes(); // spec 074: nor may a note of a statement nobody executed
 		proto.kind = "statement";
@@ -351,6 +351,8 @@ struct StatementAudit {
 	}
 
 	AuditPipeline *audit;
+	//! spec 155: where a principal's decided statements are known, whatever the audit level or sink
+	PrincipalTextRegistry &texts;
 	AuditEvent proto; // what every event of the batch shares: door, session, principal, trace
 	int8_t session_level = -1;
 	int8_t session_profile = -1;   // spec 074 slice 3: the operator's profile level on the session
@@ -377,6 +379,28 @@ struct StatementAudit {
 	}
 
 	void Decided(const AuditTrail::Statement &stmt, bool allowed, const string &code, const string &reason) {
+		if (allowed && stmt.executes && stmt.statement != "native" && proto.detail != "anonymous") {
+			// spec 155: whichever connection runs it, and whenever, its error is a principal's
+			PrincipalText text;
+			text.renamed = stmt.renamed;
+			for (auto &object : stmt.objects) {
+				NamePath path;
+				string ignored;
+				if (!NamePath::TryFromKey(object.name, path, ignored) || path.Parts().empty()) {
+					continue;
+				}
+				// a name a CREATE / DROP / temp offers is the client's own: its leaf is said back as the table's,
+				// never its parts as a schema or a database the statement resolved
+				if (object.capability == "create" || object.capability == "drop" || object.capability == "temp") {
+					text.target_leaves.push_back(StringUtil::Lower(path.Parts().back()));
+					continue;
+				}
+				for (auto &part : path.Parts()) {
+					text.object_parts.push_back(StringUtil::Lower(part));
+				}
+			}
+			texts.Note(stmt.text_hash, std::move(text));
+		}
 		if (!audit) {
 			return;
 		}
@@ -405,6 +429,7 @@ struct StatementAudit {
 			note.statement = stmt.statement;
 			note.objects = stmt.objects;
 			note.physical = stmt.physical;
+			note.renamed = stmt.renamed;
 			note.origins = stmt.origins;
 			if (stmt.lineage) {
 				stmt.lineage->decision_seq = seq; // spec 107: the run names its decision
@@ -1048,7 +1073,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	} catch (std::exception &ex) {
 		// a prefix that does not read (an unterminated quote, a bare ACL TOKEN) is a refusal too, and
 		// counted as one: nobody is known yet, so it is the gateway's, and a parse
-		StatementAudit audit(store.audit.get());
+		StatementAudit audit(store.audit.get(), store.principal_texts);
 		audit.Denied(ex);
 		RethrowUnlocated(ex, ErrorsAsJson(options));
 	}
@@ -1059,7 +1084,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		// loads this extension loses quack's bulk loading (spec 043, found by the throughput benchmark,
 		// whose un-ACL'd baseline could not load at all).
 		if (store.DoorOpen() && DrainsQuackClientStream(query)) {
-			StatementAudit audit(store.audit.get());
+			StatementAudit audit(store.audit.get(), store.principal_texts);
 			audit.proto.detail = "drain";
 			try {
 				auto result = DrainStreamUnderPrincipal(store, query, options, audit);
@@ -1080,7 +1105,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 
 	// the decision is audited whatever happens to it (spec 069): one event per statement decided, or
 	// one for the refusal - the events are emitted here, after the decision, never on its path
-	StatementAudit audit(store.audit.get());
+	StatementAudit audit(store.audit.get(), store.principal_texts);
 	audit.proto.correlation_id = prefix.correlation_id;
 	audit.proto.traceparent = prefix.traceparent;
 	if (prefix.kind == AclPrefix::Kind::SESSION || prefix.kind == AclPrefix::Kind::INGEST) {
