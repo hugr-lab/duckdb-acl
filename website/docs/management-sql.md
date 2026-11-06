@@ -863,8 +863,9 @@ session opens, and a limit it does not name is the node's setting.
 | `max_sessions` | the live sessions charged to this group | unlimited |
 
 - **Writing a limit.** Each item is the limit's name, an optional `=`, and one value: a number
-  (`-1`), a word (`32MiB`) or a quoted string (`'32 MiB'` - a value with a space is quoted). A name
-  is written once in any case, and an empty item (`(, window_max 8,)`) is none.
+  and its unit written together (`64`, `32MiB`, `.5GB`), a signed number (`-1`) or a quoted string
+  (`'32 MiB'` - a value with a space is quoted). A name is written once in any case, and an empty
+  item (`(, window_max 8,)`) is none.
 - **Validation.** A name outside the table is refused, and so is a negative value. Only
   `queue_priority` may be negative.
 - **Several groups.** A principal whose roles are in several groups gets the most generous value of

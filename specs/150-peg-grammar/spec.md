@@ -300,7 +300,7 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   its path's key, a one-part name no bare word could be (`"||"`, `"IS DISTINCT FROM"`) in double quotes, then `TABLE` /
   `SCALAR` as written - what `ParseFunctionSpec` reads, as the compiler's `FunctionSpecText` wrote it; a platform
   function takes no kind (refused). The limits are `TextKind::LIMITS`, read by the compiler's `ResourceLimitsJson`, and
-  a value list: a string continued on the next line refused. Fixed with the move (3f's reviews): a function spec is read
+  a value list: a string continued on the next line refused (a rule since 4b). Fixed with the move (3f's reviews): a function spec is read
   as duckdb reads a qualified name - `ParseFunctionSpec` reads its parts with `QualifiedName::ParseComponents` (a word
   or a double-quoted name, `""` a quote), a kind only as a last word after any space outside quotes, an unquoted part
   plain (a space only - no apostrophe, parenthesis, tab, line break or control character), a part never empty nor with
@@ -426,7 +426,7 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       words by `RefuseUnreadStatement`, chosen by its head on duckdb's tokens (`HeadWords` over `ReadStatementHeads`)
       as the compiler chose them - a module's by its usage, a tokenizer refusal still first. `AdminScanner` stays as
       the readers of a statement's lists (REQUIRE / ATTRIBUTES, a column list, a claim map, limits - handed their text
-      by the rules): they become rules with stage 4, as do their checks (`JudgeListText`, `ScannerUnreadable`, once
+      by the rules): they become rules with stage 4 (limits: 4b), as do their checks (`JudgeListText`, `ScannerUnreadable`, once
       `JudgeLegacyText`); its members only the statement compiler used go. The batch reader stops at the first
       statement no rule reads (the batch is refused there: reading on cost a failed match - duckdb renders the batch's
       tokens for each - per statement after it, 32,000 of them 20 s); under the `ACL` marker a CREATE / ALTER / DROP
@@ -480,10 +480,14 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   `AclWordToken '='? AclValue` (the limit's name a word; its value a number, a word like `32MiB`, a quoted one),
   `LimitsJson` in the transform (a name once in any case, lower-cased; an empty item none, as the text reader took
   it); `ResourceLimitsJson` and `TextKind::LIMITS` go, and `MgmtCall::Text` shares the value reader
-  (`ValueTextOf`). What it reads differently: a value is one value, so one with a space is quoted (`batch_bytes
-  '32 MiB'`; the text reader took `32 MiB` bare as the rest of the item), a backtick value reads (it was refused),
-  and a string continued on the next line is refused as no plain literal (duckdb joins `'4'` and `'MiB'`), as it was
-  refused before in other words.
+  (`ValueTextOf`, its wrong-part refusal kept for a module). A value (`AclLimitValue`) is a run of touching tokens
+  (`AclLimitRunToken`: a number and its unit - `32MiB`, `.5GB`, `1e-3GB` -, a word), a signed number (its sign may
+  stand apart: `- 1`) or a quoted one. What it reads differently: a value with a space is quoted (`batch_bytes
+  '32 MiB'`; the text reader took `32 MiB` bare as the rest of the item, and a comment inside a value as a space), a
+  backtick value reads (it was refused), a value may touch its name or `=` (`window_max=8`, `window_max'8'`), and a
+  string continued on the next line is refused as no plain literal (duckdb joins `'4'` and `'MiB'`), as it was
+  refused before in other words. Found by its reviews: the admin function's number parse let `std::stoll`'s
+  exceptions out (a quoted `'-'`, 20 digits) - a refusal naming the limit now.
 - 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
   ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
 - 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.

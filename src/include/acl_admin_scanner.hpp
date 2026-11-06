@@ -2,8 +2,8 @@
 // acl_admin_scanner.hpp
 //
 // The scanner the readers of a management statement's lists still use (spec 008): a list a rule read is handed to
-// them as its text (REQUIRE / ATTRIBUTES, a column list, a claim map, limits). Every statement is a rule since spec
-// 150 3g-3c; the lists become rules with stage 4.
+// them as its text (REQUIRE / ATTRIBUTES, a column list, a claim map; a group's limits are a rule since 4b). Every
+// statement is a rule since spec 150 3g-3c; the lists become rules with stage 4.
 //===----------------------------------------------------------------------===//
 
 #pragma once

@@ -1430,12 +1430,16 @@ case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const ch
 			} else if (yyjson_is_str(val)) {
 				string text = yyjson_get_str(val);
 				StringUtil::Trim(text);
-				bool digits = !text.empty();
+				bool digits = !text.empty() && text != "-";
 				for (idx_t i = 0; i < text.size(); i++) {
 					digits = digits && (StringUtil::CharacterIsDigit(text[i]) || (i == 0 && text[i] == '-'));
 				}
 				if (digits) {
-					value = std::stoll(text);
+					try {
+						value = std::stoll(text);
+					} catch (std::out_of_range &) {
+						throw BinderException("%s: %s is out of range, got \"%s\"", fn, name, text);
+					}
 				} else if (name == "batch_bytes") {
 					value = MemoryLimitBytes(DBConfig::ParseMemoryLimit(text));
 				} else {

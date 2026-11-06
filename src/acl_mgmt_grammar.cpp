@@ -255,7 +255,9 @@ public:
 	//! WORD_OR_QUOTED: a value's word or a quoted one (a capability: `select`, `create` - keywords, never names)
 	//! FUNCTION_PATH: a function's path - one part read as duckdb reads a function's name (`left`, `glob` bare), a
 	//! qualified one as a path (its first part a catalog or a schema)
-	enum class Kind : uint8_t { WORD, WORD_OR_QUOTED, NAME, DOTTED, PATH, FUNCTION_PATH, NAME_VALUE, LIST_ITEM };
+	//! RUN: a value written as touching tokens - a number and its unit (`32MiB`, `.5GB`, `1e-3GB`), a word - as the
+	//! text reader took a limit's value, never across a space (spec 150 4b)
+	enum class Kind : uint8_t { WORD, WORD_OR_QUOTED, NAME, DOTTED, PATH, FUNCTION_PATH, NAME_VALUE, LIST_ITEM, RUN };
 
 	explicit AclTokenMatcher(Kind kind_p, const PEGKeywordHelper *keywords = nullptr)
 	    : AtomicMatcher(MatcherType::CUSTOM), kind(kind_p) {
@@ -273,6 +275,9 @@ public:
 		}
 		if (kind == Kind::DOTTED) {
 			return MatchDotted(state);
+		}
+		if (kind == Kind::RUN) {
+			return MatchRun(state);
 		}
 		if (kind == Kind::PATH || kind == Kind::FUNCTION_PATH || kind == Kind::NAME_VALUE) {
 			return MatchIdentifierPath(state);
@@ -322,6 +327,34 @@ private:
 			}
 		}
 		return true;
+	}
+
+	//! A token a run is made of: a number or an unquoted word
+	static bool RunPart(const MatcherToken &token) {
+		return !token.text.empty() && (token.type == TokenType::NUMBER_LITERAL ||
+		                               ((token.type == TokenType::KEYWORD || token.type == TokenType::IDENTIFIER) &&
+		                                token.text[0] != '"' && token.text[0] != '`'));
+	}
+
+	MatcherResult MatchRun(MatchState &state) const {
+		auto &tokens = state.token_iterator;
+		auto first = tokens.Position();
+		auto &head = tokens.GetToken(first);
+		string text = head.text;
+		auto end = head.offset + head.length;
+		idx_t count = 1;
+		while (first + count < tokens.Size()) {
+			auto &next = tokens.GetToken(first + count);
+			if (next.offset != end || !RunPart(next)) {
+				break;
+			}
+			text += next.text;
+			end = next.offset + next.length;
+			count++;
+		}
+		tokens.Advance(count);
+		state.UpdateMaxTokenIndex();
+		return state.AllocateParseResult<TokenParseResult>(std::move(text), head.offset, end - head.offset);
 	}
 
 	MatcherResult MatchDotted(MatchState &state) const {
@@ -449,6 +482,8 @@ private:
 			return IsDottedText(token);
 		case Kind::LIST_ITEM:
 			return token.text != "(" && token.text != ")";
+		case Kind::RUN:
+			return RunPart(token);
 		}
 		return false;
 	}
@@ -1509,9 +1544,10 @@ string ValueTextOf(PEGTransformer &transformer, ParseResult &result, const char 
 }
 
 //! `AclLimits <- '(' AclLimitEntry AclLimitMore* ')'` (AclLimitEntry <- AclLimitItem?, AclLimitItem <- AclWordToken
-//! '='? AclValue; spec 150 4b): a resource group's limits `(window_max 64, batch_bytes '32MiB', …)` as the JSON the
-//! admin functions take (spec 085; ALTER RESOURCE GROUP … SET (…), spec 120) - each name once in any case, lower-cased,
-//! its value as written (a quoted one unquoted); the functions judge both
+//! '='? AclLimitValue; spec 150 4b - a value a run of touching tokens, a signed number or a quoted one): a resource
+//! group's limits `(window_max 64, batch_bytes '32MiB', …)` as the JSON the admin functions take (spec 085; ALTER
+//! RESOURCE GROUP … SET (…), spec 120) - each name once in any case, lower-cased, its value as written (a quoted one
+//! unquoted); the functions judge both
 string LimitsJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
 	vector<reference<ParseResult>> items;
 	auto &list = Strip(result).Cast<ListParseResult>();
@@ -1535,7 +1571,10 @@ string LimitsJson(PEGTransformer &transformer, ParseResult &result, MgmtParseDat
 		if (!named.insert(name).second) {
 			throw BinderException("acl admin: limit \"%s\" is written twice - write each limit once", name);
 		}
-		auto value = ValueTextOf(transformer, parts.GetChild(2), "a limit's value", data);
+		auto &value_node = Strip(parts.GetChild(2));
+		auto value = value_node.Name() == "AclLimitRunToken"
+		                 ? TokenOf(value_node).text
+		                 : ValueTextOf(transformer, value_node, "a limit's value", data);
 		entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));
 	}
 	return "{" + StringUtil::Join(entries, ", ") + "}";
@@ -2788,7 +2827,13 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclRevokeSource <- 'REVOKE' 'SOURCE' AclPath 'FROM' 'ROLE' AclName",
 		                                         Start<FinalizeSourceGrant>));
 		// spec 150 4b: a group's limits as a rule - a word, `=` or not, a value (a quoted one, a word, a signed number)
-		changes.push_back(GrammarChange::AddRule("AclLimitItem <- AclWordToken '='? AclValue"));
+		changes.push_back(GrammarChange::AddRule("AclLimitRunToken <- Identifier"));
+		changes.push_back(GrammarChange::AddTerminalRuleOverride(
+		    "AclLimitRunToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::RUN);
+		    }));
+		changes.push_back(GrammarChange::AddRule("AclLimitValue <- AclLimitRunToken / AclSignedNumber / AclNameValue"));
+		changes.push_back(GrammarChange::AddRule("AclLimitItem <- AclWordToken '='? AclLimitValue"));
 		changes.push_back(GrammarChange::AddRule("AclLimitEntry <- AclLimitItem?"));
 		changes.push_back(GrammarChange::AddRule("AclLimitMore <- ',' AclLimitEntry"));
 		changes.push_back(GrammarChange::AddRule("AclLimits <- '(' AclLimitEntry AclLimitMore* ')'"));
@@ -3489,6 +3534,10 @@ string MgmtCall::Keyword(ParseResult &result) {
 }
 
 string MgmtCall::Text(ParseResult &result, const char *what) {
+	auto name = Strip(result).Name();
+	if (name != "AclSignedNumber" && name != "AclNameValueToken" && name != "AclDottedToken" && !IsQuotedPart(result)) {
+		throw BinderException("acl admin: %s is read where no value is (a module's rule)", what);
+	}
 	return ValueTextOf(impl->transformer, result, what, *impl->data);
 }
 

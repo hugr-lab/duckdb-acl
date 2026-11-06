@@ -489,7 +489,7 @@ its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW
 list of names quoted as JSON; `ParseCaps(json, strict)` where caps are written; a platform view's grant a point
 grant, `PlatformGrantCall` since 3f). 3e: CREATE / ALTER / DROP ISSUER | CLIENT - the spec JSON built in the
 transform, a list inside it a marker its reading replaces (`TextArg::splice`). 3f: function categories and grants,
-platform's point grants, sources, resource groups (`TextKind::LIMITS`) - after it the compiler reads only hugr-node's
+platform's point grants, sources, resource groups (their limits a rule since 4b) - after it the compiler reads only hugr-node's
 registered forms. 3g-1: the batch's classification on duckdb's tokens (`ReadStatementHeads` -> `IsMgmtHead`;
 `SplitBatchText` gone; the Flight door's `ClientTextIsMgmt` reads the same heads). 3g-2a: GRANT / REVOKE SECRET as
 rules (`MgmtParsed::secrets`). 3g-2b: `USE [SCHEMA]` on duckdb's tokens. 3g-2c: `ATTACH … LINEAGE` on duckdb's
