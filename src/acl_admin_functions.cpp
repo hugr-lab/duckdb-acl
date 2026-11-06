@@ -1360,7 +1360,8 @@ void FunctionNameGrant(DataChunk &args, ExpressionState &state, Vector &result, 
 			}
 		});
 		if (remove && !removed) {
-			ThrowNothingToRevoke(role, "grant of function \"" + key.ToString() + "\"");
+			ThrowNothingToRevoke(
+			    role, StringUtil::Format("grant of %s function \"%s\"", FunctionKindName(key.kind), key.ToString()));
 		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));

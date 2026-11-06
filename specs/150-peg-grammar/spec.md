@@ -455,8 +455,8 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   connection that wrote it). Newly refused bare, as duckdb refuses them: such a keyword (`CREATE ROLE "full"`, the
   legacy wrappers' catalog `"default"`) and a leading digit (`ISSUER "v1.2"`, `objects."9t"`) - what is stored
   under such a name keeps working, only its statement quotes it, and the refusal says so (`NameHint`: the token the
-  parse stopped at, `… - full is an SQL keyword: a name spelled so is written in double quotes ("full")`). A name
-  that is a value (an issuer, client, group, secret, `AclNameValue`) keeps stage 3's reading of bare words joined by
+  parse stopped at, right after a word a name follows - `ROLE`, `TABLE`, `OF`, `EXISTS` … -, `… - full is an SQL
+  keyword: as a name it is written in double quotes ("full")`). A name that is a value (an issuer, client, group, secret, `AclNameValue`) keeps stage 3's reading of bare words joined by
   dots as one name (`kc.local`), never a word, a dot and a quoted part (`a."b"` is no name); a backtick one is a
   quoted one there too. A VALUE (a scope, a level, a setting's value, a capability) stays the scanner's word
   (`true`, `v1.0`, `4GB`; a capability a word or a quoted one - `select` is a keyword). A name offered back to paste
@@ -464,7 +464,9 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   `c."old"`, `"größe"`; the same in a message that suggests a statement). Found by its reviews: `REVOKE CATALOG …
   FROM ROLE <a name that only looks like the role's>` answered success and left the grant - EVERY revoke of nothing
   is refused now (`ThrowNothingToRevoke`: catalog, schema, resource group, function, function category, platform's
-  point grants and sources, `REVOKE ADMIN` without a scope; REVOKE TABLE and a scoped REVOKE ADMIN were already);
+  point grants and sources, `REVOKE ADMIN` without a scope; REVOKE TABLE and a scoped REVOKE ADMIN were already; a
+  schema row inherited from a parent's grant is that grant's - its revoke is refused, naming it; a point grant's
+  object and a source compare in any case, as the rights read them);
   whether a column expression is a plain rename (`RenameOnlyColumns`) and a key column (`BareIdentifier`) are
   duckdb's parser's reading (`PlainColumnName`: one token of the text the parser reads, one column reference of one
   part, no alias - `x = größe` stays a writable rename, `x = (b)`, `x = "b"` and `` x = `b` `` stay read-only; duckdb's

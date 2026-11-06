@@ -184,9 +184,18 @@ bool DuckdbIdentifier(const MatcherToken &token, bool after_dot, optional_ptr<co
 	return !info.IsKeyword() || info.HasAnyFlags(mask);
 }
 
-//! spec 150 4a: why a statement no rule reads may hold a name that does not read - the parse stopped at a keyword
-//! duckdb takes as no name (`full`, `select`), or at a number a word touches (`9abc`): said with the quoting that reads
-//! it
+//! The words a name follows in the management statements (`ROLE r`, `VIRTUAL TABLE c.t`, `IF NOT EXISTS r`, `ALIAS OF
+//! f`)
+bool IntroducesName(const string &word) {
+	static const case_insensitive_set_t WORDS = {"role",   "catalog", "schema",    "table",    "view",
+	                                             "issuer", "client",  "group",     "function", "category",
+	                                             "secret", "source",  "reference", "of",       "exists"};
+	return WORDS.count(word) > 0;
+}
+
+//! spec 150 4a: why a statement no rule reads may hold a name that does not read - the parse stopped, right after a
+//! word a name follows, at a keyword duckdb takes as no name (`full`, `select`) or at a number a word touches (`9abc`):
+//! said with the quoting that reads it; '' anywhere else (the parse may have stopped there for another reason)
 string NameHint(const ErrorData &error, const TokenIterator &tokens, const PEGKeywordHelper &keywords) {
 	auto &info = error.ExtraInfo();
 	auto entry = info.find("position");
@@ -199,27 +208,28 @@ string NameHint(const ErrorData &error, const TokenIterator &tokens, const PEGKe
 	} catch (std::exception &) {
 		return string();
 	}
-	if (!index.IsValid()) {
+	if (!index.IsValid() || index.GetIndex() == 0 || !IntroducesName(tokens.GetToken(index.GetIndex() - 1).text)) {
 		return string();
 	}
 	auto &token = tokens.GetToken(index.GetIndex());
 	if (token.type == TokenType::NUMBER_LITERAL) {
+		// the word the tokenizer split at its leading digit, up to a dot (`9cat.t`: the name is `9cat`)
 		auto written = token.text;
 		auto end = token.offset + token.length;
 		for (auto next = index.GetIndex() + 1; next < tokens.Size(); next++) {
 			auto &part = tokens.GetToken(next);
-			if (part.offset != end || (part.type != TokenType::KEYWORD && part.type != TokenType::IDENTIFIER &&
-			                           part.type != TokenType::NUMBER_LITERAL)) {
+			if (part.offset != end || part.text.find('.') != string::npos ||
+			    (part.type != TokenType::KEYWORD && part.type != TokenType::IDENTIFIER &&
+			     part.type != TokenType::NUMBER_LITERAL)) {
 				break;
 			}
 			written += part.text;
 			end = part.offset + part.length;
 		}
-		if (written.size() == token.text.size() || !Tokenizer::CharacterIsInitialNumber(written[0]) ||
-		    written[0] == '.') {
+		if (written.size() == token.text.size() || written.find('.') != string::npos) {
 			return string();
 		}
-		return " - a name that starts with a digit is written in double quotes (\"" + written + "\")";
+		return " - as a name, a word that starts with a digit is written in double quotes (\"" + written + "\")";
 	}
 	if (token.type != TokenType::KEYWORD && token.type != TokenType::IDENTIFIER) {
 		return string();
@@ -228,8 +238,7 @@ string NameHint(const ErrorData &error, const TokenIterator &tokens, const PEGKe
 	if (!literal.IsKeyword() || literal.HasAnyFlags(keywords.GetIdentifierMask(SuggestionState::SUGGEST_VARIABLE))) {
 		return string();
 	}
-	return " - " + token.text + " is an SQL keyword: a name spelled so is written in double quotes (\"" + token.text +
-	       "\")";
+	return " - " + token.text + " is an SQL keyword: as a name it is written in double quotes (\"" + token.text + "\")";
 }
 
 //! One token or run of them: a name or a path of names, read as duckdb reads an identifier (DuckdbIdentifier); a
@@ -2994,7 +3003,8 @@ string BodyText(const string &text, const TokenIterator &tokens, idx_t start, id
 			auto value = token.text.size() >= 2 ? token.text.substr(1, token.text.size() - 2) : string();
 			value = StringUtil::Replace(value, string(2, quote), string(1, quote));
 			if (!WrittenPlainly(text, token, value)) {
-				throw BinderException("acl admin: expected %s, quoted ('...' or \"...\") as one plain literal", what);
+				throw BinderException("acl admin: expected %s, quoted ('...', \"...\" or `...`) as one plain literal",
+				                      what);
 			}
 			return value;
 		}

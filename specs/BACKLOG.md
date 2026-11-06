@@ -101,6 +101,15 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - 102: writes through an object-declared narrowing (it is read-only: the object stores the
     compiled expression); a `[]` narrowing is read-only by design; LATERAL in a write statement's
     subqueries is not walked; the write expression grows ~2^depth.
+  - 150 4a (the owner, 2026-11-06: follow-ups): `REVOKE CATALOG` leaves the role's schema grants of that catalog
+    (`role_schemas`), so a later `GRANT CATALOG … CAPS '{}'` gives the schema's reads back - the revoke should take
+    them with the object grants; a `GRANT` / `DENY` to a role nobody defined is accepted (a role may come from claims
+    alone), so a deny under a misspelt role restricts nobody - refuse or warn when the role is unknown.
+  - Role names compare as duckdb compares identifiers (the owner, 2026-11-06: its own spec, after 4a): case-insensitive
+    quoted or not, the spelling kept as created; two roles differing only by case cannot coexist (as catalogs, spec
+    116); a token's role claims match the same way (`Admin` reaches role `admin`). Today roles compare exactly
+    everywhere but the role mappings' duplicate check and DROP MAP (case-insensitive) and the memory store's platform
+    grants - one rule for all of them, with the migration step that refuses existing case collisions.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

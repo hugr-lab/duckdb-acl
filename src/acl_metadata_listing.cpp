@@ -309,14 +309,14 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " tags AS acl_tags FROM acl_physical_columns(" +
 	    sources + "))";
 	// a declared column that reads one source column by name - no expression, or a bare (spec 150 4a: what duckdb's
-	// tokenizer keeps in a word - no ASCII punctuation but `_`, and `$` not first) or quoted identifier that is no
-	// special value - and the name it reads: spec 039's broken mark and spec 143's tags alike
+	// tokenizer keeps in a word - no ASCII punctuation but `_`, and `$` not first) or quoted identifier (either quote)
+	// that is no special value - and the name it reads: spec 039's broken mark and spec 143's tags alike
 	auto reads_by_name = [](const string &c) {
 		return "(" + c + ".\"expr\" IS NULL OR " + c + ".\"expr\" = '' OR regexp_matches(" + c +
 		       ".\"expr\", '^[^\\x00\\t-\\r !-@\\[-^`{-~]([^\\x00\\t-\\r !-/:-@\\[-^`{-~]|\\$)*$') OR "
 		       "regexp_matches(" +
-		       c +
-		       ".\"expr\", '^\"[^\"]+\"$'))"
+		       c + ".\"expr\", '^\"[^\"]+\"$') OR regexp_matches(" + c +
+		       ".\"expr\", '^`[^`]+`$'))"
 		       " AND " +
 		       KeyFoldSql("coalesce(" + c + ".\"expr\", '')") +
 		       " NOT IN ('null', 'true', 'false', 'current_catalog',"
@@ -325,8 +325,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	};
 	auto read_name = [](const string &c) {
 		return "CASE WHEN " + c + ".\"expr\" IS NULL OR " + c + ".\"expr\" = '' THEN " + c + ".\"name\" WHEN " + c +
-		       ".\"expr\" LIKE '\"%\"' THEN substr(" + c + ".\"expr\", 2, length(" + c + ".\"expr\") - 2) ELSE " + c +
-		       ".\"expr\" END";
+		       ".\"expr\" LIKE '\"%\"' OR " + c + ".\"expr\" LIKE '`%`' THEN substr(" + c + ".\"expr\", 2, length(" +
+		       c + ".\"expr\") - 2) ELSE " + c + ".\"expr\" END";
 	};
 	string declared = "declared AS (SELECT dc.\"vcat\" AS vcat, dc.\"vname\" AS vname,"
 	                  " list(dc.\"name\" ORDER BY dc.\"pos\") AS names, list(" +

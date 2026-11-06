@@ -2523,7 +2523,7 @@ ACL ADMIN REVOKE FUNCTION CATEGORY c4a FROM ROLE rev4a;
 statement error
 ACL ADMIN REVOKE FUNCTION lower FROM ROLE rev4a;
 ----
-<REGEX>:.*holds no grant of function "system.main.lower" - nothing to revoke.*
+<REGEX>:.*holds no grant of scalar function "system.main.lower" - nothing to revoke.*
 
 statement error
 ACL ADMIN REVOKE VIEW platform.roles FROM ROLE rev4a;
@@ -2574,14 +2574,60 @@ ACL ADMIN DROP FUNCTION CATEGORY c4a; DROP RESOURCE GROUP g4a; DROP VIRTUAL SCHE
 statement error
 ACL ADMIN CREATE ROLE full;
 ----
-full is an SQL keyword: a name spelled so is written in double quotes ("full")
+full is an SQL keyword: as a name it is written in double quotes ("full")
 
 statement error
 ACL ADMIN CHECK VIRTUAL CATALOG default;
 ----
-default is an SQL keyword: a name spelled so is written in double quotes ("default")
+default is an SQL keyword: as a name it is written in double quotes ("default")
 
 statement error
 ACL ADMIN CREATE ROLE 9abc;
 ----
-a name that starts with a digit is written in double quotes ("9abc")
+as a name, a word that starts with a digit is written in double quotes ("9abc")
+
+# no hint where no name was expected: the parse stopped at a keyword for another reason
+statement error
+ACL ADMIN CREATE ROLE r4a FULL;
+----
+<!REGEX>:.*SQL keyword.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE 9cat.t AS phys.main.t;
+----
+as a name, a word that starts with a digit is written in double quotes ("9cat")
+
+# an inherited schema row is its parent grant's: revoking it is refused, the parent's revoke takes it
+statement ok
+ACL ADMIN CREATE ROLE inh4a; CREATE VIRTUAL SCHEMA продажи.raw4a AS memory.main; GRANT SCHEMA продажи.raw4a TO ROLE inh4a WITH (select);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA продажи.raw4a.eu AS memory.main;
+
+statement error
+ACL ADMIN REVOKE SCHEMA продажи.raw4a.eu FROM ROLE inh4a;
+----
+it inherits a parent schema's - revoke that one
+
+statement ok
+ACL ADMIN REVOKE SCHEMA продажи.raw4a FROM ROLE inh4a;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_schemas WHERE role = 'inh4a';
+----
+0
+
+# a source compares in any case, as the rights read it
+statement ok
+ACL ADMIN GRANT SOURCE PHYS TO ROLE inh4a; GRANT SOURCE phys TO ROLE inh4a;
+
+query I
+SELECT count(*) FROM aclcat.acl.platform_grants WHERE role = 'inh4a';
+----
+1
+
+statement ok
+ACL ADMIN REVOKE SOURCE Phys FROM ROLE inh4a;
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA продажи.raw4a.eu; DROP VIRTUAL SCHEMA продажи.raw4a; DROP ROLE inh4a;

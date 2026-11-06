@@ -2168,8 +2168,12 @@ void PolicyStore::CatalogRevokeSchema(const string &role, const string &vcat, co
 	auto where =
 	    " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		if (read("SELECT 1 FROM " + catalog->Tbl("role_schemas") + where)->RowCount() == 0) {
-			ThrowNothingToRevoke(role, "grant on schema \"" + vcat + "." + path + "\"");
+		// a row inherited from a parent schema's grant is that grant's - the rematerialization below puts it back
+		if (read("SELECT 1 FROM " + catalog->Tbl("role_schemas") + where + " AND NOT \"inherited\"")->RowCount() == 0) {
+			bool inherits = read("SELECT 1 FROM " + catalog->Tbl("role_schemas") + where)->RowCount() > 0;
+			ThrowNothingToRevoke(role,
+			                     "grant on schema \"" + vcat + "." + path + "\"" +
+			                         (inherits ? string(" (it inherits a parent schema's - revoke that one)") : ""));
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + where);
 	});
@@ -3517,7 +3521,8 @@ void PolicyStore::CatalogWriteFunctionGrant(const string &role, const string &ca
 			}
 		}
 		if (remove && read("SELECT 1 FROM " + catalog->Tbl("function_grants") + where)->RowCount() == 0) {
-			ThrowNothingToRevoke(role, key ? "grant of function \"" + key->ToString() + "\""
+			ThrowNothingToRevoke(role, key ? StringUtil::Format("grant of %s function \"%s\"",
+			                                                    FunctionKindName(key->kind), key->ToString())
 			                               : "grant of function category \"" + category + "\"");
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("function_grants") + where);
@@ -3894,7 +3899,9 @@ void PolicyStore::CatalogGrantAdmin(const string &role, const string &scope) {
 void PolicyStore::CatalogWritePlatformGrant(const string &role, const string &kind, const string &object, bool allowed,
                                             bool remove) {
 	RequireCatalog(catalog, remove ? "acl_revoke_platform" : "acl_grant_platform");
-	auto where = " WHERE \"role\" = " + Lit(role) + " AND \"object\" = " + Lit(object) + " AND \"kind\" = " + Lit(kind);
+	// the object and the kind in any case, as the rights read them (a source as written - `PHYS` admits `phys`)
+	auto where = " WHERE \"role\" = " + Lit(role) + " AND " + KeyFoldSql("\"object\"") + " = " +
+	             KeyFoldSql(Lit(object)) + " AND " + KeyFoldSql("\"kind\"") + " = " + KeyFoldSql(Lit(kind));
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		if (remove && read("SELECT 1 FROM " + catalog->Tbl("platform_grants") + where)->RowCount() == 0) {
 			ThrowNothingToRevoke(role, "grant on " + kind + " \"" + object + "\"");
