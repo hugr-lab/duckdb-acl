@@ -276,24 +276,37 @@ string DeclaredName(const string &text, const char *what) {
 	if (tokens.size() == 1 && tokens[0].type != TokenType::STRING_LITERAL && tokens[0].text.size() >= 2 &&
 	    tokens[0].text[0] == '"' && tokens[0].offset == 0 && tokens[0].length == text.size()) {
 		name = StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"");
-		if (name.find_first_of(".[") != string::npos || name.empty() || name[0] == '"') {
+		if (name.empty()) {
+			throw BinderException("acl admin: %s holds an item that names no column", what);
+		}
+		if (name.find_first_of(".[") != string::npos || name[0] == '"') {
 			throw BinderException("acl admin: %s declares the column \"%s\" - a declared column's name holds no '.' "
-			                      "or '[' (the list reads it as a path into a column)",
+			                      "or '[' and starts with no '\"' (the list reads it as a path into a column)",
 			                      what, name);
 		}
 	}
-	// a path written with spaces (`s . x`, `items [ ] . price`) is the path duckdb's tokens read: its tokens joined
-	bool path = tokens.size() > 1;
-	bool step = false;
-	for (auto &token : tokens) {
-		bool word = (token.type == TokenType::IDENTIFIER || token.type == TokenType::KEYWORD) && !token.text.empty();
+	// a path written with spaces (`s . x`, `items [ ] . price`) is the path duckdb's tokens read: its tokens joined -
+	// only a path's own shape, a name and then `. name` or `[ ]` steps (`my col.x` stays the text it is)
+	auto is_word = [](const MatcherToken &token) {
+		return (token.type == TokenType::IDENTIFIER || token.type == TokenType::KEYWORD) && !token.text.empty();
+	};
+	auto is_step = [](const MatcherToken &token, const char *step) {
 		// a `.` standing alone is a number token to duckdb's tokenizer
-		bool joins = (token.type == TokenType::OPERATOR || token.type == TokenType::NUMBER_LITERAL) &&
-		             (token.text == "." || token.text == "[" || token.text == "]" || token.text == "[]");
-		step = step || joins;
-		path = path && (word || joins);
+		return (token.type == TokenType::OPERATOR || token.type == TokenType::NUMBER_LITERAL) && token.text == step;
+	};
+	bool path = tokens.size() > 1 && is_word(tokens[0]);
+	for (idx_t i = 1; path && i < tokens.size();) {
+		if (is_step(tokens[i], "[]")) {
+			i++;
+		} else if (is_step(tokens[i], "[") && i + 1 < tokens.size() && is_step(tokens[i + 1], "]")) {
+			i += 2;
+		} else if (is_step(tokens[i], ".") && i + 1 < tokens.size() && is_word(tokens[i + 1])) {
+			i += 2;
+		} else {
+			path = false;
+		}
 	}
-	if (path && step) {
+	if (path) {
 		name.clear();
 		for (auto &token : tokens) {
 			name += token.text;
@@ -318,32 +331,30 @@ vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *
 	vector<DeclaredColumnText> columns;
 	for (auto &item : SplitOnTokens(text, tokens)) {
 		DeclaredColumnText column;
-		if (item.has_value) {
-			column.name = DeclaredName(item.name, what);
-			column.expr = TakeMark(item.value, true, column.nullable);
-			columns.push_back(std::move(column));
-			continue;
-		}
-		auto rest = TakeMark(item.text, false, column.nullable);
-		// `expr AS name` (SQL's spelling) is `name = expr`: the last `AS` outside every bracket (a CAST's is inside it)
-		auto top = TopTokens(rest);
+		// `expr AS name` (SQL's spelling) is `name = expr`: the last `AS` outside every bracket (a CAST's is inside
+		// it) - read first, as the rule does, so `CASE WHEN a = 1 THEN x END AS u` is u and `k = id AS y` is y = (k =
+		// id)
+		auto top = TopTokens(item.text);
 		optional_idx as;
 		for (idx_t i = 1; i + 1 < top.size(); i++) {
 			if (IsWord(top[i], "as")) {
 				as = i;
 			}
 		}
-		if (!as.IsValid()) {
-			column.name = DeclaredName(rest, what);
-			columns.push_back(std::move(column));
-			continue;
-		}
-		auto &word = top[as.GetIndex()];
-		column.name = DeclaredName(Trimmed(rest.substr(word.offset + word.length)), what);
-		int8_t mark = -1;
-		column.expr = TakeMark(Trimmed(rest.substr(0, word.offset)), true, mark);
-		if (mark >= 0) {
-			column.nullable = mark; // `expr NOT NULL AS name`, as the text reader read it
+		if (as.IsValid()) {
+			auto &word = top[as.GetIndex()];
+			auto named = TakeMark(Trimmed(item.text.substr(word.offset + word.length)), false, column.nullable);
+			column.name = DeclaredName(named, what);
+			int8_t mark = -1;
+			column.expr = TakeMark(Trimmed(item.text.substr(0, word.offset)), true, mark);
+			if (mark >= 0) {
+				column.nullable = mark; // `expr NOT NULL AS name`, as the text reader read it
+			}
+		} else if (item.has_value) {
+			column.name = DeclaredName(item.name, what);
+			column.expr = TakeMark(item.value, true, column.nullable);
+		} else {
+			column.name = DeclaredName(TakeMark(item.text, false, column.nullable), what);
 		}
 		columns.push_back(std::move(column));
 	}

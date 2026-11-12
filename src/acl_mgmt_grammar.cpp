@@ -631,10 +631,10 @@ void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg
 //! `AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue` into argument `arg` (spec 150 4f): an object's
 //! own column list (COLUMNS of CREATE VIRTUAL TABLE / ADD TABLE / SET COLUMNS, REMAP). `AclDeclaredItems <- '('
 //! AclDeclaredEntry AclDeclaredMore* ')'`, each `AclDeclaredColumn <- AclDeclaredAs / AclDeclaredNamed` - `Expression
-//! 'AS' AclNameToken AclColumnMark?` (SQL's spelling) or `AclFieldPath AclDeclaredValue? AclColumnMark?`, a name or a
-//! path each part duckdb's identifier, a value `'=' Expression` - duckdb's expression rule. The list goes as written
-//! (each comment a space) to the one reader of an object's list, `SplitDeclaredColumns`, which the function forms read
-//! it with too; the legacy quoted string goes to it as it stands
+//! 'AS' ColLabel AclColumnMark?` (SQL's spelling, the alias duckdb's) or `AclFieldPath (AclDeclaredValue /
+//! AclColumnMark)?`, a name or a path each part duckdb's identifier, a value `'=' Expression` - duckdb's expression
+//! rule. The list goes as written (each comment a space) to the one reader of an object's list, `SplitDeclaredColumns`,
+//! which the function forms read it with too; the legacy quoted string goes to it as it stands
 void DeclaredColumnsInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg, MgmtParseData &data) {
 	auto &node = Strip(result);
 	if (node.Name() == "AclParenList") {
@@ -3051,9 +3051,12 @@ public:
 		// and only the AS form reads past it; a NULL mark after the name (after an expression it is the expression's
 		// `x NOT NULL`, which the reader takes off as spec 048's mark)
 		changes.push_back(GrammarChange::AddRule("AclColumnMark <- 'NOT'? 'NULL'"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredAs <- Expression 'AS' AclNameToken AclColumnMark?"));
+		// the name after AS is duckdb's alias (`ColLabel`: any keyword - `AS order`, as `SELECT … AS order` reads)
+		changes.push_back(GrammarChange::AddRule("AclDeclaredAs <- Expression 'AS' ColLabel AclColumnMark?"));
 		changes.push_back(GrammarChange::AddRule("AclDeclaredValue <- '=' Expression"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredNamed <- AclFieldPath AclDeclaredValue? AclColumnMark?"));
+		// a value's own `NOT NULL` is the expression's; a bare `NULL` after it is no mark (`u = ssn NULL`)
+		changes.push_back(GrammarChange::AddRule("AclDeclaredRest <- AclDeclaredValue / AclColumnMark"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredNamed <- AclFieldPath AclDeclaredRest?"));
 		changes.push_back(GrammarChange::AddRule("AclDeclaredColumn <- AclDeclaredAs / AclDeclaredNamed"));
 		changes.push_back(GrammarChange::AddRule("AclDeclaredEntry <- AclDeclaredColumn?"));
 		changes.push_back(GrammarChange::AddRule("AclDeclaredMore <- ',' AclDeclaredEntry"));

@@ -90,6 +90,23 @@ ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.m AS phys.main.orders COLUMNS (id, te
 ----
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 
+# spec 150 4f: `expr AS name` is judged too - the gate walked only a `name = expr` item, while the writer stored the AS
+# form as `name = expr`, so a catalog admin's AS item ran an acl_* call as the node at the first read (escalation)
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.m AS phys.main.orders COLUMNS (id, acl_grant_admin('cadm', 'passthrough')::VARCHAR AS t2);
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+statement error
+ACL ROLE "cadm" ADD TABLE phys.main.orders AS sales.m2 COLUMNS (id, acl_grant_admin('cadm', 'passthrough')::VARCHAR AS t2);
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+statement error
+ACL ROLE "cadm" SELECT platform.add_relation('sales', 'm3', 'phys.main.orders', 'id, acl_grant_admin(''cadm'', ''passthrough'')::VARCHAR AS t2', '');
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
 # verification round: ALTER GRANT … SET RLS / COLUMNS stores a body like GRANT does
 statement error
 ACL ROLE "pol" SELECT platform.alter_grant('reader', 'sales', 'rls', 'acl_grant_admin(''pol'', ''passthrough'') IS NOT NULL');

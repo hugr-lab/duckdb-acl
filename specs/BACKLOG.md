@@ -126,6 +126,11 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     `COLUMNS`: a stored declared name is read as a path when it holds one, so spec 150 4f refuses `"a.b"` there (before
     4f it declared the path `a.b`, which read nothing). An object without a list, or a grant's list (where such a name
     is stored quoted), exposes it; decide whether `relation_columns` should store a quoted name.
+  - An object's own list, found by spec 150 4f's review (both pre-existing): a star (`COLUMNS (id, x = *)`, `* AS x`,
+    `x = COLUMNS('s.*')`) passes spec 148 and exposes every source column, and a grant's mask `x = *` on such an object
+    reads source columns the object never declared (the grant-side star is the item above); a NULL mark on a path
+    (`s.x NOT NULL`) is silently dropped (keyed by the path, the column is `s`); a name written twice
+    (`"n", "n" = upper("n")`) reads `n` and `n_1` - a grant's list refuses that since 4e.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

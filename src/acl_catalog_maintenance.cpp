@@ -15,6 +15,7 @@
 #include "acl_types.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -256,7 +257,8 @@ private:
 					    "declared column \"" + entry.first + "\" reads " +
 					        (entry.second.empty() ? "a source column of that name" : "\"" + entry.second + "\"") +
 					        ", which \"" + relation.phys + "\" no longer has: " + error,
-					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" + entry.first +
+					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" +
+					        KeywordHelper::WriteOptionallyQuoted(entry.first) +
 					        " = <column>)  -- or DROP MISSING COLUMNS");
 				}
 				if (!any_missing && stored_derived) {
@@ -483,8 +485,9 @@ private:
 					Add(kind, relation.vname, "", "types_mismatch",
 					    "declared column \"" + entry.first + "\" is described as " + said + " and reads as " +
 					        probed[0].second + " - an expression that makes a type of its own is not cast",
-					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" + entry.first + " = CAST(" + item +
-					        " AS " + said + "))");
+					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" +
+					        KeywordHelper::WriteOptionallyQuoted(entry.first) + " = CAST(" + item + " AS " + said +
+					        "))");
 				}
 			}
 		}

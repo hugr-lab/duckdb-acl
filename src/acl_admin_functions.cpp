@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -833,9 +834,13 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));
 			continue;
 		}
-		// spec 148: the memory store pastes this text at read too
+		// spec 148: the memory store pastes this text at read too - a name as an identifier (the reader took a quoted
+		// one's quotes off, spec 150 4f), a path as written
 		acl_detail::RequireOneExpression("the grant's RLS", rls);
 		for (auto &column : columns) {
+			if (column.first.find_first_of(".[") == string::npos) {
+				column.first = KeywordHelper::WriteOptionallyQuoted(column.first);
+			}
 			acl_detail::RequireColumnName("the grant's column list", column.first);
 			acl_detail::RequireOneExpression("the grant's column list", column.second);
 		}

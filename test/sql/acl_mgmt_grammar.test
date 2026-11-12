@@ -3540,11 +3540,62 @@ ACL ADMIN CREATE VIRTUAL TABLE c4f.bad AS phys.main.t4f COLUMNS (id AS "x[1]");
 ----
 holds no '.' or '['
 
-# `name = x AS y` is neither form: the expression `x AS y` is no one expression (spec 148)
-statement error
-ACL ADMIN CREATE VIRTUAL TABLE c4f.bad AS phys.main.t4f COLUMNS (k = id AS y);
+# an item with a top-level AS is the AS form, as SQL reads it - in the rule and in the reader alike: `id = 1 AS f` is
+# f = (id = 1), a CASE's own `=` stays in it
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c4f.cmp AS phys.main.t4f COLUMNS (id = 1 AS f, CASE WHEN id = 1 THEN ssn END AS u,
+    id AS order, ssn AS left);
+
+query II
+SELECT name, expr FROM aclcat.acl.relation_columns WHERE vcat = 'c4f' AND vname = 'cmp' ORDER BY pos;
 ----
-spec 148
+f	id = 1
+u	CASE WHEN id = 1 THEN ssn END
+order	id
+left	ssn
+
+# ... the alias is duckdb's (`AS order`), a bare name is duckdb's column name: a keyword only a function or a type may
+# be (`left`) is quoted there, as duckdb's CREATE TABLE needs it
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c4f.bad AS phys.main.t4f COLUMNS (id, left);
+----
+an object's column list is items
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c4f.kw AS phys.main.t4f COLUMNS (id, "left" = ssn);
+
+statement ok
+SELECT acl_add_relation('c4f', 'cmp2', 'phys.main.t4f', 'CASE WHEN id = 1 THEN ssn END AS u', '');
+
+query I
+SELECT expr FROM aclcat.acl.relation_columns WHERE vcat = 'c4f' AND vname = 'cmp2';
+----
+CASE WHEN id = 1 THEN ssn END
+
+# a bare NULL after a value is no mark (the expression's own `x NOT NULL` is)
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c4f.bad AS phys.main.t4f COLUMNS (u = ssn NULL);
+----
+an object's column list is items
+
+# the function form's raw name keeps its spaces: `my col.x` is no path (joined, it read another column)
+statement ok
+SELECT acl_add_relation('c4f', 'raw', 'phys.main.t4f', 'id, odd name', '');
+
+query I
+SELECT name FROM aclcat.acl.relation_columns WHERE vcat = 'c4f' AND vname = 'raw' ORDER BY pos;
+----
+id
+odd name
+
+statement ok
+SELECT acl_add_relation('c4f', 'raw2', 'phys.main.t4f', 'id, my col.x', '');
+
+query I
+SELECT name FROM aclcat.acl.relation_columns WHERE vcat = 'c4f' AND vname = 'raw2' ORDER BY pos;
+----
+id
+my col.x
 
 # the legacy quoted form is read by the same reader: a quoted name unquoted, a mark kept
 statement ok
@@ -3600,6 +3651,28 @@ statement error
 ACL ADMIN REPAIR VIRTUAL TABLE c4f.r REMAP (u = ssn NOT NULL);
 ----
 carries a NULL mark
+
+# the check's repair text names a column as the rule reads one: quoted when it must be, so it runs pasted
+statement ok
+CREATE TABLE phys.main.t4f_gone ("odd name" INTEGER, "order" INTEGER, id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c4f.gone AS phys.main.t4f_gone COLUMNS (id, "odd name", "order");
+
+statement ok
+ALTER TABLE phys.main.t4f_gone DROP COLUMN "odd name";
+
+statement ok
+ALTER TABLE phys.main.t4f_gone DROP COLUMN "order";
+
+query I
+SELECT repair FROM acl_check_catalog('c4f') WHERE object = 'gone' AND problem = 'column_missing' ORDER BY 1;
+----
+REPAIR VIRTUAL TABLE c4f.gone REMAP ("odd name" = <column>)  -- or DROP MISSING COLUMNS
+REPAIR VIRTUAL TABLE c4f.gone REMAP ("order" = <column>)  -- or DROP MISSING COLUMNS
+
+statement ok
+ACL ADMIN REPAIR VIRTUAL TABLE c4f.gone REMAP ("odd name" = id, "order" = id + 1);
 
 statement ok
 ACL ADMIN DROP ROLE r4f; DROP VIRTUAL CATALOG c4f;

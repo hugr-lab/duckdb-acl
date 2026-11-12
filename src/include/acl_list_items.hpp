@@ -51,9 +51,10 @@ struct DeclaredColumnText {
 
 //! An object's declared column list (CREATE VIRTUAL TABLE ... COLUMNS, SET COLUMNS, REMAP, the function forms) read on
 //! duckdb's tokens: the items as `SplitListItems` splits them (a `$...$` string or a backtick name included - no stored
-//! row of this list is text), `name = expr` or `expr AS name` (the last `AS` outside every bracket), a trailing `NOT
-//! NULL` / `NULL` after a name and `NOT NULL` after an expression (never `IS NOT NULL`) a mark, one quoted name the
-//! name it quotes. Refused: a comment or a text ending inside a literal or a quoted name, a quoted name holding `.` or
+//! row of this list is text), `expr AS name` (the last `AS` outside every bracket, read first) or `name = expr`, a
+//! trailing `NOT NULL` / `NULL` after a name and `NOT NULL` after an expression (never `IS NOT NULL`) a mark, one
+//! quoted name the name it quotes. Refused: a comment or a text ending inside a literal or a quoted name, a quoted name
+//! holding `.` or
 //! `[` (the object's list reads it as a path), an item that names nothing. `what` names the list in the refusal
 vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what);
 
