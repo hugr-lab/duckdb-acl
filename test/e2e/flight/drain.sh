@@ -59,7 +59,7 @@ operator() {
 }
 
 # spec 066's addendum: an operator - the operate bundle, its role reached through the client's own mapping (spec 095)
-operator OPS_ROLE "acl_define_role('ops', '{}')"
+operator OPS_ROLE "acl_define_role('ops', '')"
 operator OPS_SCOPE "acl_grant_admin('ops', 'operate')"
 operator OPS_MAP "acl_map_role('client', 'test/idp/s', 'claim-value', 'ops', 'ops')"
 OPS_TOKEN="$("$PYBIN" "$ROOT/test/scripts/idp_fixtures.py" mint \
@@ -67,10 +67,10 @@ OPS_TOKEN="$("$PYBIN" "$ROOT/test/scripts/idp_fixtures.py" mint \
 # the node's own rights seat a call (the addendum): a point grant on platform.resume, the operate bundle with a deny
 # on resume (it still ends sessions - but resumes nothing), the observe bundle (it watches the drain); the policy
 # bundle holds none of them
-operator RESUMER_ROLE "acl_define_role('resumer', '{}')"
+operator RESUMER_ROLE "acl_define_role('resumer', '')"
 operator RESUMER_GRANT "acl_grant_platform('resumer', 'function', 'resume')"
 operator RESUMER_MAP "acl_map_role('client', 'test/idp/s', 'claim-value', 'resumer', 'resumer')"
-operator NORESUME_ROLE "acl_define_role('noresume', '{}')"
+operator NORESUME_ROLE "acl_define_role('noresume', '')"
 operator NORESUME_SCOPE "acl_grant_admin('noresume', 'operate')"
 operator NORESUME_DENY "acl_grant_platform('noresume', 'function', 'resume', 'false')"
 operator NORESUME_MAP "acl_map_role('client', 'test/idp/s', 'claim-value', 'noresume', 'noresume')"
@@ -78,10 +78,10 @@ mint() {
 	"$PYBIN" "$ROOT/test/scripts/idp_fixtures.py" mint \
 		"{\"iss\": \"test/idp/s\", \"aud\": \"api://acl-test\", \"exp\": 4102444800, \"sub\": \"u-$1\", \"roles\": [\"$1\"], \"tid\": \"acme\"}"
 }
-operator OBSERVER_ROLE "acl_define_role('observer', '{}')"
+operator OBSERVER_ROLE "acl_define_role('observer', '')"
 operator OBSERVER_SCOPE "acl_grant_admin('observer', 'observe')"
 operator OBSERVER_MAP "acl_map_role('client', 'test/idp/s', 'claim-value', 'observer', 'observer')"
-operator POLICY_ROLE "acl_define_role('policyonly', '{}')"
+operator POLICY_ROLE "acl_define_role('policyonly', '')"
 operator POLICY_SCOPE "acl_grant_admin('policyonly', 'policy')"
 operator POLICY_MAP "acl_map_role('client', 'test/idp/s', 'claim-value', 'policyonly', 'policyonly')"
 RESUMER_TOKEN="$(mint resumer)"

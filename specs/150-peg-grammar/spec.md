@@ -236,7 +236,7 @@ compiler; `AdminScanner` went with 4c.
   list's JSON is built without escaping (`\u006danage` stores manage), `ParseCaps` reads a key up to a NUL and counts
   a duplicate key true if any is (both fixed in 3d); 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside
   quotes (fixed in 3e); 3b's
-  `ClaimsListToCsv` splits at an `=` inside a quoted name (stage 4's rule); 3g - `UseSchemaAsSet`'s own comment
+  `ClaimsListToCsv` splits at an `=` inside a quoted name (fixed in 4d); 3g - `UseSchemaAsSet`'s own comment
   reader (`--` ends at `\n` only, `/* */` not nested).
 - 3d (built): grants - `GRANT CATALOG c TO ROLE r` / `GRANT SCHEMA c.p …` / `GRANT TABLE | VIEW | OBJECT c.n …` with
   their clauses in any order, each once (`WITH (…)` / `CAPS '<json>'` one kind, `RLS`, `COLUMNS`, a catalog's `MAIN`;
@@ -521,7 +521,15 @@ compiler; `AdminScanner` went with 4c.
   acl-clients quotes it); a dotted bare name (`a.b`) is refused, as an attribute's; a backtick value reads; a `+1` and
   a value in parentheses are refused. Refused now: a name holding `=`, `,`, a quote or a parenthesis (the csv's reader
   splits at them - `"a(" = 'x', b = 'y'` would have read back as one claim), and in `ParseClaims` an item that names
-  no claim (`'tenant'`, `='x'` - skipped, the claim lost silently).
+  no claim (`'tenant'`, `='x'`, `{}` - skipped, the claim lost silently; drain.sh passed `'{}'`), a claim named twice
+  in any case (the last won: `tenant = 'a', "TENANT" = 'b'` read `b`), a quoted value that is not one literal (`'x' y`,
+  `'x` read as their text) and a name holding a quote or a parenthesis. A quoted name in the list means the name it
+  quotes: `"tenant id"` is the claim `tenant id` (the text reader stored it with its quotes, a claim no
+  `acl_claim('tenant id')` read); a quoted name with a space at an end is refused (the csv's reader trims it). The
+  quoted form is checked at parse, so a refused list refuses its batch whole. Stored rows are not rewritten: a name
+  stored with its quotes before 4d stays until its role's next `SET CLAIMS`, where the old spelling (quotes included)
+  is refused - the operator writes the name it meant.
+  From the reviews: the duplicate, the trim, the loose literal, `'{}'` and the parse-time check of the quoted form.
 - 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
   takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
   the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what

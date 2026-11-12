@@ -630,7 +630,8 @@ void ClaimsInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, Mgm
 	auto &node = Strip(result);
 	if (node.Name() == "AclParenList") {
 		throw BinderException("acl admin: a claims list is name = value items - a name one word or quoted "
-		                      "(\"custom:tenant\"), a value a word, a number or quoted ('eu-west')");
+		                      "(\"custom:tenant\", \"a.b\"), a value a word, words joined by '.', a signed number or "
+		                      "quoted ('eu-west')");
 	}
 	if (node.Name() != "AclClaimItems") {
 		// the quoted csv as it stands, split by its reader - judged as a quoted columns list is
@@ -646,13 +647,19 @@ void ClaimsInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, Mgm
 		span.resolved = true;
 		span.text = entry.value;
 		data.spans.push_back(std::move(span));
+		ParseClaims(entry.value); // refused at parse, the batch whole - not at its call, after the calls before it
 		return;
 	}
 	vector<string> entries;
 	for (auto &item : ListEntries(node)) {
 		auto &claim = item.get().Cast<ListParseResult>();
 		auto name = AttrNameOf(transformer, claim.GetChild(0), "a claim", data);
-		StringUtil::Trim(name);
+		auto trimmed = name;
+		StringUtil::Trim(trimmed);
+		if (trimmed != name) {
+			// the csv's reader trims a name: `" t "` would be the claim `t`
+			throw BinderException("acl admin: a claim's name has no space at its ends, got \"%s\"", name);
+		}
 		// the csv's reader splits at the first `=` and at a `,` outside quotes and parentheses: a name holding one of
 		// them would be read back as other claims than written
 		if (name.find_first_of("=,'\"()") != string::npos) {
@@ -662,7 +669,9 @@ void ClaimsInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, Mgm
 		auto value = ValueTextOf(transformer, claim.GetChild(2), "a claim's value", data);
 		entries.push_back(name + "='" + StringUtil::Replace(value, "'", "''") + "'");
 	}
-	data.args[arg] = Value(StringUtil::Join(entries, ","));
+	auto csv = StringUtil::Join(entries, ",");
+	ParseClaims(csv); // what the call will read: a claim named twice refused here, the batch whole
+	data.args[arg] = Value(csv);
 }
 
 //! `AclBody <- AclTailToken+` into argument `arg`: a body written either way - inline to the end of the statement

@@ -148,7 +148,7 @@ travel as AST constants, and `ACL ADMIN` remains gateway-trusted until spec 009 
 `CREATE ROLE r CLAIMS (tenant = 'a,b')` stored `tenant = a`: the list form compiled to an unquoted csv
 (`tenant=a,b`) that `ParseClaims` split again at the top level, so a `,` in a value cut it (the rest, with no `=`,
 was dropped silently) and a `'` opened a quote that swallowed every pair after it. Found while composing the
-statements of the DBeaver plugin's role editor (acl-clients spec 008). Now `ClaimsListToCsv` writes each value as
+statements of the DBeaver plugin's role editor (acl-clients spec 008). Now `ClaimsListToCsv` (since spec 150 4d the rule's transform `ClaimsInto`) writes each value as
 one quoted literal (`tenant='a,b'`, quotes doubled) and `ParseClaims` takes the quotes off a value written wholly
 in `'…'`; the legacy quoted-csv form is unchanged otherwise (`'tenant=acme,unit=eu'`), and `'tenant=''a,b'''` is how
 it writes a comma. Test: `test/sql/acl_role_claims_values.test` (memory store and policy catalog; fails before).

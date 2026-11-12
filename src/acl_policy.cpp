@@ -95,6 +95,49 @@ bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns) {
 	return true;
 }
 
+case_insensitive_map_t<string> ParseClaims(const string &csv) {
+	case_insensitive_map_t<string> claims;
+	for (auto &item : SplitTopLevel(csv, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		auto pos = item.find('=');
+		auto name = pos == string::npos ? item : item.substr(0, pos);
+		StringUtil::Trim(name);
+		if (pos == string::npos || name.empty()) {
+			// spec 150 4d: an item that names no claim was skipped - a claim the admin wrote went missing silently
+			throw InvalidInputException("acl: a claim is written as name='value', got \"%s\"", item);
+		}
+		if (name.find_first_of("'\"()") != string::npos) {
+			// a quote is no part of a name the list form writes (`"Tenant"` there is the claim Tenant)
+			throw InvalidInputException("acl: a claim's name holds no quote or parenthesis, got \"%s\"", name);
+		}
+		// a value written as one '...' literal is its text, quotes doubled inside (the list form compiles to that)
+		auto value = item.substr(pos + 1);
+		StringUtil::Trim(value);
+		if (!value.empty() && value.front() == '\'') {
+			bool one_literal = value.size() >= 2 && value.back() == '\'';
+			for (idx_t i = 1; one_literal && i + 1 < value.size(); i++) {
+				if (value[i] == '\'') {
+					one_literal = i + 2 < value.size() && value[i + 1] == '\'';
+					i++;
+				}
+			}
+			if (!one_literal) {
+				// `a='x' y`, `a='x` read as the text `'x' y` / `'x`: never the value written
+				throw InvalidInputException("acl: claim \"%s\"'s quoted value is one '...' literal, got %s", name,
+				                            value);
+			}
+			value = StringUtil::Replace(value.substr(1, value.size() - 2), "''", "'");
+		}
+		if (!claims.emplace(name, value).second) {
+			// a later item replaced an earlier one silently (`t = 'x', T = 'y'`: names compare in any case)
+			throw InvalidInputException("acl: claim \"%s\" is named twice", name);
+		}
+	}
+	return claims;
+}
+
 vector<string> SplitTopLevel(const string &text, char delimiter) {
 	vector<string> parts;
 	string current;

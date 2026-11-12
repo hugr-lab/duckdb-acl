@@ -481,8 +481,8 @@ duckdb's tokens - since 3g-3c nothing is compiled from text). 3a: KILL SESSION, 
 SESSION … AUDIT LEVEL, PROFILE SESSION, DRAIN / RESUME NODE, MIGRATE POLICY CATALOG. 3b: CREATE / ALTER / DROP ROLE,
 GRANT / REVOKE ADMIN, [DROP] MAP, SET / RESET SESSION VIEW AS - the compiler's values on duckdb's tokens
 (`AclTokenMatcher`: a word - the run of tokens the tokenizer split at a leading digit -, a quoted name, a dotted name
-judged whole, a list item; `AclName`, `AclNameValue`, a claims list for `ClaimsListToCsv` as written with each comment
-a space - a rule since 4d). 3c: the virtual catalog's objects - CREATE / ALTER / COMMENT ON / ANALYZE / DROP VIRTUAL …, DROP RELATION |
+judged whole, a list item; `AclName`, `AclNameValue`, a claims list as written with each comment a space -
+its own rule since 4d). 3c: the virtual catalog's objects - CREATE / ALTER / COMMENT ON / ANALYZE / DROP VIRTUAL …, DROP RELATION |
 [VIRTUAL] REFERENCE, CHECK, REPAIR, the ADD forms - `AclPathToken` (a path judged whole into its canonical key),
 `AclPathName`, `AclList` (a list as written, each comment a space), `AclBody` (one plain quoted token its value, else
 its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT, ALTER GRANT (`WITH (…)` a

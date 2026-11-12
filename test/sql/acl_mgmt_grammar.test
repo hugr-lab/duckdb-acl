@@ -380,7 +380,7 @@ region	us
 statement error
 ACL ADMIN CREATE ROLE punctuated CLAIMS (custom:tenant = 'acme');
 ----
-a claims list is name = value items - a name one word or quoted ("custom:tenant"), a value a word, a number or quoted ('eu-west')
+a claims list is name = value items - a name one word or quoted ("custom:tenant", "a.b"), a value a word, words joined by '.', a signed number or quoted ('eu-west')
 
 statement error
 ACL ADMIN CREATE ROLE punctuated CLAIMS (region = eu-west);
@@ -3029,3 +3029,80 @@ SELECT count(*) FROM aclcat.acl.role_claims WHERE role = 'claims4d';
 
 statement ok
 ACL ADMIN DROP ROLE claims4d;
+
+# from 4d's reviews: a claim named twice in any case is refused (the last won), at parse - the batch whole
+statement error
+ACL ADMIN CREATE ROLE twice4d; CREATE ROLE twice4d_b CLAIMS (tenant = 'a', "TENANT" = 'b');
+----
+claim "TENANT" is named twice
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role LIKE 'twice4d%';
+----
+0
+
+# ... a quoted form that does not read, at parse too
+statement error
+ACL ADMIN CREATE ROLE loose4d; CREATE ROLE loose4d_b CLAIMS 'q';
+----
+a claim is written as name='value', got "q"
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role LIKE 'loose4d%';
+----
+0
+
+statement error
+ACL ADMIN CREATE ROLE loose4d CLAIMS 'a=''x'' y';
+----
+claim "a"'s quoted value is one '...' literal, got 'x' y
+
+statement error
+ACL ADMIN CREATE ROLE loose4d CLAIMS 'a=''x';
+----
+quoted value is one '...' literal
+
+# a quoted name means the name it quotes; a space at its ends would be trimmed by the csv's reader - refused
+statement error
+ACL ADMIN CREATE ROLE padded4d CLAIMS (" t " = 'x');
+----
+a claim's name has no space at its ends, got " t "
+
+statement error
+ACL ADMIN CREATE ROLE padded4d CLAIMS '"Tenant"=''x''';
+----
+a claim's name holds no quote or parenthesis, got ""Tenant""
+
+# the rest of what a name holds no more than the csv's reader can carry
+statement error
+ACL ADMIN CREATE ROLE odd4d CLAIMS ("a,b" = 'x');
+----
+holds no =, comma, quote or parenthesis
+
+statement error
+ACL ADMIN CREATE ROLE odd4d CLAIMS ("a'b" = 'x');
+----
+holds no =, comma, quote or parenthesis
+
+statement error
+ACL ADMIN CREATE ROLE odd4d CLAIMS ("a""b" = 'x');
+----
+holds no =, comma, quote or parenthesis
+
+statement error
+ACL ADMIN CREATE ROLE odd4d CLAIMS ("a)" = 'x');
+----
+holds no =, comma, quote or parenthesis
+
+# a keyword is a name, as an attribute's; NULL is the text NULL, as before
+statement ok
+ACL ADMIN CREATE ROLE words4d CLAIMS (select = 'x', order = null);
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'words4d' ORDER BY claim;
+----
+order	null
+select	x
+
+statement ok
+ACL ADMIN DROP ROLE words4d;

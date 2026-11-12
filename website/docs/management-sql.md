@@ -387,8 +387,10 @@ In the list form a claim's name is one word or a quoted name (`"custom:tenant"`,
 quote or parenthesis. A value is a word, words joined by `.`, a signed number (`-1`), or a quoted literal
 (`'eu-west'`), which may hold `,`, `=` or `'` (doubled). Anything else is quoted: a bare `custom:tenant` or `eu-west`
 is refused, and so is a value written `E'…'` or `$$…$$`. A comment inside the list is ignored, and an empty item is
-none. In the quoted csv form a value with a comma is written in quotes of its own: `CLAIMS 'tenant=''a,b'''`. Each
-item names its claim: `CLAIMS 'tenant'` is refused, in the function form too.
+none. A quoted name is the name it quotes (`"tenant id"` is the claim `tenant id`) and has no space at its ends. In
+the quoted csv form a value with a comma is written in quotes of its own: `CLAIMS 'tenant=''a,b'''`. In every form,
+the function forms too, each item names its claim, once in any case (`tenant = 'a', TENANT = 'b'` is refused), and a
+quoted value is one literal (`'tenant=''a'' b'` is refused).
 
 A role is an internal name that grants attach to. Its claims are defaults: they are what
 `acl_claim('<name>')` answers under the bare `ACL ROLE "r"` form, and under a token they fill in only
