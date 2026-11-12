@@ -486,28 +486,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 			auto text = list_rows.GetValue(0, i).ToString();
 			vector<string> names;
 			for (auto &item : ParseColumnList(text)) {
-				auto name = item.first;
-				StringUtil::Trim(name);
-				string head;
 				bool path = false;
-				if (!name.empty() && name[0] == '"') {
-					for (idx_t at = 1; at < name.size(); at++) {
-						if (name[at] == '"') {
-							if (at + 1 < name.size() && name[at + 1] == '"') {
-								head += '"';
-								at++;
-								continue;
-							}
-							path = at + 1 < name.size();
-							break;
-						}
-						head += name[at];
-					}
-				} else {
-					auto cut = name.find_first_of(".[");
-					head = name.substr(0, cut);
-					path = cut != string::npos;
-				}
+				auto head = acl_detail::ItemHead(item.first, path);
 				names.push_back(StringUtil::Lower(head));
 				if (path || !item.second.empty()) {
 					path_heads.insert(StringUtil::Lower(head));

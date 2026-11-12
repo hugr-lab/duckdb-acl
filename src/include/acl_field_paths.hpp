@@ -10,6 +10,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
+#include "acl_list_items.hpp"
+
 #include <functional>
 
 namespace duckdb {
@@ -641,11 +643,31 @@ struct ColumnTrees {
 	//! A column is written as it was named; only one that paths step into is quoted, where needed,
 	//! so the paths read back
 	static string RootName(const FieldNode &column) {
-		bool plain_ok = column.name.find('.') == string::npos && column.name.find('[') == string::npos &&
-		                (column.name.empty() || column.name[0] != '"');
-		return column.fields.empty() && !column.element && plain_ok ? column.name : FieldName(column.name);
+		if (!column.fields.empty() || column.element) {
+			return FieldName(column.name); // a path's head
+		}
+		// spec 150 4e: a column bare only when the stored list reads it back as itself (`odd name`); `a,b`, `od'd`,
+		// `a--b` quoted, as `"a.b"` always was
+		return StoresBare(column.name) ? column.name : QuotedName(column.name);
 	}
 };
+
+//! The column an item's name reads (spec 150 4e: one reading for the read path and the listings) - a path's head, or
+//! the name itself when it holds no `.` / `[`, opens no quoted name, or does not read as a path (a column whatever it
+//! holds: `odd name`, `od'd`); `is_path` when it steps into the column
+inline string ItemHead(const string &name_p, bool &is_path) {
+	auto name = name_p;
+	StringUtil::Trim(name);
+	FieldPath path;
+	string error;
+	is_path = false;
+	if ((name.find('.') == string::npos && name.find('[') == string::npos && (name.empty() || name[0] != '"')) ||
+	    !ParseFieldPath(name, path, error)) {
+		return name;
+	}
+	is_path = !path.IsColumn();
+	return path.head;
+}
 
 //! COLUMNS items as the csv the grant rows store
 inline string ItemsCsv(const vector<std::pair<string, string>> &items) {

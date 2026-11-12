@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a-4d implemented)
+- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a-4e implemented)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -532,11 +532,56 @@ compiler; `AdminScanner` went with 4c.
   is refused - the operator writes the name it meant.
   From the reviews: the duplicate, the trim, the loose literal, `'{}'` and the parse-time check of the quoted form;
   from the re-review the unquoted value.
-- 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
-  takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
-  the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what
-  the stored text reads back as. The other readers of a stored list follow (`acl_platform_list`, the lineage tags,
-  the listings' copy of `ParseFieldPath`), and `ParseFieldPath`'s bare word is duckdb's identifier, as 4a's.
+- 4e (built): a grant's column list. The rule: `AclGrantColumnList <- AclGrantColumnItems / AclParenList /
+  AclQuotedValue`, `AclGrantColumnItems <- '(' AclGrantColumnEntry AclGrantColumnMore* ')'`, `AclGrantColumn <-
+  AclFieldPath AclGrantColumnMask?`, `AclFieldPath <- AclNameToken AclFieldStep*` (a step `'.' AclNameToken` or `'['
+  ']'`), `AclGrantColumnMask <- '=' Expression` - duckdb's own expression rule, so `[ ]`, `{ }`, `MAP`, lambdas read
+  as duckdb reads them (`COLUMNS (tags = ['a', 'b'])` was refused by spec 148: the counter split it into `['a'` and
+  `'b']`). Each part of a name is read as duckdb reads an identifier (`AclNameToken`, 4a's): `COLUMNS (id, order)` and
+  an expression in a name's place (`s.x || 'y'`) are refused in one sentence (the rule does not say which item) - the
+  text reader stored them, and the object's check refused the second later. The mask is stored as written with each
+  comment a space (`GrantColumnsText`, once the batch's tokens are known). The read: `ParseColumnList` splits on
+  duckdb's tokens (`SplitListItems`, its own translation unit `acl_list_items.cpp`: an item ends at a comma outside
+  every bracket, literal, quoted name and comment; the name is the text before the item's first top-level `=` - an
+  operator token the tokenizer joins to it, `ssn=~ssn`, `x=@x`, splits there too, as the text reader split it). A
+  `$…$` string, an `E'…'` one or a backtick name in a grant's list is read the old way (below), so a mask holding one
+  with a top-level comma is refused where written - as before 4e, when the statement form refused them all.
+  Names: a column is stored bare only when the stored list reads it back as itself (`StoresBare`: `odd name`, a
+  keyword), else quoted (`"a,b"`, `"x=y"`, `"od'd"`, `"a--b"`, as `"a.b"` always was) - in the rule
+  (`StoredFieldPath`), in `NormaliseGrantColumns` (`RootName`) and in the legacy quoted form (`UnquoteColumnsList` keeps
+  such a name quoted for a grant, `TextKind::GRANT_COLUMNS`); the path reader takes the quotes off. So a column named
+  `a,b` is grantable (the text reader refused it in the statement forms and the function form split it), and
+  `COLUMNS ("od'd", id)` - the quote opened a literal across the next item - stores what it says. A writer's list must
+  read back as the items it wrote (`RequireColumnsReadBack`, in the rule and in `NormaliseGrantColumns`); a caller's
+  text - the function forms', ALTER GRANT's - holding a comment, or ending inside a literal or a quoted name, is
+  refused (`ParseWrittenColumnList`, spec 148's check; a closed `/* */` too, which spec 148 accepted), a list rebuilt
+  from a stored row (ALTER GRANT of another field, a REPAIR) is read as stored. A stored list holding a comment is read
+  as every build before 4e read it (`SplitListItemsAsStored`: `SplitTopLevel`'s commas, the first `=`) - such a build
+  stored a name holding `--` / `/*` as it is, and duckdb's tokens read `a--b, c` as the column `a` (one the role was
+  never granted) and a comment, `-- x` as no list at all (every column); no writer stores a comment since. The other
+  readers of a stored list follow: `acl_platform_list` (the platform views' `columns`), the lineage tags of a narrowed
+  column, and the listings' head of an item (`ItemHead` reads a name as `ColumnTrees::From` does; the listing's own copy is gone).
+  `ParseFieldPath` keeps reading a stored row as written (a keyword part included: a stored row is never re-judged);
+  the statement form's parts are duckdb's identifiers. A differential test (`test/cpp/test_acl_list_items.cpp`) pins
+  that `SplitListItems`' items are the expressions duckdb's parser reads the same text as (`$$…$$`, `E'…'`, lambdas,
+  `::DECIMAL(10, 2)`) and the reading of a text with a comment or a literal the text reader did not know; `acl_mgmt_grammar.test` that a stored list reads back
+  (`acl_platform_list`) as the items the rule read, and rows written as an older build stored them. Left to 4f: a
+  relation's list (`COLUMNS` of `CREATE VIRTUAL TABLE`, `REMAP`) is still written by `SplitTopLevel`
+  (`ParseColumns`) while the author's body gate (`AuthorizeBodies`) and REMAP's reader split it on the tokens - spec
+  148 refuses the halves the old split makes, so no body passes unjudged, but the two readings differ until 4f.
+  From the reviews: the comment reading of stored rows (a name holding `--` read wider), the `=~` split, quoting a
+  name the list cannot read back bare (the plugin's write-back and `"b/**/"` in the quoted form), judging only a
+  caller's list (ALTER GRANT of the caps re-judged the stored one); a star mask, `GRANT SCHEMA … COLUMNS ()` and a
+  positional `#2` mask are older and in BACKLOG. From the re-review: the operator's screens matched a stored item by
+  its text, quotes included (`acl_check_catalog` called a mask on `"a,b"` broken and its repair took the mask away,
+  REPAIR … DROP MISSING COLUMNS orphaned such a mask, `effective_rights` / `check_grant` left it out) - they match by
+  the item's column now (`MatchKey` / `ItemHead`); a closer ends only the bracket it matches (`x(], ssn` read `ssn`
+  out of the `(`), a `$…$` string, an `E'…'` one or a backtick name is read as the text reader read it (it read
+  `id, $$'$$, ssn, x'` inside the `'`), and a name holding a bracket, a quote, `$` or a backtick is stored quoted. From
+  the second re-review: the check's repair text dropped only the item spelled as the broken one (`id, ssn, "ssn" =
+  upper(nosuch)` was repaired to `id, ssn` - the column unmasked); it drops every item of the column now
+  (`Without` by `MatchKey`). A list naming a column twice (`ssn, ssn = 'm'`) is refused where written: a catalog
+  grant's list is stored as written and its read let the bare item win (stored rows: BACKLOG).
 - 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
   `ScannerUnreadable` go.
 
@@ -556,7 +601,8 @@ an inventory of `src/`, each with its verdict; the REPLACE ones are the next wor
 | `GetTableNames` output cut at ` as ` (acl_catalog_admin.cpp) | a body's table names | replace: `BodyTables` (the AST walk) |
 | `SplitProjectionItem` (lineage) | our own `expr AS "name"` | replace: carry the pairs |
 | `TextNamesPolicyStore`, `SqlNamesSource` | view / macro bodies | keep: they over-read on purpose, string literals too (`query_table('acl.admins')`) |
-| `ParseFieldPath` | `a.b`, `items[].x` | keep (duckdb has no `[]` path); its word reads as duckdb's identifier in 4e |
+| `ParseFieldPath` | `a.b`, `items[].x` | keep (duckdb has no `[]` path) for stored rows; since 4e a statement's path is the rule `AclFieldPath`, each part duckdb's identifier |
+| `SplitListItemsAsStored` (`SplitTopLevel`) | a stored list holding a comment, a `$…$` / `E'…'` string or a backtick name | keep: the reading the rows of builds before 4e were written for (no writer stores a comment since) |
 | the first-word ACL check, `MayCarryAttachLineage`, `CallsFunctionNamed` | every query | keep: prefilters before the real read on tokens |
 | keys (`NamePath`), JWT, base64, URLs, `\x1f` serializations, JSON | not SQL | keep |
 
@@ -565,7 +611,7 @@ an inventory of `src/`, each with its verdict; the REPLACE ones are the next wor
 1. Stored policy rows are text by contract (read back and pasted). The owner, 2026-11-06: the rules read a policy
    text where it is WRITTEN (the statement's lists, the function forms' text arguments); the stored row stays the
    text as written - no parse at read, no row emitted from a tree - and spec 148's check stays. So the read side keeps
-   reading the stored text (`ParseColumnList`) - split on duckdb's tokens since 4e (decision 2); a write-side rule
+   reading the stored text (`ParseColumnList`) - split on duckdb's tokens since 4e (decision 2, `SplitListItems`); a write-side rule
    and it must split one list alike, which stage 4's tests pin.
 2. A mask with a list / struct literal (`COLUMNS (tags = ['a', 'b'])`, `{'k': 1}`) works as in duckdb (the owner,
    2026-11-06: "что бы работало так же") - by duckdb's own grammar and tokenizer, not a second hand-written one.

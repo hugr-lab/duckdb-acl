@@ -44,27 +44,62 @@ inline string LitList(const vector<string> &values) {
 	return StringUtil::Join(quoted, ", ");
 }
 
-//! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use.
-//! Split at top level only, so an expression may contain commas of its own (`coalesce(a, b)`).
+//! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use - split on duckdb's
+//! tokens (`SplitListItems`, spec 150 4e), so an expression may hold commas of its own (`coalesce(a, b)`,
+//! `['a', 'b']`) and the name is the text before the item's first top-level `=`
 inline vector<std::pair<string, string>> ParseColumnList(const string &csv) {
 	vector<std::pair<string, string>> columns;
-	for (auto &part : SplitTopLevel(csv, ',')) {
-		auto item = part;
-		if (item.empty()) {
-			continue;
+	for (auto &item : SplitListItems(csv)) {
+		if (item.has_value) {
+			columns.emplace_back(item.name, item.value);
+		} else {
+			columns.emplace_back(item.text, string());
 		}
-		auto pos = item.find('=');
-		if (pos == string::npos) {
-			columns.emplace_back(item, string());
-			continue;
-		}
-		auto name = item.substr(0, pos);
-		auto expr = item.substr(pos + 1);
-		StringUtil::Trim(name);
-		StringUtil::Trim(expr);
-		columns.emplace_back(name, expr);
 	}
 	return columns;
+}
+
+//! A grant's column list as a writer gives it (spec 150 4e): read as `ParseColumnList` reads it, and refused when the
+//! text holds a comment or ends inside a literal or a quoted name - the read leaves a comment out (a stored one is read
+//! the old way, `SplitListItems`), and a stored text with one would keep it (spec 148: `note = upper(note) -- hidden`)
+inline vector<std::pair<string, string>> ParseWrittenColumnList(const string &csv) {
+	bool open = false, comment = false;
+	SplitListItems(csv, &open, &comment);
+	if (open || comment) {
+		throw BinderException("acl admin: the grant's column list holds a comment or ends inside a literal or a quoted "
+		                      "name - it does not stay one expression per item (spec 148); write it without comments");
+	}
+	auto items = ParseColumnList(csv);
+	// a column named twice (`ssn, ssn = 'm'`, `ssn, "SSN" = 'm'`): a catalog grant's list is stored as written, and its
+	// read lets the bare item win over the mask - refused where written (spec 150 4e's review)
+	case_insensitive_set_t named;
+	for (auto &item : items) {
+		bool is_path = false;
+		auto head = ItemHead(item.first, is_path);
+		if (!named.insert(is_path ? item.first : head).second) {
+			throw BinderException("acl admin: the grant's column list names \"%s\" twice - name a column once, bare "
+			                      "or masked",
+			                      is_path ? item.first : head);
+		}
+	}
+	return items;
+}
+
+//! A writer's column list must read back as the items it wrote (spec 150 4e): the csv split by `ParseColumnList`
+//! gives the same names and masks in the same order, or the write is refused - the read would grant other columns
+//! than written (a name holding `,` or `=`, a quote in a name that opens a literal across the next item)
+inline void RequireColumnsReadBack(const vector<std::pair<string, string>> &items, const string &csv) {
+	auto read = ParseColumnList(csv);
+	for (idx_t i = 0; i < MaxValue(items.size(), read.size()); i++) {
+		if (i < items.size() && i < read.size() && read[i] == items[i]) {
+			continue;
+		}
+		auto &named = i < items.size() ? items[i].first : read[i].first;
+		throw BinderException("acl admin: column \"%s\" cannot be carried by a COLUMNS list - its stored form would "
+		                      "read back as other items than written (a name holding ',' or '=', or a quote that opens "
+		                      "a literal before the next item)",
+		                      named);
+	}
 }
 
 //! The policy one role's grant chain imposes on one object (spec 011). Levels compose by narrowing:

@@ -35,7 +35,7 @@ namespace {
 //! quotes. Only the item's NAME (left of a top-level `=`) is unquoted: the right side is an
 //! expression, where a quoted identifier is already valid SQL. Stored verbatim, the quotes made the
 //! item match no column, ever - the function form never had the defect.
-string UnquoteColumnsList(const string &raw) {
+string UnquoteColumnsList(const string &raw, bool grant) {
 	vector<string> items;
 	for (auto &item : SplitTopLevel(raw, ',')) {
 		auto text = item;
@@ -82,8 +82,11 @@ string UnquoteColumnsList(const string &raw) {
 				close = i;
 				break;
 			}
-			if (close < name.size()) {
-				auto bare = StringUtil::Replace(name.substr(1, close - 1), "\"\"", "\"");
+			auto bare = close < name.size() ? StringUtil::Replace(name.substr(1, close - 1), "\"\"", "\"") : string();
+			if (grant && close + 1 == name.size() && !bare.empty() && !StoresBare(bare)) {
+				// spec 150 4e: a grant's name the stored list cannot read back bare (`"a,b"`, `"od'd"`, `"a--b"`) stays
+				// quoted - the path reader takes the quotes off
+			} else if (close < name.size()) {
 				// the stored csv form cannot carry these characters in a name: every later reader
 				// splits on them, and a silent re-split would grant something the admin never wrote
 				if (bare.find(',') != string::npos || bare.find('=') != string::npos) {
@@ -734,7 +737,10 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			string read;
 			switch (list.kind) {
 			case MgmtParsed::TextKind::COLUMNS:
-				read = UnquoteColumnsList(list.text);
+				read = UnquoteColumnsList(list.text, false);
+				break;
+			case MgmtParsed::TextKind::GRANT_COLUMNS:
+				read = UnquoteColumnsList(list.text, true);
 				break;
 			case MgmtParsed::TextKind::TEXT:
 				read = list.text;

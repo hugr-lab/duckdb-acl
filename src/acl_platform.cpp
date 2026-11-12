@@ -3039,7 +3039,8 @@ void CapsFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
-//! acl_platform_list(text) -> VARCHAR[]: a JSON array, or a top-level csv (a column list, a parameter list)
+//! acl_platform_list(text) -> VARCHAR[]: a JSON array, or a top-level csv (a column list, a parameter list) split on
+//! duckdb's tokens
 void ListFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto value = args.GetValue(0, row);
@@ -3054,10 +3055,9 @@ void ListFunc(DataChunk &args, ExpressionState &, Vector &result) {
 			JsonDocument doc(text);
 			items = JsonStrings(doc.Root());
 		} else if (!text.empty()) {
-			for (auto &part : SplitTopLevel(text, ',')) {
-				if (!part.empty()) {
-					items.emplace_back(part);
-				}
+			// split as the read splits it (spec 150 4e: on duckdb's tokens - a mask's `[ ]` / `{ }` is one item's)
+			for (auto &part : SplitListItems(text)) {
+				items.emplace_back(part.text);
 			}
 		}
 		result.SetValue(row, Value::LIST(LogicalType::VARCHAR, std::move(items)));

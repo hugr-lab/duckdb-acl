@@ -713,7 +713,10 @@ string NormaliseGrantColumns(CatalogBackend &catalog, const ReadFn &read, const 
 			acl_detail::SerializeNode(*column, acl_detail::ColumnTrees::RootName(*column), items);
 		}
 	}
-	return acl_detail::ItemsCsv(items);
+	auto csv = acl_detail::ItemsCsv(items);
+	// spec 150 4e: in the object's order an item may read otherwise than where it was written (`od'd` before another)
+	acl_detail::RequireColumnsReadBack(items, csv);
+	return csv;
 }
 
 void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, const string &role, const string &vcat,
@@ -1226,12 +1229,8 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 				return;
 			}
 			// spec 102: the column's own items - `address.city`, `address.ssn = NULL` - one tag per path
-			for (auto item : SplitTopLevel(entry->second, ',')) {
-				StringUtil::Trim(item);
-				auto eq = item.find('=');
-				auto path = eq == string::npos ? item : item.substr(0, eq);
-				StringUtil::Trim(path);
-				tags.push_back(AuditLineageTag {key, eq == string::npos ? "visible" : "masked", path});
+			for (auto &item : acl_detail::ParseColumnList(entry->second)) {
+				tags.push_back(AuditLineageTag {key, item.second.empty() ? "visible" : "masked", item.first});
 			}
 		};
 		if (!policy.caps.count("select")) {
@@ -2569,7 +2568,9 @@ void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const str
 void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
                                const string &rls, const string &columns, bool judge_columns, bool judge_caps) {
 	RequireCatalog(catalog, "acl_grant_catalog");
-	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls, acl_detail::ParseColumnList(columns));
+	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls,
+	                             judge_columns ? acl_detail::ParseWrittenColumnList(columns)
+	                                           : acl_detail::ParseColumnList(columns));
 	if (vcat.empty()) {
 		throw BinderException("acl admin: a grant needs a catalog name");
 	}
@@ -4213,9 +4214,12 @@ string ExposedColumnList(CatalogBackend &catalog, const ReadFn &read, const stri
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
                                        const string &caps_json, const string &rls, const string &columns,
-                                       bool judge_caps, bool ensure_grant) {
+                                       bool judge_caps, bool ensure_grant, bool written_list) {
 	RequireCatalog(catalog, "acl catalog");
-	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls, acl_detail::ParseColumnList(columns));
+	// a list given by a caller is judged as written; one rebuilt from a stored row (a repair) is read as stored
+	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls,
+	                             written_list ? acl_detail::ParseWrittenColumnList(columns)
+	                                          : acl_detail::ParseColumnList(columns));
 	ValidateGrantColumns(*catalog, vcat, columns, vname);
 	CatalogCheckObjectCaps(vcat, vname, caps_json, judge_caps);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
@@ -4262,7 +4266,7 @@ vector<PolicyStore::GrantCheckRow> PolicyStore::CatalogCheckGrant(const string &
 	}
 	if (!step(rls.empty() ? "columns" : "rls", [&]() {
 		    RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls,
-		                                 acl_detail::ParseColumnList(columns));
+		                                 acl_detail::ParseWrittenColumnList(columns));
 	    })) {
 		return out;
 	}
@@ -4334,9 +4338,9 @@ vector<PolicyStore::GrantCheckRow> PolicyStore::CatalogCheckGrant(const string &
 		for (auto &column : plan.probed) {
 			string mask;
 			for (auto &item : expressions) {
-				auto name = item.first;
-				StringUtil::Trim(name);
-				if (StringUtil::CIEquals(name, column.first) && !item.second.empty()) {
+				bool is_path = false; // a quoted one-part name is its column (spec 150 4e)
+				auto name = acl_detail::ItemHead(item.first, is_path);
+				if (!is_path && StringUtil::CIEquals(name, column.first) && !item.second.empty()) {
 					mask = item.second;
 				}
 			}

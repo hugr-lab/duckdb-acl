@@ -483,7 +483,9 @@ void EffectiveRights(PolicyStore &store, const vector<string> &arguments, Rights
 					for (auto &list : {decision.row.catalog_columns, decision.row.object_columns}) {
 						for (auto &item : acl_detail::ParseColumnList(list)) {
 							for (auto &name : found->second) {
-								if (!item.second.empty() && StringUtil::CIEquals(item.first, name)) {
+								bool is_path = false; // a quoted one-part name is its column (spec 150 4e)
+								auto column = acl_detail::ItemHead(item.first, is_path);
+								if (!item.second.empty() && !is_path && StringUtil::CIEquals(column, name)) {
 									stated.push_back(item.first + " = " + item.second);
 								}
 							}

@@ -504,8 +504,9 @@ function's one part by its function mask; nothing of ours on top; a refusal name
 stays the scanner's word, `ToGrammar` quotes as `KeywordHelper::RequiresQuotes`, every revoke of nothing refused
 (`ThrowNothingToRevoke`), `PlainColumnName` = duckdb's parser; 4b built: a group's limits are a rule (`AclLimits`,
 `LimitsJson`); 4c built: a client's lists are rules (`AclItems`, `AclRequireList`, `AclAttributeList`, `AclClaimMapList`;
-`AdminScanner` gone); 4d built: a role's claims are a rule (`AclClaimItems`; `ParseClaims` the one csv reader); 4e reads a mask with duckdb's `Expression` and splits
-a stored list on duckdb's tokens; spec 150 lists the hand-written readers left, each replace / keep). Tests `acl_prefix_grammar.test`,
+`AdminScanner` gone); 4d built: a role's claims are a rule (`AclClaimItems`; `ParseClaims` the one csv reader); 4e built: a grant's column list is a rule (`AclGrantColumnItems`:
+a path of duckdb identifiers, a mask duckdb's `Expression`) and a stored list is split on duckdb's tokens (`SplitListItems`, `acl_list_items.cpp`; a
+writer's list must read back as written - `RequireColumnsReadBack`); spec 150 lists the hand-written readers left, each replace / keep). Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`, `test_acl_mgmt_rules.cpp`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
