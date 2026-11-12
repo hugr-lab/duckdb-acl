@@ -69,7 +69,20 @@ inline vector<std::pair<string, string>> ParseWrittenColumnList(const string &cs
 		throw BinderException("acl admin: the grant's column list holds a comment or ends inside a literal or a quoted "
 		                      "name - it does not stay one expression per item (spec 148); write it without comments");
 	}
-	return ParseColumnList(csv);
+	auto items = ParseColumnList(csv);
+	// a column named twice (`ssn, ssn = 'm'`, `ssn, "SSN" = 'm'`): a catalog grant's list is stored as written, and its
+	// read lets the bare item win over the mask - refused where written (spec 150 4e's review)
+	case_insensitive_set_t named;
+	for (auto &item : items) {
+		bool is_path = false;
+		auto head = ItemHead(item.first, is_path);
+		if (!named.insert(is_path ? item.first : head).second) {
+			throw BinderException("acl admin: the grant's column list names \"%s\" twice - name a column once, bare "
+			                      "or masked",
+			                      is_path ? item.first : head);
+		}
+	}
+	return items;
 }
 
 //! A writer's column list must read back as the items it wrote (spec 150 4e): the csv split by `ParseColumnList`

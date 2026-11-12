@@ -118,6 +118,10 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     should refuse it (spec 148's `OneExpression` and the projection probe let it through; found by spec 150 4e's
     review). Same review: `GRANT SCHEMA … COLUMNS ()` (an empty list) is accepted while a non-empty one is refused, and
     a mask `#2` reads the physical table's column by position - neither widens; decide whether to refuse them.
+  - A catalog grant's list stored before spec 150 4e naming a column twice (`ssn, ssn = 'm'`) reads the column unmasked
+    (`GrantUnion::Add` merges one role's duplicates as two roles'), while `"ssn" = 'm'` beside `ssn` reads masked (the
+    tree path) and the screens say masked. 4e refuses such a list where written; the stored rows are not re-judged -
+    decide whether the read should take the narrower reading (found by 4e's second re-review).
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

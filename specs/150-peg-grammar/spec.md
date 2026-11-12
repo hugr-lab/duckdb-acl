@@ -577,7 +577,11 @@ compiler; `AdminScanner` went with 4c.
   REPAIR … DROP MISSING COLUMNS orphaned such a mask, `effective_rights` / `check_grant` left it out) - they match by
   the item's column now (`MatchKey` / `ItemHead`); a closer ends only the bracket it matches (`x(], ssn` read `ssn`
   out of the `(`), a `$…$` string, an `E'…'` one or a backtick name is read as the text reader read it (it read
-  `id, $$'$$, ssn, x'` inside the `'`), and a name holding a bracket, a quote, `$` or a backtick is stored quoted.
+  `id, $$'$$, ssn, x'` inside the `'`), and a name holding a bracket, a quote, `$` or a backtick is stored quoted. From
+  the second re-review: the check's repair text dropped only the item spelled as the broken one (`id, ssn, "ssn" =
+  upper(nosuch)` was repaired to `id, ssn` - the column unmasked); it drops every item of the column now
+  (`Without` by `MatchKey`). A list naming a column twice (`ssn, ssn = 'm'`) is refused where written: a catalog
+  grant's list is stored as written and its read let the bare item win (stored rows: BACKLOG).
 - 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
   `ScannerUnreadable` go.
 

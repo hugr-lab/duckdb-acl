@@ -3235,6 +3235,29 @@ SELECT masks FROM acl_effective_rights('r4e', 'c4e', 'odd');
 ----
 ['"a,b" = 0']
 
+# a column named twice is refused where written (a catalog list's read let the bare item win over the mask)
+statement error
+ACL ADMIN GRANT CATALOG c4e TO ROLE r4e MAIN COLUMNS (id, "a,b", "a,b" = 0);
+----
+names "a,b" twice
+
+statement error
+SELECT acl_grant_catalog('r4e', 'c4e', '', true, '', 'id, note, "NOTE" = ''m''');
+----
+names "NOTE" twice
+
+# the check's repair of a broken mask takes the column out whatever its spelling - never leaves it unmasked
+statement ok
+UPDATE aclcat.acl.role_object_caps SET columns = 'id, "a,b", "A,B" = nosuch(1)' WHERE role = 'r4e' AND vname = 'odd';
+
+statement ok
+UPDATE aclcat.acl.meta SET "value" = (CAST("value" AS BIGINT) + 1)::VARCHAR WHERE "key" = 'policy_version';
+
+query I
+SELECT DISTINCT repair FROM acl_check_catalog('c4e') WHERE object = 'odd' AND kind = 'grant';
+----
+SELECT acl_grant_object('r4e', 'c4e', 'odd', '{"select": true}', '', 'id')
+
 statement ok
 ACL ADMIN DROP VIRTUAL TABLE c4e.odd;
 

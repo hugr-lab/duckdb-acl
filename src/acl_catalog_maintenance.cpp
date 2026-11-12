@@ -760,10 +760,13 @@ private:
 	}
 
 	//! A list without one item, as the csv the writers take
+	//! The list without every item of the column `name`'s item names (spec 150 4e: by the column, so a repair of a
+	//! broken `"ssn" = …` beside a bare `ssn` takes both - the column leaves the list, never stays unmasked)
 	static string Without(const Columns &items, const string &name) {
 		vector<string> kept;
+		auto column = MatchKey(name);
 		for (auto &item : items) {
-			if (StringUtil::CIEquals(item.first, name)) {
+			if (StringUtil::CIEquals(MatchKey(item.first), column)) {
 				continue;
 			}
 			kept.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
