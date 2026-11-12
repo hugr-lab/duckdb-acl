@@ -64,11 +64,11 @@ struct MgmtParsed {
 	//! spec 082: `GRANT | REVOKE SECRET` - the secrets service's call, not an acl_* one: `function` is grant_secret /
 	//! revoke_secret, `args` the secret's name, the principal (`role:r` / `group:g`) and the service named ('' none)
 	bool secrets = false;
-	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
-	//! rule in stage 4): a columns list for UnquoteColumnsList (a grant's legacy quoted list too: GRANT_COLUMNS keeps a
-	//! name quoted that the stored list cannot read back bare, spec 150 4e), the rest as is (a group's limits are a
-	//! rule since spec 150 4b, a client's lists since 4c, a role's claims since 4d)
-	enum class TextKind : uint8_t { COLUMNS, GRANT_COLUMNS, TEXT };
+	//! arguments written as a list or a body, as text their readers take: a grant's legacy quoted list for
+	//! UnquoteGrantColumns (GRANT_COLUMNS: a quoted name stored bare where the stored list reads it back so, spec 150
+	//! 4e), the rest as is (a group's limits are a rule since spec 150 4b, a client's lists since 4c, a role's claims
+	//! since 4d, a grant's columns since 4e, an object's own column list since 4f)
+	enum class TextKind : uint8_t { GRANT_COLUMNS, TEXT };
 	struct TextArg {
 		idx_t arg;
 		string text;

@@ -2510,8 +2510,10 @@ void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const str
 	}
 	vector<string> names;
 	for (auto &column : acl_detail::ParseColumnList(columns)) {
-		auto name = column.first;
-		StringUtil::Trim(name);
+		// the item's column as the read takes it - its quotes off (`"a,b"`, a stored name since spec 150 4f), a path's
+		// head (spec 150 4f's re-review: the quoted text matched no stored name)
+		bool is_path = false;
+		auto name = acl_detail::ItemHead(column.first, is_path);
 		if (!name.empty() && column.second.empty()) {
 			names.push_back(Lit(StringUtil::Lower(name)));
 		}

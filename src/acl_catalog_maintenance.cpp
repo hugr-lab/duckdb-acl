@@ -15,6 +15,7 @@
 #include "acl_types.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -256,7 +257,8 @@ private:
 					    "declared column \"" + entry.first + "\" reads " +
 					        (entry.second.empty() ? "a source column of that name" : "\"" + entry.second + "\"") +
 					        ", which \"" + relation.phys + "\" no longer has: " + error,
-					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" + entry.first +
+					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" +
+					        KeywordHelper::WriteOptionallyQuoted(entry.first) +
 					        " = <column>)  -- or DROP MISSING COLUMNS");
 				}
 				if (!any_missing && stored_derived) {
@@ -483,8 +485,9 @@ private:
 					Add(kind, relation.vname, "", "types_mismatch",
 					    "declared column \"" + entry.first + "\" is described as " + said + " and reads as " +
 					        probed[0].second + " - an expression that makes a type of its own is not cast",
-					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" + entry.first + " = CAST(" + item +
-					        " AS " + said + "))");
+					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" +
+					        KeywordHelper::WriteOptionallyQuoted(entry.first) + " = CAST(" + item + " AS " + said +
+					        "))");
 				}
 			}
 		}
@@ -1298,7 +1301,14 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		if (spec.empty()) {
 			throw BinderException("acl admin: REMAP needs a list: name = expression, ...");
 		}
-		for (auto &item : ParseColumnList(spec)) {
+		for (auto &column : SplitDeclaredColumns(spec, "the REMAP list")) {
+			if (column.nullable >= 0) {
+				// a mark is the declaration's (spec 048); in a REMAP `x NOT NULL` would be taken off the expression
+				throw BinderException("acl admin: REMAP item \"%s\" carries a NULL mark - REMAP changes an expression; "
+				                      "SET COLUMNS declares nullability",
+				                      column.name);
+			}
+			std::pair<string, string> item {column.name, column.expr};
 			if (item.second.empty()) {
 				throw BinderException("acl admin: REMAP item \"%s\" states no expression (expected name = expression)",
 				                      item.first);

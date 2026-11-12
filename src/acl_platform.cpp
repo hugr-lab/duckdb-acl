@@ -1585,6 +1585,15 @@ void WalkBodyCalls(const string &text, BodyShape shape,
 			}
 		}
 		return;
+	case BodyShape::DECLARED_COLUMNS:
+		for (auto &column : SplitDeclaredColumns(trimmed, "the object's column list")) {
+			if (!column.expr.empty()) {
+				for (auto &expr : Parser(options).ParseExpressionList(column.expr)) {
+					WalkBodyExpr(*expr, none, callback);
+				}
+			}
+		}
+		return;
 	case BodyShape::SELECT: {
 		Parser parser(options);
 		parser.ParseQuery(trimmed);
@@ -1620,7 +1629,7 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 	auto S = FunctionKind::SCALAR;
 	auto T = FunctionKind::TABLE;
 	if (target == "acl_add_relation") {
-		return {{3, BodyShape::COLUMNS, S}, {4, BodyShape::EXPRESSION, S}};
+		return {{3, BodyShape::DECLARED_COLUMNS, S}, {4, BodyShape::EXPRESSION, S}};
 	}
 	if (target == "acl_add_view") {
 		return {{2, BodyShape::SELECT, S}};
@@ -1646,7 +1655,7 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 			return {{3, BodyShape::SELECT, S}};
 		}
 		if (field == "columns") {
-			return {{3, BodyShape::COLUMNS, S}};
+			return {{3, BodyShape::DECLARED_COLUMNS, S}};
 		}
 		return {};
 	}
@@ -1676,7 +1685,7 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 		return {{3, BodyShape::EXPRESSION, S}, {4, BodyShape::COLUMNS, S}};
 	}
 	if (target == "acl_repair_relation") {
-		return {{3, BodyShape::COLUMNS, S}};
+		return {{3, BodyShape::DECLARED_COLUMNS, S}};
 	}
 	if (target == "acl_add_reference") {
 		return {{7, BodyShape::EXPRESSION, S}};
@@ -1788,23 +1797,18 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 			if (!text_of(call, body.index, text) || StringUtil::Replace(text, " ", "").empty()) {
 				continue;
 			}
-			// a column list (a relation's columns, a REMAP) is checked item by item, each as an expression
+			// a column list (a grant's, a relation's, a REMAP) is checked item by item, each expression as one
 			vector<std::pair<string, bool>> pieces;
-			if (body.shape == BodyShape::COLUMNS) {
+			if (body.shape == BodyShape::DECLARED_COLUMNS) {
+				for (auto &column : SplitDeclaredColumns(text, "the object's column list")) {
+					if (!column.expr.empty()) {
+						pieces.emplace_back(column.expr, true); // a column named as is reads no table
+					}
+				}
+			} else if (body.shape == BodyShape::COLUMNS) {
 				for (auto &item : acl_detail::ParseColumnList(text)) {
-					// `name = expr`, or the grammar's `expr AS name` (kept whole as the item's name)
-					auto piece = item.second.empty() ? item.first : item.second;
-					auto as_at = StringUtil::Lower(piece).rfind(" as ");
-					if (item.second.empty() && as_at != string::npos) {
-						piece = piece.substr(0, as_at);
-					}
-					bool plain = true; // a column named as is reads no table
-					for (auto c : piece) {
-						plain = plain && (StringUtil::CharacterIsAlphaNumeric(c) || c == '_' || c == '"' || c == '.' ||
-						                  StringUtil::CharacterIsSpace(c));
-					}
-					if (!plain) {
-						pieces.emplace_back(piece, true);
+					if (!item.second.empty()) {
+						pieces.emplace_back(item.second, true); // a column or a path reads no table
 					}
 				}
 			} else {
