@@ -50,15 +50,17 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 	case_insensitive_map_t<string> claims;
 	for (auto &item : SplitCsv(csv)) {
 		auto pos = item.find('=');
-		if (pos == string::npos) {
-			continue;
+		auto name = Trimmed(item.substr(0, pos));
+		if (pos == string::npos || name.empty()) {
+			// spec 150 4d: an item that names no claim was skipped - a claim the admin wrote went missing silently
+			throw InvalidInputException("acl: a claim is written as name='value', got \"%s\"", Trimmed(item));
 		}
 		// a value written as one '...' literal is its text, quotes doubled inside (the list form compiles to that)
 		auto value = Trimmed(item.substr(pos + 1));
 		if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'') {
 			value = StringUtil::Replace(value.substr(1, value.size() - 2), "''", "'");
 		}
-		claims[Trimmed(item.substr(0, pos))] = value;
+		claims[name] = value;
 	}
 	return claims;
 }

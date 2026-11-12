@@ -30,37 +30,6 @@ namespace acl {
 
 namespace {
 
-//! Strip one layer of quotes from a list element written as a literal
-string Unquoted(string value) {
-	StringUtil::Trim(value);
-	if (value.size() >= 2 && (value.front() == '\'' || value.front() == '"') && value.back() == value.front()) {
-		auto quote = value.front();
-		value = value.substr(1, value.size() - 2);
-		value = StringUtil::Replace(value, string(2, quote), string(1, quote));
-	}
-	return value;
-}
-
-//! `(tenant = 'acme', unit = 'eu')` -> the csv `tenant='acme',unit='eu'`: each value stays one quoted literal, so
-//! a `,` or a `'` inside it is part of the value (ParseClaims takes the quotes off)
-string ClaimsListToCsv(const string &list) {
-	vector<string> entries;
-	for (auto &item : SplitTopLevel(list, ',')) {
-		if (item.empty()) {
-			continue;
-		}
-		auto split = item.find('=');
-		if (split == string::npos) {
-			throw BinderException("acl admin: a claim is written as name = 'value', got \"%s\"", item);
-		}
-		auto name = item.substr(0, split);
-		StringUtil::Trim(name);
-		auto value = Unquoted(item.substr(split + 1));
-		entries.push_back(name + "='" + StringUtil::Replace(value, "'", "''") + "'");
-	}
-	return StringUtil::Join(entries, ",");
-}
-
 //! spec 065: a management COLUMNS list is written like SQL, so a quoted identifier must mean the
 //! name it quotes - `COLUMNS ("odd name", id = pk)` stores `odd name` (with its space), not the
 //! quotes. Only the item's NAME (left of a top-level `=`) is unquoted: the right side is an
@@ -764,9 +733,6 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		for (auto &list : entry.texts) {
 			string read;
 			switch (list.kind) {
-			case MgmtParsed::TextKind::CLAIMS:
-				read = ClaimsListToCsv(list.text);
-				break;
 			case MgmtParsed::TextKind::COLUMNS:
 				read = UnquoteColumnsList(list.text);
 				break;

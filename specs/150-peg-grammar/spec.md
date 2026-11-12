@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a, 4b, 4c implemented)
+- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a-4d implemented)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -510,7 +510,18 @@ compiler; `AdminScanner` went with 4c.
   trimmed inside its quotes (`' r '` is `r`), as `ListItemsJson` did - an `IN` value is compared as written, as
   before; `name = CONSTANT` with its value missing is refused (it read as the path `CONSTANT` - the constant from the
   token); an attribute name is a word, a name in any script, or quoted.
-- 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
+- 4d (built): a role's claims list is a rule (`AclClaimItems`, each `AclClaimItem <- AclAttrName '=' AclValue`; the
+  compiler's `ClaimsListToCsv`, the span's `ClaimsListText` and the text kind CLAIMS go): the name as an attribute's
+  (4c - one word, a name in any script, or quoted; `AttrNameOf`, shared), the value a word, words joined by `.`, a
+  signed number or quoted, kept as written (inside its quotes untrimmed, as before); an empty item none. The transform
+  writes the csv the admin functions take, so `ParseClaims` is the one reader of a list's text - the quoted form
+  (judged as before) and the function forms. What reads differently: a bare name or value is one of those forms - the
+  text reader took the tokens as they touched (`custom:tenant`, `cost-center`, `eu-west` bare; the survey of the four
+  repositories found such names only in our own test and the DBeaver plugin, which writes a stored name back bare -
+  acl-clients quotes it); a dotted bare name (`a.b`) is refused, as an attribute's; a backtick value reads; a `+1` and
+  a value in parentheses are refused. Refused now: a name holding `=`, `,`, a quote or a parenthesis (the csv's reader
+  splits at them - `"a(" = 'x', b = 'y'` would have read back as one claim), and in `ParseClaims` an item that names
+  no claim (`'tenant'`, `='x'` - skipped, the claim lost silently).
 - 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
   takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
   the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what

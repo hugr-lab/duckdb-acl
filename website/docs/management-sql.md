@@ -383,9 +383,12 @@ ALTER ROLE <role> SET COMMENT '<text>'
 DROP ROLE [IF EXISTS] <role>
 ```
 
-A value in the list form is one quoted literal and may hold `,`, `=` or `'` (doubled) - single quotes only: a value
-written `E'…'` or `$$…$$`, or a name in backticks, is refused in the list; a comment inside it is ignored. In the
-quoted csv form a value with a comma is written in quotes of its own: `CLAIMS 'tenant=''a,b'''`.
+In the list form a claim's name is one word or a quoted name (`"custom:tenant"`, `"tenant id"`) holding no `=`, `,`,
+quote or parenthesis. A value is a word, words joined by `.`, a signed number (`-1`), or a quoted literal
+(`'eu-west'`), which may hold `,`, `=` or `'` (doubled). Anything else is quoted: a bare `custom:tenant` or `eu-west`
+is refused, and so is a value written `E'…'` or `$$…$$`. A comment inside the list is ignored, and an empty item is
+none. In the quoted csv form a value with a comma is written in quotes of its own: `CLAIMS 'tenant=''a,b'''`. Each
+item names its claim: `CLAIMS 'tenant'` is refused, in the function form too.
 
 A role is an internal name that grants attach to. Its claims are defaults: they are what
 `acl_claim('<name>')` answers under the bare `ACL ROLE "r"` form, and under a token they fill in only

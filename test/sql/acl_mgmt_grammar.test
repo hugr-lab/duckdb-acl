@@ -375,9 +375,20 @@ SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'commented_claims';
 ----
 region	us
 
-# ... and the list is otherwise as written: a name or an unquoted value keeps what touches in it
+# spec 150 4d: a claims list is a rule - a name one word or quoted, a value a word, words joined by `.`, a signed
+# number or quoted; what touches in a bare name or value (`custom:tenant`, `eu-west`) is quoted
+statement error
+ACL ADMIN CREATE ROLE punctuated CLAIMS (custom:tenant = 'acme');
+----
+a claims list is name = value items - a name one word or quoted ("custom:tenant"), a value a word, a number or quoted ('eu-west')
+
+statement error
+ACL ADMIN CREATE ROLE punctuated CLAIMS (region = eu-west);
+----
+a claims list is name = value items
+
 statement ok
-ACL ADMIN CREATE ROLE punctuated CLAIMS (custom:tenant = 'acme', cost-center = '42', level = -1, region = eu-west);
+ACL ADMIN CREATE ROLE punctuated CLAIMS ("custom:tenant" = 'acme', "cost-center" = '42', level = -1, region = 'eu-west');
 
 query II
 SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'punctuated' ORDER BY claim;
@@ -387,33 +398,27 @@ custom:tenant	acme
 level	-1
 region	eu-west
 
-# a literal the compiler's reader would split otherwise than duckdb's tokenizer reads it is refused in a list (stage
-# 4 makes the list a rule): `$$a, tenant = 'globex', b = $$` is one value to the tokenizer, three claims to the reader
+# a literal is read as duckdb's tokenizer reads it: `$$a, tenant = 'globex', b = $$` is one value - refused as no
+# plain literal, never three claims
 statement error
 ACL ADMIN CREATE ROLE split_list CLAIMS (region = $$a, tenant = 'globex', b = $$);
 ----
-a claims list is written as name = 'value' items
+expected a claim's value, quoted ('...', "..." or `...`) as one plain literal
 
 statement error
 ACL ADMIN CREATE ROLE split_list CLAIMS (region = E'a\'b', tenant = 'x');
 ----
-a claims list is written as name = 'value' items
+expected a claim's value, quoted ('...', "..." or `...`) as one plain literal
 
-statement error
-ACL ADMIN CREATE ROLE split_list CLAIMS (region = `a, tenant = 'globex', z = `);
-----
-a backtick name
-
-# ... and a text the tokens do not tile (after a lone `$` the tokenizer places the next token at the `$`)
 statement error
 ACL ADMIN CREATE ROLE split_list CLAIMS (region = $, tenant = 'x');
 ----
-a claims list is written as name = 'value' items
+a claims list is name = value items
 
 statement error
 ACL ADMIN CREATE ROLE split_list CLAIMS (region = 'x', tenant = $);
 ----
-a claims list is written as name = 'value' items
+a claims list is name = value items
 
 query I
 SELECT count(*) FROM aclcat.acl.roles WHERE role = 'split_list';
@@ -519,7 +524,7 @@ write GRANT ADMIN <scope> TO ROLE <role>
 statement error
 ACL ADMIN ALTER ROLE tenant_reader SET CLAIMS (tenant 'x');
 ----
-a claim is written as name = 'value'
+a claims list is name = value items
 
 statement error
 ACL ADMIN MAP GROUP admins FROM ISSUER corp TO ROLE tenant_reader;
@@ -1660,7 +1665,7 @@ statement error
 ACL ADMIN CREATE ROLE never CLAIMS (tenant = 'ac'
 'me');
 ----
-a string continued on the next line
+expected a claim's value, quoted ('...', "..." or `...`) as one plain literal
 
 # ALGS is a key's, a client secret is never written - in a client's ALTER it names FROM SECRET
 statement error
@@ -2902,3 +2907,125 @@ SELECT attributes FROM acl_clients() WHERE name = 'test/idp/d';
 
 statement ok
 ACL ADMIN DROP CLIENT lists4c; DROP ISSUER 'test/idp/d';
+
+# --- stage 4d: a role's claims are a rule (a name one word or quoted, a value a word, words joined by `.`, a number,
+# quoted) ------------------------------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE claims4d CLAIMS ("tenant id" = `v`, größe = 'g', size = 1.5, path = a.b, level = - 1, "t2" = "dq", , 'quoted' = ' sp ', flag = true, );
+
+query II
+SELECT claim, '[' || value || ']' FROM aclcat.acl.role_claims WHERE role = 'claims4d' ORDER BY claim;
+----
+flag	[true]
+größe	[g]
+level	[-1]
+path	[a.b]
+quoted	[ sp ]
+size	[1.5]
+t2	[dq]
+tenant id	[v]
+
+# a backtick value is one literal, read whole
+statement ok
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS (region = `a, tenant = 'globex', z = `, b = 'it''s', c = 'a,b');
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'claims4d' ORDER BY claim;
+----
+b	it's
+c	a,b
+region	a, tenant = 'globex', z = 
+
+# a name is one name: a dotted bare one and a blank one are refused, as an attribute's are
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS (a.b = 'x');
+----
+a claims list is name = value items
+
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS (größe.x = 'x');
+----
+a claim's name is one word or a quoted name, got "größe.x"
+
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS ('  ' = 'x');
+----
+a claim's name is one word or a quoted name
+
+# ... and holds nothing the stored csv's reader splits at: `"a(" = 'x', b = 'y'` read back as one claim `a(`
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS ("a(" = 'x', b = 'y');
+----
+a claim's name holds no =, comma, quote or parenthesis, got "a("
+
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS ("a=b" = 'x');
+----
+a claim's name holds no =, comma, quote or parenthesis
+
+# two literals with no separator, a value in parentheses, a `+` sign: no claims list
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS (a = 'x' 'y');
+----
+a claims list is name = value items
+
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS (a = (b));
+----
+a claims list is name = value items
+
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS (a = +1);
+----
+a claims list is name = value items
+
+# the refusals left the claims as they were
+query I
+SELECT count(*) FROM aclcat.acl.role_claims WHERE role = 'claims4d';
+----
+3
+
+# the quoted form and the function forms are the csv, read by one reader: an item that names no claim is refused
+# (it was skipped - the claim went missing silently)
+statement error
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS 'tenant';
+----
+a claim is written as name='value', got "tenant"
+
+statement error
+SELECT acl_alter_role('claims4d', 'a=''x'',=''y''');
+----
+a claim is written as name='value', got "='y'"
+
+statement ok
+SELECT acl_alter_role('claims4d', 'a=''x'',, b = ''y''');
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'claims4d' ORDER BY claim;
+----
+a	x
+b	y
+
+# an empty list and an empty quoted one clear them
+statement ok
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS ();
+
+query I
+SELECT count(*) FROM aclcat.acl.role_claims WHERE role = 'claims4d';
+----
+0
+
+statement ok
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS (a = 'x');
+
+statement ok
+ACL ADMIN ALTER ROLE claims4d SET CLAIMS '';
+
+query I
+SELECT count(*) FROM aclcat.acl.role_claims WHERE role = 'claims4d';
+----
+0
+
+statement ok
+ACL ADMIN DROP ROLE claims4d;

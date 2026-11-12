@@ -65,9 +65,9 @@ struct MgmtParsed {
 	//! revoke_secret, `args` the secret's name, the principal (`role:r` / `group:g`) and the service named ('' none)
 	bool secrets = false;
 	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
-	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, the
-	//! rest as is (a group's limits are a rule since spec 150 4b, a client's lists since 4c)
-	enum class TextKind : uint8_t { CLAIMS, COLUMNS, TEXT };
+	//! rule in stage 4): a columns list for UnquoteColumnsList, the rest as is (a group's limits are a rule since
+	//! spec 150 4b, a client's lists since 4c, a role's claims since 4d)
+	enum class TextKind : uint8_t { COLUMNS, TEXT };
 	struct TextArg {
 		idx_t arg;
 		string text;
