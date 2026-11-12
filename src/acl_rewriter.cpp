@@ -1749,6 +1749,13 @@ private:
 			         " is not allowed - an ON CONFLICT DO UPDATE / INSERT OR REPLACE updates the row "
 			         "already there");
 		}
+		if (update.exposes_nothing) {
+			// spec 156: its column sets are empty, which below reads as "no column policy"
+			Deny(Reason::POLICY_ERROR, "update on " + Shown(key) +
+			                               " is not allowed: it exposes no column - an ON "
+			                               "CONFLICT DO UPDATE / INSERT OR REPLACE updates the row "
+			                               "already there");
+		}
 		if (node.on_conflict_info->action_type == OnConflictAction::REPLACE &&
 		    (!update.rls.empty() || !update.injections.empty() || !update.write_columns.empty() ||
 		     !update.field_writes.empty() || !update.visible_columns.empty())) {

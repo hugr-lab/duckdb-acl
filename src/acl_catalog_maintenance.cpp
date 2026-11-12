@@ -794,10 +794,11 @@ private:
 			// GRANT OBJECT with fewer clauses would reset what it does not state
 			auto regrant = [&](const string &columns_text) {
 				if (columns_text.empty()) {
-					// spec 156: an empty list is a row-only grant - every column; the list without its last item is
-					// none
-					return "SELECT acl_revoke_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) +
-					       ")  -- the list would be empty, which reads every column";
+					// spec 156: an empty list is a row-only grant - every column - and a revoke drops the grant's RLS
+					// too (the catalog grant then decides): the operator names the columns, the placeholder never runs
+					return "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
+					       Lit(caps) + ", " + Lit(rls) +
+					       ", '<columns>')  -- name what the role reads; an empty list reads every column";
 				}
 				return "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
 				       Lit(caps) + ", " + Lit(rls) + ", " + Lit(columns_text) + ")";
@@ -823,12 +824,12 @@ private:
 			auto columns = Text(catalogs_rows.GetValue(2, row));
 			auto rls_checked = catalogs_rows.GetValue(3, row);
 			auto items = ParseColumnList(columns);
-			// spec 156: the list without its last item is no list - every column - so that repair revokes instead
+			// spec 156: the list without its last item is no list - every column - so that repair names a placeholder
 			auto set_columns = [&](const string &rest) {
 				auto grantee = NamePath(vector<string> {role}).ToGrammar();
 				if (rest.empty()) {
-					return "REVOKE CATALOG " + NamePath::KeyToGrammar(vcat) + " FROM ROLE " + grantee +
-					       "  -- the list would be empty, which reads every column";
+					return "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee +
+					       " SET COLUMNS '<columns>'  -- name what the role reads; an empty list reads every column";
 				}
 				return "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee + " SET COLUMNS " +
 				       Lit(rest);

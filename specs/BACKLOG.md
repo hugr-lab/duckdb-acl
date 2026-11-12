@@ -122,6 +122,9 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     (`GrantUnion::Add` merges one role's duplicates as two roles'), while `"ssn" = 'm'` beside `ssn` reads masked (the
     tree path) and the screens say masked. 4e refuses such a list where written; the stored rows are not re-judged -
     decide whether the read should take the narrower reading (found by 4e's second re-review).
+  - A role whose own grants leave none of an object's columns still contributes its rows to a verb's union with another
+    role (spec 146's per-object union): `UPDATE` by {analyst: update on `k` in `id = 2`; auditor: update, no column}
+    updates rows outside analyst's slice. Decide whether such a role's rows leave the union for that verb (spec 156).
   - `acl_check_catalog` does not name a grant whose list leaves none of its object's declared columns (spec 156: such
     a grant's reads and writes refuse; a `SET COLUMNS` under an object grant reaches it).
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.

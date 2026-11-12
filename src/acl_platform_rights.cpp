@@ -464,7 +464,7 @@ void EffectiveRights(PolicyStore &store, const vector<string> &arguments, Rights
 				for (auto &cap : decision.caps) {
 					writes = writes || IsWriteCap(cap);
 				}
-				writable = Value::BOOLEAN(policy.writable && writes);
+				writable = Value::BOOLEAN(policy.writable && writes && !policy.exposes_nothing); // spec 156
 				string schema, leaf;
 				NamePath::SplitLeaf(vname, schema, leaf);
 				auto key =

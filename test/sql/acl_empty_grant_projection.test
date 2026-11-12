@@ -182,8 +182,8 @@ ACL ROLE "ix" UPDATE p SET ssn = 'x' RETURNING *;
 ----
 exposes no column
 
-# the check's repair of a grant's last broken item revokes it - the list without it would be empty, which reads every
-# column
+# the check's repair of a grant's last broken item names a placeholder - the list without it would be empty, which
+# reads every column, and a revoke would drop the grant's RLS (the catalog grant then decides)
 statement ok
 CREATE TABLE phys.main.d (id INTEGER, old INTEGER);
 
@@ -202,7 +202,7 @@ ACL ADMIN REPAIR VIRTUAL TABLE c.dt DROP MISSING COLUMNS;
 query I
 SELECT repair FROM acl_check_catalog('c') WHERE object = 'dt' AND role = 'dr' AND problem = 'grant_column_missing';
 ----
-SELECT acl_revoke_object('dr', 'c', 'dt')  -- the list would be empty, which reads every column
+SELECT acl_grant_object('dr', 'c', 'dt', '', '', '<columns>')  -- name what the role reads; an empty list reads every column
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE dr MAIN;
@@ -211,3 +211,42 @@ statement error
 ACL ROLE "dr" SELECT * FROM dt;
 ----
 exposes no readable columns
+
+# INSERT OR REPLACE updates the row already there: under a role whose grants leave no column it is refused too (its
+# empty column sets read as "no column policy")
+statement ok
+CREATE TABLE phys.main.k (id INTEGER PRIMARY KEY, ssn VARCHAR, b INTEGER);
+
+statement ok
+INSERT INTO phys.main.k VALUES (1, 'secret', 2);
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+# the token carries analyst (insert) and auditor (update, its lists intersecting to nothing over kp)
+statement ok
+ACL ADMIN CREATE ROLE analyst; CREATE ROLE auditor; ADD TABLE phys.main.k AS c.kp;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (insert) MAIN; GRANT CATALOG c TO ROLE auditor WITH (update) MAIN COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT TABLE c.kp TO ROLE auditor COLUMNS (b);
+
+statement error
+ACL ROLE "auditor" UPDATE kp SET b = 1;
+----
+exposes no column
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT OR REPLACE INTO kp VALUES (1, 'pwn', 99);
+----
+exposes no column
+
+query III
+SELECT * FROM phys.main.k;
+----
+1	secret	2

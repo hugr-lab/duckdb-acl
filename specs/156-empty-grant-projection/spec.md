@@ -39,8 +39,11 @@ tags (`RoleTags`) tagged every field `visible` for such a role.
 
 `TablePolicy::exposes_nothing` (acl_policy.hpp): set by `ApplyGrantPolicy` when the narrowed projection over a declared
 list is empty. `BuildTableSubquery` refuses on it, as on an empty projection without RLS; `ResolveDmlTarget` refuses
-every verb on it (`<verb> on "w" is not allowed: it exposes no column`) - a plain `DELETE` too: an object of which a
-role reads no column is not one it changes; `VerbReadScope` takes such a role as reading no column. The no-declared-list branch sets the flag when the lists
+every verb on it (`<verb> on "w" is not allowed: it exposes no column`) - a plain `DELETE` too: an object of which the
+principal's united grants read no column is not one it changes - and so does `ConflictUpdatePolicy` (`INSERT OR
+REPLACE` / `ON CONFLICT DO UPDATE` update the row already there: the update's union read as "no column policy" and
+overwrote it). `VerbReadScope` takes a role whose own grants leave no column as reading no column (spec 145's
+intersection: it was skipped as "every column as stored"). The no-declared-list branch sets the flag when the lists
 intersect to nothing (and the read refuses on it before a view's or the branch's query is used). The check's repair of
 a grant's last item revokes the grant (`acl_revoke_object` / `REVOKE CATALOG`), never an empty list; `RoleTags`
 gives such a role no field tag. An empty
@@ -49,7 +52,14 @@ projection beside an RLS keeps meaning a row-only grant (every column) - only wh
 ## Enforcement & security
 
 Fails closed: the read refuses with the existing `exposes no readable columns`, every write before anything is written.
-The listings were right already (they never showed such columns). A grant written over a list it matched and left
+The listings were right already (they never showed such columns); `effective_rights` says `writable = false`.
+
+Visible changes beside the leak (the owner's to keep or reopen): a plain `DELETE` with no column refuses; a principal
+whose verb role alone leaves no column has that role's `VerbReadScope` contribute nothing, so `UPDATE … WHERE k = …`
+by a principal reading `k` through another role refuses (spec 145's rule, which the skip had let through); an ingest
+role whose list names physical names (`COLUMNS (id, b)`) no longer inserts into an object renaming them (it wrote
+every column unchecked). Unchanged (spec 146): a role whose own grants leave no column still contributes its ROWS to
+a verb's union with other roles - BACKLOG. A grant written over a list it matched and left
 narrowing to none by a later `SET COLUMNS` refuses the same way; `acl_check_catalog` does not name it yet.
 
 ## Tests
