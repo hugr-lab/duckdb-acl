@@ -156,8 +156,14 @@ The four clauses after `AS <phys>` come in any order, each once. A `COLUMNS` ite
 | `name`                     | expose the physical column                                                                   |
 | `new_name = column`        | rename                                                                                       |
 | `name = <expression>`      | a mask (`ssn = NULL`) or a computed column (`total = amount * 2`), evaluated over the physical row |
-| `name NOT NULL` / `name NULL` | expose and declare nullability (spec 048); `name = <expr> NOT NULL` is the promise that lets a masked column be a key |
-| `"odd name"`               | a quoted identifier means the name it quotes (spec 065); a quoted name containing `,` or `=` is refused |
+| `<expression> AS name`     | the same as `name = <expression>`, in SQL's spelling                                         |
+| `name NOT NULL` / `name NULL` | expose and declare nullability (spec 048); `name = <expr> NOT NULL` (or `<expr> NOT NULL AS name`, `<expr> AS name NOT NULL`) is the promise that lets a masked column be a key - `IS NOT NULL` stays the expression's |
+| `"odd name"`               | a quoted identifier means the name it quotes (spec 065), `,` or `=` in it included; a quoted name holding `.` or `[` is refused - the list reads it as a path into a column |
+
+Each name is an identifier as duckdb reads one (quote a keyword or a name holding other characters), each expression one
+duckdb expression - so `['a', 'b']`, `{'k': 1}`, `$$x,y$$` and a lambda are read as duckdb reads them. The legacy quoted
+form `COLUMNS '<list>'`, `SET COLUMNS '<list>'`, `REMAP` and the function forms (`acl_add_relation`,
+`acl_alter_relation`) read their text with the same reader; there a comment is refused (spec 150 4f).
 
 A mask, a computed column and an `RLS` predicate are each **one SQL expression**: text with a comment left open, an
 alias, a parameter or a clause after it (`FROM`, `WHERE`, a second statement) is refused where it is written (spec

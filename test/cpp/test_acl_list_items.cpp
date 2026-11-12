@@ -13,6 +13,7 @@
 using namespace acl_test;
 using duckdb::Parser;
 using duckdb::ParserOptions;
+using duckdb::acl::SplitDeclaredColumns;
 using duckdb::acl::SplitListItems;
 
 namespace {
@@ -139,6 +140,49 @@ void StoredWithComment() {
 	Check(items.size() == 2 && items[1].text == "x(], ssn", "a closer of another bracket does not end a (");
 }
 
+//! spec 150 4f: an object's declared list - `name`, `name = expr`, `expr AS name`, the NULL marks - on duckdb's tokens
+std::string Declared(const std::string &list) {
+	std::string out;
+	for (auto &column : SplitDeclaredColumns(list, "the list")) {
+		out += "[" + column.name + "|" + column.expr + "|" + std::to_string(column.nullable) + "]";
+	}
+	return out;
+}
+
+bool Refused(const std::string &list) {
+	try {
+		SplitDeclaredColumns(list, "the list");
+	} catch (std::exception &) {
+		return true;
+	}
+	return false;
+}
+
+void DeclaredColumns() {
+	std::vector<std::pair<std::string, std::string>> cases = {
+	    {"id, name", "[id||-1][name||-1]"},
+	    {"id NOT NULL, note NULL", "[id||0][note||1]"},
+	    {"k = id + 1 NOT NULL, v = x IS NOT NULL, w = NULL", "[k|id + 1|0][v|x IS NOT NULL|-1][w|NULL|-1]"},
+	    {"upper(ssn) AS u, cast(x AS INT) AS y", "[u|upper(ssn)|-1][y|cast(x AS INT)|-1]"},
+	    {"id + 0 NOT NULL AS z, x AS y NOT NULL", "[z|id + 0|0][y|x|0]"},
+	    {"\"odd name\", \"a,b\" NOT NULL, \"x\"\"y\" = 1", "[odd name||-1][a,b||0][x\"y|1|-1]"},
+	    {"x AS \"As\", 'a,b' AS s", "[As|x|-1][s|'a,b'|-1]"},
+	    {"s . x, items [ ] . price, s.y", "[s.x||-1][items[].price||-1][s.y||-1]"},
+	    {"t = ['a', 'b'], m = MAP {'k': 1}, d = $$x,y$$", "[t|['a', 'b']|-1][m|MAP {'k': 1}|-1][d|$$x,y$$|-1]"},
+	    {"odd name", "[odd name||-1]"},
+	};
+	for (auto &entry : cases) {
+		auto got = Declared(entry.first);
+		Check(got == entry.second, "declared " + entry.first + " -> " + got);
+	}
+	Check(Refused("id -- note"), "a comment is refused");
+	Check(Refused("id, /* x */ y"), "a closed comment is refused");
+	Check(Refused("id, 'open"), "an open literal is refused");
+	Check(Refused("\"a.b\""), "a quoted name holding . is refused");
+	Check(Refused("x AS \"a[1]\""), "a quoted name holding [ is refused");
+	Check(Refused("= 1"), "an item naming nothing is refused");
+}
+
 } // namespace
 
 int main() {
@@ -146,6 +190,7 @@ int main() {
 	NamedItems();
 	Edges();
 	StoredWithComment();
+	DeclaredColumns();
 	if (failures) {
 		std::cout << failures << " FAILED\n";
 		return 1;

@@ -122,6 +122,10 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     (`GrantUnion::Add` merges one role's duplicates as two roles'), while `"ssn" = 'm'` beside `ssn` reads masked (the
     tree path) and the screens say masked. 4e refuses such a list where written; the stored rows are not re-judged -
     decide whether the read should take the narrower reading (found by 4e's second re-review).
+  - A physical column whose name holds `.` or `[` (Parquet's `odd.col`) cannot be declared in an object's own
+    `COLUMNS`: a stored declared name is read as a path when it holds one, so spec 150 4f refuses `"a.b"` there (before
+    4f it declared the path `a.b`, which read nothing). An object without a list, or a grant's list (where such a name
+    is stored quoted), exposes it; decide whether `relation_columns` should store a quoted name.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

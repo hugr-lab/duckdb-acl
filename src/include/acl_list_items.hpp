@@ -41,6 +41,22 @@ struct ListItemText {
 //! it holds a comment (both what a writer refuses)
 vector<ListItemText> SplitListItems(const string &text, bool *open = nullptr, bool *comment = nullptr);
 
+//! One item of an object's declared column list (spec 150 4f): the column's name, its expression ('' = the source's
+//! column as it is) and its nullability mark (spec 048: -1 none, 0 NOT NULL, 1 NULL)
+struct DeclaredColumnText {
+	string name;
+	string expr;
+	int8_t nullable = -1;
+};
+
+//! An object's declared column list (CREATE VIRTUAL TABLE ... COLUMNS, SET COLUMNS, REMAP, the function forms) read on
+//! duckdb's tokens: the items as `SplitListItems` splits them (a `$...$` string or a backtick name included - no stored
+//! row of this list is text), `name = expr` or `expr AS name` (the last `AS` outside every bracket), a trailing `NOT
+//! NULL` / `NULL` after a name and `NOT NULL` after an expression (never `IS NOT NULL`) a mark, one quoted name the
+//! name it quotes. Refused: a comment or a text ending inside a literal or a quoted name, a quoted name holding `.` or
+//! `[` (the object's list reads it as a path), an item that names nothing. `what` names the list in the refusal
+vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what);
+
 //! Whether a column's name may be stored bare in a list (spec 150 4e): it reads back as one item that is itself - no
 //! `,` / `=` / bracket or quote that the split reads otherwise, no comment, no space at an end - and not as a path (no
 //! `.` / `[`, no leading `"`). Otherwise a writer quotes it, and the path reader takes the quotes off

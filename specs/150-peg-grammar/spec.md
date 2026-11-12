@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a-4e implemented)
+- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a-4f implemented)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -582,8 +582,30 @@ compiler; `AdminScanner` went with 4c.
   upper(nosuch)` was repaired to `id, ssn` - the column unmasked); it drops every item of the column now
   (`Without` by `MatchKey`). A list naming a column twice (`ssn, ssn = 'm'`) is refused where written: a catalog
   grant's list is stored as written and its read let the bare item win (stored rows: BACKLOG).
-- 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
-  `ScannerUnreadable` go.
+- 4f (built): an object's own column list - `COLUMNS` of `CREATE VIRTUAL TABLE` / `ADD TABLE` / `SET COLUMNS`, and
+  `REMAP` - is a rule (`AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue`, each `AclDeclaredColumn <-
+  AclDeclaredAs / AclDeclaredNamed`: `Expression 'AS' AclNameToken AclColumnMark?` or `AclFieldPath AclDeclaredValue?
+  AclColumnMark?`, a value `'=' Expression`, a mark `'NOT'? 'NULL'`). duckdb's PEG has no lookahead (`!` is ignored),
+  so the AS form is tried first: a name alone reads as an expression too, and only the AS form reads past it; after a
+  value the mark is the expression's own `x NOT NULL` (duckdb's `IsTest`), taken off by the reader as spec 048 always
+  did. The rule judges the shape and hands the list as written (each comment a space, any literal) to the ONE reader of
+  an object's list, `SplitDeclaredColumns` (acl_list_items.cpp, beside `SplitListItems`): the items on duckdb's tokens
+  (never the old reading - no stored row of this list is text, `relation_columns` keeps a row per column), `name =
+  expr`, `expr AS name` at the last `AS` outside every bracket, `NOT NULL` after a name or an expression (never `IS NOT
+  NULL`) and `NULL` after a name a mark (`expr NOT NULL AS name`, as the text reader read it, and now `expr AS name NOT
+  NULL`), one quoted name the name it quotes, a path written with spaces joined (`s . x` - a lone `.` is a number token
+  to duckdb's tokenizer). The function forms (`acl_add_relation`, `acl_alter_relation`, `acl_grant_table`), REMAP
+  (`acl_repair_relation`) and the author's body gate (`AuthorizeBodies` / `WalkBodyCalls`: `BodyShape::DECLARED_COLUMNS`
+  beside a grant's `COLUMNS`) read with it, so a statement and a function call mean one thing. Changed: a quoted name
+  holding `,` or `=` is the name it quotes (`"a,b"` was refused - the text reader split it); `$$x,y$$`, `['a', 'b']`,
+  `{…}` are one expression (refused or split before); the function form's `"odd name"` is `odd name` (it was stored
+  with its quotes and read nothing - spec 065 fixed only the statement form); a quoted name holding `.` or `[` is
+  refused (it declared the path `a.b`, which read nothing - BACKLOG); a caller's text holding a comment is refused (spec
+  148's rule, as 4e did for a grant's); a REMAP item carrying a NULL mark is refused (`u = ssn NOT NULL` remapped `u` to
+  a boolean). `UnquoteColumnsList` goes (a grant's legacy quoted list keeps its own, now on tokens -
+  `UnquoteGrantColumns`; `TextKind` is `GRANT_COLUMNS` / `TEXT`); `JudgeListText` / `ScannerUnreadable` stay for the
+  quoted claims list and a grant's quoted list, whose readers they guard. Tests: `test_acl_list_items.cpp`
+  (`DeclaredColumns`), `acl_mgmt_grammar.test` (the 4f section), `acl_listing_truth.test`.
 
 **Hand-written readers left outside stage 4** (the owner, 2026-11-06: reuse duckdb's grammar wherever it applies -
 an inventory of `src/`, each with its verdict; the REPLACE ones are the next work after stage 4):

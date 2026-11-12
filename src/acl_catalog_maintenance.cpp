@@ -1298,7 +1298,14 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		if (spec.empty()) {
 			throw BinderException("acl admin: REMAP needs a list: name = expression, ...");
 		}
-		for (auto &item : ParseColumnList(spec)) {
+		for (auto &column : SplitDeclaredColumns(spec, "the REMAP list")) {
+			if (column.nullable >= 0) {
+				// a mark is the declaration's (spec 048); in a REMAP `x NOT NULL` would be taken off the expression
+				throw BinderException("acl admin: REMAP item \"%s\" carries a NULL mark - REMAP changes an expression; "
+				                      "SET COLUMNS declares nullability",
+				                      column.name);
+			}
+			std::pair<string, string> item {column.name, column.expr};
 			if (item.second.empty()) {
 				throw BinderException("acl admin: REMAP item \"%s\" states no expression (expected name = expression)",
 				                      item.first);
