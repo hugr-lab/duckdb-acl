@@ -590,8 +590,8 @@ void OptionalParensInto(ListParseResult &list, idx_t index, idx_t arg, MgmtParse
 }
 
 //! `AclList <- AclParenList / AclQuotedValue` into argument `arg`: a list as written, or the legacy quoted string -
-//! both to the compiler's reader of that kind (a quoted claims list is the stored csv as it stands); `sql` for a
-//! list duckdb's parser reads (an RLS predicate), which may hold any literal
+//! both to the compiler's reader of that kind; `sql` for a list duckdb's parser reads (an RLS predicate), which may
+//! hold any literal
 void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg, MgmtParsed::TextKind kind, bool sql,
               const char *what, MgmtParseData &data) {
 	auto &node = Strip(result);
@@ -608,19 +608,70 @@ void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg
 	}
 	MgmtParseData::Span span;
 	span.arg = arg.GetIndex();
-	// a quoted claims list is the stored csv as it stands; a columns list goes to its reader - both split by readers
-	// of ours, judged as the compiler's text is
-	span.kind = kind == MgmtParsed::TextKind::CLAIMS ? MgmtParsed::TextKind::TEXT : kind;
+	// a quoted columns list goes to its reader, split by a reader of ours - judged as the compiler's text is
+	span.kind = kind;
 	span.judge = kind != MgmtParsed::TextKind::TEXT;
-	span.what = kind == MgmtParsed::TextKind::CLAIMS ? "claims list" : "columns list";
+	span.what = "columns list";
 	span.resolved = true;
 	span.text = entry.value;
 	data.spans.push_back(std::move(span));
 }
 
-//! `AclClaims <- AclParenList / AclQuotedValue` into argument `arg`
+string AttrNameOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data);
+string ValueTextOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data);
+vector<reference<ParseResult>> ListEntries(ParseResult &result);
+
+//! `AclClaims <- AclClaimItems / AclParenList / AclQuotedValue` into argument `arg` (spec 150 4d): the claims as the
+//! csv the admin functions read (`ParseClaims`, the one reader of a list's text - the quoted form and the function
+//! forms): `AclClaimItems <- '(' AclClaimEntry AclClaimMore* ')'`, each `AclClaimItem <- AclAttrName '=' AclValue` -
+//! the name as an attribute's (the claim RLS reads), the value a word, words joined by `.`, a signed number or quoted,
+//! as written; an empty item none. The quoted form is that csv as it stands
 void ClaimsInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, MgmtParseData &data) {
-	ListInto(transformer, result, arg, MgmtParsed::TextKind::CLAIMS, false, "claims list", data);
+	auto &node = Strip(result);
+	if (node.Name() == "AclParenList") {
+		throw BinderException("acl admin: a claims list is name = value items - a name one word or quoted "
+		                      "(\"custom:tenant\", \"a.b\"), a value a word, words joined by '.', a signed number or "
+		                      "quoted ('eu-west')");
+	}
+	if (node.Name() != "AclClaimItems") {
+		// the quoted csv as it stands, split by its reader - judged as a quoted columns list is
+		QuotedValue entry;
+		entry.value = ValueOf(transformer, node, entry.offset);
+		entry.what = "claims list";
+		data.quoted.push_back(entry);
+		MgmtParseData::Span span;
+		span.arg = arg;
+		span.kind = MgmtParsed::TextKind::TEXT;
+		span.judge = true;
+		span.what = "claims list";
+		span.resolved = true;
+		span.text = entry.value;
+		data.spans.push_back(std::move(span));
+		ParseClaims(entry.value); // refused at parse, the batch whole - not at its call, after the calls before it
+		return;
+	}
+	vector<string> entries;
+	for (auto &item : ListEntries(node)) {
+		auto &claim = item.get().Cast<ListParseResult>();
+		auto name = AttrNameOf(transformer, claim.GetChild(0), "a claim", data);
+		auto trimmed = name;
+		StringUtil::Trim(trimmed);
+		if (trimmed != name) {
+			// the csv's reader trims a name: `" t "` would be the claim `t`
+			throw BinderException("acl admin: a claim's name has no space at its ends, got \"%s\"", name);
+		}
+		// the csv's reader splits at the first `=` and at a `,` outside quotes and parentheses: a name holding one of
+		// them would be read back as other claims than written
+		if (name.find_first_of("=,'\"()") != string::npos) {
+			throw BinderException("acl admin: a claim's name holds no =, comma, quote or parenthesis, got \"%s\"",
+			                      name);
+		}
+		auto value = ValueTextOf(transformer, claim.GetChild(2), "a claim's value", data);
+		entries.push_back(name + "='" + StringUtil::Replace(value, "'", "''") + "'");
+	}
+	auto csv = StringUtil::Join(entries, ",");
+	ParseClaims(csv); // what the call will read: a claim named twice refused here, the batch whole
+	data.args[arg] = Value(csv);
 }
 
 //! `AclBody <- AclTailToken+` into argument `arg`: a body written either way - inline to the end of the statement
@@ -1948,22 +1999,29 @@ string RequireJson(PEGTransformer &transformer, ParseResult &result, MgmtParseDa
 	return "[" + StringUtil::Join(conditions, ",") + "]";
 }
 
+//! `AclAttrName <- AclWordToken / AclNameValueToken / AclQuotedValue`: the name of a claim RLS reads (an attribute's,
+//! a role's claim) - one word, a name in any script, or quoted; a dotted bare one (`a.b`, `größe.x`) is refused as the
+//! word refuses it, a blank quoted one too
+string AttrNameOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
+	auto &node = Strip(result);
+	auto name = node.Name() == "AclWordToken" || node.Name() == "AclNameValueToken"
+	                ? TokenOf(node).text
+	                : QuotedOf(transformer, node, (string(what) + "'s name").c_str(), data);
+	auto trimmed = name;
+	StringUtil::Trim(trimmed);
+	if (trimmed.empty() || (node.Name() == "AclNameValueToken" && StringUtil::Contains(name, "."))) {
+		throw BinderException("acl admin: %s's name is one word or a quoted name, got \"%s\"", what, name);
+	}
+	return name;
+}
+
 //! `AclAttributeList <- '(' AclAttributeEntry AclAttributeMore* ')'` (spec 150 4c): `name = path`, `name = (path, …)`,
 //! `name = CONSTANT 'v'` as the spec's JSON - the claims RLS reads
 string AttributesJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
 	vector<string> attributes;
 	for (auto &item : ListEntries(result)) {
 		auto &attribute = item.get().Cast<ListParseResult>();
-		auto &name_node = Strip(attribute.GetChild(0));
-		auto name = name_node.Name() == "AclWordToken" || name_node.Name() == "AclNameValueToken"
-		                ? TokenOf(name_node).text
-		                : QuotedOf(transformer, name_node, "an attribute name", data);
-		auto trimmed = name;
-		StringUtil::Trim(trimmed);
-		if (trimmed.empty() || (name_node.Name() == "AclNameValueToken" && StringUtil::Contains(name, "."))) {
-			// one name, as a word reads one (`a.b` bare is refused): a dotted one is quoted, a blank one none
-			throw BinderException("acl admin: an attribute's name is one word or a quoted name, got \"%s\"", name);
-		}
+		auto name = AttrNameOf(transformer, attribute.GetChild(0), "an attribute", data);
 		auto &value = Strip(attribute.GetChild(2));
 		if (value.Name() == "AclAttrConstant") {
 			attributes.push_back(
@@ -2642,7 +2700,6 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclNameValue <- StringLiteral / AclNameValueToken / Identifier"));
 		changes.push_back(GrammarChange::AddRule("AclListItem <- AclParenList / AclListToken"));
 		changes.push_back(GrammarChange::AddRule("AclParenList <- '(' AclListItem* ')'"));
-		changes.push_back(GrammarChange::AddRule("AclClaims <- AclParenList / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclOrReplace <- 'OR' 'REPLACE'"));
 		changes.push_back(GrammarChange::AddRule("AclIfNotExists <- 'IF' 'NOT' 'EXISTS'"));
 		changes.push_back(GrammarChange::AddRule("AclIfExists <- 'IF' 'EXISTS'"));
@@ -2901,6 +2958,12 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclAttrValue <- AclAttrConstant / AclClaimPaths / AclClaimPath"));
 		changes.push_back(GrammarChange::AddRule("AclAttrName <- AclWordToken / AclNameValueToken / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclAttribute <- AclAttrName '=' AclAttrValue"));
+		// spec 150 4d: a role's claims - named as an attribute is, each value a value
+		changes.push_back(GrammarChange::AddRule("AclClaimItem <- AclAttrName '=' AclValue"));
+		changes.push_back(GrammarChange::AddRule("AclClaimEntry <- AclClaimItem?"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMore <- ',' AclClaimEntry"));
+		changes.push_back(GrammarChange::AddRule("AclClaimItems <- '(' AclClaimEntry AclClaimMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclClaims <- AclClaimItems / AclParenList / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclAttributeEntry <- AclAttribute?"));
 		changes.push_back(GrammarChange::AddRule("AclAttributeMore <- ',' AclAttributeEntry"));
 		changes.push_back(GrammarChange::AddRule("AclAttributeList <- '(' AclAttributeEntry AclAttributeMore* ')'"));
@@ -3190,34 +3253,6 @@ string ListText(const string &text, const TokenIterator &tokens, idx_t start, id
 			                      "with a backslash and a backtick name are not read as one item here yet");
 		}
 	});
-}
-
-//! A claims list's text for the compiler's `ClaimsListToCsv`: a list's, in the words of a claims list (that reader
-//! keeps a name and an unquoted value as written - `custom:tenant`, `-1`)
-string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
-	const string prefix = "acl admin: a claims list is written as name = 'value' items - ";
-	auto refuse = [&prefix](const char *why) {
-		throw BinderException(prefix + why);
-	};
-	if (!BetweenParentheses(text, start, end)) {
-		refuse("its text does not read as written");
-	}
-	optional_ptr<const MatcherToken> previous;
-	return TokensText(
-	    text, tokens, start, end, true, false, prefix + "its text does not read as written",
-	    [&](const MatcherToken &token) {
-		    if (previous && JoinsStrings(*previous, token)) {
-			    refuse(
-			        "a value is one literal (a string continued on the next line is not read as one value here yet)");
-		    }
-		    previous = &token;
-		    if (token.type == TokenType::STRING_LITERAL && (token.text.empty() || token.text[0] != '\'')) {
-			    refuse("a value is in single quotes (E'...' and $$...$$ are not read as one value here yet)");
-		    }
-		    if (!token.text.empty() && token.text[0] == '`') {
-			    refuse("a backtick name is not read as one name here");
-		    }
-	    });
 }
 
 //! Why a list reader of ours cannot read the tokens in [start, end) as written, '' when it can: its scanner knows
@@ -3881,8 +3916,6 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				} else if (span.body) {
 					value = BodyText(text, tokens, span.start, span.end, span.what);
 					JudgeBody(value, span.what, span.expression, options);
-				} else if (span.kind == MgmtParsed::TextKind::CLAIMS) {
-					value = ClaimsListText(text, tokens, span.start, span.end);
 				} else {
 					value = ListText(text, tokens, span.start, span.end, span.sql);
 				}

@@ -481,8 +481,8 @@ duckdb's tokens - since 3g-3c nothing is compiled from text). 3a: KILL SESSION, 
 SESSION … AUDIT LEVEL, PROFILE SESSION, DRAIN / RESUME NODE, MIGRATE POLICY CATALOG. 3b: CREATE / ALTER / DROP ROLE,
 GRANT / REVOKE ADMIN, [DROP] MAP, SET / RESET SESSION VIEW AS - the compiler's values on duckdb's tokens
 (`AclTokenMatcher`: a word - the run of tokens the tokenizer split at a leading digit -, a quoted name, a dotted name
-judged whole, a list item; `AclName`, `AclNameValue`, a claims list for `ClaimsListToCsv` as written with each comment
-a space). 3c: the virtual catalog's objects - CREATE / ALTER / COMMENT ON / ANALYZE / DROP VIRTUAL …, DROP RELATION |
+judged whole, a list item; `AclName`, `AclNameValue`, a claims list as written with each comment a space -
+its own rule since 4d). 3c: the virtual catalog's objects - CREATE / ALTER / COMMENT ON / ANALYZE / DROP VIRTUAL …, DROP RELATION |
 [VIRTUAL] REFERENCE, CHECK, REPAIR, the ADD forms - `AclPathToken` (a path judged whole into its canonical key),
 `AclPathName`, `AclList` (a list as written, each comment a space), `AclBody` (one plain quoted token its value, else
 its tokens' text as written). 3d: GRANT / REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT, ALTER GRANT (`WITH (…)` a
@@ -504,7 +504,7 @@ function's one part by its function mask; nothing of ours on top; a refusal name
 stays the scanner's word, `ToGrammar` quotes as `KeywordHelper::RequiresQuotes`, every revoke of nothing refused
 (`ThrowNothingToRevoke`), `PlainColumnName` = duckdb's parser; 4b built: a group's limits are a rule (`AclLimits`,
 `LimitsJson`); 4c built: a client's lists are rules (`AclItems`, `AclRequireList`, `AclAttributeList`, `AclClaimMapList`;
-`AdminScanner` gone); 4e reads a mask with duckdb's `Expression` and splits
+`AdminScanner` gone); 4d built: a role's claims are a rule (`AclClaimItems`; `ParseClaims` the one csv reader); 4e reads a mask with duckdb's `Expression` and splits
 a stored list on duckdb's tokens; spec 150 lists the hand-written readers left, each replace / keep). Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`, `test_acl_mgmt_rules.cpp`.
 

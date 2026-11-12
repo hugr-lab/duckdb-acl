@@ -110,6 +110,9 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     116); a token's role claims match the same way (`Admin` reaches role `admin`). Today roles compare exactly
     everywhere but the role mappings' duplicate check and DROP MAP (case-insensitive) and the memory store's platform
     grants - one rule for all of them, with the migration step that refuses existing case collisions.
+  - An issuer whose URL comes from its `oidc_issuer` secret cannot be moved back to a URL of its own by `ALTER ISSUER`
+    (found 2026-11-06 by acl-clients spec 008): `SET URL '…'` is refused as both, `DROP FROM SECRET` as no URL - the
+    move the other way is one statement (`SET URL '' FROM SECRET s`), the way back has no form.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

@@ -251,6 +251,11 @@ const char *MetadataSurfaceOf(const string &name);
 //! first `coalesce(a, b)` - and breaks it silently, into two nonsense entries.
 vector<string> SplitTopLevel(const string &text, char delimiter);
 
+//! A role's claims csv `name='value',...` (spec 150 4d: the one reader of a claims list's text - the quoted form, the
+//! function forms, and what the list rule writes): each item names its claim once in any case, a quoted value is one
+//! '...' literal (quotes doubled inside), an unquoted one its text
+case_insensitive_map_t<string> ParseClaims(const string &csv);
+
 //! Whether a column list renames and nothing else - every entry is `virtual = <plain column>`. Such a
 //! list keeps a relation in the writable alias form; anything else (a mask, a computed column) makes
 //! it a read-only subquery. Since spec 029 both restrict alike, so this decides writability only -
