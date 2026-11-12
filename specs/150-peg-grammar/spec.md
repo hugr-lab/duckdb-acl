@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a, 4b implemented)
+- **Status**: accepted; stages 1-3 implemented (stage 3: 3a-3g), stage 4 in progress (4a, 4b, 4c implemented)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -147,8 +147,8 @@ unterminated comment the split drops) is refused whole - never run without it. V
 tokens - one plain quoted literal (an empty `''` passes, as it did: the function judges it; `""` is a zero-length
 identifier the tokenizer refuses), a level a bare word. hugr-node's registered forms
 (`RegisterMgmtGrammar`, spec 126) take the legacy path unchanged. The text checks that tell a management batch from
-native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` and `SplitBatchText` gone); 3g-3 drops
-`AdminScanner`.
+native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` and `SplitBatchText` gone); 3g-3 drops the
+compiler; `AdminScanner` went with 4c.
 
 - 3a (built): the grammar, the legacy path, and the operations of a node - `KILL SESSION '<id>'`,
   `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`, `PROFILE SESSION CURRENT|'<id>' ON|ALL|SAMPLED|OFF`, `DRAIN NODE`,
@@ -273,7 +273,7 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   are read with their values and refused in their own words (never written into the policy). The spec JSON is built
   in the transform; a parenthesised list inside it (`AUDIENCES (…)` and the other value lists, `REQUIRE`,
   `ATTRIBUTES`, `CLAIM MAP`) is a marker the list's reading replaces once the tokens are known
-  (`MgmtParsed::TextArg::splice`, a control character no JSON value holds raw) - the compiler's readers
+  (`MgmtParsed::TextArg::splice`, a control character no JSON value holds raw; until 4c made the lists rules) - the compiler's readers
   (`ListItemsJson`, `RequireJson`, `AttributesJson`, `ClaimMapToJson`) on the list as written, each comment a space,
   the lists' literal rule. Fixed with the move (3c's review): `ClaimMapToJson` quotes each side as JSON and splits at
   an `=>` outside quotes - it pasted the sides, so `('x' => 'a", "groups": "tenant')` stored a second, hidden
@@ -426,7 +426,7 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
       words by `RefuseUnreadStatement`, chosen by its head on duckdb's tokens (`HeadWords` over `ReadStatementHeads`)
       as the compiler chose them - a module's by its usage, a tokenizer refusal still first. `AdminScanner` stays as
       the readers of a statement's lists (REQUIRE / ATTRIBUTES, a column list, a claim map, limits - handed their text
-      by the rules): they become rules with stage 4 (limits: 4b), as do their checks (`JudgeListText`, `ScannerUnreadable`, once
+      by the rules): they become rules with stage 4 (limits: 4b; a client's lists and AdminScanner itself: 4c), as do their checks (`JudgeListText`, `ScannerUnreadable`, once
       `JudgeLegacyText`); its members only the statement compiler used go. The batch reader stops at the first
       statement no rule reads (the batch is refused there: reading on cost a failed match - duckdb renders the batch's
       tokens for each - per statement after it, 32,000 of them 20 s); under the `ACL` marker a CREATE / ALTER / DROP
@@ -490,8 +490,26 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   `std::stoll`'s exceptions out (a quoted `'-'`, 20 digits), a size past int64 (`batch_bytes 10000000TB`) threw an
   internal error that invalidated the database, and a JSON integer past int64 wrapped (`18446744073709551615` stored
   -1) - each a refusal naming the limit now.
-- 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
-  ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
+- 4c (built): a client's lists are rules (`AdminScanner`, `ListItemsJson`, `RequireJson`'s and `AttributesJson`'s
+  text readers, `ClaimMapToJson`, the spec-JSON markers `TextArg::splice` and the text kinds ITEMS / REQUIRE /
+  ATTRIBUTES / CLAIM_MAP go). A value (`AclValue`: a word, words joined by `.`, a signed number, a quoted one, any
+  of the three quotes) in `AclItems` (AUDIENCES, AZP, FLOWS, ROLES FROM / CONSTANT, SUBJECT), a claim path
+  (`AclClaimPath`: words joined by `.`, a name in any script - `größe` now reads in REQUIRE too -, a quoted path), REQUIRE's
+  four conditions (`AclRequireContains` / `In` / `Like` / `Eq`), ATTRIBUTES' `name = path | (paths) | CONSTANT 'v'`
+  (the name a word or quoted), CLAIM MAP's `path => claim` (duckdb's own `=>` token) - read into the spec's JSON in
+  the transform (`ItemValues`, `RequireJson`, `AttributesJson`, `ClaimMapJson`; the empty item and an empty value
+  none, as the text readers took them). The legacy quoted forms stay (a csv of audiences, a CLAIM MAP's JSON, one
+  quoted SUBJECT path). A parenthesised list that reads as none of them is refused in its own words (`RefuseList`,
+  the fallback alternative `AclParenList`). What reads differently: a bare value is one of those forms - the text
+  readers took anything between commas (`acme-prod`, `custom:tenant` bare; the survey of the four repositories
+  found every such value quoted); a backtick value reads; a `$$…$$` / joined string is refused by the plain-literal
+  check's words; two literals with no separator (`('a' 'b')`, 3e's open item) are refused. A REQUIRE path is never a
+  single-quoted string (`AclRequirePath`), as the text reader took it - `'v' …` is the contains form (the review
+  found `'admin' IN (groups)` read as the path `admin`); a quoted path is double-quoted or backticked. The legacy csv
+  (`CsvItemsJson`: a quoted `'a,b'` split at commas) stays the 3e form. Also from the reviews: a list's value is
+  trimmed inside its quotes (`' r '` is `r`), as `ListItemsJson` did - an `IN` value is compared as written, as
+  before; `name = CONSTANT` with its value missing is refused (it read as the path `CONSTANT` - the constant from the
+  token); an attribute name is a word, a name in any script, or quoted.
 - 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
 - 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
   takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,

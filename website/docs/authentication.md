@@ -165,7 +165,7 @@ ACL ADMIN CREATE CLIENT etl ISSUER github AUDIENCES ('acl-node')
 | --- | --- |
 | `AUDIENCES (…)` | **required** (here or in the client's secret); the token's `aud` must intersect |
 | `AZP (…)` | the token's `azp` must be one of them (an Entra v1 token, `ver` 1.0, names it `appid`) |
-| `REQUIRE (…)` | all must hold: `path = 'v'` (or a bare `true` / number), `path IN ('a', …)`, `'v' IN path` (an array claim contains it), `path LIKE 'p%'` - SQL's `LIKE`: `_` is any one character too, there is no escape |
+| `REQUIRE (…)` | all must hold: `path = 'v'` (or a bare word or number), `path IN ('a', …)`, `'v' IN path` (an array claim contains it), `path LIKE 'p%'` - SQL's `LIKE`: `_` is any one character too, there is no escape |
 | `ROLES FROM (…)` | claim paths whose values are role candidates (the union; a string or an array each) |
 | `ROLES CONSTANT (…)` | roles every token of the client gets |
 | `UNMAPPED IGNORE` / `UNMAPPED AS ROLE` | what an unmapped candidate does; an explicit client defaults to `IGNORE` |
@@ -177,8 +177,10 @@ ACL ADMIN CREATE CLIENT etl ISSUER github AUDIENCES ('acl-node')
 | `FROM SECRET s [IN c]` | an `oidc_client` secret: `AUDIENCES`, `CLIENT_ID`, `CLIENT_SECRET` |
 
 A claim path is first looked up as one key (Entra's URL-shaped claim names), then walked as a dot
-path - so a top-level claim spelled `a.b` wins over a nested `a` → `b`. A bare object name is a word
-(letters, digits, `_`); quote a name with `-` or `.` in it. A client without `FLOWS` only accepts tokens - an external application or a CI job.
+path - so a top-level claim spelled `a.b` wins over a nested `a` → `b`. A claim's value is compared
+as text (a boolean claim reads `true`, a number as it is written); a value in these lists is written
+as [management-sql.md says](management-sql.md#issuers-and-clients) - a word, dotted words, a number or
+a quoted string, anything else quoted (`'svc-1'`). A client without `FLOWS` only accepts tokens - an external application or a CI job.
 `ALTER CLIENT c SET <clauses>` / `DROP FROM SECRET` change it; `DROP CLIENT c` removes it with its
 mappings; an issuer with explicit clients is dropped only after them.
 

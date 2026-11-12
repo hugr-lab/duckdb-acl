@@ -1612,8 +1612,8 @@ SELECT audiences FROM acl_clients() WHERE name = 'svc';
 ----
 ["api://svc2","api://svc3"]
 
-# REQUIRE and ATTRIBUTES take parentheses; a list's items are plain literals - a bare word, `""`, a $$…$$ string and
-# a string continued on the next line (duckdb joins `'api://'⏎'x'`, the list's reader stored the line break) refused
+# REQUIRE and ATTRIBUTES take parentheses; a list's items are plain literals - a bare word outside a list, `""`, a
+# $$…$$ string and a string continued on the next line (duckdb joins `'api://'⏎'x'`) refused
 statement error
 ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') REQUIRE 'sub = x';
 ----
@@ -1637,24 +1637,24 @@ zero-length delimited identifier
 statement error
 ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ($$x$$);
 ----
-a list is written with '...' literals
+expected audiences, quoted
 
 statement error
 ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') REQUIRE (sub = $$x$$);
 ----
-a list is written with '...' literals
+expected a value, quoted
 
 statement error
 ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('api://'
 'x');
 ----
-a string continued on the next line
+expected audiences, quoted
 
 statement error
 ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLES FROM ('rol' -- a note
 'es');
 ----
-a string continued on the next line
+expected claim paths, quoted
 
 statement error
 ACL ADMIN CREATE ROLE never CLAIMS (tenant = 'ac'
@@ -2761,3 +2761,144 @@ ACL ADMIN DROP RESOURCE GROUP lim4b2;
 
 statement ok
 ACL ADMIN DROP RESOURCE GROUP lim4b;
+
+# --- stage 4c: a client's lists are rules (a value a word, words joined by `.`, a number, quoted) --------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/d' AUDIENCES ('api://kc') ROLE CLAIM 'roles';
+
+statement ok
+ACL ADMIN CREATE CLIENT lists4c ISSUER 'test/idp/d' CLIENT ID 'lists4c' AUDIENCES ('api://a', , `b`) FLOWS (authcode, device)
+ROLES FROM (realm_access.roles, 'groups', größe) SUBJECT (email, "sub")
+REQUIRE (email_verified = TRUE, level IN (1, -2), 'admin' IN groups, sub LIKE 'x%', tier = gold, größe = 'x', "quoted.path" = 'v')
+ATTRIBUTES (tenant = tid, mail = (upn, 'email'), org = CONSTANT 'acme', "Odd" = a.b);
+
+query IIIII
+SELECT audiences, flows, roles_from, subject, attributes FROM acl_clients() WHERE name = 'lists4c';
+----
+["api://a","b"]	["authcode","device"]	["realm_access.roles","groups","größe"]	["email","sub"]	[{"name":"tenant","paths":["tid"]},{"name":"mail","paths":["upn","email"]},{"name":"org","constant":"acme"},{"name":"Odd","paths":["a.b"]}]
+
+query I
+SELECT requires FROM acl_clients() WHERE name = 'lists4c';
+----
+[{"path":"email_verified","op":"eq","values":["true"]},{"path":"level","op":"in","values":["1","-2"]},{"path":"groups","op":"contains","values":["admin"]},{"path":"sub","op":"like","values":["x%"]},{"path":"tier","op":"eq","values":["gold"]},{"path":"größe","op":"eq","values":["x"]},{"path":"quoted.path","op":"eq","values":["v"]}]
+
+# CLAIM MAP's sides are claim paths, the legacy JSON string stays; a legacy csv of audiences and one quoted SUBJECT path
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/d' SET CLAIM MAP (tid => tenant, 'x.y' => "z", a.b => c);
+
+query I
+SELECT attributes FROM acl_clients() WHERE name = 'test/idp/d';
+----
+[{"name":"tenant","paths":["tid"]},{"name":"z","paths":["x.y"]},{"name":"c","paths":["a.b"]}]
+
+statement ok
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES 'a,b' SUBJECT 'preferred_username' REQUIRE ();
+
+query III
+SELECT audiences, subject, requires IS NULL FROM acl_clients() WHERE name = 'lists4c';
+----
+["a","b"]	["preferred_username"]	true
+
+# anything else is quoted - refused saying how a list's items are written
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET REQUIRE (sub = svc-1);
+----
+a REQUIRE condition is path = value
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET REQUIRE (sub ~ 'x');
+----
+a REQUIRE condition is path = value
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES (acme-prod);
+----
+audiences are a list of values
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (tenant);
+----
+an attribute is name = path
+
+statement error
+ACL ADMIN ALTER ISSUER 'test/idp/d' SET CLAIM MAP (tid tenant);
+----
+a claim mapping is <jwt path> => <claim>
+
+# a REQUIRE path is never single-quoted: `'v' …` is the contains form, `'admin' IN (groups)` no path admin
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET REQUIRE ('admin' IN (groups));
+----
+a REQUIRE condition is path = value
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET REQUIRE ('v' = x);
+----
+a REQUIRE condition is path = value
+
+# CONSTANT with its value missing is no path (the constant would come from the token's claim `CONSTANT`)
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (org = CONSTANT);
+----
+CONSTANT takes its value
+
+# (an empty value is none, as the model takes it)
+statement ok
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (org = "constant") REQUIRE (t IN ('x', ''));
+
+query II
+SELECT attributes, requires FROM acl_clients() WHERE name = 'lists4c';
+----
+[{"name":"org","paths":["constant"]}]	[{"path":"t","op":"in","values":["x"]}]
+
+# a list's value is trimmed inside its quotes, as the text reader took it; an attribute name in any script reads bare
+statement ok
+ACL ADMIN ALTER CLIENT lists4c SET ROLES CONSTANT (' r ') ATTRIBUTES (größe = 'g');
+
+query II
+SELECT roles_constant, attributes FROM acl_clients() WHERE name = 'lists4c';
+----
+["r"]	[{"name":"größe","paths":["g"]}]
+
+# an attribute's name is one name: a dotted one in any script is quoted, a blank one none
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (größe.x = 'x');
+----
+an attribute's name is one word or a quoted name
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (' ' = 'x');
+----
+an attribute's name is one word or a quoted name
+
+# two literals with no separator are no list
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ('a' 'b');
+----
+audiences are a list of values
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ($$x$$);
+----
+expected audiences, quoted ('...', "..." or `...`) as one plain literal
+
+statement ok
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ('acme-prod', 'custom:tenant' /* a comment beside it */);
+
+query I
+SELECT audiences FROM acl_clients() WHERE name = 'lists4c';
+----
+["acme-prod","custom:tenant"]
+
+# the legacy CLAIM MAP JSON string stays
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/d' SET CLAIM MAP '{"oid": "user_id"}';
+
+query I
+SELECT attributes FROM acl_clients() WHERE name = 'test/idp/d';
+----
+[{"name":"user_id","paths":["oid"]}]
+
+statement ok
+ACL ADMIN DROP CLIENT lists4c; DROP ISSUER 'test/idp/d';
