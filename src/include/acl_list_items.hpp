@@ -47,6 +47,8 @@ struct DeclaredColumnText {
 	string name;
 	string expr;
 	int8_t nullable = -1;
+	//! the name was written as one quoted name (`"odd name"`) - its quotes taken off
+	bool quoted = false;
 };
 
 //! An object's declared column list (CREATE VIRTUAL TABLE ... COLUMNS, SET COLUMNS, REMAP, the function forms) read on

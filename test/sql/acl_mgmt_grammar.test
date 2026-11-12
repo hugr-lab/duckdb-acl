@@ -3652,6 +3652,19 @@ ACL ADMIN REPAIR VIRTUAL TABLE c4f.r REMAP (u = ssn NOT NULL);
 ----
 carries a NULL mark
 
+# a name only 4f lets an object declare (`"a,b"`) is grantable on its own: the write's check compares the item's column,
+# its quotes off (it compared the quoted text and refused the list as matching nothing)
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c4f.odd AS phys.main.t4f COLUMNS (id, "a,b");
+
+statement ok
+ACL ADMIN GRANT TABLE c4f.odd TO ROLE r4f WITH (select) COLUMNS ("a,b");
+
+query I
+ACL ROLE "r4f" SELECT * FROM odd;
+----
+6
+
 # the check's repair text names a column as the rule reads one: quoted when it must be, so it runs pasted
 statement ok
 CREATE TABLE phys.main.t4f_gone ("odd name" INTEGER, "order" INTEGER, id INTEGER);

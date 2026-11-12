@@ -170,6 +170,12 @@ void DeclaredColumns() {
 	    {"s . x, items [ ] . price, s.y", "[s.x||-1][items[].price||-1][s.y||-1]"},
 	    {"t = ['a', 'b'], m = MAP {'k': 1}, d = $$x,y$$", "[t|['a', 'b']|-1][m|MAP {'k': 1}|-1][d|$$x,y$$|-1]"},
 	    {"odd name", "[odd name||-1]"},
+	    // spec 150 4f's re-review: the alias one word and a mark after it, as the rule reads it; a backtick name
+	    // quoted; a `=` after the AS keeps the function form's raw name, as the text reader read it
+	    {"id AS NOT NULL, x AS odd name NOT NULL", "[NOT|id|1][odd name|x|0]"},
+	    {"`odd name`, id AS `k k`", "[odd name||-1][k k|id|-1]"},
+	    {"name as text = upper(a)", "[name as text|upper(a)|-1]"},
+	    {"CASE WHEN a = 1 THEN x END AS u, k = id AS y", "[u|CASE WHEN a = 1 THEN x END|-1][y|k = id|-1]"},
 	};
 	for (auto &entry : cases) {
 		auto got = Declared(entry.first);
@@ -181,6 +187,7 @@ void DeclaredColumns() {
 	Check(Refused("\"a.b\""), "a quoted name holding . is refused");
 	Check(Refused("x AS \"a[1]\""), "a quoted name holding [ is refused");
 	Check(Refused("= 1"), "an item naming nothing is refused");
+	Check(Refused("id NOT NULL AS z NULL"), "two NULL marks are refused");
 }
 
 } // namespace

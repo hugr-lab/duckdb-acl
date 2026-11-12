@@ -834,12 +834,14 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));
 			continue;
 		}
-		// spec 148: the memory store pastes this text at read too - a name as an identifier (the reader took a quoted
-		// one's quotes off, spec 150 4f), a path as written
+		// spec 148: the memory store pastes this text at read too - a quoted name quoted again (the reader took its
+		// quotes off, spec 150 4f), any other as written
 		acl_detail::RequireOneExpression("the grant's RLS", rls);
-		for (auto &column : columns) {
-			if (column.first.find_first_of(".[") == string::npos) {
-				column.first = KeywordHelper::WriteOptionallyQuoted(column.first);
+		auto written = SplitDeclaredColumns(OptionalArg(args, 3, row, ""), "the relation's column list");
+		for (idx_t i = 0; i < columns.size(); i++) {
+			auto &column = columns[i];
+			if (written[i].quoted) {
+				column.first = KeywordHelper::WriteOptionallyQuoted(column.first, '"', true);
 			}
 			acl_detail::RequireColumnName("the grant's column list", column.first);
 			acl_detail::RequireOneExpression("the grant's column list", column.second);

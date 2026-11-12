@@ -614,7 +614,11 @@ compiler; `AdminScanner` went with 4c.
   for a grant's; a REMAP item carrying a NULL mark is refused (`u = ssn NOT NULL` remapped `u` to a boolean); a bare
   keyword only a function or a type may be (`left`, `full`, `at`) is refused as a name in the parenthesised form (the
   DBeaver plugin quotes them since acl-clients' re-pin); `x=~y` without a space is refused there (the tokenizer joins
-  `=~`; write `x = ~y`), as in a grant's list. `acl_check_catalog`'s repair texts quote a column's name
+  `=~`; write `x = ~y`), as in a grant's list. From the re-review: the
+  grant writer's check (`ValidateGrantColumns`) compares an item's column by `ItemHead` (`COLUMNS ("a,b")` matched no
+  stored `a,b`); the alias is one word with a mark after it (`x AS NOT NULL` - the name `NOT`, as the rule reads it); a
+  backtick name is a quoted name; two NULL marks on one item are refused; a `=` after the AS keeps the function form's
+  raw name (`name as text = upper(a)`, as main read it). `acl_check_catalog`'s repair texts quote a column's name
   (`REMAP ("odd name" = <column>)`, `"order"`), and `RenameItems` quotes the virtual name. `UnquoteColumnsList` goes (a
   grant's legacy quoted list keeps its own, now on tokens - `UnquoteGrantColumns`; `TextKind` is `GRANT_COLUMNS` /
   `TEXT`); `JudgeListText` / `ScannerUnreadable` stay for the quoted claims list and a grant's quoted list, whose

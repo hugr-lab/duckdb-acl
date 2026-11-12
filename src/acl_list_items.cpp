@@ -265,7 +265,7 @@ string TakeMark(const string &text, bool expression, int8_t &mark) {
 
 //! A declared column's name as written: one quoted name is the name it quotes; anything else as it stands (a word, a
 //! path, the function form's raw text)
-string DeclaredName(const string &text, const char *what) {
+string DeclaredName(const string &text, const char *what, bool *quoted = nullptr) {
 	vector<MatcherToken> tokens;
 	for (auto &token : ListTokens(text, nullptr, nullptr)) {
 		if (token.type != TokenType::END_OF_INPUT && token.type != TokenType::END_OF_INPUT_AUTOCOMPLETE) {
@@ -273,9 +273,15 @@ string DeclaredName(const string &text, const char *what) {
 		}
 	}
 	string name = text;
+	auto quote = tokens.size() == 1 && !tokens[0].text.empty() ? tokens[0].text[0] : '\0';
 	if (tokens.size() == 1 && tokens[0].type != TokenType::STRING_LITERAL && tokens[0].text.size() >= 2 &&
-	    tokens[0].text[0] == '"' && tokens[0].offset == 0 && tokens[0].length == text.size()) {
-		name = StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"");
+	    (quote == '"' || quote == '`') && tokens[0].offset == 0 && tokens[0].length == text.size()) {
+		// a backtick name is a quoted name to duckdb too
+		auto doubled = string(2, quote);
+		name = StringUtil::Replace(text.substr(1, text.size() - 2), doubled, string(1, quote));
+		if (quoted) {
+			*quoted = true;
+		}
 		if (name.empty()) {
 			throw BinderException("acl admin: %s holds an item that names no column", what);
 		}
@@ -341,20 +347,42 @@ vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *
 				as = i;
 			}
 		}
+		// ... unless a top-level `=` stands after it: `name as text = upper(a)` is the function form's raw name `name
+		// as text`, as the text reader read it (the rule refuses it)
+		for (idx_t i = as.IsValid() ? as.GetIndex() + 1 : top.size(); i < top.size(); i++) {
+			if (top[i].type == TokenType::OPERATOR && top[i].text[0] == '=') {
+				as.SetInvalid();
+				break;
+			}
+		}
 		if (as.IsValid()) {
 			auto &word = top[as.GetIndex()];
-			auto named = TakeMark(Trimmed(item.text.substr(word.offset + word.length)), false, column.nullable);
-			column.name = DeclaredName(named, what);
+			auto named = Trimmed(item.text.substr(word.offset + word.length));
+			// the alias is one word (the rule's `ColLabel`), a mark after it - `x AS NOT NULL` is the name `NOT` and a
+			// NULL mark, as the rule reads it; else as written (the function form's raw name)
+			auto words = TopTokens(named);
+			int8_t after = -1;
+			if (words.size() >= 2 &&
+			    Trimmed(TakeMark("x " + Trimmed(named.substr(words[1].offset)), false, after)) == "x" && after >= 0) {
+				named = Trimmed(named.substr(0, words[1].offset));
+				column.nullable = after;
+			} else {
+				named = TakeMark(named, false, column.nullable);
+			}
+			column.name = DeclaredName(named, what, &column.quoted);
 			int8_t mark = -1;
 			column.expr = TakeMark(Trimmed(item.text.substr(0, word.offset)), true, mark);
+			if (mark >= 0 && column.nullable >= 0) {
+				throw BinderException("acl admin: %s gives \"%s\" two NULL marks - write one", what, column.name);
+			}
 			if (mark >= 0) {
 				column.nullable = mark; // `expr NOT NULL AS name`, as the text reader read it
 			}
 		} else if (item.has_value) {
-			column.name = DeclaredName(item.name, what);
+			column.name = DeclaredName(item.name, what, &column.quoted);
 			column.expr = TakeMark(item.value, true, column.nullable);
 		} else {
-			column.name = DeclaredName(TakeMark(item.text, false, column.nullable), what);
+			column.name = DeclaredName(TakeMark(item.text, false, column.nullable), what, &column.quoted);
 		}
 		columns.push_back(std::move(column));
 	}
