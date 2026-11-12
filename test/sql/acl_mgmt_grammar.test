@@ -2861,6 +2861,17 @@ SELECT roles_constant, attributes FROM acl_clients() WHERE name = 'lists4c';
 ----
 ["r"]	[{"name":"größe","paths":["g"]}]
 
+# an attribute's name is one name: a dotted one in any script is quoted, a blank one none
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (größe.x = 'x');
+----
+an attribute's name is one word or a quoted name
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (' ' = 'x');
+----
+an attribute's name is one word or a quoted name
+
 # two literals with no separator are no list
 statement error
 ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ('a' 'b');

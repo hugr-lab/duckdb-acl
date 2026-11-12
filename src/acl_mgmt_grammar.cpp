@@ -1958,6 +1958,12 @@ string AttributesJson(PEGTransformer &transformer, ParseResult &result, MgmtPars
 		auto name = name_node.Name() == "AclWordToken" || name_node.Name() == "AclNameValueToken"
 		                ? TokenOf(name_node).text
 		                : QuotedOf(transformer, name_node, "an attribute name", data);
+		auto trimmed = name;
+		StringUtil::Trim(trimmed);
+		if (trimmed.empty() || (name_node.Name() == "AclNameValueToken" && StringUtil::Contains(name, "."))) {
+			// one name, as a word reads one (`a.b` bare is refused): a dotted one is quoted, a blank one none
+			throw BinderException("acl admin: an attribute's name is one word or a quoted name, got \"%s\"", name);
+		}
 		auto &value = Strip(attribute.GetChild(2));
 		if (value.Name() == "AclAttrConstant") {
 			attributes.push_back(
@@ -1974,8 +1980,8 @@ string AttributesJson(PEGTransformer &transformer, ParseResult &result, MgmtPars
 			if (value.Name() == "AclDottedToken" && StringUtil::CIEquals(TokenOf(value).text, "constant")) {
 				// `name = CONSTANT` with its value missing is no path: the constant would come from the token
 				throw BinderException("acl admin: attribute \"%s\" = CONSTANT takes its value, quoted - a claim named "
-				                      "constant is written \"constant\"",
-				                      name);
+				                      "so is written \"%s\"",
+				                      name, TokenOf(value).text);
 			}
 			paths.push_back(ClaimPathOf(transformer, value, "a claim path", data));
 		}
