@@ -122,8 +122,8 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     (`GrantUnion::Add` merges one role's duplicates as two roles'), while `"ssn" = 'm'` beside `ssn` reads masked (the
     tree path) and the screens say masked. 4e refuses such a list where written; the stored rows are not re-judged -
     decide whether the read should take the narrower reading (found by 4e's second re-review).
-  - A role whose grants leave none of an object's columns (spec 156: its reads refuse) still deletes the rows its
-    filter reaches on a writable object - `delete` is a row capability; decide whether no column means no DML.
+  - `acl_check_catalog` does not name a grant whose list leaves none of its object's declared columns (spec 156: such
+    a grant's reads and writes refuse; a `SET COLUMNS` under an object grant reaches it).
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

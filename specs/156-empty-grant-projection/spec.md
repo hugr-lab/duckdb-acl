@@ -7,7 +7,8 @@
 ## Summary
 
 A role whose grants narrow an object's declared columns to none read every physical column of the object's source
-whenever a row filter applied. The read now refuses, as it already did without a row filter.
+whenever a row filter applied, and - on a writable object - wrote, filtered on and returned every physical column
+whatever filter applied. The read now refuses, as it already did without a row filter, and so does every write.
 
 ## Problem
 
@@ -21,23 +22,30 @@ writes: `ValidateGrantColumns` refuses only a list matching nothing anywhere in 
 `COLUMNS (id)` over objects of which only some declare `id`; an object grant written over a list it matched, then the
 object's list changed by `SET COLUMNS` (nothing re-judges the grant).
 
+Writes (found by this spec's review): on a writable object (a rename-only list, no RLS) every column set a write is
+judged by - `visible_columns`, `write_columns` - was empty, and every DML site reads an empty set as "no column
+policy" (`MapReadable`, `RequireWritableColumn`, `RequireReadableReturning`, `ApplyInsertPolicy`,
+`ApplyMergeInsertPolicy`, `ConflictUpdatePolicy`): `UPDATE w SET ssn = … RETURNING *` wrote and returned the whole
+physical row, `DELETE … WHERE ssn = …` read a hidden column. `VerbReadScope` (spec 145) skipped such a role as reading
+"every column as stored".
+
 ## Design
 
 `TablePolicy::exposes_nothing` (acl_policy.hpp): set by `ApplyGrantPolicy` when the narrowed projection over a declared
-list is empty. `BuildTableSubquery` refuses on it, as on an empty projection without RLS. An empty projection beside
-an RLS keeps meaning a row-only grant (every column) - only where no grant narrows the columns.
+list is empty. `BuildTableSubquery` refuses on it, as on an empty projection without RLS; `ResolveDmlTarget` refuses
+every verb on it (`<verb> on "w" is not allowed: it exposes no column`) - a plain `DELETE` too: an object of which a
+role reads no column is not one it changes; `VerbReadScope` takes such a role as reading no column. An empty
+projection beside an RLS keeps meaning a row-only grant (every column) - only where no grant narrows the columns.
 
 ## Enforcement & security
 
-Fails closed: the read refuses with the existing `exposes no readable columns`; a write already found no writable
-column (`write_columns` cleared). The listings were right already (they never showed such columns).
-
-Not changed (BACKLOG): a role whose grants leave no column still holds `delete` on a writable object and deletes the
-rows its filter reaches - a capability of rows, not a read of values; the owner decides whether no column means no
-DML.
+Fails closed: the read refuses with the existing `exposes no readable columns`, every write before anything is written.
+The listings were right already (they never showed such columns). A grant written over a list it matched and left
+narrowing to none by a later `SET COLUMNS` refuses the same way; `acl_check_catalog` does not name it yet.
 
 ## Tests
 
 `test/sql/acl_empty_grant_projection.test`: the object's RLS, the catalog grant's RLS, a rename-only object, an object
-grant left behind by `SET COLUMNS`; a row-only grant still reads every declared column. Fails without the fix (the
-first read returns `id, ssn, b`).
+grant left behind by `SET COLUMNS`, every verb on a writable object (UPDATE / DELETE / INSERT / INSERT OR REPLACE /
+MERGE, with RETURNING); a row-only grant still reads every declared column, a list naming the object's column still
+writes. Fails without the fix (the first read returns `id, ssn, b`).

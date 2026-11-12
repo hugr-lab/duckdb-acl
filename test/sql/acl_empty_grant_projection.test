@@ -103,3 +103,63 @@ query II
 ACL ROLE "o" SELECT * FROM g;
 ----
 1	2
+
+# a writable object (a rename-only list, no RLS) whose grants leave no column: every column set of a write was empty,
+# which read as "no column policy" - the whole physical row written, read in WHERE and returned. No write at all now
+statement ok
+ACL ADMIN CREATE ROLE wr; CREATE VIRTUAL TABLE c.w AS phys.main.t COLUMNS (k = b);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE wr MAIN COLUMNS (id);
+
+statement error
+ACL ROLE "wr" SELECT * FROM w;
+----
+exposes no readable columns
+
+statement error
+ACL ROLE "wr" UPDATE w SET ssn = 'x' WHERE id = 1 RETURNING *;
+----
+exposes no column
+
+statement error
+ACL ROLE "wr" DELETE FROM w WHERE ssn = 'secret' RETURNING *;
+----
+exposes no column
+
+statement error
+ACL ROLE "wr" DELETE FROM w;
+----
+exposes no column
+
+statement error
+ACL ROLE "wr" INSERT INTO w VALUES (7, 'z', 7) RETURNING *;
+----
+exposes no column
+
+statement error
+ACL ROLE "wr" INSERT OR REPLACE INTO w (ssn) VALUES ('q');
+----
+exposes no column
+
+statement error
+ACL ROLE "wr" MERGE INTO w USING (SELECT 1 AS x) s ON w.id = s.x WHEN MATCHED THEN UPDATE SET ssn = 'm' RETURNING *;
+----
+exposes no column
+
+query III
+SELECT * FROM phys.main.t;
+----
+1	secret	2
+
+# the same object under a grant that lists its column stays writable
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE wr MAIN COLUMNS (id, k);
+
+statement ok
+ACL ROLE "wr" UPDATE w SET k = 5 WHERE k = 2;
+
+query I
+SELECT b FROM phys.main.t;
+----
+5
