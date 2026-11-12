@@ -549,7 +549,8 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
   one main catalog across its roles resolves only qualified names.
 - **`RLS`** is the grant's own predicate, AND-ed onto every object of the catalog for this role (and
   onto the object's own). **`COLUMNS`** is the grant's own column list, intersected with the object's;
-  a name the object hides cannot be re-exposed here. A grant narrows, it never widens. Across roles the
+  a name the object hides cannot be re-exposed here; when the intersection leaves no column, every read and every
+  write of the object by the role refuses, whatever the `RLS` (spec 156). A grant narrows, it never widens. Across roles the
   effective policy is the union of the roles that hold the capability exercised (spec 145): a role that
   may read without a narrowing grant lifts it for a principal holding both, while a role that may not
   read - one with `insert` only, an object grant `CAPS '{}'` - lifts no read role's filter or columns;

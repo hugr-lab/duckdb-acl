@@ -828,6 +828,12 @@ tokens hold it (`ClientWrote` - never a string), else a sentence naming nothing;
 re-written, a throw fails closed. The text is copied at QueryBegin (QueryEnd may run with no active query). Tests
 `acl_principal_errors.test`, `test_acl_principal_errors.cpp`.
 
+**Spec 156 — a grant that leaves no column reads no column**: `TablePolicy::exposes_nothing` (set by `ApplyGrantPolicy`
+when the grants narrow an object's declared list to none) - `BuildTableSubquery` refuses on it, `ResolveDmlTarget`
+every verb, `VerbReadScope` reads no column of such a role; an empty projection beside an RLS read `SELECT *` over the
+source before, and an empty column set let a write touch, filter on and return every column. Test
+`acl_empty_grant_projection.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

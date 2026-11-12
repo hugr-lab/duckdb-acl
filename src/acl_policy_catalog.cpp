@@ -892,6 +892,7 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		                (predicate.empty() ? "" : " WHERE " + predicate);
 		out.casts.clear();
 		auto items = ViewItems(grants.columns);
+		out.exposes_nothing = restricts && items.empty(); // spec 156: the lists intersect to nothing
 		out.query = restricts ? "SELECT " + StringUtil::Join(items, ", ") + " FROM (" + filtered + ") AS __acl_granted"
 		                      : filtered;
 		return;
@@ -908,6 +909,7 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		// a view has no column list of its own to intersect: wrap its SQL, so the grant's columns
 		// and predicate apply to the view's output
 		auto items = ViewItems(grants.columns);
+		out.exposes_nothing = restricts && items.empty(); // spec 156: the lists intersect to nothing
 		out.query = "SELECT " + (restricts ? StringUtil::Join(items, ", ") : string("*")) + " FROM (" + out.query +
 		            ") AS __acl_granted" + (predicate.empty() ? "" : " WHERE " + predicate);
 		return;
@@ -986,6 +988,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
 		}
 		inner += out.ReadFrom();
+		// spec 156: the grants' lists intersect to nothing (a catalog grant's and an object grant's) - no column
+		out.exposes_nothing = listed.empty();
 		out.query = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
 		            StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
 		for (auto &column : listed) {
@@ -1047,6 +1051,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			out.field_writes.emplace_back(source, column.TreeItems(source));
 		}
 	}
+	// spec 156: nothing the grants list is a column of the object - the role reads no column, whatever the RLS
+	out.exposes_nothing = out.projection.empty();
 	out.subquery_form = true; // a narrowed read is a projection, so it needs the subquery shape
 }
 

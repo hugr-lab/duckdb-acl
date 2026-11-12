@@ -796,6 +796,13 @@ private:
 			// the re-grant that keeps everything but the item: an object grant has no ALTER form, and
 			// GRANT OBJECT with fewer clauses would reset what it does not state
 			auto regrant = [&](const string &columns_text) {
+				if (columns_text.empty() && !columns.empty()) {
+					// spec 156: an empty list is a row-only grant - every column - and a revoke drops the grant's RLS
+					// too (the catalog grant then decides): the operator names the columns, the placeholder never runs
+					return "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
+					       Lit(caps) + ", " + Lit(rls) +
+					       ", '<columns>')  -- name what the role reads; an empty list reads every column";
+				}
 				return "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
 				       Lit(caps) + ", " + Lit(rls) + ", " + Lit(columns_text) + ")";
 			};
@@ -820,6 +827,16 @@ private:
 			auto columns = Text(catalogs_rows.GetValue(2, row));
 			auto rls_checked = catalogs_rows.GetValue(3, row);
 			auto items = ParseColumnList(columns);
+			// spec 156: the list without its last item is no list - every column - so that repair names a placeholder
+			auto set_columns = [&](const string &rest) {
+				auto grantee = NamePath(vector<string> {role}).ToGrammar();
+				if (rest.empty()) {
+					return "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee +
+					       " SET COLUMNS '<columns>'  -- name what the role reads; an empty list reads every column";
+				}
+				return "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee + " SET COLUMNS " +
+				       Lit(rest);
+			};
 			case_insensitive_set_t matched;
 			for (auto &entry : relations) {
 				auto &relation = entry.second;
@@ -835,11 +852,7 @@ private:
 					                   NamePath(vector<string> {role}).ToGrammar() + " SET RLS '<predicate>'");
 				}
 				for (auto &item : items) {
-					JudgeColumns(relation, role, {item}, false,
-					             "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
-					                 NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
-					                 Lit(Without(items, item.first)),
-					             &matched);
+					JudgeColumns(relation, role, {item}, false, set_columns(Without(items, item.first)), &matched);
 				}
 			}
 			// a catalog-wide bare name applies where an object has it and is absent elsewhere by
@@ -849,9 +862,7 @@ private:
 					Add("grant", "*", role, "grant_column_missing",
 					    "the catalog-wide COLUMNS item \"" + item.first + "\" matches no column of any object of \"" +
 					        vcat + "\" - the role reads less than the grant says",
-					    "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
-					        NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
-					        Lit(Without(items, item.first)));
+					    set_columns(Without(items, item.first)));
 				}
 			}
 		}
@@ -1378,6 +1389,20 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		// A grant rewrite that fails leaves the object whole and the dead entry unreadable as
 		// before; a cut that fails leaves masks gone from grants that could not read the column
 		// anyway. Nothing on either path widens.
+		// spec 156: an emptied list is no list - every column - so neither the object's nor a grant's may be emptied
+		// here (both read wider than before: the source's every column, a row-only grant)
+		Columns kept;
+		for (auto &column : columns) {
+			if (!missing.count(column.first)) {
+				kept.push_back(column);
+			}
+		}
+		if (kept.empty()) {
+			throw BinderException("acl admin: \"%s.%s\": every declared column is missing - an object without a "
+			                      "list reads every column of its source; SET COLUMNS to what it exposes, or drop it",
+			                      vcat, vname);
+		}
+		vector<string> rewritten;
 		for (auto &grant : affected) {
 			vector<string> items;
 			for (auto &item : grant.items) {
@@ -1387,14 +1412,17 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 				}
 				items.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
 			}
-			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, StringUtil::Join(items, ", "), false,
-			                     false, false);
-		}
-		Columns kept;
-		for (auto &column : columns) {
-			if (!missing.count(column.first)) {
-				kept.push_back(column);
+			if (items.empty() && !grant.items.empty()) {
+				throw BinderException("acl admin: \"%s.%s\": dropping the masks would leave the grant of role \"%s\" "
+				                      "with no column - an empty list reads every column; alter or revoke that grant "
+				                      "first",
+				                      vcat, vname, grant.role);
 			}
+			rewritten.push_back(StringUtil::Join(items, ", "));
+		}
+		for (idx_t i = 0; i < affected.size(); i++) {
+			auto &grant = affected[i];
+			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, rewritten[i], false, false, false);
 		}
 		columns = std::move(kept);
 		changed += NumericCast<int64_t>(missing.size());

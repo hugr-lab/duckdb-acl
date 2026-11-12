@@ -1236,6 +1236,9 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 		if (!policy.caps.count("select")) {
 			continue; // spec 145: a role that may not read reads no field - no visible or masked tag
 		}
+		if (policy.exposes_nothing) {
+			continue; // spec 156: the role's grants leave no column - no field tag (an empty list here read as all)
+		}
 		if (policy.projection.empty()) {
 			// a writable object a grant narrows keeps its shape: what the role reads is the grant's
 			// visible columns (all of them when it names none), a masked one carried as an injection

@@ -1694,10 +1694,12 @@ private:
 			auto one = principal;
 			one.roles = {role};
 			TablePolicy own;
-			if (!store.ResolveTable(one, key, own, verb) || !own.caps.count(verb) || own.visible_columns.empty()) {
+			if (!store.ResolveTable(one, key, own, verb) || !own.caps.count(verb) ||
+			    (own.visible_columns.empty() && !own.exposes_nothing)) {
 				continue; // no grant here, no such verb, or every column as stored
 			}
-			case_insensitive_set_t mine = own.visible_columns;
+			// spec 156: a role whose grants leave no column reads none here - never "every column"
+			case_insensitive_set_t mine = own.exposes_nothing ? case_insensitive_set_t() : own.visible_columns;
 			for (auto &mask : own.injections) {
 				mine.erase(mask.first);
 			}
@@ -1746,6 +1748,13 @@ private:
 			     "update on " + Shown(key) +
 			         " is not allowed - an ON CONFLICT DO UPDATE / INSERT OR REPLACE updates the row "
 			         "already there");
+		}
+		if (update.exposes_nothing) {
+			// spec 156: its column sets are empty, which below reads as "no column policy"
+			Deny(Reason::POLICY_ERROR, "update on " + Shown(key) +
+			                               " is not allowed: it exposes no column - an ON "
+			                               "CONFLICT DO UPDATE / INSERT OR REPLACE updates the row "
+			                               "already there");
 		}
 		if (node.on_conflict_info->action_type == OnConflictAction::REPLACE &&
 		    (!update.rls.empty() || !update.injections.empty() || !update.write_columns.empty() ||
@@ -2588,6 +2597,11 @@ private:
 	//! as `(SELECT <projection> FROM <phys> [WHERE <rls>]) AS <alias>`. Claim values are baked in.
 	unique_ptr<TableRef> BuildTableSubquery(const string &vname, const TablePolicy &policy, BaseTableRef &original) {
 		string sql;
+		if (policy.exposes_nothing) {
+			// spec 156: the grants narrowed the object's columns to none (an empty projection beside an RLS is a
+			// row-only grant - every column - and an empty intersection of two lists no column at all)
+			Deny(Reason::POLICY_ERROR, "object " + Shown(vname) + " exposes no readable columns");
+		}
 		if (!policy.query.empty()) {
 			sql = policy.query; // a view: its SQL is the definition
 		} else {
@@ -3900,6 +3914,11 @@ private:
 		}
 		if (!policy.caps.count(capability)) {
 			Deny(Reason::CAPABILITY, capability + " on " + Shown(key) + " is not allowed");
+		}
+		// spec 156: the grants leave none of the object's columns - every column set below would be empty, which
+		// reads as "no column policy" (the whole physical row written, read in WHERE, returned): no write at all
+		if (policy.exposes_nothing) {
+			Deny(Reason::POLICY_ERROR, capability + " on " + Shown(key) + " is not allowed: it exposes no column");
 		}
 		// spec 145: what the statement's own conditions read of the target, and what its RETURNING returns, is a read -
 		// under the read policy where the principal reads the object (the verb's RLS stays AND-ed in), the verb's

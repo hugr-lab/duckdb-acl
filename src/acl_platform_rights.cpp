@@ -464,14 +464,18 @@ void EffectiveRights(PolicyStore &store, const vector<string> &arguments, Rights
 				for (auto &cap : decision.caps) {
 					writes = writes || IsWriteCap(cap);
 				}
-				writable = Value::BOOLEAN(policy.writable && writes);
+				writable = Value::BOOLEAN(policy.writable && writes && !policy.exposes_nothing); // spec 156
 				string schema, leaf;
 				NamePath::SplitLeaf(vname, schema, leaf);
 				auto key =
 				    std::make_pair(StringUtil::Lower(schema.empty() ? string("main") : NamePath::Display(schema)),
 				                   StringUtil::Lower(leaf));
 				auto found = read_columns.find(key);
-				if (!listing_error.empty()) {
+				if (policy.exposes_nothing) {
+					refused = Value("the grants leave no column of it - every read and write refuses (spec 156)");
+					columns = TextList({});
+					masks = TextList({});
+				} else if (!listing_error.empty()) {
 					refused = Value("the columns listing failed: " + listing_error);
 				} else if (found == read_columns.end()) {
 					columns = TextList({}); // the role reads none of its columns - a read of it fails
