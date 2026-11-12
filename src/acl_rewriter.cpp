@@ -2591,7 +2591,9 @@ private:
 		if (!policy.query.empty()) {
 			sql = policy.query; // a view: its SQL is the definition
 		} else {
-			if (policy.projection.empty() && policy.rls.empty()) {
+			// spec 156: an empty projection beside an RLS is a row-only grant (every column) - unless the grants
+			// narrowed the object's columns to none
+			if (policy.exposes_nothing || (policy.projection.empty() && policy.rls.empty())) {
 				Deny(Reason::POLICY_ERROR, "object " + Shown(vname) + " exposes no readable columns");
 			}
 			// no projection means the grant narrowed only the rows (spec 011): every column is read,

@@ -1,0 +1,105 @@
+# name: test/sql/acl_empty_grant_projection.test
+# description: spec 156 - a grant whose column list leaves none of an object's declared columns reads no column,
+#   whatever row filter applies; an empty projection beside an RLS used to read every physical column of the source
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t (id INTEGER, ssn VARCHAR, b INTEGER);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'secret', 2);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r; CREATE ROLE o;
+
+# `narrow` declares k and b, `wide` declares id: a catalog grant listing id reads `wide`'s id and nothing of `narrow`
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.main.t COLUMNS (k = id, b) RLS (id > 0);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.wide AS phys.main.t COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN COLUMNS (id);
+
+query I
+ACL ROLE "r" SELECT * FROM wide;
+----
+1
+
+# the object's own RLS beside a list narrowed to none: refused, never `SELECT *` over the source
+statement error
+ACL ROLE "r" SELECT * FROM narrow;
+----
+exposes no readable columns
+
+statement error
+ACL ROLE "r" SELECT count(*) FROM narrow WHERE ssn = 'secret';
+----
+exposes no readable columns
+
+# the grant's own RLS, and a rename-only object (read as `* RENAME (...)` before)
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ren AS phys.main.t COLUMNS (i = id, k = b);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN COLUMNS (id) RLS 'id > 0';
+
+statement error
+ACL ROLE "r" SELECT * FROM narrow;
+----
+exposes no readable columns
+
+statement error
+ACL ROLE "r" SELECT * FROM ren;
+----
+exposes no readable columns
+
+query I
+ACL ROLE "r" SELECT * FROM wide;
+----
+1
+
+# an object grant written over a list it matched, then the object's list changed under it: nothing re-judges the
+# grant, and the read must not widen
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.g AS phys.main.t COLUMNS (id, b);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE o MAIN; GRANT TABLE c.g TO ROLE o COLUMNS (id) RLS (id > 0);
+
+query I
+ACL ROLE "o" SELECT * FROM g;
+----
+1
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.g SET COLUMNS (k = id, b);
+
+statement error
+ACL ROLE "o" SELECT * FROM g;
+----
+exposes no readable columns
+
+# a row-only grant (no list) still reads every declared column under its filter
+statement ok
+ACL ADMIN GRANT TABLE c.g TO ROLE o RLS (id > 0);
+
+query II
+ACL ROLE "o" SELECT * FROM g;
+----
+1	2

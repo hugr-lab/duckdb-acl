@@ -116,6 +116,9 @@ struct TablePolicy {
 	string canonical;          // spec 107: the virtual object the name resolved to, `vcat.vname` (catalog store)
 	vector<string> projection; // SQL select items (SUBQUERY), e.g. {"id", "NULL AS ssn", "amount*2 AS total"}
 	string rls;                // predicate template (SUBQUERY); may contain acl_claim('<name>'); empty = none
+	//! spec 156: the grants narrowed the object's declared columns to none - an empty `projection` alone means "every
+	//! column" (a row-only grant), so the read refuses on this, never on an empty list beside an RLS
+	bool exposes_nothing = false;
 	//! Whether some part of `rls` was never bound against this object (spec 027): the object did not
 	//! exist where the predicate was written, so nothing judged what its names refer to. Harmless on a
 	//! read - the binder decides - but a write with a second relation in scope must not inject a

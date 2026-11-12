@@ -1,0 +1,43 @@
+# Spec 156: a grant that leaves no column reads no column
+
+- **Status**: implemented
+- **Date**: 2026-11-12
+- **Author**: hugr lab (found by spec 150 4f's re-review)
+
+## Summary
+
+A role whose grants narrow an object's declared columns to none read every physical column of the object's source
+whenever a row filter applied. The read now refuses, as it already did without a row filter.
+
+## Problem
+
+`ApplyGrantPolicy` folds a grant's column list into the object's declared list (spec 038). When nothing the grants
+list is a column of the object, the projection it builds is empty. `BuildTableSubquery` read an empty projection as
+"the grant narrowed only the rows" (spec 011): with no RLS it refused (`exposes no readable columns`), but with an RLS
+- the object's own, the catalog grant's or the object grant's - it emitted `SELECT * FROM <phys> WHERE <rls>` (or
+`SELECT * RENAME (…)` for a rename-only object). The role then read columns neither the object nor its grant ever
+exposed (`ssn` beside a declared `k = id, b`), while the listings showed none. Reachable by an admin's ordinary
+writes: `ValidateGrantColumns` refuses only a list matching nothing anywhere in the catalog, so a catalog grant
+`COLUMNS (id)` over objects of which only some declare `id`; an object grant written over a list it matched, then the
+object's list changed by `SET COLUMNS` (nothing re-judges the grant).
+
+## Design
+
+`TablePolicy::exposes_nothing` (acl_policy.hpp): set by `ApplyGrantPolicy` when the narrowed projection over a declared
+list is empty. `BuildTableSubquery` refuses on it, as on an empty projection without RLS. An empty projection beside
+an RLS keeps meaning a row-only grant (every column) - only where no grant narrows the columns.
+
+## Enforcement & security
+
+Fails closed: the read refuses with the existing `exposes no readable columns`; a write already found no writable
+column (`write_columns` cleared). The listings were right already (they never showed such columns).
+
+Not changed (BACKLOG): a role whose grants leave no column still holds `delete` on a writable object and deletes the
+rows its filter reaches - a capability of rows, not a read of values; the owner decides whether no column means no
+DML.
+
+## Tests
+
+`test/sql/acl_empty_grant_projection.test`: the object's RLS, the catalog grant's RLS, a rename-only object, an object
+grant left behind by `SET COLUMNS`; a row-only grant still reads every declared column. Fails without the fix (the
+first read returns `id, ssn, b`).

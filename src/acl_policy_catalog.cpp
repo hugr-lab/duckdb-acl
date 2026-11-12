@@ -1047,6 +1047,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			out.field_writes.emplace_back(source, column.TreeItems(source));
 		}
 	}
+	// spec 156: nothing the grants list is a column of the object - the role reads no column, whatever the RLS
+	out.exposes_nothing = out.projection.empty();
 	out.subquery_form = true; // a narrowed read is a projection, so it needs the subquery shape
 }
 
