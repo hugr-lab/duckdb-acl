@@ -45,8 +45,13 @@ REPLACE` / `ON CONFLICT DO UPDATE` update the row already there: the update's un
 overwrote it). `VerbReadScope` takes a role whose own grants leave no column as reading no column (spec 145's
 intersection: it was skipped as "every column as stored"). The no-declared-list branch sets the flag when the lists
 intersect to nothing (and the read refuses on it before a view's or the branch's query is used). The check's repair of
-a grant's last item revokes the grant (`acl_revoke_object` / `REVOKE CATALOG`), never an empty list; `RoleTags`
-gives such a role no field tag. An empty
+a grant's last item names a placeholder (`'<columns>'` - pasted as is it matches no column and is refused), never an
+empty list nor a revoke (which drops the grant's RLS too, and the catalog grant then decides); a row-only grant's
+predicate repair stays row-only. `REPAIR … DROP MISSING COLUMNS [AND MASKS]` refuses to empty a list - the object's
+(every declared column missing: it would read every source column) and a grant's (a mask-only list) - both found by
+the re-review, both on main. The view branches set the flag when the lists intersect to nothing (duckdb's `SELECT
+clause without selection list` before). `RoleTags` gives such a role no field tag; `effective_rights` says why it
+refuses. An empty
 projection beside an RLS keeps meaning a row-only grant (every column) - only where no grant narrows the columns.
 
 ## Enforcement & security
@@ -59,13 +64,16 @@ whose verb role alone leaves no column has that role's `VerbReadScope` contribut
 by a principal reading `k` through another role refuses (spec 145's rule, which the skip had let through); an ingest
 role whose list names physical names (`COLUMNS (id, b)`) no longer inserts into an object renaming them (it wrote
 every column unchecked). Unchanged (spec 146): a role whose own grants leave no column still contributes its ROWS to
-a verb's union with other roles - BACKLOG. A grant written over a list it matched and left
+a verb's union - and a read's - with other roles - BACKLOG. Not caught (BACKLOG): over an object WITHOUT a declared
+list, a grant naming no column its source has is known only at bind - the read refuses there, a plain `DELETE` /
+`MERGE … DELETE` still deletes. A grant written over a list it matched and left
 narrowing to none by a later `SET COLUMNS` refuses the same way; `acl_check_catalog` does not name it yet.
 
 ## Tests
 
 `test/sql/acl_empty_grant_projection.test`: the object's RLS, the catalog grant's RLS, a rename-only object, an object
 grant left behind by `SET COLUMNS`, every verb on a writable object (UPDATE / DELETE / INSERT / INSERT OR REPLACE /
-MERGE, with RETURNING), two lists intersecting to nothing over an object without a list, the check's revoke after
-`DROP MISSING COLUMNS`; a row-only grant still reads every declared column, a list naming the object's column still
+MERGE, with RETURNING), two lists intersecting to nothing over an object without a list, the check's placeholder
+after `DROP MISSING COLUMNS`, the repair refusing to empty an object's or a grant's list, a row-only grant's predicate
+repair, `effective_rights`' reason, a two-role `INSERT OR REPLACE`; a row-only grant still reads every declared column, a list naming the object's column still
 writes. Fails without the fix (the first read returns `id, ssn, b`).

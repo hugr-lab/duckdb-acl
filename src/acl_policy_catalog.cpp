@@ -892,6 +892,7 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		                (predicate.empty() ? "" : " WHERE " + predicate);
 		out.casts.clear();
 		auto items = ViewItems(grants.columns);
+		out.exposes_nothing = restricts && items.empty(); // spec 156: the lists intersect to nothing
 		out.query = restricts ? "SELECT " + StringUtil::Join(items, ", ") + " FROM (" + filtered + ") AS __acl_granted"
 		                      : filtered;
 		return;
@@ -908,6 +909,7 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		// a view has no column list of its own to intersect: wrap its SQL, so the grant's columns
 		// and predicate apply to the view's output
 		auto items = ViewItems(grants.columns);
+		out.exposes_nothing = restricts && items.empty(); // spec 156: the lists intersect to nothing
 		out.query = "SELECT " + (restricts ? StringUtil::Join(items, ", ") : string("*")) + " FROM (" + out.query +
 		            ") AS __acl_granted" + (predicate.empty() ? "" : " WHERE " + predicate);
 		return;

@@ -124,7 +124,11 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     decide whether the read should take the narrower reading (found by 4e's second re-review).
   - A role whose own grants leave none of an object's columns still contributes its rows to a verb's union with another
     role (spec 146's per-object union): `UPDATE` by {analyst: update on `k` in `id = 2`; auditor: update, no column}
-    updates rows outside analyst's slice. Decide whether such a role's rows leave the union for that verb (spec 156).
+    updates rows outside analyst's slice (a read too: each role's rows read the other's columns). Decide whether such a
+    role's rows leave the union (spec 156).
+  - Over an object without a declared list (or a live alias), a grant whose names its source does not have is known
+    only at bind: the read refuses, a plain `DELETE` / `MERGE … DELETE` still deletes the rows its filter reaches
+    (spec 156's re-review; `ValidateGrantColumns` does not judge a catalog holding a list-less object).
   - `acl_check_catalog` does not name a grant whose list leaves none of its object's declared columns (spec 156: such
     a grant's reads and writes refuse; a `SET COLUMNS` under an object grant reaches it).
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.

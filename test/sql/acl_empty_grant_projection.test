@@ -250,3 +250,53 @@ query III
 SELECT * FROM phys.main.k;
 ----
 1	secret	2
+
+# REPAIR ... DROP MISSING COLUMNS never empties a list: the object's (it would read every source column) nor a grant's
+# (AND MASKS: a mask-only list emptied is a row-only grant)
+statement ok
+CREATE TABLE phys.main.m (id INTEGER, old INTEGER, ssn VARCHAR, b INTEGER);
+
+statement ok
+ACL ADMIN CREATE ROLE mr; CREATE VIRTUAL TABLE c.only AS phys.main.m COLUMNS (old); CREATE VIRTUAL TABLE c.mk AS phys.main.m COLUMNS (i = id, old, b);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE mr MAIN; GRANT TABLE c.mk TO ROLE mr COLUMNS (old = 0) RLS (id > 0);
+
+statement ok
+ALTER TABLE phys.main.m DROP COLUMN old;
+
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.only DROP MISSING COLUMNS;
+----
+every declared column is missing
+
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.mk DROP MISSING COLUMNS AND MASKS;
+----
+with no column
+
+query I
+SELECT columns FROM store.acl.role_object_caps WHERE role = 'mr' AND vname = 'mk';
+----
+old = 0
+
+# a row-only object grant's predicate repair keeps it row-only (no placeholder: nothing was taken out of a list)
+statement ok
+CREATE TABLE phys.main.f (id INTEGER, flag INTEGER);
+
+statement ok
+ACL ADMIN CREATE ROLE er; CREATE VIRTUAL TABLE c.ft AS phys.main.f COLUMNS (id, flag); GRANT TABLE c.ft TO ROLE er RLS (flag > 0);
+
+statement ok
+ALTER TABLE phys.main.f DROP COLUMN flag;
+
+query I
+SELECT repair LIKE '%''<columns>''%' FROM acl_check_catalog('c') WHERE object = 'ft' AND role = 'er' AND problem LIKE 'rls%';
+----
+false
+
+# the operator's screen says why
+query II
+SELECT writable, refused IS NOT NULL FROM acl_effective_rights('r', 'c', 'narrow');
+----
+false	true
