@@ -673,6 +673,16 @@ scalar is refused. The target must exist. When the grant states columns, its pro
 where it is written and stored, so `DESCRIBE` and `information_schema.columns` describe what the
 role reads (a mask that changes a type, a computed column the object never had).
 
+A grant's `COLUMNS` item is `name` or `name = <mask>`. The name is a column or a path into one
+(below), each part an identifier as duckdb reads one - a keyword or a name holding other characters
+is quoted (`"order"`, `"odd name"`, `"a.b"` - one column whose name holds a dot). The mask is one
+expression as duckdb reads it, list and struct literals, `MAP` and lambdas included
+(`tags = ['a', 'b']`, `s = {'x': 1}`, `items = list_transform(items, lambda e: {'price': 0})`), and is
+stored as written. The stored list is read back on duckdb's tokens, so a name it could not carry
+(one holding `,` or `=`) is refused where it is written. The quoted form `COLUMNS '<list>'` and the
+function forms' text are read on the same tokens; such a text that ends inside or with a comment, a
+literal or a quoted name is refused.
+
 A `COLUMNS` item with a value on a writable table is an assignment as well as a mask:
 `tenant = acl_claim('tenant')` is added to an `INSERT` when absent, overrides a supplied value, and
 is applied to an `UPDATE`'s `SET`.

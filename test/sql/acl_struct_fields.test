@@ -174,7 +174,7 @@ ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address[].city);
 statement error
 ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.city || 'x');
 ----
-<REGEX>:.*lists "address.city \|\| 'x'", which the object does not have.*
+a grant's column list is items
 
 # two roles masking one field differently: refused, never picked
 statement ok

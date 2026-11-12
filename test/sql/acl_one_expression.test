@@ -61,6 +61,7 @@ SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upp
 ----
 does not stay one expression
 
+# spec 150 4e: the list is read on duckdb's tokens, where an open comment is nothing - refused as written all the same
 statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* hidden');
 ----

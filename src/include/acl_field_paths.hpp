@@ -647,6 +647,23 @@ struct ColumnTrees {
 	}
 };
 
+//! The column an item's name reads (spec 150 4e: one reading for the read path and the listings) - a path's head, or
+//! the name itself when it holds no `.` / `[`, opens no quoted name, or does not read as a path (a column whatever it
+//! holds: `odd name`, `od'd`); `is_path` when it steps into the column
+inline string ItemHead(const string &name_p, bool &is_path) {
+	auto name = name_p;
+	StringUtil::Trim(name);
+	FieldPath path;
+	string error;
+	is_path = false;
+	if ((name.find('.') == string::npos && name.find('[') == string::npos && (name.empty() || name[0] != '"')) ||
+	    !ParseFieldPath(name, path, error)) {
+		return name;
+	}
+	is_path = !path.IsColumn();
+	return path.head;
+}
+
 //! COLUMNS items as the csv the grant rows store
 inline string ItemsCsv(const vector<std::pair<string, string>> &items) {
 	vector<string> parts;

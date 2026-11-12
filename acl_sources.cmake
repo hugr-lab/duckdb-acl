@@ -39,6 +39,7 @@ set(EXTENSION_SOURCES
     ${ACL_ROOT}/src/oidc/acl_quack_auth.cpp
     ${ACL_ROOT}/src/oidc/acl_oidc_secret.cpp
     ${ACL_ROOT}/src/acl_function_categories.cpp
+    ${ACL_ROOT}/src/acl_list_items.cpp
     ${ACL_ROOT}/src/acl_policy.cpp
     ${ACL_ROOT}/src/acl_policy_catalog.cpp
     ${ACL_ROOT}/src/acl_catalog_admin.cpp

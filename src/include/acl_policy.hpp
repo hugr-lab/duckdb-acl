@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "acl_list_items.hpp"
+
 #include "acl_name_path.hpp"
 #include "acl_door_certificate.hpp"
 #include "acl_function_categories.hpp"

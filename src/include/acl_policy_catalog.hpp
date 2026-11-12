@@ -44,27 +44,71 @@ inline string LitList(const vector<string> &values) {
 	return StringUtil::Join(quoted, ", ");
 }
 
-//! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use.
-//! Split at top level only, so an expression may contain commas of its own (`coalesce(a, b)`).
+//! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use - split on duckdb's
+//! tokens (`SplitListItems`, spec 150 4e), so an expression may hold commas of its own (`coalesce(a, b)`,
+//! `['a', 'b']`) and the name is the text before the item's first top-level `=`
 inline vector<std::pair<string, string>> ParseColumnList(const string &csv) {
 	vector<std::pair<string, string>> columns;
-	for (auto &part : SplitTopLevel(csv, ',')) {
-		auto item = part;
-		if (item.empty()) {
-			continue;
+	for (auto &item : SplitListItems(csv)) {
+		if (item.has_value) {
+			columns.emplace_back(item.name, item.value);
+		} else {
+			columns.emplace_back(item.text, string());
 		}
-		auto pos = item.find('=');
-		if (pos == string::npos) {
-			columns.emplace_back(item, string());
-			continue;
-		}
-		auto name = item.substr(0, pos);
-		auto expr = item.substr(pos + 1);
-		StringUtil::Trim(name);
-		StringUtil::Trim(expr);
-		columns.emplace_back(name, expr);
 	}
 	return columns;
+}
+
+//! A grant's column list as a writer gives it (spec 150 4e): read as `ParseColumnList` reads it, and refused when the
+//! text ends inside a comment, a literal or a quoted name - the read leaves such an end out, the stored text would
+//! keep it (spec 148: `note = upper(note) /* hidden` is stored as written)
+inline vector<std::pair<string, string>> ParseWrittenColumnList(const string &csv) {
+	bool open = false;
+	auto items = SplitListItems(csv, &open);
+	// after the last item only separators, spaces and closed /* */ comments: a line comment there is stored and read
+	// as nothing, and a text written after the stored one would be read as that comment (`note = upper(note) --
+	// hidden`)
+	auto tail = items.empty() ? csv : csv.substr(items.back().end);
+	bool trailing = false;
+	for (idx_t i = 0; i < tail.size() && !trailing; i++) {
+		if (tail.compare(i, 2, "/*") == 0) {
+			idx_t depth = 1; // duckdb nests block comments; the text is not open, so it closes
+			for (i += 2; i < tail.size() && depth > 0; i++) {
+				if (tail.compare(i, 2, "/*") == 0) {
+					depth++;
+					i++;
+				} else if (tail.compare(i, 2, "*/") == 0) {
+					depth--;
+					i++;
+				}
+			}
+			i--;
+			continue;
+		}
+		trailing = tail.compare(i, 2, "--") == 0;
+	}
+	if (open || trailing) {
+		throw BinderException("acl admin: the grant's column list ends inside or with a comment, a literal or a quoted "
+		                      "name - it does not stay one expression per item (spec 148)");
+	}
+	return ParseColumnList(csv);
+}
+
+//! A writer's column list must read back as the items it wrote (spec 150 4e): the csv split by `ParseColumnList`
+//! gives the same names and masks in the same order, or the write is refused - the read would grant other columns
+//! than written (a name holding `,` or `=`, a quote in a name that opens a literal across the next item)
+inline void RequireColumnsReadBack(const vector<std::pair<string, string>> &items, const string &csv) {
+	auto read = ParseColumnList(csv);
+	for (idx_t i = 0; i < MaxValue(items.size(), read.size()); i++) {
+		if (i < items.size() && i < read.size() && read[i] == items[i]) {
+			continue;
+		}
+		auto &named = i < items.size() ? items[i].first : read[i].first;
+		throw BinderException("acl admin: column \"%s\" cannot be carried by a COLUMNS list - its stored form would "
+		                      "read back as other items than written (a name holding ',' or '=', or a quote that opens "
+		                      "a literal before the next item)",
+		                      named);
+	}
 }
 
 //! The policy one role's grant chain imposes on one object (spec 011). Levels compose by narrowing:

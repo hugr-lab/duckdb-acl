@@ -114,6 +114,10 @@ $(TEST_CPP_DIR)/test_acl_identity_routing: TEST_CPP_EXTRA := src/acl_identity.cp
 $(TEST_CPP_DIR)/test_acl_session_state: src/acl_session_state.cpp src/include/acl_session_state.hpp
 $(TEST_CPP_DIR)/test_acl_session_state: TEST_CPP_EXTRA := src/acl_session_state.cpp duckdb/third_party/yyjson/yyjson.cpp
 
+# spec 150 4e: a stored list's split, run beside duckdb's parser (the differential)
+$(TEST_CPP_DIR)/test_acl_list_items: src/acl_list_items.cpp src/include/acl_list_items.hpp
+$(TEST_CPP_DIR)/test_acl_list_items: TEST_CPP_EXTRA := src/acl_list_items.cpp
+
 # spec 107: the lineage walker is its own translation unit, run over plans bound from SQL
 $(TEST_CPP_DIR)/test_acl_lineage_walker: src/acl_lineage_walker.cpp src/include/acl_lineage_walker.hpp
 $(TEST_CPP_DIR)/test_acl_lineage_walker: TEST_CPP_EXTRA := src/acl_lineage_walker.cpp
