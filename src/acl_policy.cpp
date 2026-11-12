@@ -129,6 +129,12 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 				                            value);
 			}
 			value = StringUtil::Replace(value.substr(1, value.size() - 2), "''", "'");
+		} else if (value.find_first_of("'\"()") != string::npos) {
+			// the split opened a quote or a parenthesis inside it and took the items after it in (`a=x'y,b=c` read
+			// one claim a): an unquoted value holds none
+			throw InvalidInputException("acl: claim \"%s\"'s unquoted value holds no quote or parenthesis, got %s - "
+			                            "quote it",
+			                            name, value);
 		}
 		if (!claims.emplace(name, value).second) {
 			// a later item replaced an earlier one silently (`t = 'x', T = 'y'`: names compare in any case)

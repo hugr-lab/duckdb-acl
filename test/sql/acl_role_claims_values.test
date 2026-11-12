@@ -61,6 +61,22 @@ SELECT acl_define_role('loose', 'tenant=''a'' b');
 ----
 quoted value is one '...' literal
 
+# ... and an unquoted value holding a quote or a parenthesis, which took the items after it in (`unit` was lost)
+statement error
+ACL ADMIN CREATE ROLE loose CLAIMS 'tenant=a''b,unit=c';
+----
+claim "tenant"'s unquoted value holds no quote or parenthesis
+
+statement error
+SELECT acl_define_role('loose', 'tenant=f(a,unit=b');
+----
+unquoted value holds no quote or parenthesis
+
+statement error
+SELECT acl_define_token('tok-loose', 'comma', 'tenant="a,unit=b');
+----
+unquoted value holds no quote or parenthesis
+
 # --- the policy catalog ------------------------------------------------------------------------------
 
 statement ok

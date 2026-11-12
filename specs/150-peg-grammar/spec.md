@@ -523,13 +523,15 @@ compiler; `AdminScanner` went with 4c.
   splits at them - `"a(" = 'x', b = 'y'` would have read back as one claim), and in `ParseClaims` an item that names
   no claim (`'tenant'`, `='x'`, `{}` - skipped, the claim lost silently; drain.sh passed `'{}'`), a claim named twice
   in any case (the last won: `tenant = 'a', "TENANT" = 'b'` read `b`), a quoted value that is not one literal (`'x' y`,
-  `'x` read as their text) and a name holding a quote or a parenthesis. A quoted name in the list means the name it
+  `'x` read as their text), an unquoted one holding a quote or a parenthesis (the split took the items after it in:
+  `tenant=a'b,unit=c` read one claim) and a name holding a quote or a parenthesis. A quoted name in the list means the name it
   quotes: `"tenant id"` is the claim `tenant id` (the text reader stored it with its quotes, a claim no
   `acl_claim('tenant id')` read); a quoted name with a space at an end is refused (the csv's reader trims it). The
   quoted form is checked at parse, so a refused list refuses its batch whole. Stored rows are not rewritten: a name
   stored with its quotes before 4d stays until its role's next `SET CLAIMS`, where the old spelling (quotes included)
   is refused - the operator writes the name it meant.
-  From the reviews: the duplicate, the trim, the loose literal, `'{}'` and the parse-time check of the quoted form.
+  From the reviews: the duplicate, the trim, the loose literal, `'{}'` and the parse-time check of the quoted form;
+  from the re-review the unquoted value.
 - 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
   takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,
   the first top-level `=`) - both sides lex as duckdb does; a differential test pins that the rule's items are what
