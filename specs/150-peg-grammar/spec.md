@@ -490,8 +490,20 @@ native SQL read the batch's heads on duckdb's tokens since 3g-1 (`IsMgmtStart` a
   `std::stoll`'s exceptions out (a quoted `'-'`, 20 digits), a size past int64 (`batch_bytes 10000000TB`) threw an
   internal error that invalidated the database, and a JSON integer past int64 wrapped (`18446744073709551615` stored
   -1) - each a refusal naming the limit now.
-- 4c: a client's REQUIRE / ATTRIBUTES / claim map and the ITEMS lists as rules (`AdminScanner` goes - its words are
-  ASCII, so `REQUIRE (größe = 'x')` is refused until then while `ROLES FROM (größe)` reads).
+- 4c (built): a client's lists are rules (`AdminScanner`, `ListItemsJson`, `RequireJson`'s and `AttributesJson`'s
+  text readers, `ClaimMapToJson`, the spec-JSON markers `TextArg::splice` and the text kinds ITEMS / REQUIRE /
+  ATTRIBUTES / CLAIM_MAP go). A value (`AclValue`: a word, words joined by `.`, a signed number, a quoted one, any
+  of the three quotes) in `AclItems` (AUDIENCES, AZP, FLOWS, ROLES FROM / CONSTANT, SUBJECT), a claim path
+  (`AclClaimPath`: words joined by `.`, a name in any script - `größe` now reads in REQUIRE too -, a quoted path), REQUIRE's
+  four conditions (`AclRequireContains` / `In` / `Like` / `Eq`), ATTRIBUTES' `name = path | (paths) | CONSTANT 'v'`
+  (the name a word or quoted), CLAIM MAP's `path => claim` (duckdb's own `=>` token) - read into the spec's JSON in
+  the transform (`ItemValues`, `RequireJson`, `AttributesJson`, `ClaimMapJson`; the empty item and an empty value
+  none, as the text readers took them). The legacy quoted forms stay (a csv of audiences, a CLAIM MAP's JSON, one
+  quoted SUBJECT path). A parenthesised list that reads as none of them is refused in its own words (`RefuseList`,
+  the fallback alternative `AclParenList`). What reads differently: a bare value is one of those forms - the text
+  readers took anything between commas (`acme-prod`, `custom:tenant` bare; the survey of the four repositories
+  found every such value quoted); a backtick value reads; a `$$…$$` / joined string is refused by the plain-literal
+  check's words; `'v' = x` reads as a quoted path (it was refused as a malformed contains).
 - 4d: a role's claims list as rules, and one reader of a list's text for the quoted form and the function forms.
 - 4e: a grant's column list: a mask read by duckdb's `Expression` rule (`[ ]`, `{ }`, `MAP`, lambdas as duckdb
   takes them), and the stored list split on duckdb's tokens instead of `SplitTopLevel`'s counter (a top-level comma,

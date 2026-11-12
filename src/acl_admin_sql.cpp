@@ -7,7 +7,6 @@
 #include "acl_admin_sql.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "acl_grammar.hpp"
-#include "acl_admin_scanner.hpp"
 #include "acl_platform.hpp"
 
 #include "acl_door_common.hpp"
@@ -29,6 +28,9 @@
 
 namespace duckdb {
 namespace acl {
+
+namespace {
+
 //! Strip one layer of quotes from a list element written as a literal
 string Unquoted(string value) {
 	StringUtil::Trim(value);
@@ -39,8 +41,6 @@ string Unquoted(string value) {
 	}
 	return value;
 }
-
-namespace {
 
 //! `(tenant = 'acme', unit = 'eu')` -> the csv `tenant='acme',unit='eu'`: each value stays one quoted literal, so
 //! a `,` or a `'` inside it is part of the value (ParseClaims takes the quotes off)
@@ -60,37 +60,6 @@ string ClaimsListToCsv(const string &list) {
 		entries.push_back(name + "='" + StringUtil::Replace(value, "'", "''") + "'");
 	}
 	return StringUtil::Join(entries, ",");
-}
-
-//! `(tid => tenant, oid => user_id)` -> the stored JSON `{"tid": "tenant", "oid": "user_id"}` - each side quoted as
-//! JSON, split at the first `=>` outside quotes (spec 150 stage 3e: the sides were pasted into the JSON, so a quoted
-//! side holding `", "` stored a second mapping, and an `=>` inside quotes split the item there)
-string ClaimMapToJson(const string &list) {
-	vector<string> entries;
-	for (auto &item : SplitTopLevel(list, ',')) {
-		if (item.empty()) {
-			continue;
-		}
-		idx_t arrow = string::npos;
-		char quote = 0;
-		for (idx_t i = 0; i + 1 < item.size(); i++) {
-			auto c = item[i];
-			if (quote) {
-				quote = c == quote ? 0 : quote;
-			} else if (c == '\'' || c == '"') {
-				quote = c;
-			} else if (c == '=' && item[i + 1] == '>') {
-				arrow = i;
-				break;
-			}
-		}
-		if (arrow == string::npos) {
-			throw BinderException("acl admin: a claim mapping is written as <jwt path> => <claim>, got \"%s\"", item);
-		}
-		entries.push_back(JsonQuote(Unquoted(item.substr(0, arrow))) + ": " +
-		                  JsonQuote(Unquoted(item.substr(arrow + 2))));
-	}
-	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
 //! spec 065: a management COLUMNS list is written like SQL, so a quoted identifier must mean the
@@ -457,146 +426,6 @@ struct HeadWords {
 	                      "RESOURCE GROUP ... FROM ROLE <role>");
 }
 
-// --- spec 095: the readers of an issuer's and a client's lists ---------------------------------------
-
-string JsonList(const vector<string> &values) {
-	vector<string> quoted;
-	for (auto &value : values) {
-		quoted.push_back(JsonQuote(value));
-	}
-	return "[" + StringUtil::Join(quoted, ",") + "]";
-}
-
-//! A list written `(a, 'b', …)` - the text between its parentheses - as a JSON list, items unquoted
-string ListItemsJson(const string &inside) {
-	vector<string> out;
-	for (auto &item : SplitTopLevel(inside, ',')) {
-		auto value = Unquoted(item);
-		StringUtil::Trim(value);
-		if (!value.empty()) {
-			out.push_back(value);
-		}
-	}
-	return JsonList(out);
-}
-
-//! A claim path: a quoted string (a claim with characters a word cannot hold) or word(.word)*
-string ClaimPath(AdminScanner &s) {
-	s.Skip();
-	if (s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"')) {
-		return s.Quoted("claim path");
-	}
-	return s.DottedWords("a claim path");
-}
-
-//! A REQUIRE value: a quoted string, or a bare word or number (a boolean or numeric claim, compared as
-//! the text it reads as: `true`, `42`)
-string RequireValue(AdminScanner &c) {
-	c.Skip();
-	if (c.pos < c.text.size() && (c.text[c.pos] == '\'' || c.text[c.pos] == '"')) {
-		return c.Quoted("value");
-	}
-	auto start = c.pos;
-	while (c.pos < c.text.size() && (IsWordChar(c.text[c.pos]) || c.text[c.pos] == '.' || c.text[c.pos] == '-')) {
-		c.pos++;
-	}
-	if (c.pos == start) {
-		throw BinderException("acl admin: expected a value at position %llu", start);
-	}
-	return StringUtil::Lower(c.text.substr(start, c.pos - start)) == "true" ||
-	               StringUtil::Lower(c.text.substr(start, c.pos - start)) == "false"
-	           ? StringUtil::Lower(c.text.substr(start, c.pos - start))
-	           : c.text.substr(start, c.pos - start);
-}
-
-//! REQUIRE (sub LIKE 'repo:x:%', owner = 'hugr-lab', tid IN ('a', 'b'), 'admin' IN groups)
-string RequireJson(const string &list) {
-	vector<string> conditions;
-	for (auto &item : SplitTopLevel(list, ',')) {
-		if (item.empty()) {
-			continue;
-		}
-		AdminScanner c(item);
-		string path, op;
-		vector<string> values;
-		c.Skip();
-		if (c.pos < item.size() && item[c.pos] == '\'') {
-			// 'v' IN path: the claim (an array) contains the value
-			values.push_back(c.Quoted("value"));
-			c.Expect("in");
-			path = ClaimPath(c);
-			op = "contains";
-		} else {
-			path = ClaimPath(c);
-			c.Skip();
-			if (c.pos < item.size() && item[c.pos] == '=') {
-				c.pos++;
-				op = "eq";
-				values.push_back(RequireValue(c));
-			} else if (c.Accept("in")) {
-				op = "in";
-				for (auto &value : SplitTopLevel(c.Parens(), ',')) {
-					if (!value.empty()) {
-						values.push_back(Unquoted(value));
-					}
-				}
-			} else if (c.Accept("like")) {
-				op = "like";
-				values.push_back(c.Quoted("pattern"));
-			} else {
-				throw BinderException("acl admin: a REQUIRE condition is path = value, path IN ('a', …), 'v' IN path "
-				                      "or path LIKE 'p%%' - got \"%s\"",
-				                      item);
-			}
-		}
-		if (!c.Done()) {
-			throw BinderException("acl admin: unexpected text in the REQUIRE condition \"%s\"", item);
-		}
-		conditions.push_back("{\"path\":" + JsonQuote(path) + ",\"op\":" + JsonQuote(op) +
-		                     ",\"values\":" + JsonList(values) + "}");
-	}
-	return "[" + StringUtil::Join(conditions, ",") + "]";
-}
-
-//! ATTRIBUTES (tenant = 'tenant', email = ('email', 'upn'), org = CONSTANT 'acme')
-string AttributesJson(const string &list) {
-	vector<string> attributes;
-	for (auto &item : SplitTopLevel(list, ',')) {
-		if (item.empty()) {
-			continue;
-		}
-		AdminScanner a(item);
-		auto name = a.Word("an attribute name");
-		a.Skip();
-		if (a.pos >= item.size() || item[a.pos] != '=') {
-			throw BinderException("acl admin: an attribute is written name = 'path' | ('path', …) | CONSTANT 'v' - "
-			                      "got \"%s\"",
-			                      item);
-		}
-		a.pos++;
-		if (a.Accept("constant")) {
-			attributes.push_back("{\"name\":" + JsonQuote(name) + ",\"constant\":" + JsonQuote(a.Quoted("value")) +
-			                     "}");
-		} else {
-			vector<string> paths;
-			if (a.AtParen()) {
-				for (auto &path : SplitTopLevel(a.Parens(), ',')) {
-					if (!path.empty()) {
-						paths.push_back(Unquoted(path));
-					}
-				}
-			} else {
-				paths.push_back(ClaimPath(a));
-			}
-			attributes.push_back("{\"name\":" + JsonQuote(name) + ",\"paths\":" + JsonList(paths) + "}");
-		}
-		if (!a.Done()) {
-			throw BinderException("acl admin: unexpected text in the attribute \"%s\"", item);
-		}
-	}
-	return "[" + StringUtil::Join(attributes, ",") + "]";
-}
-
 //! A GRANT / REVOKE SECRET its rule did not read (spec 082 / 150 3g-2a): the form in its own words
 [[noreturn]] void RefuseSecretsForm(bool grant) {
 	RefuseMovedForm(grant
@@ -945,31 +774,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			case MgmtParsed::TextKind::TEXT:
 				read = list.text;
 				break;
-			case MgmtParsed::TextKind::ITEMS:
-				read = ListItemsJson(list.text);
-				break;
-			case MgmtParsed::TextKind::REQUIRE:
-				read = RequireJson(list.text);
-				break;
-			case MgmtParsed::TextKind::ATTRIBUTES:
-				read = AttributesJson(list.text);
-				break;
-			case MgmtParsed::TextKind::CLAIM_MAP:
-				read = JsonQuote(ClaimMapToJson(list.text)); // kept as a JSON string, which the spec parses
-				break;
 			}
-			if (list.splice.empty()) {
-				entry.args[list.arg] = Value(read);
-			} else {
-				// a list inside a JSON spec: its reading where the rule left its marker
-				entry.args[list.arg] = Value(StringUtil::Replace(entry.args[list.arg].ToString(), list.splice, read));
-			}
-		}
-		for (auto &list : entry.texts) {
-			// a reading is JSON, which never holds a raw control character: one left is a marker nothing replaced
-			if (!list.splice.empty() && StringUtil::Contains(entry.args[list.arg].ToString(), "\x01")) {
-				throw BinderException("acl admin: a list's marker is left in a spec");
-			}
+			entry.args[list.arg] = Value(read);
 		}
 		if (entry.current_session) {
 			if (current_session.empty()) {

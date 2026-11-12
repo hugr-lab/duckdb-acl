@@ -78,8 +78,6 @@ struct MgmtParseData : ParserExtensionParseData {
 		bool expression = false;
 		//! a quoted list a reader of ours splits: judged as the compiler's text is (no comment, no `$$`, ...)
 		bool judge = false;
-		//! where the list's reading goes inside the argument (a JSON spec), '' = the whole argument
-		string splice;
 	};
 	vector<Span> spans;
 
@@ -1543,12 +1541,9 @@ string ValueTextOf(PEGTransformer &transformer, ParseResult &result, const char 
 	return sign + number.get().Cast<NumberParseResult>().number;
 }
 
-//! `AclLimits <- '(' AclLimitEntry AclLimitMore* ')'` (AclLimitEntry <- AclLimitItem?, AclLimitItem <- AclWordToken
-//! '='? AclLimitValue; spec 150 4b - a value a run of touching tokens, a signed number or a quoted one): a resource
-//! group's limits `(window_max 64, batch_bytes '32MiB', …)` as the JSON the admin functions take (spec 085; ALTER
-//! RESOURCE GROUP … SET (…), spec 120) - each name once in any case, lower-cased, its value as written (a quoted one
-//! unquoted); the functions judge both
-string LimitsJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
+//! A list rule's items - `'(' <Entry> <More>* ')'`, each Entry `<Item>?`, each More `',' <Entry>` (spec 150 4b / 4c):
+//! the items written, an empty one (`(a, , b)`, `()`) none
+vector<reference<ParseResult>> ListEntries(ParseResult &result) {
 	vector<reference<ParseResult>> items;
 	auto &list = Strip(result).Cast<ListParseResult>();
 	auto collect = [&items](ParseResult &entry) {
@@ -1563,6 +1558,16 @@ string LimitsJson(PEGTransformer &transformer, ParseResult &result, MgmtParseDat
 	for (auto &next : more) {
 		collect(next.get().Cast<ListParseResult>().GetChild(1));
 	}
+	return items;
+}
+
+//! `AclLimits <- '(' AclLimitEntry AclLimitMore* ')'` (AclLimitEntry <- AclLimitItem?, AclLimitItem <- AclWordToken
+//! '='? AclLimitValue; spec 150 4b - a value a run of touching tokens, a signed number or a quoted one): a resource
+//! group's limits `(window_max 64, batch_bytes '32MiB', …)` as the JSON the admin functions take (spec 085; ALTER
+//! RESOURCE GROUP … SET (…), spec 120) - each name once in any case, lower-cased, its value as written (a quoted one
+//! unquoted); the functions judge both
+string LimitsJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
+	auto items = ListEntries(result);
 	vector<string> entries;
 	case_insensitive_set_t named;
 	for (auto &item : items) {
@@ -1826,19 +1831,6 @@ arena_ptr<TransformResultValue> FinalizeAlterGrant(PEGTransformer &transformer, 
 
 // --- issuers and clients (spec 095) --------------------------------------------------------------------------------
 
-//! A parenthesised list inside a JSON spec: its marker in the spec, which the reading of its text replaces once the
-//! batch's tokens are known (a control character never stands raw in JSON, so no value can forge it)
-string SpecListMarker(ParseResult &paren_list, MgmtParsed::TextKind kind, idx_t arg, MgmtParseData &data) {
-	auto index = data.spans.size();
-	auto marker = string("\x01") + std::to_string(index) + "\x01";
-	ParensInto(paren_list, arg, kind, false, data);
-	if (data.spans.size() != index + 1) {
-		throw ParserException("acl admin: a list inside a spec left no span");
-	}
-	data.spans[index].splice = marker;
-	return marker;
-}
-
 //! A JSON list of a legacy csv's items (`'a,b'`): split at the commas, each trimmed, the empty ones left out
 string CsvItemsJson(const string &csv) {
 	vector<string> items;
@@ -1851,11 +1843,43 @@ string CsvItemsJson(const string &csv) {
 	return "[" + StringUtil::Join(items, ",") + "]";
 }
 
-//! `AclList <- AclParenList / AclQuotedValue` inside a JSON spec: a list of values as written, or the legacy csv
-string ItemsJson(PEGTransformer &transformer, ParseResult &result, const char *what, idx_t arg, MgmtParseData &data) {
+//! `AclItems <- '(' AclItemEntry AclItemMore* ')'` (AclItemEntry <- AclValue?; spec 150 4c): the values written - each
+//! a word, a dotted word, a signed number or a quoted value; an empty item and an empty quoted value none, as the text
+//! reader took them
+vector<string> ItemValues(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
+	vector<string> values;
+	for (auto &item : ListEntries(result)) {
+		auto value = ValueTextOf(transformer, item, what, data);
+		if (!value.empty()) {
+			values.push_back(std::move(value));
+		}
+	}
+	return values;
+}
+
+string JsonStrings(const vector<string> &values) {
+	vector<string> quoted;
+	for (auto &value : values) {
+		quoted.push_back(JsonQuote(value));
+	}
+	return "[" + StringUtil::Join(quoted, ",") + "]";
+}
+
+//! A list that did not read as its rule (`AclParenList`, the fallback alternative): refused in its own words
+[[noreturn]] void RefuseList(const char *what) {
+	throw BinderException("acl admin: %s - each value a word, a number or a quoted string (anything else quoted: "
+	                      "'acme-prod', 'custom:tenant')",
+	                      what);
+}
+
+//! `AclItemList <- AclItems / AclParenList / AclQuotedValue` inside a JSON spec: a list of values, or the legacy csv
+string ItemsJson(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
 	auto &node = Strip(result);
+	if (node.Name() == "AclItems") {
+		return JsonStrings(ItemValues(transformer, node, what, data));
+	}
 	if (node.Name() == "AclParenList") {
-		return SpecListMarker(node, MgmtParsed::TextKind::ITEMS, arg, data);
+		RefuseList((string(what) + " are a list of values").c_str());
 	}
 	QuotedValue entry;
 	entry.value = ValueOf(transformer, node, entry.offset);
@@ -1875,6 +1899,90 @@ void SecretEntries(PEGTransformer &transformer, ListParseResult &clause, idx_t n
 		entries.push_back("\"service\":" +
 		                  JsonQuote(NameOf(ClauseList(in.GetResult()).GetChild(1), "a secrets service")));
 	}
+}
+
+//! `AclClaimPath <- AclDottedToken / AclNameValue`: a claim's path - words joined by `.` (`realm_access.roles`), a name
+//! in any script, or a quoted path (`'https://acme/roles'`)
+string ClaimPathOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
+	return NameValueOf(transformer, Strip(result), what, data);
+}
+
+//! `AclRequireList <- '(' AclRequireEntry AclRequireMore* ')'` (spec 150 4c): the conditions as the spec's JSON -
+//! `'v' IN path` (the claim, a list, contains the value), `path IN (v, …)`, `path LIKE 'p'`, `path = v` (a bare
+//! `true` / `false` lower-cased, as the claim reads)
+string RequireJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
+	vector<string> conditions;
+	for (auto &item : ListEntries(result)) {
+		auto &condition = item.get().Cast<ListParseResult>();
+		auto form = condition.Name();
+		string path, op;
+		vector<string> values;
+		if (form == "AclRequireContains") {
+			values.push_back(QuotedOf(transformer, condition.GetChild(0), "a value", data));
+			path = ClaimPathOf(transformer, condition.GetChild(2), "a claim path", data);
+			op = "contains";
+		} else {
+			path = ClaimPathOf(transformer, condition.GetChild(0), "a claim path", data);
+			if (form == "AclRequireIn") {
+				op = "in";
+				values = ItemValues(transformer, condition.GetChild(2), "a value", data);
+			} else if (form == "AclRequireLike") {
+				op = "like";
+				values.push_back(QuotedOf(transformer, condition.GetChild(2), "a pattern", data));
+			} else {
+				op = "eq";
+				auto &value = Strip(condition.GetChild(2));
+				auto text = ValueTextOf(transformer, value, "a value", data);
+				auto lowered = StringUtil::Lower(text);
+				values.push_back(value.Name() == "AclDottedToken" && (lowered == "true" || lowered == "false") ? lowered
+				                                                                                               : text);
+			}
+		}
+		conditions.push_back("{\"path\":" + JsonQuote(path) + ",\"op\":" + JsonQuote(op) +
+		                     ",\"values\":" + JsonStrings(values) + "}");
+	}
+	return "[" + StringUtil::Join(conditions, ",") + "]";
+}
+
+//! `AclAttributeList <- '(' AclAttributeEntry AclAttributeMore* ')'` (spec 150 4c): `name = path`, `name = (path, …)`,
+//! `name = CONSTANT 'v'` as the spec's JSON - the claims RLS reads
+string AttributesJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
+	vector<string> attributes;
+	for (auto &item : ListEntries(result)) {
+		auto &attribute = item.get().Cast<ListParseResult>();
+		auto &name_node = Strip(attribute.GetChild(0));
+		auto name = name_node.Name() == "AclWordToken" ? TokenOf(name_node).text
+		                                               : QuotedOf(transformer, name_node, "an attribute name", data);
+		auto &value = Strip(attribute.GetChild(2));
+		if (value.Name() == "AclAttrConstant") {
+			attributes.push_back(
+			    "{\"name\":" + JsonQuote(name) + ",\"constant\":" +
+			    JsonQuote(QuotedOf(transformer, value.Cast<ListParseResult>().GetChild(1), "a constant", data)) + "}");
+			continue;
+		}
+		vector<string> paths;
+		if (value.Name() == "AclClaimPaths") {
+			for (auto &path : ListEntries(value)) {
+				paths.push_back(ClaimPathOf(transformer, path, "a claim path", data));
+			}
+		} else {
+			paths.push_back(ClaimPathOf(transformer, value, "a claim path", data));
+		}
+		attributes.push_back("{\"name\":" + JsonQuote(name) + ",\"paths\":" + JsonStrings(paths) + "}");
+	}
+	return "[" + StringUtil::Join(attributes, ",") + "]";
+}
+
+//! `AclClaimMapList <- '(' AclClaimMapEntry AclClaimMapMore* ')'` (the short form's legacy attributes; spec 150 4c):
+//! `<jwt path> => <claim>` as the JSON object the spec keeps as a string
+string ClaimMapJson(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
+	vector<string> entries;
+	for (auto &item : ListEntries(result)) {
+		auto &mapping = item.get().Cast<ListParseResult>();
+		entries.push_back(JsonQuote(ClaimPathOf(transformer, mapping.GetChild(0), "a jwt path", data)) + ": " +
+		                  JsonQuote(ClaimPathOf(transformer, mapping.GetChild(2), "a claim name", data)));
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
 //! One clause of a client (spec 095 §2) into its spec entries: each clause once. `issuer` collects what is the
@@ -1926,25 +2034,31 @@ void ClientClauseInto(PEGTransformer &transformer, ParseResult &result, idx_t ar
 		           : name == "AclRolesFrom" ? "roles_from"
 		                                    : "roles_constant";
 		auto what = name == "AclRolesFrom" ? "claim paths" : name == "AclRolesConstant" ? "roles" : key;
-		entries.push_back(string("\"") + key + "\":" +
-		                  ItemsJson(transformer, parts.GetChild(parts.GetChildren().size() - 1), what, arg, data));
+		entries.push_back(string("\"") + key +
+		                  "\":" + ItemsJson(transformer, parts.GetChild(parts.GetChildren().size() - 1), what, data));
 	} else if (name == "AclRequire" || name == "AclAttributes") {
 		// AclRequire <- 'REQUIRE' AclList / AclAttributes <- 'ATTRIBUTES' AclList - a list in parentheses only
 		bool require = name == "AclRequire";
 		auto &list = Strip(parts.GetChild(1));
-		if (list.Name() != "AclParenList") {
+		if (list.Name() == "AclParenList") {
+			RefuseList(require ? "a REQUIRE condition is path = value, path IN (value, ...), 'value' IN path or path "
+			                     "LIKE 'pattern'"
+			                   : "an attribute is name = path, name = (path, ...) or name = CONSTANT 'value'");
+		}
+		if (list.Name() != "AclRequireList" && list.Name() != "AclAttributeList") {
 			throw BinderException(require ? "acl admin: REQUIRE takes its conditions in parentheses"
 			                              : "acl admin: ATTRIBUTES takes its list in parentheses");
 		}
 		entries.push_back(string(require ? "\"require\":" : "\"attributes\":") +
-		                  SpecListMarker(list,
-		                                 require ? MgmtParsed::TextKind::REQUIRE : MgmtParsed::TextKind::ATTRIBUTES,
-		                                 arg, data));
+		                  (require ? RequireJson(transformer, list, data) : AttributesJson(transformer, list, data)));
 	} else if (name == "AclClaimMap") {
 		// AclClaimMap <- 'CLAIM' 'MAP' AclList - the map kept as a JSON string, which the spec parses
 		auto &map = Strip(parts.GetChild(2));
-		entries.push_back("\"claim_map\":" + (map.Name() == "AclParenList"
-		                                          ? SpecListMarker(map, MgmtParsed::TextKind::CLAIM_MAP, arg, data)
+		if (map.Name() == "AclParenList") {
+			RefuseList("a claim mapping is <jwt path> => <claim>");
+		}
+		entries.push_back("\"claim_map\":" + (map.Name() == "AclClaimMapList"
+		                                          ? JsonQuote(ClaimMapJson(transformer, map, data))
 		                                          : JsonQuote(Quoted(transformer, parts, 2, "claim map", data))));
 	} else if (name == "AclRoleClaim") {
 		// AclRoleClaim <- 'ROLE' 'CLAIM' AclQuotedValue - the short form's one source
@@ -1956,9 +2070,12 @@ void ClientClauseInto(PEGTransformer &transformer, ParseResult &result, idx_t ar
 	} else if (name == "AclSubject") {
 		// AclSubject <- 'SUBJECT' AclList - paths in parentheses, or one quoted path
 		auto &paths = Strip(parts.GetChild(1));
+		if (paths.Name() == "AclParenList") {
+			RefuseList("subject paths are a list of values");
+		}
 		entries.push_back("\"subject\":" +
-		                  (paths.Name() == "AclParenList"
-		                       ? SpecListMarker(paths, MgmtParsed::TextKind::ITEMS, arg, data)
+		                  (paths.Name() == "AclItems"
+		                       ? JsonStrings(ItemValues(transformer, paths, "subject paths", data))
 		                       : "[" + JsonQuote(Quoted(transformer, parts, 1, "subject path", data)) + "]"));
 	} else if (name == "AclTokenType") {
 		// AclTokenType <- 'TOKEN' 'TYPE' AclQuotedValue
@@ -2739,20 +2856,55 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclFromSecret <- 'FROM' 'SECRET' AclNameValue AclSecretIn?"));
 		changes.push_back(
 		    GrammarChange::AddRule("AclClientSecret <- 'CLIENT' 'FROM' 'SECRET' AclNameValue AclSecretIn?"));
-		changes.push_back(GrammarChange::AddRule("AclAudiences <- 'AUDIENCES' AclList"));
-		changes.push_back(GrammarChange::AddRule("AclAzp <- 'AZP' AclList"));
-		changes.push_back(GrammarChange::AddRule("AclRequire <- 'REQUIRE' AclList"));
-		changes.push_back(GrammarChange::AddRule("AclRolesFrom <- 'ROLES' 'FROM' AclList"));
-		changes.push_back(GrammarChange::AddRule("AclRolesConstant <- 'ROLES' 'CONSTANT' AclList"));
+		// spec 150 4c: a client's lists as rules - a value a word, a dotted word, a signed number or a quoted one; a
+		// claim path words joined by `.`, a name, or quoted; a list that does not read so is its own refusal
+		// (AclParenList, the last alternative but the legacy quoted form)
+		changes.push_back(GrammarChange::AddRule("AclItemEntry <- AclValue?"));
+		changes.push_back(GrammarChange::AddRule("AclItemMore <- ',' AclItemEntry"));
+		changes.push_back(GrammarChange::AddRule("AclItems <- '(' AclItemEntry AclItemMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclItemList <- AclItems / AclParenList / AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclClaimPath <- AclDottedToken / AclNameValue"));
+		changes.push_back(GrammarChange::AddRule("AclRequireContains <- StringLiteral 'IN' AclClaimPath"));
+		changes.push_back(GrammarChange::AddRule("AclRequireIn <- AclClaimPath 'IN' AclItems"));
+		changes.push_back(GrammarChange::AddRule("AclRequireLike <- AclClaimPath 'LIKE' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclRequireEq <- AclClaimPath '=' AclValue"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclRequireCondition <- AclRequireContains / AclRequireIn / AclRequireLike / AclRequireEq"));
+		changes.push_back(GrammarChange::AddRule("AclRequireEntry <- AclRequireCondition?"));
+		changes.push_back(GrammarChange::AddRule("AclRequireMore <- ',' AclRequireEntry"));
+		changes.push_back(GrammarChange::AddRule("AclRequireList <- '(' AclRequireEntry AclRequireMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclClaimPathEntry <- AclClaimPath?"));
+		changes.push_back(GrammarChange::AddRule("AclClaimPathMore <- ',' AclClaimPathEntry"));
+		changes.push_back(GrammarChange::AddRule("AclClaimPaths <- '(' AclClaimPathEntry AclClaimPathMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclAttrConstant <- 'CONSTANT' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclAttrValue <- AclAttrConstant / AclClaimPaths / AclClaimPath"));
+		changes.push_back(GrammarChange::AddRule("AclAttrName <- AclWordToken / AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclAttribute <- AclAttrName '=' AclAttrValue"));
+		changes.push_back(GrammarChange::AddRule("AclAttributeEntry <- AclAttribute?"));
+		changes.push_back(GrammarChange::AddRule("AclAttributeMore <- ',' AclAttributeEntry"));
+		changes.push_back(GrammarChange::AddRule("AclAttributeList <- '(' AclAttributeEntry AclAttributeMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMapping <- AclClaimPath '=>' AclClaimPath"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMapEntry <- AclClaimMapping?"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMapMore <- ',' AclClaimMapEntry"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMapList <- '(' AclClaimMapEntry AclClaimMapMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclAudiences <- 'AUDIENCES' AclItemList"));
+		changes.push_back(GrammarChange::AddRule("AclAzp <- 'AZP' AclItemList"));
+		changes.push_back(GrammarChange::AddRule("AclRequireArg <- AclRequireList / AclParenList / AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclRequire <- 'REQUIRE' AclRequireArg"));
+		changes.push_back(GrammarChange::AddRule("AclRolesFrom <- 'ROLES' 'FROM' AclItemList"));
+		changes.push_back(GrammarChange::AddRule("AclRolesConstant <- 'ROLES' 'CONSTANT' AclItemList"));
 		changes.push_back(GrammarChange::AddRule("AclRoleClaim <- 'ROLE' 'CLAIM' AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclUnmappedAs <- 'IGNORE' / AclAsRole"));
 		changes.push_back(GrammarChange::AddRule("AclAsRole <- 'AS' 'ROLE'"));
 		changes.push_back(GrammarChange::AddRule("AclUnmapped <- 'UNMAPPED' AclUnmappedAs"));
-		changes.push_back(GrammarChange::AddRule("AclAttributes <- 'ATTRIBUTES' AclList"));
-		changes.push_back(GrammarChange::AddRule("AclClaimMap <- 'CLAIM' 'MAP' AclList"));
-		changes.push_back(GrammarChange::AddRule("AclSubject <- 'SUBJECT' AclList"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclAttributesArg <- AclAttributeList / AclParenList / AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclAttributes <- 'ATTRIBUTES' AclAttributesArg"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMapArg <- AclClaimMapList / AclParenList / AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMap <- 'CLAIM' 'MAP' AclClaimMapArg"));
+		changes.push_back(GrammarChange::AddRule("AclSubject <- 'SUBJECT' AclItemList"));
 		changes.push_back(GrammarChange::AddRule("AclTokenType <- 'TOKEN' 'TYPE' AclQuotedValue"));
-		changes.push_back(GrammarChange::AddRule("AclFlows <- 'FLOWS' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclFlows <- 'FLOWS' AclItemList"));
 		changes.push_back(GrammarChange::AddRule("AclClientId <- 'CLIENT' 'ID' AclQuotedValue"));
 		// what is never written into the policy - read with its value, so the refusal says where it goes
 		changes.push_back(GrammarChange::AddRule("AclClientSecretValue <- 'CLIENT' 'SECRET' AclList?"));
@@ -2995,24 +3147,17 @@ bool BetweenParentheses(const string &text, idx_t start, idx_t end) {
 //! A parenthesised list's text between its parentheses, as written with each comment a space (a comment would
 //! otherwise be read as part of the list: `(a = 1 -- note⏎)` left an open comment in an RLS predicate). A list our
 //! readers split (`SplitTopLevel` knows `'…'` with `''` and `"…"` only) refuses a literal it would split into other
-//! items than written - a `$$…$$` string, an `E'…'` one with a backslash, a backtick name - and one whose items its
-//! reader takes as literals (`literal_items`: spec 095's lists) a string continued on the next line, which duckdb
-//! joins (an item that is SQL - a mask, a REMAP expression - is read by duckdb, joined); one duckdb's parser reads
-//! (`sql`) takes any
-string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql, bool literal_items) {
+//! items than written - a `$$…$$` string, an `E'…'` one with a backslash, a backtick name (an item that is SQL - a
+//! mask, a REMAP expression - is read by duckdb); one duckdb's parser reads (`sql`) takes any. Spec 095's lists are
+//! rules since spec 150 4c
+string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql) {
 	if (!BetweenParentheses(text, start, end)) {
 		throw BinderException(TILING_REFUSAL);
 	}
-	optional_ptr<const MatcherToken> previous;
 	return TokensText(text, tokens, start, end, true, true, TILING_REFUSAL, [&](const MatcherToken &token) {
 		if (sql) {
 			return;
 		}
-		if (literal_items && previous && JoinsStrings(*previous, token)) {
-			throw BinderException("acl admin: a list item is one literal - a string continued on the next line (which "
-			                      "duckdb joins) is not read as one item here yet");
-		}
-		previous = &token;
 		if (token.text.empty()) {
 			return;
 		}
@@ -3718,13 +3863,9 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				} else if (span.kind == MgmtParsed::TextKind::CLAIMS) {
 					value = ClaimsListText(text, tokens, span.start, span.end);
 				} else {
-					auto kind = span.kind;
-					value = ListText(text, tokens, span.start, span.end, span.sql,
-					                 kind == MgmtParsed::TextKind::ITEMS || kind == MgmtParsed::TextKind::REQUIRE ||
-					                     kind == MgmtParsed::TextKind::ATTRIBUTES ||
-					                     kind == MgmtParsed::TextKind::CLAIM_MAP);
+					value = ListText(text, tokens, span.start, span.end, span.sql);
 				}
-				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind, span.splice});
+				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind});
 			}
 		}
 		result.push_back(std::move(parsed));

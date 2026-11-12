@@ -503,7 +503,8 @@ where written - stored rows stay text; 4a built: a name is read exactly as duckd
 function's one part by its function mask; nothing of ours on top; a refusal names the keyword - `NameHint`), a value
 stays the scanner's word, `ToGrammar` quotes as `KeywordHelper::RequiresQuotes`, every revoke of nothing refused
 (`ThrowNothingToRevoke`), `PlainColumnName` = duckdb's parser; 4b built: a group's limits are a rule (`AclLimits`,
-`LimitsJson`); 4e reads a mask with duckdb's `Expression` and splits
+`LimitsJson`); 4c built: a client's lists are rules (`AclItems`, `AclRequireList`, `AclAttributeList`, `AclClaimMapList`;
+`AdminScanner` gone); 4e reads a mask with duckdb's `Expression` and splits
 a stored list on duckdb's tokens; spec 150 lists the hand-written readers left, each replace / keep). Tests `acl_prefix_grammar.test`,
 `acl_prefix_completion.test`, `acl_mgmt_grammar.test`, `test_acl_client_mgmt.cpp`, `test_acl_mgmt_rules.cpp`.
 
