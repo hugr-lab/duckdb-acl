@@ -29,12 +29,21 @@ policy" (`MapReadable`, `RequireWritableColumn`, `RequireReadableReturning`, `Ap
 physical row, `DELETE … WHERE ssn = …` read a hidden column. `VerbReadScope` (spec 145) skipped such a role as reading
 "every column as stored".
 
+From the review too: an object without a declared list whose catalog grant's and object grant's lists intersect to
+nothing (the read failed on duckdb's empty `COLUMNS(...)`, a write again saw no column policy); `acl_check_catalog`'s
+repair of a grant's last broken item was the list without it - an empty list, which is a row-only grant and reads
+every column (`SELECT acl_grant_object(…, '')` after `DROP MISSING COLUMNS` took the only listed column); the lineage
+tags (`RoleTags`) tagged every field `visible` for such a role.
+
 ## Design
 
 `TablePolicy::exposes_nothing` (acl_policy.hpp): set by `ApplyGrantPolicy` when the narrowed projection over a declared
 list is empty. `BuildTableSubquery` refuses on it, as on an empty projection without RLS; `ResolveDmlTarget` refuses
 every verb on it (`<verb> on "w" is not allowed: it exposes no column`) - a plain `DELETE` too: an object of which a
-role reads no column is not one it changes; `VerbReadScope` takes such a role as reading no column. An empty
+role reads no column is not one it changes; `VerbReadScope` takes such a role as reading no column. The no-declared-list branch sets the flag when the lists
+intersect to nothing (and the read refuses on it before a view's or the branch's query is used). The check's repair of
+a grant's last item revokes the grant (`acl_revoke_object` / `REVOKE CATALOG`), never an empty list; `RoleTags`
+gives such a role no field tag. An empty
 projection beside an RLS keeps meaning a row-only grant (every column) - only where no grant narrows the columns.
 
 ## Enforcement & security
@@ -47,5 +56,6 @@ narrowing to none by a later `SET COLUMNS` refuses the same way; `acl_check_cata
 
 `test/sql/acl_empty_grant_projection.test`: the object's RLS, the catalog grant's RLS, a rename-only object, an object
 grant left behind by `SET COLUMNS`, every verb on a writable object (UPDATE / DELETE / INSERT / INSERT OR REPLACE /
-MERGE, with RETURNING); a row-only grant still reads every declared column, a list naming the object's column still
+MERGE, with RETURNING), two lists intersecting to nothing over an object without a list, the check's revoke after
+`DROP MISSING COLUMNS`; a row-only grant still reads every declared column, a list naming the object's column still
 writes. Fails without the fix (the first read returns `id, ssn, b`).

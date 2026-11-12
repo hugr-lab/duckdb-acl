@@ -793,6 +793,12 @@ private:
 			// the re-grant that keeps everything but the item: an object grant has no ALTER form, and
 			// GRANT OBJECT with fewer clauses would reset what it does not state
 			auto regrant = [&](const string &columns_text) {
+				if (columns_text.empty()) {
+					// spec 156: an empty list is a row-only grant - every column; the list without its last item is
+					// none
+					return "SELECT acl_revoke_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) +
+					       ")  -- the list would be empty, which reads every column";
+				}
 				return "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
 				       Lit(caps) + ", " + Lit(rls) + ", " + Lit(columns_text) + ")";
 			};
@@ -817,6 +823,16 @@ private:
 			auto columns = Text(catalogs_rows.GetValue(2, row));
 			auto rls_checked = catalogs_rows.GetValue(3, row);
 			auto items = ParseColumnList(columns);
+			// spec 156: the list without its last item is no list - every column - so that repair revokes instead
+			auto set_columns = [&](const string &rest) {
+				auto grantee = NamePath(vector<string> {role}).ToGrammar();
+				if (rest.empty()) {
+					return "REVOKE CATALOG " + NamePath::KeyToGrammar(vcat) + " FROM ROLE " + grantee +
+					       "  -- the list would be empty, which reads every column";
+				}
+				return "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee + " SET COLUMNS " +
+				       Lit(rest);
+			};
 			case_insensitive_set_t matched;
 			for (auto &entry : relations) {
 				auto &relation = entry.second;
@@ -832,11 +848,7 @@ private:
 					                   NamePath(vector<string> {role}).ToGrammar() + " SET RLS '<predicate>'");
 				}
 				for (auto &item : items) {
-					JudgeColumns(relation, role, {item}, false,
-					             "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
-					                 NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
-					                 Lit(Without(items, item.first)),
-					             &matched);
+					JudgeColumns(relation, role, {item}, false, set_columns(Without(items, item.first)), &matched);
 				}
 			}
 			// a catalog-wide bare name applies where an object has it and is absent elsewhere by
@@ -846,9 +858,7 @@ private:
 					Add("grant", "*", role, "grant_column_missing",
 					    "the catalog-wide COLUMNS item \"" + item.first + "\" matches no column of any object of \"" +
 					        vcat + "\" - the role reads less than the grant says",
-					    "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
-					        NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
-					        Lit(Without(items, item.first)));
+					    set_columns(Without(items, item.first)));
 				}
 			}
 		}

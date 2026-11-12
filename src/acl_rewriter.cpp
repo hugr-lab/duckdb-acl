@@ -2590,12 +2590,15 @@ private:
 	//! as `(SELECT <projection> FROM <phys> [WHERE <rls>]) AS <alias>`. Claim values are baked in.
 	unique_ptr<TableRef> BuildTableSubquery(const string &vname, const TablePolicy &policy, BaseTableRef &original) {
 		string sql;
+		if (policy.exposes_nothing) {
+			// spec 156: the grants narrowed the object's columns to none (an empty projection beside an RLS is a
+			// row-only grant - every column - and an empty intersection of two lists no column at all)
+			Deny(Reason::POLICY_ERROR, "object " + Shown(vname) + " exposes no readable columns");
+		}
 		if (!policy.query.empty()) {
 			sql = policy.query; // a view: its SQL is the definition
 		} else {
-			// spec 156: an empty projection beside an RLS is a row-only grant (every column) - unless the grants
-			// narrowed the object's columns to none
-			if (policy.exposes_nothing || (policy.projection.empty() && policy.rls.empty())) {
+			if (policy.projection.empty() && policy.rls.empty()) {
 				Deny(Reason::POLICY_ERROR, "object " + Shown(vname) + " exposes no readable columns");
 			}
 			// no projection means the grant narrowed only the rows (spec 011): every column is read,

@@ -163,3 +163,51 @@ query I
 SELECT b FROM phys.main.t;
 ----
 5
+
+# an object without a declared list: the catalog grant's list and the object grant's intersect to nothing - the read
+# refuses in our words (duckdb's empty COLUMNS error before), a write before anything is written
+statement ok
+ACL ADMIN CREATE ROLE ix; CREATE VIRTUAL TABLE c.p AS phys.main.t;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE ix MAIN COLUMNS (id) RLS 'id > 0'; GRANT TABLE c.p TO ROLE ix COLUMNS (b);
+
+statement error
+ACL ROLE "ix" SELECT * FROM p;
+----
+exposes no readable columns
+
+statement error
+ACL ROLE "ix" UPDATE p SET ssn = 'x' RETURNING *;
+----
+exposes no column
+
+# the check's repair of a grant's last broken item revokes it - the list without it would be empty, which reads every
+# column
+statement ok
+CREATE TABLE phys.main.d (id INTEGER, old INTEGER);
+
+statement ok
+ACL ADMIN CREATE ROLE dr; CREATE VIRTUAL TABLE c.dt AS phys.main.d COLUMNS (i = id, old);
+
+statement ok
+ACL ADMIN GRANT TABLE c.dt TO ROLE dr COLUMNS (old);
+
+statement ok
+ALTER TABLE phys.main.d DROP COLUMN old;
+
+statement ok
+ACL ADMIN REPAIR VIRTUAL TABLE c.dt DROP MISSING COLUMNS;
+
+query I
+SELECT repair FROM acl_check_catalog('c') WHERE object = 'dt' AND role = 'dr' AND problem = 'grant_column_missing';
+----
+SELECT acl_revoke_object('dr', 'c', 'dt')  -- the list would be empty, which reads every column
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE dr MAIN;
+
+statement error
+ACL ROLE "dr" SELECT * FROM dt;
+----
+exposes no readable columns

@@ -986,6 +986,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
 		}
 		inner += out.ReadFrom();
+		// spec 156: the grants' lists intersect to nothing (a catalog grant's and an object grant's) - no column
+		out.exposes_nothing = listed.empty();
 		out.query = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
 		            StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
 		for (auto &column : listed) {
