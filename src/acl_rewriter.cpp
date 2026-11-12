@@ -2993,7 +2993,8 @@ private:
 	static vector<string> RenameItems(const TablePolicy &policy) {
 		vector<string> items;
 		for (auto &rename : policy.renames) {
-			items.push_back(rename.second + " AS " + rename.first);
+			// the virtual name quoted: a declared name may hold `,`, `=` or a space (spec 150 4f)
+			items.push_back(rename.second + " AS \"" + StringUtil::Replace(rename.first, "\"", "\"\"") + "\"");
 		}
 		return items;
 	}

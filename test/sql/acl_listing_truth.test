@@ -166,11 +166,24 @@ ACL ROLE "analyst" SELECT table_name, is_insertable_into FROM information_schema
 masked	NO
 mx	NO
 
-# a quoted name the stored form cannot carry is refused where written, not silently re-split
-statement error
-ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.audit COLUMNS ("a,b" = id);
+# spec 150 4f: an object's list is read on duckdb's tokens, so a quoted name holding ',' or '=' is the name it quotes
+# (the text reader split it, and refused it for that); one holding '.' is refused - the list reads it as a path
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.audit COLUMNS ("a,b" = id, "x=y" = note);
+
+query II
+SELECT name, expr FROM store.acl.relation_columns WHERE vcat = 'c' AND vname = 'bad' ORDER BY pos;
 ----
-<REGEX>:.*cannot be carried.*
+a,b	id
+x=y	note
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad2 AS phys.main.audit COLUMNS ("a.b" = id);
+----
+holds no '.' or '['
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.bad;
 
 # a grant written before any object exists is not judgeable, and passes
 statement ok

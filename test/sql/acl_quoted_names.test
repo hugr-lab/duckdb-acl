@@ -100,6 +100,21 @@ ACL ROLE "m" SELECT id, "Qty" FROM mart."MASKED" ORDER BY id;
 2	0
 3	0
 
+# spec 150 4f: the list's reader takes a quoted name's quotes off; the memory store pastes it back quoted
+statement ok
+CREATE TABLE phys.main.oq (id INTEGER, "odd name" INTEGER, "order" INTEGER);
+
+statement ok
+INSERT INTO phys.main.oq VALUES (1, 2, 3);
+
+statement ok
+SELECT acl_grant_table('m', 'oq', 'phys.main.oq', 'id, "odd name", "order" = "order" + 1', '', 'select');
+
+query III
+ACL ROLE "m" SELECT * FROM oq;
+----
+1	2	4
+
 # one name in any case is one object: a second grant under another case replaces it, never a sibling
 statement ok
 SELECT acl_grant_table('m', 'MART.masked', 'phys.main.u', '', '', 'select');

@@ -628,6 +628,29 @@ void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg
 	data.spans.push_back(std::move(span));
 }
 
+//! `AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue` into argument `arg` (spec 150 4f): an object's
+//! own column list (COLUMNS of CREATE VIRTUAL TABLE / ADD TABLE / SET COLUMNS, REMAP). `AclDeclaredItems <- '('
+//! AclDeclaredEntry AclDeclaredMore* ')'`, each `AclDeclaredColumn <- AclDeclaredAs / AclDeclaredNamed` - `Expression
+//! 'AS' ColLabel AclColumnMark?` (SQL's spelling, the alias duckdb's) or `AclFieldPath (AclDeclaredValue /
+//! AclColumnMark)?`, a name or a path each part duckdb's identifier, a value `'=' Expression` - duckdb's expression
+//! rule. The list goes as written (each comment a space) to the one reader of an object's list, `SplitDeclaredColumns`,
+//! which the function forms read it with too; the legacy quoted string goes to it as it stands
+void DeclaredColumnsInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg, MgmtParseData &data) {
+	auto &node = Strip(result);
+	if (node.Name() == "AclParenList") {
+		throw BinderException(
+		    "acl admin: an object's column list is items `name`, `name = <expression>` or "
+		    "`<expression> AS name`, each optionally NOT NULL / NULL - a name a column or a path into "
+		    "one (address.city), each part an identifier as duckdb reads one (quote a keyword or a "
+		    "name holding other characters), an expression one expression");
+	}
+	if (node.Name() != "AclDeclaredItems") {
+		ListInto(transformer, result, arg, MgmtParsed::TextKind::TEXT, true, "a column list", data);
+		return;
+	}
+	ParensInto(node, arg, MgmtParsed::TextKind::TEXT, true, data);
+}
+
 string AttrNameOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data);
 string ValueTextOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data);
 vector<reference<ParseResult>> ListEntries(ParseResult &result);
@@ -1181,8 +1204,7 @@ arena_ptr<TransformResultValue> FinalizeCreateTable(PEGTransformer &transformer,
 		ClauseOnce(seen, keyword);
 		auto &value = ClauseList(clause);
 		if (keyword == "columns") {
-			ListInto(transformer, value.GetChild(1), columns, MgmtParsed::TextKind::COLUMNS, false, "columns list",
-			         *data);
+			DeclaredColumnsInto(transformer, value.GetChild(1), columns, *data);
 		} else if (keyword == "rls") {
 			ListInto(transformer, value.GetChild(1), rls, MgmtParsed::TextKind::TEXT, true, "RLS predicate", *data);
 		} else if (keyword == "primary") {
@@ -1255,8 +1277,7 @@ arena_ptr<TransformResultValue> FinalizeAddTable(PEGTransformer &transformer, Pa
 	auto rls = AddArg(*data);
 	auto &columns_part = list.Child<OptionalParseResult>(5);
 	if (columns_part.HasResult()) {
-		ListInto(transformer, ClauseList(columns_part.GetResult()).GetChild(1), columns, MgmtParsed::TextKind::COLUMNS,
-		         false, "columns list", *data);
+		DeclaredColumnsInto(transformer, ClauseList(columns_part.GetResult()).GetChild(1), columns, *data);
 	}
 	auto &rls_part = list.Child<OptionalParseResult>(6);
 	if (rls_part.HasResult()) {
@@ -1351,8 +1372,7 @@ void ObjectChangeInto(PEGTransformer &transformer, ParseResult &result, const ch
 	} else if (name == "AclSetColumns") {
 		// AclSetColumns <- 'SET' AclColumnsClause
 		data.args.emplace_back("columns");
-		ListInto(transformer, ClauseList(parts.GetChild(1)).GetChild(1), AddArg(data), MgmtParsed::TextKind::COLUMNS,
-		         false, "columns list", data);
+		DeclaredColumnsInto(transformer, ClauseList(parts.GetChild(1)).GetChild(1), AddArg(data), data);
 	} else if (name == "AclSetRls") {
 		// AclSetRls <- 'SET' AclRlsClause
 		data.args.emplace_back("rls");
@@ -1451,10 +1471,9 @@ arena_ptr<TransformResultValue> FinalizeRepairTable(PEGTransformer &transformer,
 	VirtualNameArgs(list, 3, *data);
 	auto &action = Strip(list.GetChild(4)).Cast<ListParseResult>();
 	if (KeywordOf(action) == "remap") {
-		// AclRemap <- 'REMAP' AclList
+		// AclRemap <- 'REMAP' AclDeclaredList
 		data->args.emplace_back("remap");
-		ListInto(transformer, action.GetChild(1), AddArg(*data), MgmtParsed::TextKind::COLUMNS, false, "remap list",
-		         *data);
+		DeclaredColumnsInto(transformer, action.GetChild(1), AddArg(*data), *data);
 	} else {
 		// AclDropMissing <- 'DROP' 'MISSING' 'COLUMNS' AclAndMasks?
 		data->args.emplace_back(action.Child<OptionalParseResult>(3).HasResult() ? "drop_missing_and_masks"
@@ -2865,7 +2884,7 @@ public:
 		// and a name would take `v1` of `v1.0`), else a name (quoted, or in any script), else a signed number
 		changes.push_back(GrammarChange::AddRule("AclValue <- AclDottedToken / AclNameValue / AclSignedNumber"));
 		changes.push_back(GrammarChange::AddRule("AclPrimaryKey <- 'PRIMARY' 'KEY' AclList"));
-		changes.push_back(GrammarChange::AddRule("AclColumnsClause <- 'COLUMNS' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclColumnsClause <- 'COLUMNS' AclDeclaredList"));
 		changes.push_back(GrammarChange::AddRule("AclRlsClause <- 'RLS' AclList"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclCreateCatalog <- 'CREATE' AclOrReplace? 'VIRTUAL' 'CATALOG' AclIfNotExists? AclName AclComment?",
@@ -2974,7 +2993,7 @@ public:
 		                                         Start<FinalizeCommentObject>));
 		changes.push_back(GrammarChange::AddRule("AclCheckCatalog <- 'CHECK' 'VIRTUAL' 'CATALOG' AclName",
 		                                         Start<FinalizeCheckCatalog>));
-		changes.push_back(GrammarChange::AddRule("AclRemap <- 'REMAP' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclRemap <- 'REMAP' AclDeclaredList"));
 		changes.push_back(GrammarChange::AddRule("AclAndMasks <- 'AND' 'MASKS'"));
 		changes.push_back(GrammarChange::AddRule("AclDropMissing <- 'DROP' 'MISSING' 'COLUMNS' AclAndMasks?"));
 		changes.push_back(GrammarChange::AddRule("AclRepairAction <- AclRemap / AclDropMissing"));
@@ -3028,6 +3047,22 @@ public:
 		changes.push_back(
 		    GrammarChange::AddRule("AclGrantColumnList <- AclGrantColumnItems / AclParenList / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclGrantColumnsClause <- 'COLUMNS' AclGrantColumnList"));
+		// an object's own column list (spec 150 4f): `expr AS name` first - a name alone reads as an expression too,
+		// and only the AS form reads past it; a NULL mark after the name (after an expression it is the expression's
+		// `x NOT NULL`, which the reader takes off as spec 048's mark)
+		changes.push_back(GrammarChange::AddRule("AclColumnMark <- 'NOT'? 'NULL'"));
+		// the name after AS is duckdb's alias (`ColLabel`: any keyword - `AS order`, as `SELECT … AS order` reads)
+		changes.push_back(GrammarChange::AddRule("AclDeclaredAs <- Expression 'AS' ColLabel AclColumnMark?"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredValue <- '=' Expression"));
+		// a value's own `NOT NULL` is the expression's; a bare `NULL` after it is no mark (`u = ssn NULL`)
+		changes.push_back(GrammarChange::AddRule("AclDeclaredRest <- AclDeclaredValue / AclColumnMark"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredNamed <- AclFieldPath AclDeclaredRest?"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredColumn <- AclDeclaredAs / AclDeclaredNamed"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredEntry <- AclDeclaredColumn?"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredMore <- ',' AclDeclaredEntry"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredItems <- '(' AclDeclaredEntry AclDeclaredMore* ')'"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / AclGrantColumnsClause"));
 		changes.push_back(GrammarChange::AddRule("AclGrantClause <- AclObjectClause / AclMainClause"));

@@ -30,80 +30,29 @@ namespace acl {
 
 namespace {
 
-//! spec 065: a management COLUMNS list is written like SQL, so a quoted identifier must mean the
-//! name it quotes - `COLUMNS ("odd name", id = pk)` stores `odd name` (with its space), not the
-//! quotes. Only the item's NAME (left of a top-level `=`) is unquoted: the right side is an
-//! expression, where a quoted identifier is already valid SQL. Stored verbatim, the quotes made the
-//! item match no column, ever - the function form never had the defect.
-string UnquoteColumnsList(const string &raw, bool grant) {
+//! spec 065 / 150 4e: a grant's legacy quoted list (`COLUMNS '"id", ssn = upper(ssn)'`) is SQL's spelling - a quoted
+//! name means the name it quotes: stored bare when the stored list reads it back as itself, else kept quoted (`"a,b"`,
+//! `"a.b"` - the path reader takes the quotes off). Split as the stored list is read (`SplitListItems`); a mask as
+//! written
+string UnquoteGrantColumns(const string &raw) {
 	vector<string> items;
-	for (auto &item : SplitTopLevel(raw, ',')) {
-		auto text = item;
-		StringUtil::Trim(text);
-		if (text.empty()) {
-			continue;
-		}
-		// the first top-level `=` splits name from expression; one inside quotes or parens is the
-		// expression's own (the same reading SplitTopLevel gives a comma)
-		idx_t split = text.size();
-		char quote = 0;
-		idx_t depth = 0;
-		for (idx_t i = 0; i < text.size(); i++) {
-			auto c = text[i];
-			if (quote) {
-				if (c == quote) {
-					quote = 0;
+	for (auto &item : SplitListItems(raw)) {
+		auto name = item.has_value ? item.name : item.text;
+		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+			string bare;
+			bool one = true; // one quoted name: every quote inside doubled
+			for (idx_t i = 1; one && i + 1 < name.size(); i++) {
+				if (name[i] == '"') {
+					one = i + 2 < name.size() && name[i + 1] == '"';
+					i++;
 				}
-			} else if (c == '\'' || c == '"') {
-				quote = c;
-			} else if (c == '(') {
-				depth++;
-			} else if (c == ')' && depth > 0) {
-				depth--;
-			} else if (c == '=' && depth == 0) {
-				split = i;
-				break;
+				bare += name[i];
+			}
+			if (one && StoresBare(bare)) {
+				name = bare;
 			}
 		}
-		auto name = text.substr(0, split);
-		StringUtil::Trim(name);
-		if (!name.empty() && name.front() == '"') {
-			// the quoted token may carry a suffix (`"odd name" NOT NULL`, spec 048's nullability
-			// mark): unquote the token, keep the suffix - the consumer strips it as it always did
-			idx_t close = name.size();
-			for (idx_t i = 1; i < name.size(); i++) {
-				if (name[i] != '"') {
-					continue;
-				}
-				if (i + 1 < name.size() && name[i + 1] == '"') {
-					i++; // a doubled quote is a literal one
-					continue;
-				}
-				close = i;
-				break;
-			}
-			auto bare = close < name.size() ? StringUtil::Replace(name.substr(1, close - 1), "\"\"", "\"") : string();
-			if (grant && close + 1 == name.size() && !bare.empty() && !StoresBare(bare)) {
-				// spec 150 4e: a grant's name the stored list cannot read back bare (`"a,b"`, `"od'd"`, `"a--b"`) stays
-				// quoted - the path reader takes the quotes off
-			} else if (close < name.size()) {
-				// the stored csv form cannot carry these characters in a name: every later reader
-				// splits on them, and a silent re-split would grant something the admin never wrote
-				if (bare.find(',') != string::npos || bare.find('=') != string::npos) {
-					throw BinderException("acl admin: a column name containing ',' or '=' cannot be carried by a "
-					                      "COLUMNS list - the stored form splits on them (got \"%s\")",
-					                      bare);
-				}
-				name = bare + name.substr(close + 1);
-			}
-		}
-		if (split < text.size()) {
-			auto rest = text.substr(split + 1);
-			StringUtil::Trim(rest);
-			items.push_back(name + " = " + rest);
-		} else {
-			items.push_back(name);
-		}
+		items.push_back(item.has_value ? name + " = " + item.value : name);
 	}
 	return StringUtil::Join(items, ", ");
 }
@@ -736,11 +685,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		for (auto &list : entry.texts) {
 			string read;
 			switch (list.kind) {
-			case MgmtParsed::TextKind::COLUMNS:
-				read = UnquoteColumnsList(list.text, false);
-				break;
 			case MgmtParsed::TextKind::GRANT_COLUMNS:
-				read = UnquoteColumnsList(list.text, true);
+				read = UnquoteGrantColumns(list.text);
 				break;
 			case MgmtParsed::TextKind::TEXT:
 				read = list.text;

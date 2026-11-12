@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -46,73 +47,16 @@ vector<string> SplitCsv(const string &csv) {
 	return out;
 }
 
-//! cols_csv items are `name` or `name=expr`; returned as (name, expr) pairs (empty expr = plain)
-//! Strip a trailing NOT NULL / NULL declaration off a bare column item (spec 048): `id NOT NULL`
-//! declares, `ssn = NULL` masks - the '=' keeps the two unmistakable. Returns the bare name.
-string StripNullableSuffix(const string &item, case_insensitive_map_t<int8_t> &marks) {
-	auto words = StringUtil::Split(item, ' ');
-	if (words.size() >= 3 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
-	    StringUtil::CIEquals(words.back(), "null")) {
-		auto name = Trimmed(item.substr(0, item.size() - words.back().size() - words[words.size() - 2].size() - 2));
-		marks[name] = 0; // declared NOT NULL
-		return name;
-	}
-	if (words.size() >= 2 && StringUtil::CIEquals(words.back(), "null")) {
-		auto name = Trimmed(item.substr(0, item.size() - words.back().size() - 1));
-		marks[name] = 1; // declared nullable, explicitly
-		return name;
-	}
-	return item;
-}
-
-vector<std::pair<string, string>> ParseColumns(const string &csv, case_insensitive_map_t<int8_t> *marks = nullptr) {
+//! An object's declared column list (spec 150 4f: `SplitDeclaredColumns`, on duckdb's tokens): (name, expr) pairs, an
+//! empty expr the source's column as it is; a nullability mark (spec 048) into `marks` by name
+vector<std::pair<string, string>> ParseColumns(const string &csv, case_insensitive_map_t<int8_t> *marks = nullptr,
+                                               const char *what = "the relation's column list") {
 	vector<std::pair<string, string>> columns;
-	case_insensitive_map_t<int8_t> local;
-	auto &out = marks ? *marks : local;
-	for (auto &item_p : SplitCsv(csv)) {
-		auto item = item_p;
-		// `expr AS name` (SQL's spelling, outside quotes) is `name = expr` - stored as a name of its own and an
-		// expression, never as one name "expr AS name" (spec 117 review: it read nothing)
-		if (item.find('=') == string::npos && item.find('"') == string::npos && item.find('\'') == string::npos) {
-			auto lowered = StringUtil::Lower(item);
-			// the last ` as ` outside parentheses (a CAST's AS is inside its own)
-			idx_t as = string::npos;
-			idx_t depth = 0;
-			for (idx_t i = 0; i < lowered.size(); i++) {
-				if (lowered[i] == '(') {
-					depth++;
-				} else if (lowered[i] == ')' && depth > 0) {
-					depth--;
-				} else if (depth == 0 && lowered.compare(i, 4, " as ") == 0) {
-					as = i;
-				}
-			}
-			if (as != string::npos && as > 0) {
-				auto expr = Trimmed(item.substr(0, as));
-				auto name = Trimmed(item.substr(as + 4));
-				if (!expr.empty() && !name.empty()) {
-					item = name + " = " + expr;
-				}
-			}
+	for (auto &column : SplitDeclaredColumns(csv, what)) {
+		if (marks && column.nullable >= 0) {
+			(*marks)[column.name] = column.nullable;
 		}
-		auto pos = item.find('='); // the first '=' separates the name; the rest is the expression
-		if (pos == string::npos) {
-			columns.emplace_back(StripNullableSuffix(item, out), string());
-		} else {
-			auto name = Trimmed(item.substr(0, pos));
-			auto expr = Trimmed(item.substr(pos + 1));
-			// spec 048: a mask may promise NOT NULL explicitly - the one escape a computed key column
-			// has. Only this form: an expression of its own can end in "NOT NULL" only as "IS NOT
-			// NULL", which is kept whole, and a trailing bare NULL is the mask's value (`ssn = NULL`),
-			// never a mark.
-			auto words = StringUtil::Split(expr, ' ');
-			if (words.size() >= 3 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
-			    StringUtil::CIEquals(words.back(), "null") && !StringUtil::CIEquals(words[words.size() - 3], "is")) {
-				out[name] = 0;
-				expr = Trimmed(expr.substr(0, expr.size() - words.back().size() - words[words.size() - 2].size() - 2));
-			}
-			columns.emplace_back(name, expr);
-		}
+		columns.emplace_back(std::move(column.name), std::move(column.expr));
 	}
 	return columns;
 }
@@ -890,9 +834,15 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));
 			continue;
 		}
-		// spec 148: the memory store pastes this text at read too
+		// spec 148: the memory store pastes this text at read too - a quoted name quoted again (the reader took its
+		// quotes off, spec 150 4f), any other as written
 		acl_detail::RequireOneExpression("the grant's RLS", rls);
-		for (auto &column : columns) {
+		auto written = SplitDeclaredColumns(OptionalArg(args, 3, row, ""), "the relation's column list");
+		for (idx_t i = 0; i < columns.size(); i++) {
+			auto &column = columns[i];
+			if (written[i].quoted) {
+				column.first = KeywordHelper::WriteOptionallyQuoted(column.first, '"', true);
+			}
 			acl_detail::RequireColumnName("the grant's column list", column.first);
 			acl_detail::RequireOneExpression("the grant's column list", column.second);
 		}
