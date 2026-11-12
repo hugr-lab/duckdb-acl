@@ -10,7 +10,6 @@
 #include "acl_platform.hpp"
 
 #include "acl_door_common.hpp"
-#include "acl_scan_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"

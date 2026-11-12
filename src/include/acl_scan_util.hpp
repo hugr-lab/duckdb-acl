@@ -1,8 +1,8 @@
 //===----------------------------------------------------------------------===//
 // acl_scan_util.hpp — the text-scanning helpers (a word, whitespace, a quoted literal with the doubled-quote
-// escape) the readers of a management statement's lists use until spec 150's stage 4 makes them rules, and the
-// readers that stay: the override's one-word ACL gate, the quack drain's stream id, the
-// policy-store name check (TextNamesPolicyStore). Nothing here parses SQL.
+// escape) of the readers that stay: the override's one-word ACL gate, the quack drain's stream id, the
+// policy-store name check (TextNamesPolicyStore). Nothing here parses SQL; a management statement's lists are
+// rules (spec 150 stage 4).
 //===----------------------------------------------------------------------===//
 #pragma once
 

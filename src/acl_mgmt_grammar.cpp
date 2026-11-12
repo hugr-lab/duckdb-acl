@@ -1846,10 +1846,14 @@ string CsvItemsJson(const string &csv) {
 //! `AclItems <- '(' AclItemEntry AclItemMore* ')'` (AclItemEntry <- AclValue?; spec 150 4c): the values written - each
 //! a word, a dotted word, a signed number or a quoted value; an empty item and an empty quoted value none, as the text
 //! reader took them
-vector<string> ItemValues(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
+vector<string> ItemValues(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data,
+                          bool trim = true) {
 	vector<string> values;
 	for (auto &item : ListEntries(result)) {
 		auto value = ValueTextOf(transformer, item, what, data);
+		if (trim) {
+			StringUtil::Trim(value); // a list's value trimmed inside its quotes, as the text reader took it (`' r '`)
+		}
 		if (!value.empty()) {
 			values.push_back(std::move(value));
 		}
@@ -1925,7 +1929,7 @@ string RequireJson(PEGTransformer &transformer, ParseResult &result, MgmtParseDa
 			path = ClaimPathOf(transformer, condition.GetChild(0), "a claim path", data);
 			if (form == "AclRequireIn") {
 				op = "in";
-				values = ItemValues(transformer, condition.GetChild(2), "a value", data);
+				values = ItemValues(transformer, condition.GetChild(2), "a value", data, false); // compared as written
 			} else if (form == "AclRequireLike") {
 				op = "like";
 				values.push_back(QuotedOf(transformer, condition.GetChild(2), "a pattern", data));
@@ -1951,8 +1955,9 @@ string AttributesJson(PEGTransformer &transformer, ParseResult &result, MgmtPars
 	for (auto &item : ListEntries(result)) {
 		auto &attribute = item.get().Cast<ListParseResult>();
 		auto &name_node = Strip(attribute.GetChild(0));
-		auto name = name_node.Name() == "AclWordToken" ? TokenOf(name_node).text
-		                                               : QuotedOf(transformer, name_node, "an attribute name", data);
+		auto name = name_node.Name() == "AclWordToken" || name_node.Name() == "AclNameValueToken"
+		                ? TokenOf(name_node).text
+		                : QuotedOf(transformer, name_node, "an attribute name", data);
 		auto &value = Strip(attribute.GetChild(2));
 		if (value.Name() == "AclAttrConstant") {
 			attributes.push_back(
@@ -1966,6 +1971,12 @@ string AttributesJson(PEGTransformer &transformer, ParseResult &result, MgmtPars
 				paths.push_back(ClaimPathOf(transformer, path, "a claim path", data));
 			}
 		} else {
+			if (value.Name() == "AclDottedToken" && StringUtil::CIEquals(TokenOf(value).text, "constant")) {
+				// `name = CONSTANT` with its value missing is no path: the constant would come from the token
+				throw BinderException("acl admin: attribute \"%s\" = CONSTANT takes its value, quoted - a claim named "
+				                      "constant is written \"constant\"",
+				                      name);
+			}
 			paths.push_back(ClaimPathOf(transformer, value, "a claim path", data));
 		}
 		attributes.push_back("{\"name\":" + JsonQuote(name) + ",\"paths\":" + JsonStrings(paths) + "}");
@@ -2037,7 +2048,8 @@ void ClientClauseInto(PEGTransformer &transformer, ParseResult &result, idx_t ar
 		entries.push_back(string("\"") + key +
 		                  "\":" + ItemsJson(transformer, parts.GetChild(parts.GetChildren().size() - 1), what, data));
 	} else if (name == "AclRequire" || name == "AclAttributes") {
-		// AclRequire <- 'REQUIRE' AclList / AclAttributes <- 'ATTRIBUTES' AclList - a list in parentheses only
+		// AclRequire <- 'REQUIRE' AclRequireArg / AclAttributes <- 'ATTRIBUTES' AclAttributesArg - a list in
+		// parentheses only
 		bool require = name == "AclRequire";
 		auto &list = Strip(parts.GetChild(1));
 		if (list.Name() == "AclParenList") {
@@ -2052,7 +2064,7 @@ void ClientClauseInto(PEGTransformer &transformer, ParseResult &result, idx_t ar
 		entries.push_back(string(require ? "\"require\":" : "\"attributes\":") +
 		                  (require ? RequireJson(transformer, list, data) : AttributesJson(transformer, list, data)));
 	} else if (name == "AclClaimMap") {
-		// AclClaimMap <- 'CLAIM' 'MAP' AclList - the map kept as a JSON string, which the spec parses
+		// AclClaimMap <- 'CLAIM' 'MAP' AclClaimMapArg - the map kept as a JSON string, which the spec parses
 		auto &map = Strip(parts.GetChild(2));
 		if (map.Name() == "AclParenList") {
 			RefuseList("a claim mapping is <jwt path> => <claim>");
@@ -2068,7 +2080,7 @@ void ClientClauseInto(PEGTransformer &transformer, ParseResult &result, idx_t ar
 		entries.push_back(string("\"unmapped\":") +
 		                  (KeywordOf(parts.GetChild(1)) == "ignore" ? "\"ignore\"" : "\"as_role\""));
 	} else if (name == "AclSubject") {
-		// AclSubject <- 'SUBJECT' AclList - paths in parentheses, or one quoted path
+		// AclSubject <- 'SUBJECT' AclItemList - paths in parentheses, or one quoted path
 		auto &paths = Strip(parts.GetChild(1));
 		if (paths.Name() == "AclParenList") {
 			RefuseList("subject paths are a list of values");
@@ -2865,9 +2877,12 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclItemList <- AclItems / AclParenList / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclClaimPath <- AclDottedToken / AclNameValue"));
 		changes.push_back(GrammarChange::AddRule("AclRequireContains <- StringLiteral 'IN' AclClaimPath"));
-		changes.push_back(GrammarChange::AddRule("AclRequireIn <- AclClaimPath 'IN' AclItems"));
-		changes.push_back(GrammarChange::AddRule("AclRequireLike <- AclClaimPath 'LIKE' AclQuotedValue"));
-		changes.push_back(GrammarChange::AddRule("AclRequireEq <- AclClaimPath '=' AclValue"));
+		// a condition's own path is never a single-quoted string: `'v' …` is the contains form, as the text reader took
+		// it (`'admin' IN (groups)` would read as the path admin) - a quoted path is double-quoted or backticked
+		changes.push_back(GrammarChange::AddRule("AclRequirePath <- AclDottedToken / AclNameValueToken / Identifier"));
+		changes.push_back(GrammarChange::AddRule("AclRequireIn <- AclRequirePath 'IN' AclItems"));
+		changes.push_back(GrammarChange::AddRule("AclRequireLike <- AclRequirePath 'LIKE' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclRequireEq <- AclRequirePath '=' AclValue"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclRequireCondition <- AclRequireContains / AclRequireIn / AclRequireLike / AclRequireEq"));
 		changes.push_back(GrammarChange::AddRule("AclRequireEntry <- AclRequireCondition?"));
@@ -2878,7 +2893,7 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclClaimPaths <- '(' AclClaimPathEntry AclClaimPathMore* ')'"));
 		changes.push_back(GrammarChange::AddRule("AclAttrConstant <- 'CONSTANT' AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclAttrValue <- AclAttrConstant / AclClaimPaths / AclClaimPath"));
-		changes.push_back(GrammarChange::AddRule("AclAttrName <- AclWordToken / AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclAttrName <- AclWordToken / AclNameValueToken / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclAttribute <- AclAttrName '=' AclAttrValue"));
 		changes.push_back(GrammarChange::AddRule("AclAttributeEntry <- AclAttribute?"));
 		changes.push_back(GrammarChange::AddRule("AclAttributeMore <- ',' AclAttributeEntry"));

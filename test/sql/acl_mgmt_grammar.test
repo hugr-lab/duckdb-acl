@@ -2826,8 +2826,68 @@ ACL ADMIN ALTER ISSUER 'test/idp/d' SET CLAIM MAP (tid tenant);
 ----
 a claim mapping is <jwt path> => <claim>
 
+# a REQUIRE path is never single-quoted: `'v' …` is the contains form, `'admin' IN (groups)` no path admin
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET REQUIRE ('admin' IN (groups));
+----
+a REQUIRE condition is path = value
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET REQUIRE ('v' = x);
+----
+a REQUIRE condition is path = value
+
+# CONSTANT with its value missing is no path (the constant would come from the token's claim `CONSTANT`)
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (org = CONSTANT);
+----
+CONSTANT takes its value
+
+# (an empty value is none, as the model takes it)
 statement ok
-ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ('acme-prod', 'custom:tenant');
+ACL ADMIN ALTER CLIENT lists4c SET ATTRIBUTES (org = "constant") REQUIRE (t IN ('x', ''));
+
+query II
+SELECT attributes, requires FROM acl_clients() WHERE name = 'lists4c';
+----
+[{"name":"org","paths":["constant"]}]	[{"path":"t","op":"in","values":["x"]}]
+
+# a list's value is trimmed inside its quotes, as the text reader took it; an attribute name in any script reads bare
+statement ok
+ACL ADMIN ALTER CLIENT lists4c SET ROLES CONSTANT (' r ') ATTRIBUTES (größe = 'g');
+
+query II
+SELECT roles_constant, attributes FROM acl_clients() WHERE name = 'lists4c';
+----
+["r"]	[{"name":"größe","paths":["g"]}]
+
+# two literals with no separator are no list
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ('a' 'b');
+----
+audiences are a list of values
+
+statement error
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ($$x$$);
+----
+expected audiences, quoted ('...', "..." or `...`) as one plain literal
+
+statement ok
+ACL ADMIN ALTER CLIENT lists4c SET AUDIENCES ('acme-prod', 'custom:tenant' /* a comment beside it */);
+
+query I
+SELECT audiences FROM acl_clients() WHERE name = 'lists4c';
+----
+["acme-prod","custom:tenant"]
+
+# the legacy CLAIM MAP JSON string stays
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/d' SET CLAIM MAP '{"oid": "user_id"}';
+
+query I
+SELECT attributes FROM acl_clients() WHERE name = 'test/idp/d';
+----
+[{"name":"user_id","paths":["oid"]}]
 
 statement ok
 ACL ADMIN DROP CLIENT lists4c; DROP ISSUER 'test/idp/d';

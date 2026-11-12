@@ -435,9 +435,10 @@ each once - and `ROLE CLAIM` / `ROLES FROM` (both the role sources) and `ATTRIBU
 
 A value in these lists - an audience, a flow, a role, a claim path, a `REQUIRE` value - is a word,
 words joined by `.` (`realm_access.roles`), a number (`-2`) or a quoted string; anything else is
-quoted (`'acme-prod'`, `'https://acme/roles'`, `'custom:tenant'`). An empty item is none. A bare
-`true` / `false` in `REQUIRE … = …` is the claim's boolean. A list that does not read so is refused
-saying how its items are written.
+quoted (`'acme-prod'`, `'https://acme/roles'`, `'custom:tenant'`). An empty item is none. A
+`REQUIRE` path is never single-quoted (`'v' IN path` is the contains form); a quoted path is
+double-quoted. A bare `TRUE` / `FALSE` is lower-cased, as a boolean claim reads. A list that does not
+read so is refused saying how its items are written.
 
 - **The short form.** A quoted URL in place of a name, with client clauses, is one issuer and its
   implicit client of the same name - `UNMAPPED AS ROLE`, flows `authcode, device` for a public client
