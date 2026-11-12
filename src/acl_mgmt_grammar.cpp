@@ -1679,14 +1679,13 @@ string CapsListJson(ParseResult &result) {
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
-//! A field path's name as a grant's csv stores it (spec 102, 150 4e): one part as it is (`odd name`) unless it would
-//! read as a path (a `.` / `[` in it, a leading `"`: quoted), a path its parts as `FieldName` writes them, `[]` an
-//! element - what `ParseFieldPath` reads back
+//! A field path's name as a grant's csv stores it (spec 102, 150 4e): one part as it is (`odd name`) when the stored
+//! list reads it back so (`StoresBare`), else quoted; a path its parts as `FieldName` writes them, `[]` an element -
+//! what `ParseFieldPath` reads back
 string StoredFieldPath(const vector<string> &parts) {
 	if (parts.size() == 1) {
-		auto &name = parts[0];
-		bool reads_as_path = name.find_first_of(".[") != string::npos || (!name.empty() && name[0] == '"');
-		return reads_as_path ? acl_detail::QuotedName(name) : name;
+		// bare when the stored list reads it back as itself, as `NormaliseGrantColumns` writes it (`RootName`)
+		return StoresBare(parts[0]) ? parts[0] : acl_detail::QuotedName(parts[0]);
 	}
 	string path = acl_detail::FieldName(parts[0]);
 	for (idx_t i = 1; i < parts.size(); i++) {
@@ -1710,7 +1709,7 @@ void GrantColumnsInto(PEGTransformer &transformer, ParseResult &result, optional
 		                      "reads one (quote a keyword or a name holding other characters), a mask one expression");
 	}
 	if (node.Name() != "AclGrantColumnItems") {
-		ListInto(transformer, result, arg, MgmtParsed::TextKind::COLUMNS, false, "a column list", data);
+		ListInto(transformer, result, arg, MgmtParsed::TextKind::GRANT_COLUMNS, false, "a column list", data);
 		return;
 	}
 	auto &list = node.Cast<ListParseResult>();
@@ -1988,7 +1987,7 @@ arena_ptr<TransformResultValue> FinalizeAlterGrant(PEGTransformer &transformer, 
 	} else if (field == "columns") {
 		MgmtParseData::Span span;
 		span.arg = AddArg(*data);
-		span.kind = MgmtParsed::TextKind::COLUMNS;
+		span.kind = MgmtParsed::TextKind::GRANT_COLUMNS;
 		span.resolved = true;
 		span.text = Quoted(transformer, change, 1, "a column list", *data);
 		data->spans.push_back(std::move(span));

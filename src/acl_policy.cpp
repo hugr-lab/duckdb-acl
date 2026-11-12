@@ -144,46 +144,6 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 	return claims;
 }
 
-vector<string> SplitTopLevel(const string &text, char delimiter) {
-	vector<string> parts;
-	string current;
-	idx_t depth = 0;
-	for (idx_t pos = 0; pos < text.size(); pos++) {
-		auto c = text[pos];
-		if (c == '\'' || c == '"') {
-			auto quote = c;
-			current += c;
-			for (pos++; pos < text.size(); pos++) {
-				current += text[pos];
-				if (text[pos] == quote) {
-					// a doubled quote is an escaped one, not the end of the literal
-					if (pos + 1 < text.size() && text[pos + 1] == quote) {
-						current += text[++pos];
-						continue;
-					}
-					break;
-				}
-			}
-			continue;
-		}
-		if (c == '(') {
-			depth++;
-		} else if (c == ')' && depth > 0) {
-			depth--;
-		} else if (c == delimiter && depth == 0) {
-			parts.push_back(current);
-			current.clear();
-			continue;
-		}
-		current += c;
-	}
-	parts.push_back(current);
-	for (auto &part : parts) {
-		StringUtil::Trim(part);
-	}
-	return parts;
-}
-
 unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, const ParserOptions &options,
                                                            bool cached) {
 	auto parse = [&]() -> unique_ptr<QueryNode> {

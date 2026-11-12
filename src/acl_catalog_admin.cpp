@@ -2569,7 +2569,8 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
                                const string &rls, const string &columns, bool judge_columns, bool judge_caps) {
 	RequireCatalog(catalog, "acl_grant_catalog");
 	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls,
-	                             acl_detail::ParseWrittenColumnList(columns));
+	                             judge_columns ? acl_detail::ParseWrittenColumnList(columns)
+	                                           : acl_detail::ParseColumnList(columns));
 	if (vcat.empty()) {
 		throw BinderException("acl admin: a grant needs a catalog name");
 	}
@@ -4213,10 +4214,12 @@ string ExposedColumnList(CatalogBackend &catalog, const ReadFn &read, const stri
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
                                        const string &caps_json, const string &rls, const string &columns,
-                                       bool judge_caps, bool ensure_grant) {
+                                       bool judge_caps, bool ensure_grant, bool written_list) {
 	RequireCatalog(catalog, "acl catalog");
+	// a list given by a caller is judged as written; one rebuilt from a stored row (a repair) is read as stored
 	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls,
-	                             acl_detail::ParseWrittenColumnList(columns));
+	                             written_list ? acl_detail::ParseWrittenColumnList(columns)
+	                                          : acl_detail::ParseColumnList(columns));
 	ValidateGrantColumns(*catalog, vcat, columns, vname);
 	CatalogCheckObjectCaps(vcat, vname, caps_json, judge_caps);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {

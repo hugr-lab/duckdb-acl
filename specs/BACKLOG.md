@@ -113,6 +113,11 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - An issuer whose URL comes from its `oidc_issuer` secret cannot be moved back to a URL of its own by `ALTER ISSUER`
     (found 2026-11-06 by acl-clients spec 008): `SET URL '…'` is refused as both, `DROP FROM SECRET` as no URL - the
     move the other way is one statement (`SET URL '' FROM SECRET s`), the way back has no form.
+  - A grant's mask that is a star (`COLUMNS (id, note = *)`, `COLUMNS(*)`, `t.*`) is accepted where written and every
+    read of the object then fails at bind (`STAR expression is not supported here`) - fails closed, but the write
+    should refuse it (spec 148's `OneExpression` and the projection probe let it through; found by spec 150 4e's
+    review). Same review: `GRANT SCHEMA … COLUMNS ()` (an empty list) is accepted while a non-empty one is refused, and
+    a mask `#2` reads the physical table's column by position - neither widens; decide whether to refuse them.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

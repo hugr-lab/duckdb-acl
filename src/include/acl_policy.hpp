@@ -6,7 +6,6 @@
 #pragma once
 
 #include "acl_list_items.hpp"
-
 #include "acl_name_path.hpp"
 #include "acl_door_certificate.hpp"
 #include "acl_function_categories.hpp"
@@ -247,11 +246,6 @@ void RegisterAdminScope(AdminScope scope);
 //! principal's own catalog (spec 010 part 3). Returns the surface a written name maps to, or nullptr.
 //! The names are reserved: a virtual object may not take one, or it would be listed but unreachable.
 const char *MetadataSurfaceOf(const string &name);
-
-//! Split a comma-style list on top-level delimiters only: a delimiter inside quotes or inside
-//! parentheses belongs to an expression, not to the list. Without this a column list breaks on the
-//! first `coalesce(a, b)` - and breaks it silently, into two nonsense entries.
-vector<string> SplitTopLevel(const string &text, char delimiter);
 
 //! A role's claims csv `name='value',...` (spec 150 4d: the one reader of a claims list's text - the quoted form, the
 //! function forms, and what the list rule writes): each item names its claim once in any case, a quoted value is one
@@ -959,7 +953,7 @@ struct PolicyStore {
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
 	                          const string &rls = "", const string &columns = "", bool judge_caps = true,
-	                          bool ensure_grant = false);
+	                          bool ensure_grant = false, bool written_list = true);
 	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function);
 	//! `strict` where they are written (spec 150 stage 3d: a name twice, a NUL in a name)
 	void CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json, bool strict = true);

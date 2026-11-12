@@ -53,8 +53,6 @@ void Differential() {
 	    "$$x, y$$, z",
 	    "$t$x, ) y$t$, z",
 	    "E'a\\', b', c",
-	    "/* , */ a, -- ,\n b",
-	    "a /* , /* nested , */ , */, b",
 	    "x::DECIMAL(10, 2), y",
 	    "struct_pack(a := 1, b := 2), c",
 	    "CASE WHEN a = 1 THEN 'x,y' ELSE 'z' END, e",
@@ -107,9 +105,30 @@ void Edges() {
 	open = true;
 	SplitListItems("a, b -- closed by the end", &open);
 	Check(!open, "a line comment to the end is not open");
-	auto items = SplitListItems("a = 1 -- note\n, b");
-	Check(items.size() == 2 && items[0].value == "1", "a comment after an item is not the item's");
 	Check(SplitListItems("a, b; c").size() == 2, "a ';' belongs to the item it stands in");
+	// an operator the tokenizer joins to `=` still splits the item, as the text reader split it
+	auto joined = SplitListItems("ssn=~ssn, x=@x, y >= 1");
+	Check(joined.size() == 3 && joined[0].name == "ssn" && joined[0].value == "~ssn" && joined[1].value == "@x" &&
+	          !joined[2].has_value,
+	      "`=~` / `=@` split the item; `>=` does not");
+}
+
+//! A text holding a comment is read as the builds before 4e read it: they stored a name holding `--` or `/*` as it is
+void StoredWithComment() {
+	bool comment = false;
+	auto items = SplitListItems("a--b, c", nullptr, &comment);
+	Check(comment && items.size() == 2 && items[0].text == "a--b" && items[1].text == "c",
+	      "a stored name holding -- is that name, not a and a comment");
+	items = SplitListItems("c, a/*b");
+	Check(items.size() == 2 && items[1].text == "a/*b", "a stored name holding /* is that name");
+	items = SplitListItems("-- x");
+	Check(items.size() == 1 && items[0].text == "-- x", "a list that is only a comment still names something");
+	items = SplitListItems("a = 1 -- note");
+	Check(items.size() == 1 && items[0].name == "a" && items[0].value == "1 -- note",
+	      "a stored comment stays in the item it stood in");
+	comment = true;
+	SplitListItems("a, '--', \"/*\"", nullptr, &comment);
+	Check(!comment, "-- inside a literal and /* inside a quoted name are no comment");
 }
 
 } // namespace
@@ -118,6 +137,7 @@ int main() {
 	Differential();
 	NamedItems();
 	Edges();
+	StoredWithComment();
 	if (failures) {
 		std::cout << failures << " FAILED\n";
 		return 1;

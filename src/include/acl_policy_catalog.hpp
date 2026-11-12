@@ -60,36 +60,14 @@ inline vector<std::pair<string, string>> ParseColumnList(const string &csv) {
 }
 
 //! A grant's column list as a writer gives it (spec 150 4e): read as `ParseColumnList` reads it, and refused when the
-//! text ends inside a comment, a literal or a quoted name - the read leaves such an end out, the stored text would
-//! keep it (spec 148: `note = upper(note) /* hidden` is stored as written)
+//! text holds a comment or ends inside a literal or a quoted name - the read leaves a comment out (a stored one is read
+//! the old way, `SplitListItems`), and a stored text with one would keep it (spec 148: `note = upper(note) -- hidden`)
 inline vector<std::pair<string, string>> ParseWrittenColumnList(const string &csv) {
-	bool open = false;
-	auto items = SplitListItems(csv, &open);
-	// after the last item only separators, spaces and closed /* */ comments: a line comment there is stored and read
-	// as nothing, and a text written after the stored one would be read as that comment (`note = upper(note) --
-	// hidden`)
-	auto tail = items.empty() ? csv : csv.substr(items.back().end);
-	bool trailing = false;
-	for (idx_t i = 0; i < tail.size() && !trailing; i++) {
-		if (tail.compare(i, 2, "/*") == 0) {
-			idx_t depth = 1; // duckdb nests block comments; the text is not open, so it closes
-			for (i += 2; i < tail.size() && depth > 0; i++) {
-				if (tail.compare(i, 2, "/*") == 0) {
-					depth++;
-					i++;
-				} else if (tail.compare(i, 2, "*/") == 0) {
-					depth--;
-					i++;
-				}
-			}
-			i--;
-			continue;
-		}
-		trailing = tail.compare(i, 2, "--") == 0;
-	}
-	if (open || trailing) {
-		throw BinderException("acl admin: the grant's column list ends inside or with a comment, a literal or a quoted "
-		                      "name - it does not stay one expression per item (spec 148)");
+	bool open = false, comment = false;
+	SplitListItems(csv, &open, &comment);
+	if (open || comment) {
+		throw BinderException("acl admin: the grant's column list holds a comment or ends inside a literal or a quoted "
+		                      "name - it does not stay one expression per item (spec 148); write it without comments");
 	}
 	return ParseColumnList(csv);
 }

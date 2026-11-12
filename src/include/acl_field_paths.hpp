@@ -10,6 +10,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
+#include "acl_list_items.hpp"
+
 #include <functional>
 
 namespace duckdb {
@@ -641,9 +643,12 @@ struct ColumnTrees {
 	//! A column is written as it was named; only one that paths step into is quoted, where needed,
 	//! so the paths read back
 	static string RootName(const FieldNode &column) {
-		bool plain_ok = column.name.find('.') == string::npos && column.name.find('[') == string::npos &&
-		                (column.name.empty() || column.name[0] != '"');
-		return column.fields.empty() && !column.element && plain_ok ? column.name : FieldName(column.name);
+		if (!column.fields.empty() || column.element) {
+			return FieldName(column.name); // a path's head
+		}
+		// spec 150 4e: a column bare only when the stored list reads it back as itself (`odd name`); `a,b`, `od'd`,
+		// `a--b` quoted, as `"a.b"` always was
+		return StoresBare(column.name) ? column.name : QuotedName(column.name);
 	}
 };
 

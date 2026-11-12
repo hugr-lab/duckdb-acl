@@ -67,9 +67,11 @@ SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upp
 ----
 spec 148
 
-# a comment closed inside the text hides nothing around it
-statement ok
+# spec 150 4e: no comment at all - a stored list with one is read the way builds before 4e read it, so none is written
+statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* kept */');
+----
+spec 148
 
 statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1; SELECT 2');
