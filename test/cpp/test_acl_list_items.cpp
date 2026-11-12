@@ -50,9 +50,6 @@ void Differential() {
 	    "list_transform(l, lambda x: x + 1), y",
 	    "list_transform(l, x -> x + 1), y",
 	    "'a,b', \"c,d\"",
-	    "$$x, y$$, z",
-	    "$t$x, ) y$t$, z",
-	    "E'a\\', b', c",
 	    "x::DECIMAL(10, 2), y",
 	    "struct_pack(a := 1, b := 2), c",
 	    "CASE WHEN a = 1 THEN 'x,y' ELSE 'z' END, e",
@@ -60,6 +57,7 @@ void Differential() {
 	    "(a, b), c",
 	    "{'k': [1, 2], 'j': {'n': (3, 4)}}, d",
 	    "'it''s, here', f",
+	    "$$x$$, y",
 	};
 	for (auto &list : lists) {
 		auto expected = Parsed(list);
@@ -129,6 +127,16 @@ void StoredWithComment() {
 	comment = true;
 	SplitListItems("a, '--', \"/*\"", nullptr, &comment);
 	Check(!comment, "-- inside a literal and /* inside a quoted name are no comment");
+	// a literal the text reader did not know is read with it too - an older build stored `id, $$'$$, ssn, x'`, which
+	// it read inside the `'` it opened
+	items = SplitListItems("id, $$'$$, ssn, x'");
+	Check(items.size() == 2 && items[0].text == "id", "a $$ string is read as the text reader read it");
+	items = SplitListItems("id, E'\\'', ssn, x'");
+	Check(items.size() == 2, "an E'' string is read as the text reader read it");
+	Check(SplitListItems("id, `a,b`").size() == 3, "a backtick name is read as the text reader read it");
+	// a closer ends only the bracket it matches
+	items = SplitListItems("id, x(], ssn");
+	Check(items.size() == 2 && items[1].text == "x(], ssn", "a closer of another bracket does not end a (");
 }
 
 } // namespace

@@ -683,7 +683,8 @@ name it would not read back bare is stored quoted (`"a,b"`, `"od'd"`), and a lis
 back as other items than written is refused where it is written. The legacy quoted form
 `COLUMNS '<list>'` and the function forms' text take any name and mask the same way; such a text that
 holds a comment, or ends inside a literal or a quoted name, is refused. A list stored by an earlier
-build that holds a comment (a name like `a--b` was stored as it is) is read as that build read it.
+build that holds a comment (a name like `a--b` was stored as it is), a `$…$` or `E'…'` string or a
+backtick name is read as that build read it.
 
 A `COLUMNS` item with a value on a writable table is an assignment as well as a mask:
 `tenant = acl_claim('tenant')` is added to an `INSERT` when absent, overrides a supplied value, and

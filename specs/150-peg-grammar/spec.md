@@ -543,7 +543,9 @@ compiler; `AdminScanner` went with 4c.
   comment a space (`GrantColumnsText`, once the batch's tokens are known). The read: `ParseColumnList` splits on
   duckdb's tokens (`SplitListItems`, its own translation unit `acl_list_items.cpp`: an item ends at a comma outside
   every bracket, literal, quoted name and comment; the name is the text before the item's first top-level `=` - an
-  operator token the tokenizer joins to it, `ssn=~ssn`, `x=@x`, splits there too, as the text reader split it).
+  operator token the tokenizer joins to it, `ssn=~ssn`, `x=@x`, splits there too, as the text reader split it). A
+  `$…$` string, an `E'…'` one or a backtick name in a grant's list is read the old way (below), so a mask holding one
+  with a top-level comma is refused where written - as before 4e, when the statement form refused them all.
   Names: a column is stored bare only when the stored list reads it back as itself (`StoresBare`: `odd name`, a
   keyword), else quoted (`"a,b"`, `"x=y"`, `"od'd"`, `"a--b"`, as `"a.b"` always was) - in the rule
   (`StoredFieldPath`), in `NormaliseGrantColumns` (`RootName`) and in the legacy quoted form (`UnquoteColumnsList` keeps
@@ -562,7 +564,7 @@ compiler; `AdminScanner` went with 4c.
   `ParseFieldPath` keeps reading a stored row as written (a keyword part included: a stored row is never re-judged);
   the statement form's parts are duckdb's identifiers. A differential test (`test/cpp/test_acl_list_items.cpp`) pins
   that `SplitListItems`' items are the expressions duckdb's parser reads the same text as (`$$…$$`, `E'…'`, lambdas,
-  `::DECIMAL(10, 2)`) and the stored-with-comment reading; `acl_mgmt_grammar.test` that a stored list reads back
+  `::DECIMAL(10, 2)`) and the reading of a text with a comment or a literal the text reader did not know; `acl_mgmt_grammar.test` that a stored list reads back
   (`acl_platform_list`) as the items the rule read, and rows written as an older build stored them. Left to 4f: a
   relation's list (`COLUMNS` of `CREATE VIRTUAL TABLE`, `REMAP`) is still written by `SplitTopLevel`
   (`ParseColumns`) while the author's body gate (`AuthorizeBodies`) and REMAP's reader split it on the tokens - spec
@@ -570,7 +572,12 @@ compiler; `AdminScanner` went with 4c.
   From the reviews: the comment reading of stored rows (a name holding `--` read wider), the `=~` split, quoting a
   name the list cannot read back bare (the plugin's write-back and `"b/**/"` in the quoted form), judging only a
   caller's list (ALTER GRANT of the caps re-judged the stored one); a star mask, `GRANT SCHEMA … COLUMNS ()` and a
-  positional `#2` mask are older and in BACKLOG.
+  positional `#2` mask are older and in BACKLOG. From the re-review: the operator's screens matched a stored item by
+  its text, quotes included (`acl_check_catalog` called a mask on `"a,b"` broken and its repair took the mask away,
+  REPAIR … DROP MISSING COLUMNS orphaned such a mask, `effective_rights` / `check_grant` left it out) - they match by
+  the item's column now (`MatchKey` / `ItemHead`); a closer ends only the bracket it matches (`x(], ssn` read `ssn`
+  out of the `(`), a `$…$` string, an `E'…'` one or a backtick name is read as the text reader read it (it read
+  `id, $$'$$, ssn, x'` inside the `'`), and a name holding a bracket, a quote, `$` or a backtick is stored quoted.
 - 4f: a relation's column list (`AS`, the NULL marks) the same way; `UnquoteColumnsList`, `JudgeListText`,
   `ScannerUnreadable` go.
 
@@ -591,7 +598,7 @@ an inventory of `src/`, each with its verdict; the REPLACE ones are the next wor
 | `SplitProjectionItem` (lineage) | our own `expr AS "name"` | replace: carry the pairs |
 | `TextNamesPolicyStore`, `SqlNamesSource` | view / macro bodies | keep: they over-read on purpose, string literals too (`query_table('acl.admins')`) |
 | `ParseFieldPath` | `a.b`, `items[].x` | keep (duckdb has no `[]` path) for stored rows; since 4e a statement's path is the rule `AclFieldPath`, each part duckdb's identifier |
-| `SplitListItemsAsStored` (`SplitTopLevel`) | a stored list holding a comment | keep: the reading the rows of builds before 4e were written for (no writer stores a comment since) |
+| `SplitListItemsAsStored` (`SplitTopLevel`) | a stored list holding a comment, a `$…$` / `E'…'` string or a backtick name | keep: the reading the rows of builds before 4e were written for (no writer stores a comment since) |
 | the first-word ACL check, `MayCarryAttachLineage`, `CallsFunctionNamed` | every query | keep: prefilters before the real read on tokens |
 | keys (`NamePath`), JWT, base64, URLs, `\x1f` serializations, JSON | not SQL | keep |
 

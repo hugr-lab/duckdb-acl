@@ -33,6 +33,18 @@ using acl_detail::ParseColumnList;
 
 namespace {
 
+//! What a stored item's name is matched by: a path as written, a column by its name (a quoted one-part name without
+//! its quotes - spec 150 4e stores `"a,b"`, `"od'd"` so)
+string MatchKey(const string &name) {
+	bool is_path = false;
+	auto head = acl_detail::ItemHead(name, is_path);
+	return is_path ? name : head;
+}
+
+} // namespace
+
+namespace {
+
 using Finding = PolicyStore::CatalogFinding;
 using Columns = vector<std::pair<string, string>>;
 
@@ -712,10 +724,12 @@ private:
 				}
 				continue;
 			}
+			// spec 150 4e: the column a one-part item names - a quoted name (`"a,b"`) without its quotes
+			auto column = MatchKey(item.first);
 			if (item.second.empty()) {
-				if (exposed.count(item.first)) {
+				if (exposed.count(column)) {
 					if (matched) {
-						matched->insert(item.first);
+						matched->insert(column);
 					}
 				} else if (object_grant) {
 					Add("grant", relation.vname, role, "grant_column_missing",
@@ -725,7 +739,7 @@ private:
 				}
 				continue;
 			}
-			if (!exposed.count(item.first)) {
+			if (!exposed.count(column)) {
 				Add("grant", relation.vname, role, "mask_broken",
 				    "the mask \"" + item.first + " = " + item.second + "\" names a column \"" + Named(relation.vname) +
 				        "\" does not expose - every read of it by this role refuses (spec 038)",
@@ -825,7 +839,7 @@ private:
 			// a catalog-wide bare name applies where an object has it and is absent elsewhere by
 			// design (spec 038) - it is a finding only when no object of the catalog has it any more
 			for (auto &item : items) {
-				if (item.second.empty() && !matched.count(item.first) && !relations.empty()) {
+				if (item.second.empty() && !matched.count(MatchKey(item.first)) && !relations.empty()) {
 					Add("grant", "*", role, "grant_column_missing",
 					    "the catalog-wide COLUMNS item \"" + item.first + "\" matches no column of any object of \"" +
 					        vcat + "\" - the role reads less than the grant says",
@@ -1330,7 +1344,7 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 			                Text(grants_rows.GetValue(2, row)), ParseColumnList(Text(grants_rows.GetValue(3, row)))};
 			bool touched = false;
 			for (auto &item : grant.items) {
-				if (!item.second.empty() && missing.count(item.first)) {
+				if (!item.second.empty() && missing.count(MatchKey(item.first))) {
 					orphaned.push_back("\"" + item.first + "\" (role \"" + grant.role + "\")");
 					touched = true;
 				}
@@ -1354,7 +1368,7 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		for (auto &grant : affected) {
 			vector<string> items;
 			for (auto &item : grant.items) {
-				if (!item.second.empty() && missing.count(item.first)) {
+				if (!item.second.empty() && missing.count(MatchKey(item.first))) {
 					changed++;
 					continue;
 				}

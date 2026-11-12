@@ -4338,9 +4338,9 @@ vector<PolicyStore::GrantCheckRow> PolicyStore::CatalogCheckGrant(const string &
 		for (auto &column : plan.probed) {
 			string mask;
 			for (auto &item : expressions) {
-				auto name = item.first;
-				StringUtil::Trim(name);
-				if (StringUtil::CIEquals(name, column.first) && !item.second.empty()) {
+				bool is_path = false; // a quoted one-part name is its column (spec 150 4e)
+				auto name = acl_detail::ItemHead(item.first, is_path);
+				if (!is_path && StringUtil::CIEquals(name, column.first) && !item.second.empty()) {
 					mask = item.second;
 				}
 			}

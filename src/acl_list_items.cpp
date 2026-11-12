@@ -115,7 +115,17 @@ vector<ListItemText> SplitListItems(const string &text, bool *open, bool *commen
 	if (comment) {
 		*comment = behavior.comment;
 	}
-	if (behavior.comment) {
+	// a literal the text reader did not know - a `$…$` string, an `E'…'` one, a backtick name - is read with it too: a
+	// row an older build stored with one (`id, $$'$$, ssn, x'`) was read inside the `'` it opened, duckdb's tokens read
+	// `ssn` out of it; since 4e a writer stores such a list only if this reading gives its items back
+	bool legacy = behavior.comment;
+	for (auto &token : tokens) {
+		auto &written = token.text;
+		legacy = legacy || (!written.empty() &&
+		                    (written[0] == '`' || (token.type == TokenType::STRING_LITERAL &&
+		                                           (written[0] == '$' || written[0] == 'E' || written[0] == 'e'))));
+	}
+	if (legacy) {
 		return SplitListItemsAsStored(text);
 	}
 	vector<ListItemText> items;
@@ -139,7 +149,9 @@ vector<ListItemText> SplitListItems(const string &text, bool *open, bool *commen
 		first.SetInvalid();
 		equals.SetInvalid();
 	};
-	idx_t depth = 0;
+	// the brackets open, innermost last: a closer ends only the bracket it matches (`x(], ssn` stays inside the `(`, as
+	// the text reader read it)
+	string open_brackets;
 	for (auto &token : tokens) {
 		if (token.type == TokenType::END_OF_INPUT || token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
 			break;
@@ -148,20 +160,24 @@ vector<ListItemText> SplitListItems(const string &text, bool *open, bool *commen
 		// or `>=` they are none) - but an operator token that starts with `=` after the item's name is that `=` and its
 		// mask's first operator, as the text reader split it (`ssn=~ssn`, `x=@x`: the tokenizer joins `=~`)
 		auto c = token.type == TokenType::OPERATOR && token.text.size() == 1 ? token.text[0] : '\0';
-		if (token.type == TokenType::OPERATOR && token.text.size() > 1 && token.text[0] == '=' && depth == 0 &&
+		bool top = open_brackets.empty();
+		if (token.type == TokenType::OPERATOR && token.text.size() > 1 && token.text[0] == '=' && top &&
 		    first.IsValid() && !equals.IsValid()) {
 			equals = token.offset;
 			equals_end = token.offset + 1;
 		}
-		if (c == ',' && depth == 0) {
+		if (c == ',' && top) {
 			flush();
 			continue;
 		}
 		if (c == '(' || c == '[' || c == '{') {
-			depth++;
-		} else if ((c == ')' || c == ']' || c == '}') && depth > 0) {
-			depth--;
-		} else if (c == '=' && depth == 0 && first.IsValid() && !equals.IsValid()) {
+			open_brackets += c;
+		} else if (c == ')' || c == ']' || c == '}') {
+			auto opener = c == ')' ? '(' : c == ']' ? '[' : '{';
+			if (!top && open_brackets.back() == opener) {
+				open_brackets.pop_back();
+			}
+		} else if (c == '=' && top && first.IsValid() && !equals.IsValid()) {
 			equals = token.offset;
 			equals_end = token.offset + token.length;
 		}
@@ -175,7 +191,8 @@ vector<ListItemText> SplitListItems(const string &text, bool *open, bool *commen
 }
 
 bool StoresBare(const string &name) {
-	if (name.empty() || name.find_first_of(".[") != string::npos || name[0] == '"') {
+	// a bracket, a quote, `$` or a backtick in a name: quoted, whatever the split would make of it beside other items
+	if (name.empty() || name.find_first_of(".[](){}'\"`$") != string::npos) {
 		return false;
 	}
 	bool open = false, comment = false;

@@ -3220,8 +3220,42 @@ ACL ROLE "r4e" SELECT * FROM odd;
 ----
 1	5
 
+# from the re-review: the operator's screens match a quoted name by its column - the check finds nothing wrong with a
+# mask on `a,b` (it said mask_broken and its repair took the mask away), effective_rights shows the mask
+statement ok
+ACL ADMIN GRANT TABLE c4e.odd TO ROLE r4e WITH (select) COLUMNS (id, "a,b" = 0, "od'd");
+
+query I
+SELECT count(*) FROM acl_check_catalog('c4e') WHERE object = 'odd';
+----
+0
+
+query I
+SELECT masks FROM acl_effective_rights('r4e', 'c4e', 'odd');
+----
+['"a,b" = 0']
+
 statement ok
 ACL ADMIN DROP VIRTUAL TABLE c4e.odd;
+
+# a REPAIR that would drop a column a grant masks under a quoted name is refused (spec 039), as for a bare one
+statement ok
+CREATE TABLE rep4e (id INT, k INT, ssn INT);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c4e.rep AS memory.main.rep4e COLUMNS (id, "a--b" = k, ssn);
+    GRANT TABLE c4e.rep TO ROLE r4e WITH (select) COLUMNS ("a--b" = 0, id);
+
+statement ok
+ALTER TABLE rep4e DROP COLUMN k;
+
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c4e.rep DROP MISSING COLUMNS;
+----
+would orphan the mask
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c4e.rep;
 
 # a schema grant carries capabilities only - a list through the rule is refused as before
 statement ok
@@ -3366,6 +3400,30 @@ UPDATE aclcat.acl.meta SET "value" = (CAST("value" AS BIGINT) + 1)::VARCHAR WHER
 statement error
 ACL ROLE "r4e" SELECT ssn FROM old;
 ----
+
+# a closer of another bracket ends nothing: the stored `x(]` keeps what follows inside its `(` as the text reader did
+statement ok
+UPDATE aclcat.acl.role_object_caps SET columns = 'c, x(], ssn' WHERE role = 'r4e' AND vname = 'old';
+
+statement ok
+UPDATE aclcat.acl.meta SET "value" = (CAST("value" AS BIGINT) + 1)::VARCHAR WHERE "key" = 'policy_version';
+
+query I
+ACL ROLE "r4e" SELECT * FROM old;
+----
+3
+
+# a `$$` string the text reader did not know: read as it read it - inside the `'` it opened
+statement ok
+UPDATE aclcat.acl.role_object_caps SET columns = 'c, $$''$$, ssn, x''' WHERE role = 'r4e' AND vname = 'old';
+
+statement ok
+UPDATE aclcat.acl.meta SET "value" = (CAST("value" AS BIGINT) + 1)::VARCHAR WHERE "key" = 'policy_version';
+
+query I
+ACL ROLE "r4e" SELECT * FROM old;
+----
+3
 
 # the rule writes such a name quoted, and it reads back as itself
 statement ok
