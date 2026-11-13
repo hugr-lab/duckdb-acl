@@ -20,6 +20,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/common_table_expression_info.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
@@ -1367,8 +1368,20 @@ private:
 		// on what it happens to read. Claims stay markers, so a reader in another tenant still sees
 		// their own rows rather than the author's (spec 018).
 		keep_claim_markers = true;
+		view_reads = make_uniq<vector<std::pair<Identifier, unique_ptr<CommonTableExpressionInfo>>>>();
+		view_leftmost = nullptr;
+		if (info.query->node->type == QueryNodeType::SELECT_NODE) {
+			// the root's first FROM item has nothing before it and no query around it: its read stays in place
+			optional_ptr<TableRef> leftmost = info.query->node->Cast<SelectNode>().from_table.get();
+			while (leftmost && leftmost->type == TableReferenceType::JOIN) {
+				leftmost = leftmost->Cast<JoinRef>().left.get();
+			}
+			view_leftmost = leftmost;
+		}
 		RewriteQueryNode(*info.query->node);
+		view_leftmost = nullptr;
 		keep_claim_markers = false;
+		AttachViewReads(*info.query->node);
 		auto body = info.query->ToString();
 		drop_statement = true;
 		follow_ups.push_back(AclRecord(
@@ -1522,7 +1535,12 @@ private:
 		// CTE names shadow catalog objects within this node and its descendants (scoped)
 		auto saved_scope = cte_scope;
 		for (auto &entry : node.cte_map.map) {
-			cte_scope.insert(entry.first.GetIdentifierName());
+			auto &name = entry.first.GetIdentifierName();
+			if (view_reads && StringUtil::StartsWith(StringUtil::Lower(name), "__acl_read_")) {
+				// spec 162: the names a view body's reads take - a CTE of the body's own would shadow one
+				Deny(Reason::STATEMENT_TYPE, "the name " + name + " is reserved in a view");
+			}
+			cte_scope.insert(name);
 		}
 		for (auto &entry : node.cte_map.map) {
 			if (entry.second->query_node) {
@@ -1585,17 +1603,57 @@ private:
 	//! has no name left to bind to the principal's - a relation before it, a correlated query, a write's target
 	unique_ptr<TableRef> ReadRef(unique_ptr<SelectStatement> select_stmt, const string &vname, BaseTableRef &original) {
 		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
+		if (view_reads && view_leftmost.get() == &original) {
+			// spec 162: no name of the body can reach it, and its CTE would hold the reader's filters back from the
+			// source
+			auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+			sub->column_name_alias = std::move(original.column_name_alias);
+			sub->sample = std::move(original.sample);
+			return std::move(sub);
+		}
 		return ReadRef(std::move(select_stmt), alias, std::move(original.column_name_alias),
 		               std::move(original.sample));
 	}
 
 	unique_ptr<TableRef> ReadRef(unique_ptr<SelectStatement> select_stmt, const Identifier &alias,
 	                             vector<Identifier> column_aliases, unique_ptr<SampleOptions> sample) {
+		if (view_reads) {
+			// spec 162: a principal's view body is stored and read later as one read - its policy reads go to CTEs at
+			// the body's root, where nothing of the body's own FROM is in scope
+			auto name = "__acl_read_" + std::to_string(view_reads->size() + 1);
+			auto info = make_uniq<CommonTableExpressionInfo>();
+			info->query_node = std::move(select_stmt->node);
+			info->materialized = CTEMaterialize::CTE_MATERIALIZE_NEVER;
+			view_reads->emplace_back(Identifier(name), std::move(info));
+			auto ref = make_uniq<BaseTableRef>();
+			ref->SetQualifiedName(Identifier(), Identifier(), Identifier(name));
+			ref->alias = alias;
+			ref->column_name_alias = std::move(column_aliases);
+			ref->sample = std::move(sample);
+			return std::move(ref);
+		}
 		guards.push_back(select_stmt->ToString());
 		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 		sub->column_name_alias = std::move(column_aliases);
 		sub->sample = std::move(sample);
 		return std::move(sub);
+	}
+
+	//! spec 162: the view body's policy reads, ahead of the body's own CTEs at its root (a CTE of the body's own with
+	//! the reads' prefix was refused in RewriteQueryNode)
+	void AttachViewReads(QueryNode &root) {
+		auto reads = std::move(view_reads);
+		if (!reads || reads->empty()) {
+			return;
+		}
+		CommonTableExpressionMap map;
+		for (auto &read : *reads) {
+			map.map[read.first] = std::move(read.second);
+		}
+		for (auto &entry : root.cte_map.map) {
+			map.map[entry.first] = std::move(entry.second);
+		}
+		root.cte_map = std::move(map);
 	}
 
 	//! spec 159: a call whose arguments name nothing of the principal's query (constants: a parameter cannot be bound
@@ -2297,7 +2355,13 @@ private:
 			// a grant narrows what the function returns, whichever form it took (spec 011)
 			WrapWithGrantPolicy(ref, policy, alias);
 			if (closed && ref->type == TableReferenceType::SUBQUERY) {
-				guards.push_back(ref->Cast<SubqueryRef>().subquery->ToString()); // spec 159: bound alone first
+				auto &sub = ref->Cast<SubqueryRef>();
+				if (view_reads) {
+					// spec 162: in a principal's view body, at the body's root like a relation's read
+					ref = ReadRef(std::move(sub.subquery), alias, std::move(sub.column_name_alias), nullptr);
+				} else {
+					guards.push_back(sub.subquery->ToString()); // spec 159: bound alone first
+				}
 			}
 			return;
 		}
@@ -4572,6 +4636,10 @@ private:
 public:
 	//! The audit's entry for the statement being rewritten (spec 069), or null when nobody listens
 	AuditTrail::Statement *trail = nullptr;
+	//! spec 162: while a principal's view body is rewritten, its policy reads (hoisted to the body's root) and the
+	//! root's first FROM item (whose read stays in place)
+	unique_ptr<vector<std::pair<Identifier, unique_ptr<CommonTableExpressionInfo>>>> view_reads;
+	optional_ptr<TableRef> view_leftmost;
 	//! spec 157 / 159: the reads this statement binds alone first - its writes' targets (NoteReadableGuard), every
 	//! policy read (ReadRef)
 	vector<string> guards;

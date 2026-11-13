@@ -857,6 +857,13 @@ SQL, template - `BodiesOf`) to its entry's `<db>.<schema>.<table>` (`ResolvedRef
 location, the rest as written - so a principal's CTE or temp table never stands in for it. Stored rows are the check's
 `body_table_unqualified`. Test `acl_policy_tables_qualified.test`.
 
+**Spec 162 — a principal's view reads its policies at its root**: in a principal's `CREATE VIEW` (spec 113) `ReadRef`
+(`view_reads` set) turns each policy read - a relation's, a table function's called with constants - into a `NOT
+MATERIALIZED` CTE `__acl_read_<n>` that `AttachViewReads` puts at the body's root, ahead of its own CTEs: the stored body is
+read later as one read (spec 159 binds it alone), and a CTE at its root sees none of the body's FROM. The root's first FROM
+item's read stays in place (`view_leftmost`: nothing can reach it, and a CTE would stop a reader's filters at it); a body
+CTE with the `__acl_read_` prefix is refused at any level. Test `acl_principal_view_reads.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

@@ -1,0 +1,115 @@
+# name: test/sql/acl_principal_view_reads.test
+# description: spec 162 - a principal's own view (spec 113) stores its body with each policy read as a CTE at the
+#   body's root, so a policy name its source lost refuses when the view is read, rather than binding to a relation of
+#   the body
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.orders (id INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO phys.lake.orders VALUES (1, 'eu', 100), (2, 'us', 200), (3, 'us', 300);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales; CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake; CREATE ROLE w;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE w MAIN; GRANT SCHEMA sales.vs TO ROLE w WITH (select, create, drop); GRANT TABLE sales.vs.orders TO ROLE w RLS (region = 'eu');
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.mine AS SELECT o.id, o.amount FROM (SELECT 'eu' AS region) s, vs.orders o;
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.counted AS SELECT (SELECT count(*) FROM vs.orders) AS n FROM (SELECT 'eu' AS region) s;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.tf AS 'SELECT * FROM phys.lake.orders'; GRANT OBJECT sales.tf TO ROLE w RLS (region = 'eu');
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.viaf AS SELECT f.id, f.amount FROM (SELECT 'eu' AS region) s, tf() f;
+
+# the root's first FROM item has nothing before it: its read stays in place (a CTE would hold a reader's filters back)
+statement ok
+ACL ROLE "w" CREATE VIEW vs.first AS SELECT o.id, x.n FROM vs.orders o, LATERAL (SELECT o.amount AS n) x;
+
+query I
+SELECT view_sql LIKE '%__acl_read_%' FROM aclcat.acl.relations WHERE vname = 'vs.first';
+----
+false
+
+# a read after another FROM item is read through a CTE at the body's root
+query I
+SELECT view_sql LIKE 'WITH __acl_read_1 AS NOT MATERIALIZED (%' FROM aclcat.acl.relations WHERE vname = 'vs.mine';
+----
+true
+
+query II
+ACL ROLE "w" SELECT * FROM vs.mine ORDER BY id;
+----
+1	100
+
+query I
+ACL ROLE "w" SELECT * FROM vs.counted;
+----
+1
+
+query II
+ACL ROLE "w" SELECT * FROM vs.viaf ORDER BY id;
+----
+1	100
+
+statement ok
+ALTER TABLE phys.lake.orders DROP COLUMN region;
+
+# the policy's lost name refuses when the view is read - it never reaches the body's own `s.region`
+statement error
+ACL ROLE "w" SELECT * FROM vs.mine;
+----
+does not exist in its source
+
+statement error
+ACL ROLE "w" SELECT * FROM vs.counted;
+----
+does not exist in its source
+
+statement error
+ACL ROLE "w" SELECT * FROM vs.viaf;
+----
+does not exist in its source
+
+# the read left in place refuses too: the view is bound alone when read (spec 159)
+statement error
+ACL ROLE "w" SELECT * FROM vs.first;
+----
+does not exist in its source
+
+# a CTE of the body's own named like a read is refused where the view is created
+statement ok
+ALTER TABLE phys.lake.orders ADD COLUMN region VARCHAR DEFAULT 'eu';
+
+statement error
+ACL ROLE "w" CREATE VIEW vs.clash AS WITH __acl_read_1 AS (SELECT 1 AS x) SELECT o.id FROM vs.orders o, __acl_read_1;
+----
+reserved
+
+statement error
+ACL ROLE "w" CREATE VIEW vs.clash2 AS SELECT * FROM (WITH __acl_read_1 AS (SELECT 1 AS x) SELECT o.id FROM vs.orders o, __acl_read_1) q;
+----
+reserved
