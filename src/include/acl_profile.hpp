@@ -126,8 +126,8 @@ private:
 
 //! The hash a note and an execution are matched by; never the text.
 uint64_t StatementTextHash(const string &text);
-//! spec 157: the marker a guarded write's text ends with (`\n/* acl:guard:<token> */`, a line of its own), and the token a text ends with
-//! (empty when it ends with none)
+//! spec 157: the marker a guarded write's text ends with (`\n/* acl:guard:<token> */`, a line of its own), and the
+//! token a text ends with (empty when it ends with none)
 string WriteGuardMarker(const string &token);
 string WriteGuardToken(const string &text);
 //! spec 157: before a marked write is optimized, bind the role's reads its decision noted - a read that does not bind,
