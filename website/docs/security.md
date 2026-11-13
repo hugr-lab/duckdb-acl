@@ -761,7 +761,8 @@ Three consequences, stated as the decision:
    "orders" exposes no readable columns`) is the empty-intersection case on a declared object,
    whatever the row filter - and every write of it refuses too (spec 156). A `DELETE` / `UPDATE` / `MERGE`
    binds the role's read of its target, so a source that dropped the columns a grant names refuses it too
-   (spec 157).
+   (spec 157). A policy text - an RLS, a mask, a computed column, a view's SQL - binds only to its own source:
+   a name the source lost refuses, never binding to a column of the principal's query (spec 159).
    Repair is the administrator's, by rewriting the object's list (`ALTER VIRTUAL TABLE … SET
    COLUMNS`): a refresh (`acl_refresh_schema` / `ANALYZE VIRTUAL CATALOG`, spec 010) re-probes
    verdicts and derived schemas but does not heal a declared list - healing it automatically would

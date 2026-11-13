@@ -835,13 +835,21 @@ source before, and an empty column set let a write touch, filter on and return e
 `acl_empty_grant_projection.test`.
 
 **Spec 157 — a write binds the role's read**: the rewriter notes the role's read of a DELETE / UPDATE / MERGE target
-(`NoteReadableGuard`: `TableReadSql` or the RENAME / cast read, markers baked) under a random token in
-`PolicyStore::write_guards` and appends a line `/* acl:guard:<token> */` to its text (each part of a MultiStatement);
-`QueryBegin` takes the token off the running text and `WriteGuardPreOptimize` (acl_profile.cpp) binds each read with a binder of its own before the write
-is optimized - a read that does not bind, or a token gone, refuses. Never added to the statement: a subquery guard correlated
-a lost name to the target's alias / USING / the merge source, a CTE broke mysql's / mssql's whole-statement pushdown, and a
-registry by text hash failed open. `acl_check_catalog`'s `grant_exposes_nothing` (an object grant left no column; replaces
-its `grant_column_missing`). Test `acl_no_column_at_query.test`.
+(`NoteReadableGuard`: `TableReadSql` or the RENAME / cast read, markers baked) in `PolicyStore::write_guards` by the hash of
+its text (spec 159) and appends a line `/* acl:guard:<key>,… */` to its text (each part of a MultiStatement); `QueryBegin`
+takes the keys off the running text and `WriteGuardPreOptimize` (acl_profile.cpp) binds each read with a binder of its own
+before the write is optimized - a read that does not bind, or a key gone, refuses. Never added to the statement: a subquery
+guard correlated a lost name to the target's alias / USING / the merge source, a CTE broke mysql's / mssql's whole-statement
+pushdown. `acl_check_catalog`'s `grant_exposes_nothing` (an object grant left no column; replaces its
+`grant_column_missing`). Test `acl_no_column_at_query.test`.
+
+**Spec 159 — a policy text binds only to its own source**: every policy read (`ReadRef`: `BuildTableSubquery` /
+`BuildRenamedSubquery`, a table function called with closed arguments) joins spec 157's guards - bound alone before the
+statement is optimized, so a name its source lost refuses instead of binding to a relation before it (implicit LATERAL), a
+correlated query's column or a write's target. Guards are keyed by content (`WriteGuardKey`, 128 bits of SHA-256; the
+marker `/* acl:guard:<key>,… */` lists them); the statement and its plan are unchanged (hoisting reads into root CTEs kept
+them materialized under correlated joins over Postgres / MySQL). Shadowing by a principal's CTE / temp table is spec 160's.
+Test `acl_policy_own_source.test`.
 
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a

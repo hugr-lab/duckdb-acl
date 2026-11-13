@@ -1,0 +1,221 @@
+# name: test/sql/acl_policy_own_source.test
+# description: spec 159 - a policy text (an RLS, a mask, a computed column, a view's SQL, a table function's template)
+#   binds only to its own source: a name the source lost refuses rather than binding to a column of the principal's
+#   query (an implicit lateral join, a correlated subquery, a write's target)
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.logs (id INTEGER, region VARCHAR, msg VARCHAR);
+
+statement ok
+INSERT INTO phys.main.logs VALUES (1, 'eu', 'a'), (2, 'us', 'b'), (3, 'us', 'c');
+
+statement ok
+CREATE TABLE phys.main.p (id INTEGER, secret VARCHAR, note VARCHAR);
+
+statement ok
+INSERT INTO phys.main.p VALUES (1, 's1', 'n1');
+
+statement ok
+CREATE TABLE phys.main.allow (k INTEGER);
+
+statement ok
+INSERT INTO phys.main.allow VALUES (1), (2), (3);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r;
+
+# an RLS, a mask, an RLS with a subquery, a view - each over a column the source drops below
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.logs AS phys.main.logs;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.sub AS phys.main.logs;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.pm AS phys.main.p;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.v AS 'SELECT id, msg FROM phys.main.logs WHERE region = ''eu''';
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT TABLE c.logs TO ROLE r RLS (region = 'eu'); GRANT TABLE c.sub TO ROLE r RLS (id IN (SELECT k FROM phys.main.allow WHERE region = 'eu')); GRANT TABLE c.pm TO ROLE r COLUMNS (id, secret = note);
+
+query III
+ACL ROLE "r" SELECT * FROM logs;
+----
+1	eu	a
+
+query T
+ACL ROLE "r" SELECT secret FROM pm;
+----
+n1
+
+statement ok
+ALTER TABLE phys.main.logs DROP COLUMN region;
+
+statement ok
+ALTER TABLE phys.main.p DROP COLUMN note;
+
+# the read alone refuses, as before
+statement error
+ACL ROLE "r" SELECT * FROM logs;
+----
+a column this statement reads does not exist in its source
+
+# a relation before the object carries the lost name: an implicit lateral join bound the RLS to it and read every row
+statement error
+ACL ROLE "r" SELECT logs.* FROM (SELECT 'eu' AS region) s, logs;
+----
+Referenced column "region" not found
+
+# ... a correlated subquery did the same
+statement error
+ACL ROLE "r" SELECT (SELECT count(*) FROM logs) FROM (SELECT 'eu' AS region) s;
+----
+Referenced column "region" not found
+
+# ... a subquery inside the RLS (`allow` has no region: the name reaches past it)
+statement error
+ACL ROLE "r" SELECT sub.* FROM (SELECT 'eu' AS region) s, sub;
+----
+Referenced column "region" not found
+
+# ... a view's own SQL
+statement error
+ACL ROLE "r" SELECT v.* FROM (SELECT 'eu' AS region) s, v;
+----
+Referenced column "region" not found
+
+# ... and a mask: the client's own value was read back as the masked column
+statement error
+ACL ROLE "r" SELECT pm.secret FROM (SELECT 'mine' AS note) s, pm;
+----
+Referenced column "note" not found
+
+# a write reading the object: a relation before it in USING, a merge source, an UPDATE's FROM
+statement ok
+CREATE TABLE phys.main.w (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO phys.main.w VALUES (1, 'x'), (2, 'x'), (3, 'x');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.w AS phys.main.w; GRANT TABLE c.w TO ROLE r;
+
+statement error
+ACL ROLE "r" DELETE FROM w USING (SELECT 'eu' AS region) s, logs WHERE w.id = logs.id;
+----
+Referenced column "region" not found
+
+statement error
+ACL ROLE "r" DELETE FROM w WHERE id IN (SELECT id FROM (SELECT 'eu' AS region) s, logs);
+----
+Referenced column "region" not found
+
+statement error
+ACL ROLE "r" UPDATE w SET region = 'y' FROM (SELECT 'eu' AS region) s, logs WHERE w.id = logs.id;
+----
+Referenced column "region" not found
+
+statement error
+ACL ROLE "r" WITH s AS (SELECT 'eu' AS region) DELETE FROM w WHERE id IN (SELECT id FROM s, logs);
+----
+Referenced column "region" not found
+
+statement error
+ACL ROLE "r" MERGE INTO w USING (SELECT logs.id FROM (SELECT 'eu' AS region) s, logs) m ON w.id = m.id WHEN MATCHED THEN DELETE;
+----
+Referenced column "region" not found
+
+statement error
+ACL ROLE "r" INSERT INTO w SELECT logs.id, s.region FROM (SELECT 'eu' AS region) s, logs;
+----
+Referenced column "region" not found
+
+query I
+SELECT count(*) FROM phys.main.w WHERE region = 'x';
+----
+3
+
+# ... and a write whose own target has the lost name: the RLS bound to w.region
+statement ok
+UPDATE phys.main.w SET region = 'eu';
+
+statement error
+ACL ROLE "r" DELETE FROM w WHERE id IN (SELECT id FROM logs);
+----
+a column this statement reads does not exist in its source
+
+statement error
+ACL ROLE "r" DELETE FROM w WHERE EXISTS (SELECT 1 FROM logs WHERE logs.id = w.id);
+----
+a column this statement reads does not exist in its source
+
+query I
+SELECT count(*) FROM phys.main.w;
+----
+3
+
+statement ok
+UPDATE phys.main.w SET region = 'x';
+
+# a table function called with closed arguments is bound alone first like a relation's read: its template and its
+# grant's RLS
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.lf AS 'SELECT * FROM phys.main.logs'; GRANT OBJECT c.lf TO ROLE r RLS (region = 'eu');
+
+statement error
+ACL ROLE "r" SELECT l.* FROM (SELECT 'eu' AS region) s, lf() l;
+----
+Referenced column "region" not found
+
+statement error
+ACL ROLE "r" SELECT (SELECT count(*) FROM lf()) FROM (SELECT 'eu' AS region) s;
+----
+Referenced column "region" not found
+
+# a policy that still binds reads as before beside such a relation, inside a CTE, a subquery and a UNION
+statement ok
+CREATE TABLE phys.main.ok (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO phys.main.ok VALUES (1, 'eu'), (2, 'us');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ok AS phys.main.ok; GRANT TABLE c.ok TO ROLE r RLS (region = 'eu');
+
+query II
+ACL ROLE "r" SELECT ok.* FROM (SELECT 'us' AS region) s, ok;
+----
+1	eu
+
+query I
+ACL ROLE "r" WITH x AS (SELECT id FROM ok) SELECT count(*) FROM x, ok y WHERE x.id = y.id;
+----
+1
+
+query I
+ACL ROLE "r" SELECT (SELECT count(*) FROM ok WHERE ok.id = s.id) FROM (SELECT 1 AS id) s;
+----
+1
+
+query I
+ACL ROLE "r" SELECT id FROM ok UNION ALL SELECT id FROM ok ORDER BY 1;
+----
+1
+1

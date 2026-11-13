@@ -1580,6 +1580,49 @@ private:
 		cte_scope = saved_scope;
 	}
 
+	//! spec 159: a policy read, in place of the object (its alias, column aliases and sample kept), and noted to be
+	//! bound as a statement of its own before the statement is optimized (spec 157's guards): a read that binds alone
+	//! has no name left to bind to the principal's - a relation before it, a correlated query, a write's target
+	unique_ptr<TableRef> ReadRef(unique_ptr<SelectStatement> select_stmt, const string &vname, BaseTableRef &original) {
+		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
+		return ReadRef(std::move(select_stmt), alias, std::move(original.column_name_alias),
+		               std::move(original.sample));
+	}
+
+	unique_ptr<TableRef> ReadRef(unique_ptr<SelectStatement> select_stmt, const Identifier &alias,
+	                             vector<Identifier> column_aliases, unique_ptr<SampleOptions> sample) {
+		guards.push_back(select_stmt->ToString());
+		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+		sub->column_name_alias = std::move(column_aliases);
+		sub->sample = std::move(sample);
+		return std::move(sub);
+	}
+
+	//! spec 159: a call whose arguments name nothing of the principal's query (constants: a parameter cannot be bound
+	//! alone) - its template
+	//! and its grant's wrapper are bound alone first like a relation's read; one that names a column is correlated on
+	//! purpose
+	static bool ClosedArguments(FunctionExpression &function) {
+		for (auto &arg : function.GetArgumentsMutable()) {
+			if (!Closed(*arg.GetExpressionMutable())) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	static bool Closed(const ParsedExpression &expr) {
+		auto cls = expr.GetExpressionClass();
+		if (cls == ExpressionClass::COLUMN_REF || cls == ExpressionClass::SUBQUERY || cls == ExpressionClass::LAMBDA ||
+		    cls == ExpressionClass::STAR || cls == ExpressionClass::PARAMETER) {
+			return false;
+		}
+		bool closed = true;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { closed = closed && Closed(child); });
+		return closed;
+	}
+
 	//! spec 144: an item duckdb expands into several columns - one with a star anywhere in it (`* LIKE '…'`, which it
 	//! turns into COLUMNS(), `1 + COLUMNS('a|b')`, `min(COLUMNS(*))`) but the argument of COUNT(tbl.*), which it
 	//! rewrites into one count (FindStarExpression's own walk). duckdb names each column - and an alias it carries
@@ -2244,6 +2287,7 @@ private:
 			}
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
 			Identifier alias = tf.alias.empty() ? Identifier(leaf) : tf.alias;
+			bool closed = ClosedArguments(function);
 			if (policy.subquery_form) {
 				ref = BuildFunctionSubquery(leaf, policy, function, tf);
 			} else {
@@ -2252,6 +2296,9 @@ private:
 			}
 			// a grant narrows what the function returns, whichever form it took (spec 011)
 			WrapWithGrantPolicy(ref, policy, alias);
+			if (closed && ref->type == TableReferenceType::SUBQUERY) {
+				guards.push_back(ref->Cast<SubqueryRef>().subquery->ToString()); // spec 159: bound alone first
+			}
 			return;
 		}
 		if (auto surface = MetadataSurfaceOf(vname)) {
@@ -2603,12 +2650,7 @@ private:
 		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr);
-
-		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
-		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
-		sub->column_name_alias = std::move(original.column_name_alias);
-		sub->sample = std::move(original.sample);
-		return std::move(sub);
+		return ReadRef(std::move(select_stmt), vname, original);
 	}
 
 	//! The SELECT a principal reads a relation through - a view's SQL, or the projection over the source
@@ -2667,11 +2709,7 @@ private:
 		auto sql = "SELECT " + items + policy.ReadFrom();
 		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
-		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
-		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
-		sub->column_name_alias = std::move(original.column_name_alias);
-		sub->sample = std::move(original.sample);
-		return std::move(sub);
+		return ReadRef(std::move(select_stmt), vname, original);
 	}
 
 	//! Replace a metadata surface with the principal's own catalog in the same shape
@@ -4534,7 +4572,8 @@ private:
 public:
 	//! The audit's entry for the statement being rewritten (spec 069), or null when nobody listens
 	AuditTrail::Statement *trail = nullptr;
-	//! spec 157: the role's reads this statement's writes bind first (NoteReadableGuard)
+	//! spec 157 / 159: the reads this statement binds alone first - its writes' targets (NoteReadableGuard), every
+	//! policy read (ReadRef)
 	vector<string> guards;
 
 	//! Record an object the statement touches and the capability its decision needed. Noted where
@@ -4757,11 +4796,18 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			}
 		}
 		if (!rewriter.guards.empty() && !rewriter.drop_statement) {
-			// spec 157: the decision's token at the end of the text - every execution of it carries the text
+			// spec 157 / 159: each read by the hash of its text, the keys at the end of the statement's text - every
+			// execution of it carries them; the same read is one entry whoever reads it
 			auto &written = rewriter.replacement ? *rewriter.replacement : *stmt;
-			auto token = MintRandomHex(16);
-			store.write_guards.Note(token, std::move(rewriter.guards));
-			written.query += WriteGuardMarker(token);
+			vector<string> keys;
+			for (auto &read : rewriter.guards) {
+				auto key = WriteGuardKey(read);
+				if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+					store.write_guards.Note(key, read);
+					keys.push_back(key);
+				}
+			}
+			written.query += WriteGuardMarker(StringUtil::Join(keys, ","));
 			if (written.type == StatementType::MULTI_STATEMENT) {
 				// an implicit PIVOT: duckdb runs the parts, each under its own text
 				for (auto &part : written.Cast<MultiStatement>().statements) {

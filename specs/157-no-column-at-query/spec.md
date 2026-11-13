@@ -130,10 +130,12 @@ after 65,600 other statements and after a source change; a write carrying an imp
 
 ## Follow-ups
 
-- **Spec 159: policy texts bind only to their own source.** The same correlation reaches READS. An RLS whose column
-  the source lost binds, through duckdb's implicit lateral join, to a column of a relation the principal puts before
-  the object: `SELECT logs.* FROM (SELECT 'eu' AS region) s, logs` returns the rows the RLS hid. A projection item
-  does the same. On a `DELETE`, the RLS predicate (outside the guard) binds to the target's alias row.
+- **Spec 159 (built): policy texts bind only to their own source.** It also keys these guards by content - the hash of
+  the read - instead of a random token per decision, so a flood no longer evicts a prepared statement's. The same
+  correlation reaches READS. An RLS whose column the source lost binds, through duckdb's implicit lateral join, to a
+  column of a relation the principal puts before the object: `SELECT logs.* FROM (SELECT 'eu' AS region) s, logs`
+  returns the rows the RLS hid. A projection item does the same. On a `DELETE`, the RLS predicate (outside the guard)
+  binds to the target's alias row.
 - **The check skips object grants under a live schema alias.** The guard covers them; the check does not (BACKLOG).
 - **A broken projection's errors name physical columns.** Examples: duckdb's REPLACE-list error, and a `DELETE …
   RETURNING k` headed `id`. These are spec 155's (BACKLOG).
