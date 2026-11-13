@@ -716,13 +716,21 @@ vector<string> ResolvedReference(DatabaseInstance &db, const vector<string> &par
 	if (parts.empty()) {
 		return out;
 	}
+	Connection con(db);
+	con.context->RunFunctionInTransaction([&]() { out = ResolvedReference(*con.context, parts); });
+	return out;
+}
+
+vector<string> ResolvedReference(ClientContext &context, const vector<string> &parts) {
+	vector<string> out;
+	if (parts.empty()) {
+		return out;
+	}
 	vector<Identifier> path;
 	for (auto &part : parts) {
 		path.emplace_back(part);
 	}
-	Connection con(db);
-	auto &context = *con.context;
-	context.RunFunctionInTransaction([&]() {
+	{
 		CatalogEntryRetriever retriever(context);
 		// the binder's own reading of a table reference: catalog-or-schema (its ambiguity refusal too), then the lookup
 		// through the search path for whatever the name leaves out
@@ -737,7 +745,7 @@ vector<string> ResolvedReference(DatabaseInstance &db, const vector<string> &par
 			}
 			out.push_back(entry->name.GetIdentifierName());
 		}
-	});
+	}
 	return out;
 }
 

@@ -687,7 +687,9 @@ A grant's `COLUMNS` item is `name` or `name = <mask>`. The name is a column or a
 is quoted (`"order"`, `"odd name"`, `"a.b"` - one column whose name holds a dot). The mask is one
 expression as duckdb reads it, list and struct literals, `MAP` and lambdas included
 (`tags = ['a', 'b']`, `s = {'x': 1}`, `items = list_transform(items, lambda e: {'price': 0})`), and is
-stored as written (a comment in it a space). The stored list is read back on duckdb's tokens; a
+stored as written (a comment in it a space) but for the tables it names, which are stored whole -
+`<db>.<schema>.<table>` - as are those of every policy text (an RLS, a view's SQL, a template; spec 160).
+The stored list is read back on duckdb's tokens; a
 name it would not read back bare is stored quoted (`"a,b"`, `"od'd"`), and a list that would read
 back as other items than written is refused where it is written. The legacy quoted form
 `COLUMNS '<list>'` and the function forms' text take any name and mask the same way; such a text that
@@ -1169,6 +1171,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `rls_broken` / `rls_unchecked` | a predicate (object or grant) fails to bind / was accepted unchecked and binds now (spec 027) | `… SET RLS`, a re-grant / `ANALYZE VIRTUAL CATALOG` |
 | `grant_column_missing` | a bare item of a grant's `COLUMNS` list matches no column of the object (an object grant), or of any object of the catalog (a catalog grant) | `acl_grant_object(…)` / `ALTER GRANT CATALOG … SET COLUMNS` |
 | `grant_exposes_nothing` | a role's object grant lists columns and its grants leave it none of the object's: the levels intersect to nothing, the object's list changed under the grant, or (an object without a list) the source dropped them - it replaces that grant's `grant_column_missing` rows (spec 157; a catalog-wide list naming nothing of an object is by design) | `acl_grant_object(…, '<columns>')` naming what the role reads |
+| `body_table_unqualified` | a stored body (an RLS, a view, a template, a declared column, a grant's RLS or list) names a table without its database - a principal's CTE or temp table of that name would stand in for it (spec 160) | redefine it; a write through the grammar stores the table whole |
 | `mask_broken` | a `name = expr` grant item names a column the object does not expose, or its expression does not bind - every read of that object by that role refuses (spec 038) | the same |
 | `schema_missing` | a schema alias's or expansion's physical schema has no schema behind it | `ALTER VIRTUAL SCHEMA … SET PHYS` / `DROP VIRTUAL SCHEMA` |
 | `expansion_stale` | an expansion's source has tables it did not record (and did not exclude), or records whose source is gone | `ALTER VIRTUAL SCHEMA … REFRESH [PRUNE]` |

@@ -139,11 +139,6 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     found` (a cast / mask over a dropped column), and `DELETE … RETURNING k` heads its column with the physical `id`.
   - Spec 155's scrub is lost when its registry evicts a text: a principal that sends 65,536 other statements before
     executing its prepared statement reads duckdb's raw error (physical column names) - found by spec 157's re-review.
-  - Spec 160 (next): a policy's tables are the catalog's - an unqualified table in a policy text (an RLS subquery, a
-    view, a scalar template, a table function body) resolves through the connection's search path: a principal's temp
-    table (`CREATE TEMP TABLE tenants`, accepted under a gateway's per-statement prefix) shadows it for every principal
-    on that connection, and a principal's CTE shadows it in a scalar template or a call with column arguments (found
-    by spec 159's review). Qualify at write; refuse temp off a client's own session (spec 068's reasoning).
   - A principal's own view (spec 113) stores its rewritten body; spec 159's guard binds a read of it as one read, so
     the reads inside it are not bound alone. Rewrite the body with the same guards as a statement's (spec 159's
     review).

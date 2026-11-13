@@ -112,10 +112,8 @@ Each form returned the hidden rows before. The plan is the old one: nothing in t
 
 ## Follow-ups
 
-- **Spec 160: a policy's tables are the catalog's.** Qualify the tables a policy text names where it is written.
-  Then neither a principal's temp table nor its CTE can stand in for one. Today a principal holding `temp` can shadow
-  an unqualified policy table on a gateway's shared connection, for every principal on it. Refuse `CREATE TEMP` under
-  a per-statement prefix, as spec 068 does for `SET`.
+- **Spec 160 (built): a policy's tables are written whole.** Qualified where written, a policy's table is never a
+  principal's temp table's or CTE's.
 - **A principal's own view (spec 113)** stores its rewritten body, and a read of it is bound alone as one read. Its
   body should be rewritten with the same guards as a statement's.
 - **`acl_arg`**: a call's argument is spliced into the template's physical SQL. It should be evaluated in the caller's

@@ -851,6 +851,12 @@ marker `/* acl:guard:<key>,… */` lists them); the statement and its plan are u
 them materialized under correlated joins over Postgres / MySQL). Shadowing by a principal's CTE / temp table is spec 160's.
 Test `acl_policy_own_source.test`.
 
+**Spec 160 — a policy's tables are written whole**: `QualifyBodies` (acl_platform.cpp, before the authorizers) has
+`QualifiedBodyTables` (acl_platform_rights.cpp) rewrite each table a stored body names (RLS, mask, computed column, view
+SQL, template - `BodiesOf`) to its entry's `<db>.<schema>.<table>` (`ResolvedReference`, the binder's reading), at the name's
+location, the rest as written - so a principal's CTE or temp table never stands in for it. Stored rows are the check's
+`body_table_unqualified`. Test `acl_policy_tables_qualified.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

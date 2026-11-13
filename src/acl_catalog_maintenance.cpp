@@ -553,13 +553,34 @@ private:
 		} catch (std::exception &) {
 			return; // a body that does not parse is definition_broken's finding, where it applies
 		}
-		if (denied.empty()) {
+		if (!denied.empty()) {
+			Add(kind, object, role, "body_function_denied",
+			    what + " calls " + StringUtil::Join(denied, ", ") +
+			        " - a function no principal may call, which a stored body runs as the node",
+			    "redefine it without the call (the write refuses it since spec 117), or drop it");
+		}
+		if (shape == BodyShape::FUNCTION_NAME) {
 			return;
 		}
-		Add(kind, object, role, "body_function_denied",
-		    what + " calls " + StringUtil::Join(denied, ", ") +
-		        " - a function no principal may call, which a stored body runs as the node",
-		    "redefine it without the call (the write refuses it since spec 117), or drop it");
+		// spec 160: a table it names without its database reads whatever a principal's CTE or temp table of that name
+		// holds - a body stored before the write qualified it, or by the operator's own call
+		vector<string> unwritable;
+		auto qualified = QualifiedBodyTables(*catalog.Db(), text, shape == BodyShape::SELECT,
+		                                     BodyItemExpressions(text, shape), &unwritable);
+		if (!unwritable.empty()) {
+			Add(kind, object, role, "body_table_unqualified",
+			    what + " names " + StringUtil::Join(unwritable, ", ") +
+			        " in a form not written whole, so a principal's CTE or temp table of that name stands in for it",
+			    "redefine it with the tables written whole (<db>.<schema>.<table>)");
+		} else if (qualified != text) {
+			Add(kind, object, role, "body_table_unqualified",
+			    what +
+			        " names a table without its database, so a principal's CTE or temp table of that name stands in "
+			        "for it; written whole it reads: " +
+			        qualified,
+			    "redefine it with its tables written whole (a write through the grammar qualifies them since spec "
+			    "160)");
+		}
 	}
 
 	void CheckBodies() {

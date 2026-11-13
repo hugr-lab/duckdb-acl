@@ -98,7 +98,7 @@ ACL ROLE "cadm" CREATE VIRTUAL TABLE c.r1 AS src.main.t RLS (id IN (SELECT x FRO
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL VIEW c.l3 AS 'SELECT * FROM g';
 ----
-<REGEX>:.*the definition's body names "g", outside the sources granted.*
+<REGEX>:.*the definition's body names "memory\.main\.g", outside the sources granted.*
 
 # --- a name of no object (a file read by a replacement scan) reads no source ---------------------------------------
 
@@ -135,17 +135,17 @@ ACL ROLE "cadm" CREATE VIRTUAL VIEW c.s3 AS 'SELECT * FROM (DESCRIBE sec.main.se
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c1 AS 'WITH g AS (SELECT * FROM g) SELECT * FROM g';
 ----
-<REGEX>:.*names "g", outside the sources granted.*
+<REGEX>:.*names "memory\.main\.g", outside the sources granted.*
 
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c2 AS 'WITH a1 AS (SELECT * FROM g), g AS (SELECT 1 AS s) SELECT * FROM a1';
 ----
-<REGEX>:.*names "g", outside the sources granted.*
+<REGEX>:.*names "memory\.main\.g", outside the sources granted.*
 
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c3 AS 'WITH RECURSIVE g AS (SELECT * FROM g UNION ALL SELECT * FROM g WHERE false) SELECT * FROM g';
 ----
-<REGEX>:.*names "g", outside the sources granted.*
+<REGEX>:.*names "memory\.main\.g", outside the sources granted.*
 
 statement ok
 ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c4 AS 'WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r';
