@@ -1886,6 +1886,7 @@ private:
 			} else {
 				AndPolicyPredicate(node.set_info->condition, policy);
 			}
+			NoteReadableGuard(vname, policy); // spec 157
 		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
@@ -1914,6 +1915,7 @@ private:
 		} else {
 			AndPolicyPredicate(node.condition, policy);
 		}
+		NoteReadableGuard(vname, policy); // spec 157
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname);
@@ -1935,6 +1937,7 @@ private:
 		// The predicate joins the target rather than filters the result: a row outside the grant is
 		// never matched, so no WHEN MATCHED branch can reach it.
 		AndInto(node.join_condition, TargetPredicate(policy, alias, vname));
+		NoteReadableGuard(vname, policy); // spec 157
 		for (auto &action_set : node.actions) {
 			for (auto &action : action_set.second) {
 				RewriteExpr(action->condition);
@@ -2596,6 +2599,20 @@ private:
 	//! Replace a virtual relation with a subquery: a view uses its full `query`, a table is assembled
 	//! as `(SELECT <projection> FROM <phys> [WHERE <rls>]) AS <alias>`. Claim values are baked in.
 	unique_ptr<TableRef> BuildTableSubquery(const string &vname, const TablePolicy &policy, BaseTableRef &original) {
+		auto sql = TableReadSql(vname, policy);
+		NotePhysical(policy.phys, vname);
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		BakeMarkersInNode(*select_stmt->node, nullptr);
+
+		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
+		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+		sub->column_name_alias = std::move(original.column_name_alias);
+		sub->sample = std::move(original.sample);
+		return std::move(sub);
+	}
+
+	//! The SELECT a principal reads a relation through - a view's SQL, or the projection over the source
+	string TableReadSql(const string &vname, const TablePolicy &policy) {
 		string sql;
 		if (policy.exposes_nothing) {
 			// spec 156: the grants narrowed the object's columns to none (an empty projection beside an RLS is a
@@ -2618,15 +2635,28 @@ private:
 			}
 			sql = "SELECT " + items + policy.ReadFrom();
 		}
-		NotePhysical(policy.phys, vname);
-		auto select_stmt = store.InstantiateSelect(sql, template_options);
-		BakeMarkersInNode(*select_stmt->node, nullptr);
+		return sql;
+	}
 
-		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
-		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
-		sub->column_name_alias = std::move(original.column_name_alias);
-		sub->sample = std::move(original.sample);
-		return std::move(sub);
+	//! spec 157: a DELETE / UPDATE / MERGE binds the role's read of its target before it is optimized - noted on the
+	//! statement's text, bound as a statement of its own (no outer scope a lost name could bind to), never added to
+	//! the write (a scanner pushing the write down whole refuses what it cannot write). Nothing when the read is the
+	//! source's every column.
+	void NoteReadableGuard(const string &vname, const TablePolicy &policy) {
+		string read;
+		if (!policy.query.empty() || !policy.projection.empty()) {
+			read = TableReadSql(vname, policy);
+		} else if (!policy.renames.empty() || !policy.casts.empty()) {
+			read = "SELECT " +
+			       (policy.renames.empty() ? string("*")
+			                               : "* RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ")") +
+			       policy.ReadFrom();
+		} else {
+			return;
+		}
+		auto select_stmt = store.InstantiateSelect(read, template_options);
+		BakeMarkersInNode(*select_stmt->node, nullptr);
+		guards.push_back(select_stmt->ToString());
 	}
 
 	//! `(SELECT * RENAME (phys AS virt, …) FROM <source>) AS <alias>` - the read shape of a renamed (or
@@ -4504,6 +4534,8 @@ private:
 public:
 	//! The audit's entry for the statement being rewritten (spec 069), or null when nobody listens
 	AuditTrail::Statement *trail = nullptr;
+	//! spec 157: the role's reads this statement's writes bind first (NoteReadableGuard)
+	vector<string> guards;
 
 	//! Record an object the statement touches and the capability its decision needed. Noted where
 	//! the object resolved and before the capability is judged, so a refusal's event names what it
@@ -4686,6 +4718,7 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 		rewriter.follow_ups.clear();
 		rewriter.drop_statement = false;
 		rewriter.replacement = nullptr;
+		rewriter.guards.clear();
 		if (trail) {
 			trail->statements.emplace_back();
 			trail->statements.back().statement = StringUtil::Lower(StatementTypeToString(stmt->type));
@@ -4720,6 +4753,19 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 				if (TakeDenyReason() == ReasonCode(Reason::SOURCE_ERROR)) {
 					NoteDenyReason(Reason::SOURCE_ERROR);
 					throw;
+				}
+			}
+		}
+		if (!rewriter.guards.empty() && !rewriter.drop_statement) {
+			// spec 157: the decision's token at the end of the text - every execution of it carries the text
+			auto &written = rewriter.replacement ? *rewriter.replacement : *stmt;
+			auto token = MintRandomHex(16);
+			store.write_guards.Note(token, std::move(rewriter.guards));
+			written.query += WriteGuardMarker(token);
+			if (written.type == StatementType::MULTI_STATEMENT) {
+				// an implicit PIVOT: duckdb runs the parts, each under its own text
+				for (auto &part : written.Cast<MultiStatement>().statements) {
+					part->query = written.query;
 				}
 			}
 		}

@@ -1,0 +1,334 @@
+# name: test/sql/acl_no_column_at_query.test
+# description: spec 157 - a DELETE / MERGE under a column policy binds the role's read of its target first, so a
+#   grant left with no column (by the source changing, or over an object without a list) refuses there; the check names
+#   a role left with none
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t (id INTEGER, b INTEGER);
+
+statement ok
+CREATE TABLE phys.main.logs (region VARCHAR, msg VARCHAR);
+
+statement ok
+INSERT INTO phys.main.logs VALUES ('eu', 'a'), ('eu', 'b'), ('us', 'c');
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r; CREATE ROLE wr; CREATE ROLE d; CREATE ROLE e;
+
+# `logs` declares no list (every source column); `wide` declares id, so a catalog-wide `COLUMNS (id)` is accepted
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.logs AS phys.main.logs;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.wide AS phys.main.t COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN COLUMNS (id) RLS 'true';
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE wr MAIN;
+
+# r reads no column of logs: the read refused at bind, as before
+statement error
+ACL ROLE "r" SELECT * FROM logs;
+----
+a star in this statement selects no column it may read
+
+# ... and so do a DELETE and a MERGE, which named no column and deleted every row the filter reached
+statement error
+ACL ROLE "r" DELETE FROM logs;
+----
+a star in this statement selects no column it may read
+
+statement error
+ACL ROLE "r" DELETE FROM logs WHERE true;
+----
+a star in this statement selects no column it may read
+
+statement error
+ACL ROLE "r" MERGE INTO logs USING (SELECT 1 AS x) s ON true WHEN MATCHED THEN DELETE;
+----
+a star in this statement selects no column it may read
+
+query I
+SELECT count(*) FROM phys.main.logs;
+----
+3
+
+# a role without a column list deletes as before - its read is every column
+statement ok
+ACL ROLE "wr" DELETE FROM logs WHERE region = 'us';
+
+query I
+SELECT count(*) FROM phys.main.logs;
+----
+2
+
+# the source changes under a grant that matched: d reads msg of `drift`, deletes while msg is there, not after
+statement ok
+CREATE TABLE phys.main.d (id INTEGER, msg VARCHAR, other INTEGER);
+
+statement ok
+INSERT INTO phys.main.d VALUES (1, 'x', 0), (2, 'y', 0), (3, 'z', 0);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift AS phys.main.d;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE d MAIN; GRANT TABLE c.drift TO ROLE d COLUMNS (msg);
+
+query I
+ACL ROLE "d" SELECT * FROM drift ORDER BY msg;
+----
+x
+y
+z
+
+statement ok
+ACL ROLE "d" DELETE FROM drift WHERE msg = 'x';
+
+statement ok
+ACL ROLE "d" MERGE INTO drift USING (SELECT 'y' AS m) s ON drift.msg = s.m WHEN MATCHED THEN DELETE;
+
+statement ok
+ALTER TABLE phys.main.d DROP COLUMN msg;
+
+statement error
+ACL ROLE "d" DELETE FROM drift;
+----
+a star in this statement selects no column it may read
+
+statement error
+ACL ROLE "d" MERGE INTO drift USING (SELECT 1 AS x) s ON true WHEN MATCHED THEN DELETE;
+----
+a star in this statement selects no column it may read
+
+query I
+SELECT count(*) FROM phys.main.d;
+----
+1
+
+# a declared (renaming, writable) list whose column the source dropped: the role's read fails, so does its DELETE
+statement ok
+CREATE TABLE phys.main.e (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO phys.main.e VALUES (1, 10), (2, 20);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ed AS phys.main.e COLUMNS (vv = v);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE e MAIN; GRANT TABLE c.ed TO ROLE e COLUMNS (vv);
+
+statement ok
+ACL ROLE "e" DELETE FROM ed WHERE vv = 10;
+
+statement ok
+ALTER TABLE phys.main.e DROP COLUMN v;
+
+statement error
+ACL ROLE "e" DELETE FROM ed;
+----
+a column this statement reads does not exist in its source
+
+# the read is bound where no name of the statement is in scope: the lost `v` never binds to the target's alias, a
+# USING relation, a merge's source or a CTE of the principal's (a subquery's read correlated to them and deleted all)
+statement error
+ACL ROLE "e" DELETE FROM ed AS v;
+----
+
+statement error
+ACL ROLE "e" DELETE FROM ed USING (SELECT 1 AS v) u;
+----
+
+statement error
+ACL ROLE "e" WITH s AS (SELECT 1 AS v) DELETE FROM ed USING s;
+----
+
+statement error
+ACL ROLE "e" MERGE INTO ed USING (SELECT 1 AS v) s ON true WHEN MATCHED THEN DELETE;
+----
+
+statement error
+ACL ROLE "e" MERGE INTO ed AS v USING (SELECT 1 AS x) s ON true WHEN MATCHED THEN DELETE;
+----
+
+# an implicit PIVOT turns the statement into several (duckdb runs each part under its own text): each is marked
+statement error
+ACL ROLE "e" DELETE FROM ed USING (PIVOT (SELECT 'x' AS a, 1 AS b) ON a USING sum(b)) p;
+----
+a column this statement reads does not exist in its source
+
+statement error
+ACL ROLE "e" MERGE INTO ed USING (PIVOT (SELECT 'x' AS a, 1 AS b) ON a USING sum(b)) p ON true WHEN MATCHED THEN DELETE;
+----
+a column this statement reads does not exist in its source
+
+query I
+SELECT count(*) FROM phys.main.e;
+----
+1
+
+# an UPDATE naming a column that is still there binds the role's read too
+statement ok
+CREATE TABLE phys.main.u (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO phys.main.u VALUES (1, 10);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.uk AS phys.main.u COLUMNS (k = id, vv = v);
+
+statement ok
+ACL ROLE "e" UPDATE uk SET k = 2;
+
+statement ok
+ALTER TABLE phys.main.u DROP COLUMN v;
+
+statement error
+ACL ROLE "e" UPDATE uk SET k = 3;
+----
+a column this statement reads does not exist in its source
+
+query I
+SELECT id FROM phys.main.u;
+----
+2
+
+# a grant on an object names the object's columns: `id` is the source's name for `k` (spec 037's refusal)
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ren AS phys.main.t COLUMNS (k = id, b);
+
+statement error
+ACL ADMIN GRANT TABLE c.ren TO ROLE e COLUMNS (k, id);
+----
+lists "id", which the object does not have
+
+statement ok
+ACL ADMIN GRANT TABLE c.ren TO ROLE e COLUMNS (k);
+
+statement error
+ACL ADMIN GRANT TABLE c.wide TO ROLE e COLUMNS (id, nope);
+----
+lists "nope", which the object does not have
+
+statement ok
+ACL ADMIN GRANT TABLE c.wide TO ROLE e COLUMNS (id);
+
+# ... and over an object without a list, by its source's columns as they are when written; a source that changes after
+# is the query's (above) and the check's (below)
+statement error
+ACL ADMIN GRANT TABLE c.logs TO ROLE e COLUMNS (id);
+----
+lists "id", which the object does not have
+
+statement ok
+ACL ADMIN GRANT TABLE c.logs TO ROLE e COLUMNS (msg);
+
+# the check names a role whose object grant is left with no column of its object, with the grant to restate - the
+# source changed under it (drift), or the object's list did (`SET COLUMNS`)
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.sc AS phys.main.t COLUMNS (id, b);
+
+statement ok
+ACL ADMIN GRANT TABLE c.sc TO ROLE e COLUMNS (b);
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.sc SET COLUMNS (id);
+
+query TT
+SELECT object, repair LIKE 'SELECT acl_grant_object(%''<columns>'')%' FROM acl_check_catalog('c')
+WHERE problem = 'grant_exposes_nothing' ORDER BY object;
+----
+drift	true
+sc	true
+
+query T
+SELECT role FROM acl_check_catalog('c') WHERE problem = 'grant_exposes_nothing' AND object = 'drift';
+----
+d
+
+# a delete-only role is judged by the capability it holds; its finding replaces the item-by-item one
+statement ok
+ACL ADMIN CREATE ROLE w; GRANT CATALOG c TO ROLE w MAIN;
+
+statement ok
+CREATE TABLE phys.main.d2 (id INTEGER, msg VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift2 AS phys.main.d2;
+
+statement ok
+SELECT acl_grant_object('w', 'c', 'drift2', '{"delete": true}', '', 'msg');
+
+statement ok
+ALTER TABLE phys.main.d2 DROP COLUMN msg;
+
+query T
+SELECT problem FROM acl_check_catalog('c') WHERE role = 'w' AND object = 'drift2';
+----
+grant_exposes_nothing
+
+# the levels intersecting to nothing: the catalog grant lists id, the object grant b
+statement ok
+ACL ADMIN CREATE ROLE ix; GRANT CATALOG c TO ROLE ix MAIN COLUMNS (id); CREATE VIRTUAL TABLE c.bth AS phys.main.t COLUMNS (id, b); GRANT TABLE c.bth TO ROLE ix COLUMNS (b);
+
+statement error
+ACL ROLE "ix" SELECT * FROM bth;
+----
+exposes no readable columns
+
+query T
+SELECT problem FROM acl_check_catalog('c') WHERE role = 'ix' AND object = 'bth';
+----
+grant_exposes_nothing
+
+# a cast-only read (spec 099: an ENUM exposed as VARCHAR) - no column list, yet the read binds the column it casts
+statement ok
+SET GLOBAL acl_enum_types = 'varchar';
+
+statement ok
+CREATE TYPE mood AS ENUM ('ok', 'sad');
+
+statement ok
+CREATE TABLE phys.main.m (id INTEGER, md mood);
+
+statement ok
+INSERT INTO phys.main.m VALUES (1, 'ok'), (2, 'sad');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.mm AS phys.main.m;
+
+statement ok
+ACL ROLE "wr" DELETE FROM mm WHERE id = 1;
+
+statement ok
+ALTER TABLE phys.main.m DROP COLUMN md;
+
+statement error
+ACL ROLE "wr" DELETE FROM mm WHERE id = 2;
+----
+
+query I
+SELECT count(*) FROM phys.main.m;
+----
+1
+
+statement ok
+RESET GLOBAL acl_enum_types;

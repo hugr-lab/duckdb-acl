@@ -59,15 +59,14 @@ projection beside an RLS keeps meaning a row-only grant (every column) - only wh
 Fails closed: the read refuses with the existing `exposes no readable columns`, every write before anything is written.
 The listings were right already (they never showed such columns); `effective_rights` says `writable = false`.
 
-Visible changes beside the leak (the owner's to keep or reopen): a plain `DELETE` with no column refuses; a principal
-whose verb role alone leaves no column has that role's `VerbReadScope` contribute nothing, so `UPDATE … WHERE k = …`
-by a principal reading `k` through another role refuses (spec 145's rule, which the skip had let through); an ingest
-role whose list names physical names (`COLUMNS (id, b)`) no longer inserts into an object renaming them (it wrote
-every column unchecked). Unchanged (spec 146): a role whose own grants leave no column still contributes its ROWS to
-a verb's union - and a read's - with other roles - BACKLOG. Not caught (BACKLOG): over an object WITHOUT a declared
-list, a grant naming no column its source has is known only at bind - the read refuses there, a plain `DELETE` /
-`MERGE … DELETE` still deletes. A grant written over a list it matched and left
-narrowing to none by a later `SET COLUMNS` refuses the same way; `acl_check_catalog` does not name it yet.
+Visible changes beside the leak, kept by the owner (2026-11-13): a plain `DELETE` with no column refuses (it cannot
+filter); a principal whose verb role alone leaves no column has that role's `VerbReadScope` contribute nothing, so
+`UPDATE … WHERE k = …` by a principal reading `k` through another role refuses (spec 145's rule, which the skip had
+let through); an ingest role whose list names physical names (`COLUMNS (id, b)`) no longer inserts into an object
+renaming them - a role works with the object's representation, never its source's. Unchanged by decision (spec 146):
+a role whose own grants leave no column still contributes its ROWS to a verb's union - and a read's - with other
+roles; roles are added to widen. Over an object WITHOUT a declared list, a grant naming no column its source has is
+known only at bind - spec 157 binds the role's read in a `DELETE` / `MERGE` too, and its check names such a grant.
 
 ## Tests
 

@@ -409,7 +409,8 @@ shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	store->audit = pipeline;
 	store->instance = db.shared_from_this();
 	store->lineage_worker = acl::StartLineageWorker(store, pipeline, db); // spec 107
-	acl::RegisterLineageOptimizer(db, store); // spec 107: physical statements, from the bound plan
+	acl::RegisterLineageOptimizer(db, store);    // spec 107: physical statements, from the bound plan
+	acl::RegisterWriteGuardOptimizer(db, store); // spec 157: a write binds the role's read first
 	if (!contract_mismatch.empty()) {
 		// the full reason, once, where the operator reads refusals (the ring, the file, a sink of ours)
 		store->AuditPolicy("contract_mismatch", contract_mismatch);

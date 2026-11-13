@@ -113,7 +113,7 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - An issuer whose URL comes from its `oidc_issuer` secret cannot be moved back to a URL of its own by `ALTER ISSUER`
     (found 2026-11-06 by acl-clients spec 008): `SET URL '…'` is refused as both, `DROP FROM SECRET` as no URL - the
     move the other way is one statement (`SET URL '' FROM SECRET s`), the way back has no form.
-  - A grant's mask that is a star (`COLUMNS (id, note = *)`, `COLUMNS(*)`, `t.*`) is accepted where written and every
+  - (spec 158 takes it: COLUMNS becomes duckdb's select list, a star a live one) A grant's mask that is a star (`COLUMNS (id, note = *)`, `COLUMNS(*)`, `t.*`) is accepted where written and every
     read of the object then fails at bind (`STAR expression is not supported here`) - fails closed, but the write
     should refuse it (spec 148's `OneExpression` and the projection probe let it through; found by spec 150 4e's
     review). Same review: `GRANT SCHEMA … COLUMNS ()` (an empty list) is accepted while a non-empty one is refused, and
@@ -126,20 +126,21 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     `COLUMNS`: a stored declared name is read as a path when it holds one, so spec 150 4f refuses `"a.b"` there (before
     4f it declared the path `a.b`, which read nothing). An object without a list, or a grant's list (where such a name
     is stored quoted), exposes it; decide whether `relation_columns` should store a quoted name.
-  - An object's own list, found by spec 150 4f's review (both pre-existing): a star (`COLUMNS (id, x = *)`, `* AS x`,
+  - (spec 158 takes it) An object's own list, found by spec 150 4f's review (both pre-existing): a star (`COLUMNS (id, x = *)`, `* AS x`,
     `x = COLUMNS('s.*')`) passes spec 148 and exposes every source column, and a grant's mask `x = *` on such an object
     reads source columns the object never declared (the grant-side star is the item above); a NULL mark on a path
     (`s.x NOT NULL`) is silently dropped (keyed by the path, the column is `s`); a name written twice
     (`"n", "n" = upper("n")`) reads `n` and `n_1` - a grant's list refuses that since 4e.
-  - A role whose own grants leave none of an object's columns still contributes its rows to a verb's union with another
-    role (spec 146's per-object union): `UPDATE` by {analyst: update on `k` in `id = 2`; auditor: update, no column}
-    updates rows outside analyst's slice (a read too: each role's rows read the other's columns). Decide whether such a
-    role's rows leave the union (spec 156).
-  - Over an object without a declared list (or a live alias), a grant whose names its source does not have is known
-    only at bind: the read refuses, a plain `DELETE` / `MERGE … DELETE` still deletes the rows its filter reaches
-    (spec 156's re-review; `ValidateGrantColumns` does not judge a catalog holding a list-less object).
-  - `acl_check_catalog` does not name a grant whose list leaves none of its object's declared columns (spec 156: such
-    a grant's reads and writes refuse; a `SET COLUMNS` under an object grant reaches it).
+  - Spec 159 (next): a policy text binds only to its own source. An RLS / projection item whose column the source lost
+    binds to a column of a relation the principal puts before the object (duckdb's implicit lateral join): `SELECT
+    logs.* FROM (SELECT 'eu' AS region) s, logs` reads the rows the RLS hid; a DELETE's RLS binds to the target's alias
+    row (found by spec 157's review). Qualify every policy column with an alias only the read has.
+  - `acl_check_catalog`'s `grant_exposes_nothing` skips object grants under a live schema alias (spec 157: the guard
+    covers them, the check reads only `relations`).
+  - A broken projection's errors name physical columns past spec 155's scrub: duckdb's `Column "x" in REPLACE list not
+    found` (a cast / mask over a dropped column), and `DELETE … RETURNING k` heads its column with the physical `id`.
+  - Spec 155's scrub is lost when its registry evicts a text: a principal that sends 65,536 other statements before
+    executing its prepared statement reads duckdb's raw error (physical column names) - found by spec 157's re-review.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later
