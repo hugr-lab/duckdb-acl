@@ -1,0 +1,237 @@
+# name: test/sql/acl_call_arguments_scope.test
+# description: spec 163 - a call's argument that names the caller's columns is evaluated in the caller's scope, and a
+#   template (a virtual table function's, a scalar's with a subquery) reads its value: a name of the template's own
+#   physical source is never reachable through an argument
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.h (id INTEGER, pub VARCHAR, secret VARCHAR);
+
+statement ok
+INSERT INTO phys.main.h VALUES (1, 'p1', 'top-secret'), (2, 'p2', 'other');
+
+statement ok
+CREATE TABLE phys.main.t (id INTEGER, x VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'a'), (2, 'b');
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.hf(p VARCHAR) AS 'SELECT id, pub, acl_arg(1) AS echo FROM phys.main.h';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.lookup(k INTEGER) RETURNS VARCHAR AS (SELECT pub FROM phys.main.h WHERE id = acl_arg(1));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.twice(k INTEGER) RETURNS INTEGER AS acl_arg(1) * 2;
+
+statement ok
+CREATE MACRO phys.main.tm(k) AS TABLE SELECT id, pub, k AS echo FROM phys.main.h;
+
+statement ok
+CREATE MACRO phys.main.sm(k) AS (SELECT pub FROM phys.main.h WHERE id = k);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.tma ALIAS OF phys.main.tm;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.sma ALIAS OF phys.main.sm;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.viam(k INTEGER) RETURNS VARCHAR AS phys.main.sm(acl_arg(1));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.lam(k INTEGER) AS list_transform([10, 20], lambda x: x + acl_arg(1));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.agg(k INTEGER) RETURNS BIGINT AS count(acl_arg(1)) + (SELECT count(*) FROM phys.main.h);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.hs(p VARCHAR) AS 'SELECT id, pub FROM phys.main.h WHERE acl_arg(1) IS NOT NULL';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.lo ALIAS OF lower;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.lo2 ALIAS OF main.lower;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.tl(k VARCHAR) AS lower(acl_arg(1));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.rng ALIAS OF range;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.vd ALIAS OF pg_get_viewdef;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT OBJECT c.hs TO ROLE r RLS (id = 1);
+
+# a name the caller does not have refuses: it never reaches the template's source
+statement error
+ACL ROLE "r" SELECT * FROM hf(secret);
+----
+secret
+
+statement error
+ACL ROLE "r" SELECT lookup(CASE WHEN secret = 'top-secret' THEN 1 ELSE 0 END);
+----
+secret
+
+# the caller's own columns, constants and a plain expression template work as before
+query IIT
+ACL ROLE "r" SELECT t.id, f.id, f.echo FROM t, hf(t.x) f WHERE f.id = t.id ORDER BY 1;
+----
+1	1	a
+2	2	b
+
+query IT
+ACL ROLE "r" SELECT id, echo FROM hf('c') ORDER BY id;
+----
+1	c
+2	c
+
+query IT
+ACL ROLE "r" SELECT id, lookup(id) FROM t ORDER BY id;
+----
+1	p1
+2	p2
+
+query II
+ACL ROLE "r" SELECT id, twice(id) FROM t ORDER BY id;
+----
+1	2
+2	4
+
+query T
+ACL ROLE "r" SELECT lookup(2);
+----
+p2
+
+# a positional reference, a window or an aggregate in an argument is the caller's, never the template's rows
+statement error
+ACL ROLE "r" SELECT * FROM hf(#3);
+----
+out of range
+
+statement error
+ACL ROLE "r" SELECT * FROM hf((count(*) OVER ())::VARCHAR);
+----
+cannot contain window functions
+
+statement error
+ACL ROLE "r" SELECT id, lookup(row_number() OVER (ORDER BY id)) FROM t;
+----
+cannot contain window functions
+
+# a macro binds its arguments inside its body: an alias of one, and a template calling one, read them beside the call
+statement error
+ACL ROLE "r" SELECT * FROM tma(secret);
+----
+secret
+
+statement error
+ACL ROLE "r" SELECT sma(CASE WHEN secret = 'top-secret' THEN 1 ELSE 0 END);
+----
+secret
+
+statement error
+ACL ROLE "r" SELECT viam(CASE WHEN secret = 'top-secret' THEN 1 ELSE 0 END);
+----
+secret
+
+query IT
+ACL ROLE "r" SELECT id, sma(id) FROM t ORDER BY id;
+----
+1	p1
+2	p2
+
+# a template's lambda parameter is the template's name, never the caller's
+query IT
+ACL ROLE "r" SELECT x, lam(x) FROM (SELECT id AS x FROM t) ORDER BY x;
+----
+1	[11, 21]
+2	[12, 22]
+
+# a template that aggregates takes constants only when wrapped
+statement error
+ACL ROLE "r" SELECT agg(id) FROM t;
+----
+takes constants only
+
+# the same call twice is one expression: GROUP BY over it works
+query TI
+ACL ROLE "r" SELECT lookup(id) AS v, count(*) FROM t GROUP BY lookup(id) ORDER BY v;
+----
+p1	1
+p2	1
+
+# a column alias list renames what the caller reads, around the grant's wrapper: the RLS still reads the call's id
+query II
+ACL ROLE "r" SELECT f.* FROM t o, hs(o.x) AS f(a, b) ORDER BY 1;
+----
+1	p1
+1	p1
+
+# a builtin a virtual function names is the system's, written whole: a macro of the same name in the default database
+# (a body that reads a table) never stands in for it
+statement ok
+CREATE MACRO lower(k) AS (SELECT string_agg(k, ',') FROM phys.main.h);
+
+statement ok
+CREATE MACRO range(k) AS TABLE SELECT k AS range FROM phys.main.h;
+
+query TTT
+ACL ROLE "r" SELECT lo(x), lo2(x), tl(x) FROM t ORDER BY 1;
+----
+a	a	a
+b	b	b
+
+statement error
+ACL ROLE "r" SELECT lo(secret);
+----
+secret
+
+query I
+ACL ROLE "r" SELECT count(*) FROM t, rng(t.id) r;
+----
+3
+
+# a one-column table function's column keeps the call's alias as its name
+query I
+ACL ROLE "r" SELECT DISTINCT r FROM t, rng(t.id) r ORDER BY 1;
+----
+0
+1
+
+# the alias of a builtin keeps its plan: usable inside a caller's lambda
+query T
+ACL ROLE "r" SELECT list_transform(['A', 'B'], lambda v: lo(v));
+----
+[a, b]
+
+# a system macro reads a table in its body too: its argument is the caller's
+statement error
+ACL ROLE "r" SELECT vd(CASE WHEN view_name = 'x' THEN view_oid END);
+----
+view_name

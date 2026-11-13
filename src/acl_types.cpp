@@ -305,6 +305,57 @@ bool PolicyStore::SystemTypeExists(const string &name) {
 	return system_types.count(name) > 0;
 }
 
+void PolicyStore::LoadSystemFunctions() {
+	{
+		lock_guard<mutex> guard(system_functions_lock);
+		if (system_functions_loaded) {
+			return;
+		}
+	}
+	auto db = instance.lock();
+	if (!db) {
+		return;
+	}
+	Connection con(*db);
+	auto result = con.Query("SELECT DISTINCT function_name, function_type FROM system.main.duckdb_functions() WHERE "
+	                        "database_name = 'system'");
+	if (result->HasError()) {
+		return;
+	}
+	ResultRows rows(*result);
+	lock_guard<mutex> guard(system_functions_lock);
+	for (idx_t row = 0; row < rows.Count(); row++) {
+		auto name = rows.GetValue(0, row).ToString();
+		auto type = rows.GetValue(1, row).ToString();
+		system_functions.insert(name);
+		if (type == "aggregate" || type == "window") {
+			system_aggregates.insert(name);
+		}
+		if (type == "macro" || type == "table_macro") {
+			system_macros.insert(name);
+		}
+	}
+	system_functions_loaded = true;
+}
+
+bool PolicyStore::SystemFunctionExists(const string &name) {
+	LoadSystemFunctions();
+	lock_guard<mutex> guard(system_functions_lock);
+	return system_functions.count(name) > 0;
+}
+
+bool PolicyStore::SystemScalarFunction(const string &name) {
+	LoadSystemFunctions();
+	lock_guard<mutex> guard(system_functions_lock);
+	return system_functions.count(name) > 0 && !system_aggregates.count(name) && !system_macros.count(name);
+}
+
+bool PolicyStore::SystemMacroFunction(const string &name) {
+	LoadSystemFunctions();
+	lock_guard<mutex> guard(system_functions_lock);
+	return system_macros.count(name) > 0;
+}
+
 bool NodeStripsAliases(DatabaseInstance &db) {
 	return !SettingIs(db, "acl_alias_types", "keep");
 }

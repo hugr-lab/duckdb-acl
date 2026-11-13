@@ -864,6 +864,15 @@ read later as one read (spec 159 binds it alone), and a CTE at its root sees non
 item's read stays in place (`view_leftmost`: nothing can reach it, and a CTE would stop a reader's filters at it); a body
 CTE with the `__acl_read_` prefix is refused at any level. Test `acl_principal_view_reads.test`.
 
+**Spec 163 — a call's arguments are the caller's**: only `Spliceable` arguments (constants, casts, operators, CASE, the
+system's plain scalars - `SystemScalarFunction` - and parameters) are spliced into a template; others are evaluated beside
+the call in `(VALUES (…)) AS __acl_args(__acl_arg_1, …)` (`ArgumentsRef`; one name, so equal calls stay equal) and
+`acl_arg(n)` reads its column: a table function (`CallWithArguments`), an alias of a non-system macro, a scalar template
+that may bind a name of its own (`TemplateCaptures`: subquery, lambda, non-system call; one that aggregates refuses). A
+call's column alias list goes outermost, around the grant's wrapper. A builtin an alias or a template calls is written
+`system.main.<name>` (`QualifySystemCall`; a default-database macro must not stand in), and a system macro counts as a
+macro. Test `acl_call_arguments_scope.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

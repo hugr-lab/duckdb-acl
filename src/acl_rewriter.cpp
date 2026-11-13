@@ -20,6 +20,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/common_table_expression_info.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -1660,25 +1661,13 @@ private:
 	//! alone) - its template
 	//! and its grant's wrapper are bound alone first like a relation's read; one that names a column is correlated on
 	//! purpose
-	static bool ClosedArguments(FunctionExpression &function) {
+	bool ClosedArguments(FunctionExpression &function) {
 		for (auto &arg : function.GetArgumentsMutable()) {
-			if (!Closed(*arg.GetExpressionMutable())) {
+			if (!Spliceable(*arg.GetExpressionMutable(), false)) {
 				return false;
 			}
 		}
 		return true;
-	}
-
-	static bool Closed(const ParsedExpression &expr) {
-		auto cls = expr.GetExpressionClass();
-		if (cls == ExpressionClass::COLUMN_REF || cls == ExpressionClass::SUBQUERY || cls == ExpressionClass::LAMBDA ||
-		    cls == ExpressionClass::STAR || cls == ExpressionClass::PARAMETER) {
-			return false;
-		}
-		bool closed = true;
-		ParsedExpressionIterator::EnumerateChildren(
-		    expr, [&](const ParsedExpression &child) { closed = closed && Closed(child); });
-		return closed;
 	}
 
 	//! spec 144: an item duckdb expands into several columns - one with a star anywhere in it (`* LIKE '…'`, which it
@@ -2346,11 +2335,31 @@ private:
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
 			Identifier alias = tf.alias.empty() ? Identifier(leaf) : tf.alias;
 			bool closed = ClosedArguments(function);
+			// spec 163: `f(…) AS a(c1, …)` renames what the caller reads - the outermost reference, around the grant's
+			// wrapper, never the call inside it (there the wrapper's own names would read the caller's)
+			auto column_aliases = std::move(tf.column_name_alias);
 			if (policy.subquery_form) {
 				ref = BuildFunctionSubquery(leaf, policy, function, tf);
 			} else {
 				// RENAME-alias: retarget the call to a physical/system function, keep the arguments
 				function.SetQualifiedName(ParsePhysName(policy.phys));
+				if (SystemTableCall(function.GetQualifiedName())) {
+					QualifySystemCall(function); // spec 163: the system's, never a default-database macro's
+				} else {
+					// spec 163: a table macro binds its arguments inside its body - they are read beside the call
+					vector<unique_ptr<ParsedExpression>> args;
+					for (auto &arg : function.GetArgumentsMutable()) {
+						args.push_back(arg.GetExpression().Copy());
+					}
+					if (NamesCallerColumns(args)) {
+						idx_t i = 0;
+						for (auto &arg : function.GetArgumentsMutable()) {
+							arg.GetExpressionMutable() = make_uniq<ColumnRefExpression>(
+							    Identifier("__acl_arg_" + std::to_string(++i)), Identifier("__acl_args"));
+						}
+						ref = CallWithArguments(std::move(ref), args, alias, {});
+					}
+				}
 			}
 			// a grant narrows what the function returns, whichever form it took (spec 011)
 			WrapWithGrantPolicy(ref, policy, alias);
@@ -2362,6 +2371,9 @@ private:
 				} else {
 					guards.push_back(sub.subquery->ToString()); // spec 159: bound alone first
 				}
+			}
+			if (!column_aliases.empty()) {
+				ref->column_name_alias = std::move(column_aliases);
 			}
 			return;
 		}
@@ -2646,11 +2658,198 @@ private:
 		for (auto &arg : function.GetArgumentsMutable()) {
 			args.push_back(std::move(arg.GetExpressionMutable()));
 		}
-		BakeMarkersInNode(*select_stmt->node, &args);
-
 		Identifier alias = tf.alias.empty() ? Identifier(vname) : tf.alias;
-		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
-		sub->column_name_alias = std::move(tf.column_name_alias);
+		if (!NamesCallerColumns(args)) {
+			BakeMarkersInNode(*select_stmt->node, &args);
+			auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+			sub->column_name_alias = std::move(tf.column_name_alias);
+			return std::move(sub);
+		}
+		// spec 163: an argument naming the caller's columns is evaluated beside the call, in the caller's scope - the
+		// template reads its value, never its names (spliced in, they bound to the template's own source first)
+		vector<unique_ptr<ParsedExpression>> refs;
+		for (idx_t i = 0; i < args.size(); i++) {
+			refs.push_back(make_uniq<ColumnRefExpression>(Identifier("__acl_arg_" + std::to_string(i + 1)),
+			                                              Identifier("__acl_args")));
+		}
+		BakeMarkersInNode(*select_stmt->node, &refs);
+		return CallWithArguments(make_uniq<SubqueryRef>(std::move(select_stmt)), args, alias,
+		                         std::move(tf.column_name_alias));
+	}
+
+	//! spec 163: an argument spliced into a template as written - constants, casts, operators and the system's plain
+	//! scalar functions over them, and (for a call evaluated where it stands) parameters. Anything else (a column, a
+	//! positional reference, an aggregate or a window, a subquery, a lambda, a star) is the caller's, read beside the
+	//! call
+	bool Spliceable(const ParsedExpression &expr, bool parameters) {
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::CONSTANT:
+			return true;
+		case ExpressionClass::PARAMETER:
+			return parameters;
+		case ExpressionClass::CAST:
+		case ExpressionClass::OPERATOR:
+		case ExpressionClass::COMPARISON:
+		case ExpressionClass::CONJUNCTION:
+		case ExpressionClass::CASE:
+		case ExpressionClass::BETWEEN:
+			break;
+		case ExpressionClass::FUNCTION: {
+			auto &function = expr.Cast<FunctionExpression>();
+			if (!SystemCall(function.GetQualifiedName()) || function.Filter() || function.OrderBy() ||
+			    function.Distinct()) {
+				return false;
+			}
+			break;
+		}
+		default:
+			return false;
+		}
+		bool spliceable = true;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { spliceable = spliceable && Spliceable(child, parameters); });
+		return spliceable;
+	}
+
+	bool NamesCallerColumns(const vector<unique_ptr<ParsedExpression>> &args) {
+		for (auto &arg : args) {
+			if (!Spliceable(*arg, true)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! spec 163: `(VALUES (<arg 1>, …)) AS __acl_args(__acl_arg_1, …)` - the arguments in the caller's scope (VALUES:
+	//! an aggregate or a window there refuses rather than being evaluated over no row) - and, in `refs`, the column of
+	//! each, which the template's acl_arg(n) becomes. One name for every call: the same call is the same expression
+	static unique_ptr<TableRef> ArgumentsRef(vector<unique_ptr<ParsedExpression>> &args,
+	                                         vector<unique_ptr<ParsedExpression>> &refs) {
+		Identifier alias("__acl_args");
+		auto values = make_uniq<ExpressionListRef>();
+		vector<unique_ptr<ParsedExpression>> row;
+		for (idx_t i = 0; i < args.size(); i++) {
+			auto name = Identifier("__acl_arg_" + std::to_string(i + 1));
+			row.push_back(std::move(args[i]));
+			values->expected_names.push_back(name);
+			values->column_name_alias.push_back(name);
+			refs.push_back(make_uniq<ColumnRefExpression>(name, alias));
+		}
+		values->values.push_back(std::move(row));
+		values->alias = alias;
+		return std::move(values);
+	}
+
+	//! spec 163: a template that may bind an argument's names to a table of its own - a subquery, or a call of a
+	//! function that is not the system catalog's (a macro: duckdb binds its arguments inside its body)
+	bool TemplateCaptures(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY ||
+		    expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
+			return true; // a lambda's parameter is a name of the template's too
+		}
+		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expr.Cast<FunctionExpression>();
+			auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+			if (name != "acl_arg" && name != "acl_claim" && !SystemCall(function.GetQualifiedName())) {
+				return true;
+			}
+		}
+		bool captures = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { captures = captures || TemplateCaptures(child); });
+		return captures;
+	}
+
+	//! spec 163: a template evaluated over one row when wrapped: an aggregate or a window in it would change meaning
+	bool TemplateAggregates(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
+			return true;
+		}
+		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			return false; // its own query
+		}
+		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expr.Cast<FunctionExpression>();
+			auto parts = NameParts(function.GetQualifiedName());
+			if (!parts.empty() && store.SystemFunctionExists(parts.back()) &&
+			    !store.SystemScalarFunction(parts.back())) {
+				return true;
+			}
+		}
+		bool aggregates = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { aggregates = aggregates || TemplateAggregates(child); });
+		return aggregates;
+	}
+
+	//! spec 163: a call of the system's plain function (no macro: a system macro's body may read a table too) - written
+	//! `system.…`, or bare / `main.<name>`, which `QualifySystemCall` then writes whole, so a macro of that name in the
+	//! default database never stands in for it
+	bool SystemCall(const QualifiedName &name) {
+		auto parts = NameParts(name);
+		if (parts.empty()) {
+			return false;
+		}
+		bool system_written = parts.size() >= 2 && StringUtil::CIEquals(parts.front(), "system");
+		bool bare = parts.size() == 1 || (parts.size() == 2 && StringUtil::CIEquals(parts.front(), "main"));
+		return (system_written || bare) && store.SystemScalarFunction(parts.back());
+	}
+
+	//! spec 163: a call of the system's table function (no table macro)
+	bool SystemTableCall(const QualifiedName &name) {
+		auto parts = NameParts(name);
+		if (parts.empty()) {
+			return false;
+		}
+		bool system_written = parts.size() >= 2 && StringUtil::CIEquals(parts.front(), "system");
+		bool bare = parts.size() == 1 || (parts.size() == 2 && StringUtil::CIEquals(parts.front(), "main"));
+		return (system_written || bare) && store.SystemFunctionExists(parts.back()) &&
+		       !store.SystemMacroFunction(parts.back());
+	}
+
+	//! spec 163: a bare / `main.` call of the system's plain function written `system.main.<name>`
+	static void QualifySystemCall(FunctionExpression &function) {
+		auto parts = NameParts(function.GetQualifiedName());
+		if (parts.empty() || (parts.size() >= 2 && StringUtil::CIEquals(parts.front(), "system"))) {
+			return;
+		}
+		function.SetQualifiedName(
+		    QualifiedName::FromPath({Identifier("system"), Identifier("main"), Identifier(parts.back())}));
+	}
+
+	//! spec 163: every call a template makes of the system's plain functions written whole (see QualifySystemCall)
+	void QualifyTemplateCalls(unique_ptr<ParsedExpression> &expr) {
+		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expr->Cast<FunctionExpression>();
+			auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+			if (name != "acl_arg" && name != "acl_claim" && SystemCall(function.GetQualifiedName())) {
+				QualifySystemCall(function);
+			}
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { QualifyTemplateCalls(child); });
+	}
+
+	//! spec 163: `(SELECT __acl_call.* FROM (VALUES …) AS __acl_args(…), <call> AS __acl_call) AS <alias>` - a table
+	//! call reading its arguments' values from beside it
+	unique_ptr<TableRef> CallWithArguments(unique_ptr<TableRef> call, vector<unique_ptr<ParsedExpression>> &args,
+	                                       const Identifier &alias, vector<Identifier> column_aliases) {
+		vector<unique_ptr<ParsedExpression>> unused;
+		auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+		join->left = ArgumentsRef(args, unused);
+		// the user's alias inside too: duckdb names a one-column table function's column after it
+		call->alias = alias;
+		join->right = std::move(call);
+		auto shell = store.InstantiateSelect(
+		    "SELECT " + KeywordHelper::WriteOptionallyQuoted(alias.GetIdentifierName()) + ".* FROM \"__acl_inner\"",
+		    template_options, false);
+		unique_ptr<TableRef> joined = std::move(join);
+		PlaceInner(shell->node->Cast<SelectNode>().from_table, joined);
+		auto sub = make_uniq<SubqueryRef>(std::move(shell), alias);
+		sub->column_name_alias = std::move(column_aliases);
 		return std::move(sub);
 	}
 
@@ -4336,6 +4535,25 @@ private:
 					expr->SetAlias(std::move(alias));
 				} else {
 					function.SetQualifiedName(ParsePhysName(spolicy.phys));
+					vector<unique_ptr<ParsedExpression>> args;
+					for (auto &arg : function.GetArgumentsMutable()) {
+						args.push_back(arg.GetExpression().Copy());
+					}
+					if (SystemCall(function.GetQualifiedName())) {
+						QualifySystemCall(function); // spec 163: the system's, never a default-database macro's
+					} else if (NamesCallerColumns(args)) {
+						// spec 163: a macro binds its arguments inside its body - they are read beside the call
+						auto alias = function.GetAlias();
+						vector<unique_ptr<ParsedExpression>> refs;
+						auto args_ref = ArgumentsRef(args, refs);
+						idx_t i = 0;
+						for (auto &arg : function.GetArgumentsMutable()) {
+							arg.GetExpressionMutable() = std::move(refs[i++]);
+						}
+						function.SetAlias(Identifier());
+						expr = ScalarWithArguments(std::move(expr), std::move(args_ref));
+						expr->SetAlias(std::move(alias));
+					}
 				}
 				return; // handled: do not re-gate or re-recurse
 			}
@@ -4498,8 +4716,33 @@ private:
 		for (auto &arg : function.GetArgumentsMutable()) {
 			args.push_back(std::move(arg.GetExpressionMutable()));
 		}
-		BakeMarkers(replacement, &args);
-		return replacement;
+		if (!NamesCallerColumns(args) || !TemplateCaptures(*replacement)) {
+			// nothing of the template's own for an argument's names to bind to - its builtins written whole, so a macro
+			// of the same name in the default database is not what it calls
+			QualifyTemplateCalls(replacement);
+			BakeMarkers(replacement, &args);
+			return replacement;
+		}
+		// spec 163: `(SELECT <template> FROM (VALUES (<arg>, …)) AS __acl_args(…))` - the arguments in the caller's
+		// scope, the template reading their values
+		if (TemplateAggregates(*replacement)) {
+			Deny(Reason::STATEMENT_TYPE, "virtual scalar function " + Shown(vname) +
+			                                 " aggregates over its argument, so it takes constants only here");
+		}
+		vector<unique_ptr<ParsedExpression>> refs;
+		auto args_ref = ArgumentsRef(args, refs);
+		QualifyTemplateCalls(replacement);
+		BakeMarkers(replacement, &refs);
+		return ScalarWithArguments(std::move(replacement), std::move(args_ref));
+	}
+
+	unique_ptr<ParsedExpression> ScalarWithArguments(unique_ptr<ParsedExpression> value,
+	                                                 unique_ptr<TableRef> args_ref) {
+		auto shell = store.InstantiateExpr("(SELECT 1 FROM \"__acl_inner\")", template_options);
+		auto &node = shell->Cast<SubqueryExpression>().SubqueryMutable()->node->Cast<SelectNode>();
+		node.select_list[0] = std::move(value);
+		PlaceInner(node.from_table, args_ref);
+		return shell;
 	}
 
 	//! Replace template markers in a node's expressions: acl_claim('<name>') -> baked constant, and (for
