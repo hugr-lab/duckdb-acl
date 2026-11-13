@@ -26,7 +26,9 @@
 #include "duckdb/main/profiler/profiling_utils.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 
 #include <algorithm>
@@ -471,6 +473,8 @@ public:
 	//! so): its text (QueryEnd may run when duckdb holds no active query) and what its error may say
 	bool principal_statement = false;
 	string query_text;
+	//! spec 157: the running statement's write-guard token (WriteGuardToken of its text), until it ends
+	string guard_token;
 	PrincipalText query_info;
 	weak_ptr<PolicyStore> store_ref;
 	//! spec 123: the running statement's autocommit transaction rolled back with no error - a result
@@ -535,6 +539,7 @@ public:
 			}
 		}
 		query_text = principal_statement ? query : string();
+		guard_token = WriteGuardToken(query);
 		began_us = NowMicros();
 		preparing = false;
 		physical_lineage.reset();
@@ -578,6 +583,7 @@ public:
 	}
 
 	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
+		guard_token.clear();
 		if (published_session) {
 			// spec 078: whatever ended the statement - done, failed, interrupted - its session comes off
 			WithdrawStatementSession(context);
@@ -836,8 +842,76 @@ struct AclProfileCallback : ExtensionCallback {
 
 } // namespace
 
+static constexpr const char *WRITE_GUARD_OPEN = "\n/* acl:guard:";
+static constexpr const char *WRITE_GUARD_CLOSE = " */";
+static constexpr idx_t WRITE_GUARD_TOKEN = 32;
+
+string WriteGuardMarker(const string &token) {
+	return string(WRITE_GUARD_OPEN) + token + WRITE_GUARD_CLOSE;
+}
+
+string WriteGuardToken(const string &text) {
+	string open(WRITE_GUARD_OPEN), close(WRITE_GUARD_CLOSE);
+	auto length = open.size() + WRITE_GUARD_TOKEN + close.size();
+	if (text.size() < length || !StringUtil::EndsWith(text, close)) {
+		return string();
+	}
+	auto start = text.size() - length;
+	if (text.compare(start, open.size(), open) != 0) {
+		return string();
+	}
+	return text.substr(start + open.size(), WRITE_GUARD_TOKEN);
+}
+
 uint64_t StatementTextHash(const string &text) {
 	return std::hash<string> {}(text);
+}
+
+namespace {
+
+struct WriteGuardInfo : public OptimizerExtensionInfo {
+	explicit WriteGuardInfo(const shared_ptr<PolicyStore> &store_p) : store(store_p) {
+	}
+	weak_ptr<PolicyStore> store;
+};
+
+void WriteGuardPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (!plan || !input.info) {
+		return;
+	}
+	auto state = input.context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (!state || state->guard_token.empty()) {
+		return; // no statement running (ExtractPlan), or one no decision marked
+	}
+	auto store = static_cast<WriteGuardInfo &>(*input.info).store.lock();
+	vector<string> reads;
+	if (!store || !store->write_guards.Find(state->guard_token, reads)) {
+		throw BinderException("acl: this write's decision is no longer known - run it again");
+	}
+	for (auto &read : reads) {
+		// a statement of its own: no name of the write is in scope to bind a name the source lost to
+		Parser parser(ParserOptions::Builtin());
+		parser.ParseQuery(read);
+		try {
+			auto binder = Binder::CreateBinder(input.context);
+			binder->Bind(*parser.statements[0]);
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			auto info = error.ExtraInfo();
+			info.erase("position"); // an offset into the read, not into the client's text
+			info.erase("location");
+			throw Exception(info, error.Type(), error.RawMessage());
+		}
+	}
+}
+
+} // namespace
+
+void RegisterWriteGuardOptimizer(DatabaseInstance &db, const shared_ptr<PolicyStore> &store) {
+	OptimizerExtension extension;
+	extension.pre_optimize_function = WriteGuardPreOptimize;
+	extension.optimizer_info = make_shared_ptr<WriteGuardInfo>(store);
+	OptimizerExtension::Register(DBConfig::GetConfig(db), extension);
 }
 
 bool StatementDecidedVirtual(ClientContext &context, Principal &principal, string &door) {

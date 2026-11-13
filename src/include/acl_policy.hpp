@@ -398,6 +398,38 @@ private:
 	std::unordered_map<uint64_t, std::pair<PrincipalText, std::list<uint64_t>::iterator>> texts;
 };
 
+//! spec 157: the reads a principal's writes bind first, by the decision's token - the marker the rewriter puts at the
+//! end of the write's text (WriteGuardMarker), so every execution of that very decision finds its own, whichever
+//! connection runs it; a marked text whose token is gone refuses (WriteGuardPreOptimize)
+class WriteGuardRegistry {
+public:
+	void Note(const string &token, vector<string> reads) {
+		lock_guard<mutex> guard(lock);
+		order.push_back(token);
+		entries[token] = std::make_pair(std::move(reads), std::prev(order.end()));
+		while (order.size() > CAPACITY) {
+			entries.erase(order.front());
+			order.pop_front();
+		}
+	}
+	bool Find(const string &token, vector<string> &out) {
+		lock_guard<mutex> guard(lock);
+		auto found = entries.find(token);
+		if (found == entries.end()) {
+			return false;
+		}
+		order.splice(order.end(), order, found->second.second);
+		out = found->second.first;
+		return true;
+	}
+
+private:
+	static constexpr idx_t CAPACITY = 65536;
+	mutex lock;
+	std::list<string> order;
+	std::unordered_map<string, std::pair<vector<string>, std::list<string>::iterator>> entries;
+};
+
 struct PolicyStore {
 	mutex lock;
 	// role -> virtual name -> policy (tables and views share one namespace)
@@ -1133,6 +1165,8 @@ struct PolicyStore {
 	void AuditRecordNotUndone(const string &object, const string &reason, const string &why);
 	//! spec 155: the principal's statements this instance decided (see PrincipalTextRegistry)
 	PrincipalTextRegistry principal_texts;
+	//! spec 157: the reads each guarded write binds first (see WriteGuardRegistry)
+	WriteGuardRegistry write_guards;
 	//! spec 095: an issuer's or a client's resolved connection changed through its secret
 	void AuditConnection(const string &kind, const string &name, const string &fingerprint);
 	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)

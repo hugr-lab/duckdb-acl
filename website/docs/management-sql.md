@@ -550,7 +550,9 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
 - **`RLS`** is the grant's own predicate, AND-ed onto every object of the catalog for this role (and
   onto the object's own). **`COLUMNS`** is the grant's own column list, intersected with the object's;
   a name the object hides cannot be re-exposed here; when the intersection leaves no column, every read and every
-  write of the object by the role refuses, whatever the `RLS` (spec 156). A grant narrows, it never widens. Across roles the
+  write of the object by the role refuses, whatever the `RLS` (spec 156). A `DELETE`, `UPDATE` or `MERGE`
+  binds the role's read of its target first: one whose columns are gone from the source - or, over an object without a
+  list, never were there - refuses rather than writing (spec 157). A grant narrows, it never widens. Across roles the
   effective policy is the union of the roles that hold the capability exercised (spec 145): a role that
   may read without a narrowing grant lifts it for a principal holding both, while a role that may not
   read - one with `insert` only, an object grant `CAPS '{}'` - lifts no read role's filter or columns;
@@ -1166,6 +1168,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `schema_stale` | a query-defined object's stored (derived) schema - a view's, a macro's, or a declared-list table's projection - differs from what its definition binds to now | `ANALYZE VIRTUAL …` (re-derives a table's projection too since spec 039, keeping its marks and column comments) |
 | `rls_broken` / `rls_unchecked` | a predicate (object or grant) fails to bind / was accepted unchecked and binds now (spec 027) | `… SET RLS`, a re-grant / `ANALYZE VIRTUAL CATALOG` |
 | `grant_column_missing` | a bare item of a grant's `COLUMNS` list matches no column of the object (an object grant), or of any object of the catalog (a catalog grant) | `acl_grant_object(…)` / `ALTER GRANT CATALOG … SET COLUMNS` |
+| `grant_exposes_nothing` | a role's object grant lists columns and its grants leave it none of the object's: the levels intersect to nothing, the object's list changed under the grant, or (an object without a list) the source dropped them - it replaces that grant's `grant_column_missing` rows (spec 157; a catalog-wide list naming nothing of an object is by design) | `acl_grant_object(…, '<columns>')` naming what the role reads |
 | `mask_broken` | a `name = expr` grant item names a column the object does not expose, or its expression does not bind - every read of that object by that role refuses (spec 038) | the same |
 | `schema_missing` | a schema alias's or expansion's physical schema has no schema behind it | `ALTER VIRTUAL SCHEMA … SET PHYS` / `DROP VIRTUAL SCHEMA` |
 | `expansion_stale` | an expansion's source has tables it did not record (and did not exclude), or records whose source is gone | `ALTER VIRTUAL SCHEMA … REFRESH [PRUNE]` |

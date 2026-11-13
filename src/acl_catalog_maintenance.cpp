@@ -13,6 +13,7 @@
 #include "acl_policy_catalog.hpp"
 #include "acl_field_paths.hpp"
 #include "acl_types.hpp"
+#include "acl_rewriter.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -170,6 +171,7 @@ public:
 		CheckRelations();
 		CheckFunctions();
 		CheckGrants();
+		CheckGrantsLeaveColumns();
 		CheckSchemas();
 		CheckReferences();
 		CheckBodies();
@@ -865,6 +867,92 @@ private:
 					    set_columns(Without(items, item.first)));
 				}
 			}
+		}
+	}
+
+	//! spec 157: a role whose OBJECT grant lists columns and whose grants leave none of that object's - the levels'
+	//! intersection, the object's list changed under the grant (`SET COLUMNS`) or, for an object without a declared
+	//! list, the source as it binds now - reads, deletes and merges of it refuse (specs 156, 157). Judged per role by
+	//! the resolver itself. A catalog-wide list that names nothing of some object is spec 038's design: not a finding.
+	void CheckGrantsLeaveColumns() {
+		auto objects = Read("SELECT \"role\", \"vname\", \"caps\", \"rls\" FROM " + catalog.Tbl("role_object_caps") +
+		                    " WHERE \"vcat\" = " + Lit(vcat) +
+		                    " AND \"columns\" IS NOT NULL AND \"columns\" <> '' ORDER BY \"role\", \"vname\"");
+		ResultRows objects_rows(*objects);
+		for (idx_t o = 0; o < objects->RowCount(); o++) {
+			auto role = objects_rows.GetValue(0, o).ToString();
+			auto vname = objects_rows.GetValue(1, o).ToString();
+			auto found = relations.find(vname);
+			if (found == relations.end() || found->second.dead) {
+				continue;
+			}
+			auto &relation = found->second;
+			Principal principal;
+			principal.roles = {role};
+			// the policy of a capability the role holds (spec 145 unites only the rows holding it): select, else a verb
+			TablePolicy policy;
+			bool resolved = false;
+			string capability = "select";
+			for (idx_t attempt = 0; attempt < 2; attempt++) {
+				try {
+					policy = TablePolicy();
+					resolved = catalog.ResolveTable(principal, NamePath::JoinKeys(vcat, vname), policy, capability);
+				} catch (std::exception &) {
+					TakeDenyReason(); // a read that refuses for another reason: that finding says it
+					resolved = false;
+					break;
+				}
+				if (!resolved || policy.caps.count(capability)) {
+					break;
+				}
+				capability.clear();
+				for (auto verb : {"delete", "update", "merge", "insert"}) {
+					if (policy.caps.count(verb)) {
+						capability = verb;
+						break;
+					}
+				}
+				if (capability.empty()) {
+					resolved = false;
+					break;
+				}
+			}
+			if (!resolved || capability.empty() || !policy.caps.count(capability)) {
+				continue;
+			}
+			bool nothing = policy.exposes_nothing;
+			if (!nothing && relation.declared.empty() && relation.form != "view" && !policy.query.empty() &&
+			    !policy.visible_columns.empty()) {
+				// an object without a list: the names the grants keep, against the source as it binds now
+				case_insensitive_set_t exposed;
+				if (!Exposed(relation, exposed)) {
+					continue;
+				}
+				nothing = true;
+				for (auto &name : policy.visible_columns) {
+					if (exposed.count(name)) {
+						nothing = false;
+						break;
+					}
+				}
+			}
+			if (!nothing) {
+				continue;
+			}
+			// the stronger finding replaces the item-by-item ones for this grant: the role reads nothing, not less
+			out.erase(std::remove_if(out.begin(), out.end(),
+			                         [&](const Finding &finding) {
+				                         return finding.vcat == vcat && finding.kind == "grant" &&
+				                                finding.object == vname && finding.role == role &&
+				                                finding.problem == "grant_column_missing";
+			                         }),
+			          out.end());
+			Add("grant", vname, role, "grant_exposes_nothing",
+			    "the grants leave this role no column of \"" + Named(vname) +
+			        "\" - every read, DELETE and MERGE of it by the role refuses (specs 156, 157)",
+			    "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
+			        Lit(Text(objects_rows.GetValue(2, o))) + ", " + Lit(Text(objects_rows.GetValue(3, o))) +
+			        ", '<columns>')  -- name the columns of the object the role reads");
 		}
 	}
 

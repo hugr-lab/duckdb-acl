@@ -759,7 +759,9 @@ Three consequences, stated as the decision:
    here: the refusal is duckdb's binder error and names physical columns (the spec 065 accepted
    risk) - it is fail-closed on data, not name-tight. The name-tight refusal (`acl_rewrite: object
    "orders" exposes no readable columns`) is the empty-intersection case on a declared object,
-   whatever the row filter - and every write of it refuses too (spec 156).
+   whatever the row filter - and every write of it refuses too (spec 156). A `DELETE` / `UPDATE` / `MERGE`
+   binds the role's read of its target, so a source that dropped the columns a grant names refuses it too
+   (spec 157).
    Repair is the administrator's, by rewriting the object's list (`ALTER VIRTUAL TABLE … SET
    COLUMNS`): a refresh (`acl_refresh_schema` / `ANALYZE VIRTUAL CATALOG`, spec 010) re-probes
    verdicts and derived schemas but does not heal a declared list - healing it automatically would

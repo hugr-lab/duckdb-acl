@@ -19,6 +19,7 @@
 namespace duckdb {
 class ClientContext;
 class ExtensionLoader;
+class DatabaseInstance;
 
 namespace acl {
 class AuditPipeline;
@@ -125,6 +126,13 @@ private:
 
 //! The hash a note and an execution are matched by; never the text.
 uint64_t StatementTextHash(const string &text);
+//! spec 157: the marker a guarded write's text ends with (`\n/* acl:guard:<token> */`, a line of its own), and the
+//! token a text ends with (empty when it ends with none)
+string WriteGuardMarker(const string &token);
+string WriteGuardToken(const string &text);
+//! spec 157: before a marked write is optimized, bind the role's reads its decision noted - a read that does not bind,
+//! or a token no longer known, refuses the write, which is never changed for it
+void RegisterWriteGuardOptimizer(DatabaseInstance &db, const shared_ptr<PolicyStore> &store);
 
 //! The override, on its thread, per decided statement of a batch: parse and execution are one
 //! Query() on one thread, so a queue on the thread meets the batch's first execution, which takes
