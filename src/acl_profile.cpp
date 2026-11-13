@@ -2,6 +2,7 @@
 // acl_profile.cpp - spec 074: the execution profile
 //===----------------------------------------------------------------------===//
 #include "acl_profile.hpp"
+#include "mbedtls/sha256.h"
 #include "acl_lineage.hpp"
 #include "acl_session_hooks.hpp"
 
@@ -473,8 +474,8 @@ public:
 	//! so): its text (QueryEnd may run when duckdb holds no active query) and what its error may say
 	bool principal_statement = false;
 	string query_text;
-	//! spec 157: the running statement's write-guard token (WriteGuardToken of its text), until it ends
-	string guard_token;
+	//! spec 157 / 159: the keys of the reads the running statement binds first (WriteGuardKeys of its text)
+	vector<string> guard_keys;
 	PrincipalText query_info;
 	weak_ptr<PolicyStore> store_ref;
 	//! spec 123: the running statement's autocommit transaction rolled back with no error - a result
@@ -539,7 +540,7 @@ public:
 			}
 		}
 		query_text = principal_statement ? query : string();
-		guard_token = WriteGuardToken(query);
+		guard_keys = WriteGuardKeys(query);
 		began_us = NowMicros();
 		preparing = false;
 		physical_lineage.reset();
@@ -583,7 +584,7 @@ public:
 	}
 
 	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
-		guard_token.clear();
+		guard_keys.clear();
 		if (published_session) {
 			// spec 078: whatever ended the statement - done, failed, interrupted - its session comes off
 			WithdrawStatementSession(context);
@@ -844,23 +845,41 @@ struct AclProfileCallback : ExtensionCallback {
 
 static constexpr const char *WRITE_GUARD_OPEN = "\n/* acl:guard:";
 static constexpr const char *WRITE_GUARD_CLOSE = " */";
-static constexpr idx_t WRITE_GUARD_TOKEN = 32;
+static constexpr idx_t WRITE_GUARD_KEY = 32;
 
-string WriteGuardMarker(const string &token) {
-	return string(WRITE_GUARD_OPEN) + token + WRITE_GUARD_CLOSE;
+string WriteGuardKey(const string &read) {
+	unsigned char hash[32];
+	mbedtls_sha256(reinterpret_cast<const unsigned char *>(read.data()), read.size(), hash, 0);
+	static constexpr const char *HEX = "0123456789abcdef";
+	string key;
+	for (idx_t i = 0; i < WRITE_GUARD_KEY / 2; i++) {
+		key += HEX[hash[i] >> 4];
+		key += HEX[hash[i] & 0xF];
+	}
+	return key;
 }
 
-string WriteGuardToken(const string &text) {
+string WriteGuardMarker(const string &keys) {
+	return string(WRITE_GUARD_OPEN) + keys + WRITE_GUARD_CLOSE;
+}
+
+vector<string> WriteGuardKeys(const string &text) {
 	string open(WRITE_GUARD_OPEN), close(WRITE_GUARD_CLOSE);
-	auto length = open.size() + WRITE_GUARD_TOKEN + close.size();
-	if (text.size() < length || !StringUtil::EndsWith(text, close)) {
-		return string();
+	if (!StringUtil::EndsWith(text, close)) {
+		return {};
 	}
-	auto start = text.size() - length;
-	if (text.compare(start, open.size(), open) != 0) {
-		return string();
+	auto start = text.rfind(open);
+	if (start == string::npos) {
+		return {};
 	}
-	return text.substr(start + open.size(), WRITE_GUARD_TOKEN);
+	auto list = text.substr(start + open.size(), text.size() - close.size() - start - open.size());
+	auto keys = StringUtil::Split(list, ",");
+	for (auto &key : keys) {
+		if (key.size() != WRITE_GUARD_KEY || key.find_first_not_of("0123456789abcdef") != string::npos) {
+			return {}; // not ours: only a marker the rewriter wrote ends a text with keys
+		}
+	}
+	return keys;
 }
 
 uint64_t StatementTextHash(const string &text) {
@@ -880,13 +899,17 @@ void WriteGuardPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		return;
 	}
 	auto state = input.context.registered_state->Get<AclProfileState>(STATE_KEY);
-	if (!state || state->guard_token.empty()) {
+	if (!state || state->guard_keys.empty()) {
 		return; // no statement running (ExtractPlan), or one no decision marked
 	}
 	auto store = static_cast<WriteGuardInfo &>(*input.info).store.lock();
 	vector<string> reads;
-	if (!store || !store->write_guards.Find(state->guard_token, reads)) {
-		throw BinderException("acl: this write's decision is no longer known - run it again");
+	for (auto &key : state->guard_keys) {
+		string read;
+		if (!store || !store->write_guards.Find(key, read)) {
+			throw BinderException("acl: this statement's decision is no longer known - run it again");
+		}
+		reads.push_back(std::move(read));
 	}
 	for (auto &read : reads) {
 		// a statement of its own: no name of the write is in scope to bind a name the source lost to

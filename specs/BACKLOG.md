@@ -46,6 +46,8 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - a date range (an `AT (TIMESTAMP => t)` / `AT (VERSION => v)` admitted only inside it).
   It needs the grant's syntax and the rewrite of `BaseTableRef::at_clause`, which spec 139 already walks. It also
   covers the reads that name a version some other way: a scan function's version argument, and the snapshot listings.
+  Today an `AT (…)` on a virtual object read through a subquery (a projection, an RLS, a rename or a cast) is dropped
+  silently - neither read form carries `at_clause` (found by spec 159's review).
 - **Still open with the owner**:
   - 017 §7.4: rebuild others' extensions, or mirror the official binaries;
   - §7.9: the repository's licence;
@@ -131,16 +133,22 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     reads source columns the object never declared (the grant-side star is the item above); a NULL mark on a path
     (`s.x NOT NULL`) is silently dropped (keyed by the path, the column is `s`); a name written twice
     (`"n", "n" = upper("n")`) reads `n` and `n_1` - a grant's list refuses that since 4e.
-  - Spec 159 (next): a policy text binds only to its own source. An RLS / projection item whose column the source lost
-    binds to a column of a relation the principal puts before the object (duckdb's implicit lateral join): `SELECT
-    logs.* FROM (SELECT 'eu' AS region) s, logs` reads the rows the RLS hid; a DELETE's RLS binds to the target's alias
-    row (found by spec 157's review). Qualify every policy column with an alias only the read has.
   - `acl_check_catalog`'s `grant_exposes_nothing` skips object grants under a live schema alias (spec 157: the guard
     covers them, the check reads only `relations`).
   - A broken projection's errors name physical columns past spec 155's scrub: duckdb's `Column "x" in REPLACE list not
     found` (a cast / mask over a dropped column), and `DELETE … RETURNING k` heads its column with the physical `id`.
   - Spec 155's scrub is lost when its registry evicts a text: a principal that sends 65,536 other statements before
     executing its prepared statement reads duckdb's raw error (physical column names) - found by spec 157's re-review.
+  - Spec 160 (next): a policy's tables are the catalog's - an unqualified table in a policy text (an RLS subquery, a
+    view, a scalar template, a table function body) resolves through the connection's search path: a principal's temp
+    table (`CREATE TEMP TABLE tenants`, accepted under a gateway's per-statement prefix) shadows it for every principal
+    on that connection, and a principal's CTE shadows it in a scalar template or a call with column arguments (found
+    by spec 159's review). Qualify at write; refuse temp off a client's own session (spec 068's reasoning).
+  - A principal's own view (spec 113) stores its rewritten body; spec 159's guard binds a read of it as one read, so
+    the reads inside it are not bound alone. Rewrite the body with the same guards as a statement's (spec 159's
+    review).
+  - `acl_arg` splices a call's argument into the template's physical SQL (a virtual table function, a scalar
+    template): evaluate it in the caller's scope and pass only its value (spec 159's review).
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

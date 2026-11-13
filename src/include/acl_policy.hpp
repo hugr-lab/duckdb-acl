@@ -398,23 +398,31 @@ private:
 	std::unordered_map<uint64_t, std::pair<PrincipalText, std::list<uint64_t>::iterator>> texts;
 };
 
-//! spec 157: the reads a principal's writes bind first, by the decision's token - the marker the rewriter puts at the
-//! end of the write's text (WriteGuardMarker), so every execution of that very decision finds its own, whichever
-//! connection runs it; a marked text whose token is gone refuses (WriteGuardPreOptimize)
+//! spec 157 / 159: the policy reads a principal's statements bind alone first, each by the hash of its text
+//! (WriteGuardKey) - the keys the rewriter puts at the end of the statement's text (WriteGuardMarker), so every
+//! execution finds them, whichever connection runs it; a key no longer here refuses (WriteGuardPreOptimize)
 class WriteGuardRegistry {
 public:
-	void Note(const string &token, vector<string> reads) {
+	void Note(const string &key, const string &read) {
 		lock_guard<mutex> guard(lock);
-		order.push_back(token);
-		entries[token] = std::make_pair(std::move(reads), std::prev(order.end()));
-		while (order.size() > CAPACITY) {
-			entries.erase(order.front());
+		auto found = entries.find(key);
+		if (found != entries.end()) {
+			order.splice(order.end(), order, found->second.second);
+			return;
+		}
+		order.push_back(key);
+		entries.emplace(key, std::make_pair(read, std::prev(order.end())));
+		bytes += read.size();
+		while (order.size() > CAPACITY || (bytes > MAX_BYTES && order.size() > 1)) {
+			auto oldest = entries.find(order.front());
+			bytes -= oldest->second.first.size();
+			entries.erase(oldest);
 			order.pop_front();
 		}
 	}
-	bool Find(const string &token, vector<string> &out) {
+	bool Find(const string &key, string &out) {
 		lock_guard<mutex> guard(lock);
-		auto found = entries.find(token);
+		auto found = entries.find(key);
 		if (found == entries.end()) {
 			return false;
 		}
@@ -425,9 +433,11 @@ public:
 
 private:
 	static constexpr idx_t CAPACITY = 65536;
+	static constexpr idx_t MAX_BYTES = 64 * 1024 * 1024; // a read's text carries a call's constants
 	mutex lock;
+	idx_t bytes = 0;
 	std::list<string> order;
-	std::unordered_map<string, std::pair<vector<string>, std::list<string>::iterator>> entries;
+	std::unordered_map<string, std::pair<string, std::list<string>::iterator>> entries;
 };
 
 struct PolicyStore {
@@ -1165,7 +1175,7 @@ struct PolicyStore {
 	void AuditRecordNotUndone(const string &object, const string &reason, const string &why);
 	//! spec 155: the principal's statements this instance decided (see PrincipalTextRegistry)
 	PrincipalTextRegistry principal_texts;
-	//! spec 157: the reads each guarded write binds first (see WriteGuardRegistry)
+	//! spec 157 / 159: the reads principals' statements bind alone first (see WriteGuardRegistry)
 	WriteGuardRegistry write_guards;
 	//! spec 095: an issuer's or a client's resolved connection changed through its secret
 	void AuditConnection(const string &kind, const string &name, const string &fingerprint);

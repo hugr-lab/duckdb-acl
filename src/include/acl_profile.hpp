@@ -126,10 +126,11 @@ private:
 
 //! The hash a note and an execution are matched by; never the text.
 uint64_t StatementTextHash(const string &text);
-//! spec 157: the marker a guarded write's text ends with (`\n/* acl:guard:<token> */`, a line of its own), and the
-//! token a text ends with (empty when it ends with none)
-string WriteGuardMarker(const string &token);
-string WriteGuardToken(const string &text);
+//! spec 157 / 159: a read's key (128 bits of its SHA-256, hex); the marker a guarded text ends with
+//! (`\n/* acl:guard:<key>[,<key>…] */`, a line of its own); the keys a text ends with (empty when none)
+string WriteGuardKey(const string &read);
+string WriteGuardMarker(const string &keys);
+vector<string> WriteGuardKeys(const string &text);
 //! spec 157: before a marked write is optimized, bind the role's reads its decision noted - a read that does not bind,
 //! or a token no longer known, refuses the write, which is never changed for it
 void RegisterWriteGuardOptimizer(DatabaseInstance &db, const shared_ptr<PolicyStore> &store);
