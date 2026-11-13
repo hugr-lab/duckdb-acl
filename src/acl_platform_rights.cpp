@@ -146,6 +146,8 @@ void BodyTables(const string &body, bool expression, vector<vector<string>> &tab
 //! recursive CTE's right side sees its own name; the body after the WITH sees them all.
 struct ScopedReferences {
 	vector<vector<string>> &out;
+	//! spec 160: where each recorded name is written, when the caller asks
+	vector<QueryLocation> *locations = nullptr;
 	void Node(QueryNode &node, case_insensitive_set_t scope) {
 		for (auto &kv : node.cte_map.map) {
 			if (kv.second->query_node) {
@@ -202,9 +204,10 @@ struct ScopedReferences {
 		}
 	}
 	void Base(BaseTableRef &ref, const case_insensitive_set_t &scope) {
-		Name(ref.GetQualifiedName(), scope);
+		Name(ref.GetQualifiedName(), scope, ref.query_location);
 	}
-	void Name(const QualifiedName &name, const case_insensitive_set_t &scope) {
+	void Name(const QualifiedName &name, const case_insensitive_set_t &scope,
+	          QueryLocation location = QueryLocation()) {
 		auto &path = name.Path();
 		if (path.size() == 1 && scope.count(path[0].GetIdentifierName())) {
 			return; // the CTE of its scope
@@ -214,6 +217,9 @@ struct ScopedReferences {
 			parts.push_back(part.GetIdentifierName());
 		}
 		out.push_back(std::move(parts));
+		if (locations) {
+			locations->push_back(location); // one per name, so the two stay paired
+		}
 	}
 	void Ref(TableRef &ref, const case_insensitive_set_t &scope) {
 		switch (ref.type) {
@@ -889,6 +895,161 @@ void BodyReferences(const string &body, bool expression, vector<vector<string>> 
 			                      StatementTypeToString(statement->type));
 		}
 	}
+}
+
+namespace {
+
+//! The end of the name written at `start` - `parts` identifiers joined by dots, each bare or double-quoted - or
+//! npos when the text there is not such a name (the table reference's span also covers its alias, sample, AT)
+idx_t WrittenNameEnd(const string &text, idx_t start, idx_t parts) {
+	idx_t at = start;
+	for (idx_t part = 0; part < parts; part++) {
+		if (part > 0) {
+			while (at < text.size() && StringUtil::CharacterIsSpace(text[at])) {
+				at++;
+			}
+			if (at >= text.size() || text[at] != '.') {
+				return string::npos;
+			}
+			at++;
+			while (at < text.size() && StringUtil::CharacterIsSpace(text[at])) {
+				at++;
+			}
+		}
+		if (at < text.size() && text[at] == '"') {
+			at++;
+			while (true) {
+				if (at >= text.size()) {
+					return string::npos;
+				}
+				if (text[at] == '"') {
+					if (at + 1 < text.size() && text[at + 1] == '"') {
+						at += 2;
+						continue;
+					}
+					at++;
+					break;
+				}
+				at++;
+			}
+			continue;
+		}
+		auto begin = at;
+		while (at < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[at]) || text[at] == '_' ||
+		                            text[at] == '$' || static_cast<unsigned char>(text[at]) >= 0x80)) {
+			at++;
+		}
+		if (at == begin) {
+			return string::npos;
+		}
+	}
+	return at;
+}
+
+//! The replacements one parsed text needs: (offset, length, the name written whole), offsets into `text`
+void QualifyParsed(ClientContext &context, const string &text, const string &parsed, idx_t shift,
+                   vector<std::tuple<idx_t, idx_t, string>> &replacements, vector<string> &unwritable) {
+	vector<vector<string>> references;
+	vector<QueryLocation> locations;
+	Parser parser(ParserOptions::Builtin());
+	parser.ParseQuery(parsed);
+	ScopedReferences walk {references, &locations};
+	for (auto &statement : parser.statements) {
+		if (statement->type != StatementType::SELECT_STATEMENT) {
+			return;
+		}
+		walk.Node(*statement->Cast<SelectStatement>().node, case_insensitive_set_t());
+	}
+	for (idx_t i = 0; i < references.size() && i < locations.size(); i++) {
+		vector<string> entry;
+		try {
+			entry = ResolvedReference(context, references[i]);
+		} catch (std::exception &) {
+			continue; // ambiguous or unreadable: left as written for the checks that judge it
+		}
+		if (entry.size() <= references[i].size()) {
+			continue; // written whole (or not an object: a file, a function's result)
+		}
+		// a table named in a form not rewritten in place (a string, backticks, a comment between its parts, the
+		// table of a SUMMARIZE / DESCRIBE / SHOW) is the caller's to refuse: it would stay one a CTE could stand in for
+		auto &location = locations[i];
+		auto end = string::npos;
+		idx_t offset = 0;
+		if (location.offset != QueryLocation::INVALID_OFFSET && location.offset >= shift) {
+			offset = idx_t(location.offset) - shift;
+			end = WrittenNameEnd(text, offset, references[i].size());
+		}
+		if (end == string::npos) {
+			unwritable.push_back(StringUtil::Join(entry, "."));
+			continue;
+		}
+		vector<string> quoted;
+		for (auto &part : entry) {
+			quoted.push_back(KeywordHelper::WriteOptionallyQuoted(part));
+		}
+		replacements.emplace_back(offset, end - offset, StringUtil::Join(quoted, "."));
+	}
+}
+
+string ApplyReplacements(const string &text, vector<std::tuple<idx_t, idx_t, string>> replacements) {
+	std::sort(replacements.begin(), replacements.end(),
+	          [](const std::tuple<idx_t, idx_t, string> &a, const std::tuple<idx_t, idx_t, string> &b) {
+		          return std::get<0>(a) > std::get<0>(b);
+	          });
+	auto out = text;
+	for (auto &replacement : replacements) {
+		if (std::get<0>(replacement) + std::get<1>(replacement) > out.size()) {
+			return text;
+		}
+		out.replace(std::get<0>(replacement), std::get<1>(replacement), std::get<2>(replacement));
+	}
+	return out;
+}
+
+} // namespace
+
+string QualifiedBodyTables(DatabaseInstance &db, const string &text, bool select,
+                           const vector<string> &item_expressions, vector<string> *unwritable) {
+	static constexpr const char *PREFIX = "SELECT ";
+	Connection con(db);
+	vector<std::tuple<idx_t, idx_t, string>> replacements;
+	vector<string> unwritten;
+	auto qualify = [&](const string &piece, idx_t piece_offset, bool piece_select) {
+		vector<std::tuple<idx_t, idx_t, string>> found;
+		vector<string> missed;
+		try {
+			auto parsed = piece_select ? piece : string(PREFIX) + piece;
+			QualifyParsed(*con.context, piece, parsed, piece_select ? 0 : string(PREFIX).size(), found, missed);
+		} catch (std::exception &) {
+			return false; // not read here: the body's own checks refuse it
+		}
+		unwritten.insert(unwritten.end(), missed.begin(), missed.end());
+		for (auto &replacement : found) {
+			std::get<0>(replacement) += piece_offset;
+			replacements.push_back(std::move(replacement));
+		}
+		return true;
+	};
+	con.context->RunFunctionInTransaction([&]() {
+		if (qualify(text, 0, select) || item_expressions.empty()) {
+			return;
+		}
+		// a list that is no select list as a whole (a path `items[].price`, a NULL mark): each item's expression where
+		// it is written, in order
+		idx_t from = 0;
+		for (auto &expression : item_expressions) {
+			auto at = text.find(expression, from);
+			if (at == string::npos) {
+				continue;
+			}
+			qualify(expression, at, false);
+			from = at + expression.size();
+		}
+	});
+	if (unwritable) {
+		*unwritable = std::move(unwritten);
+	}
+	return ApplyReplacements(text, std::move(replacements));
 }
 
 void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {

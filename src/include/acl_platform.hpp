@@ -204,6 +204,20 @@ void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyS
 //! spec 138: the table / view names a stored body writes, as written - a one-part name that is a CTE of its scope
 //! left out. Throws when the body does not parse (or is no SELECT / expression).
 void BodyReferences(const string &body, bool expression, vector<vector<string>> &references);
+//! spec 160: a body with each table it names written whole (`<db>.<schema>.<table>`, as the binder resolves it on the
+//! node) - a principal's CTE or temp table can then never stand in for one; the rest of the text as written
+//! A list's item expressions (a grant's masks, an object's computed columns) are qualified one by one when the list
+//! as a whole is no select list.
+//! `unwritable`: the tables (whole) it names in a form not rewritten in place - a string, backticks, a comment between
+//! the parts, a SUMMARIZE / DESCRIBE / SHOW's table.
+string QualifiedBodyTables(DatabaseInstance &db, const string &text, bool select,
+                           const vector<string> &item_expressions = {}, vector<string> *unwritable = nullptr);
+//! spec 160: ResolvedReference on a context the caller holds a transaction on (one connection for many names)
+vector<string> ResolvedReference(ClientContext &context, const vector<string> &parts);
+//! spec 160: a list body's item expressions (a grant's masks, an object's computed columns); empty for other shapes
+vector<string> BodyItemExpressions(const string &text, BodyShape shape);
+//! spec 160: every body a compiled management call stores, its tables written whole (QualifiedBodyTables)
+void QualifyBodies(vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store);
 //! spec 138: the catalog entry a reference names, as duckdb's binder resolves it (catalog-or-schema, the search path,
 //! the defaults): `<db>.<schema>.<object>`, empty when it names no entry. Throws duckdb's own refusal of an ambiguous
 //! name, and whatever the lookup throws (a gate refuses then).

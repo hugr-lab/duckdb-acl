@@ -1,0 +1,188 @@
+# name: test/sql/acl_policy_tables_qualified.test
+# description: spec 160 - a table a policy text names (an RLS, a mask, a view's SQL, a template) is stored whole,
+#   <db>.<schema>.<table>, as the binder resolves it where it is written; a principal's CTE or temp table of that
+#   name then reads as itself, never in the policy's place
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE tenants (k INTEGER);
+
+statement ok
+INSERT INTO tenants VALUES (1);
+
+statement ok
+CREATE TABLE phys.main.t (id INTEGER, note VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.m AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.v AS 'SELECT id FROM phys.main.t WHERE id IN (SELECT k FROM main.tenants)';
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN WITH (select, temp); GRANT TABLE c.t TO ROLE r RLS (id IN (SELECT k FROM tenants)); GRANT TABLE c.m TO ROLE r COLUMNS (id, note = (SELECT max(k)::VARCHAR FROM tenants));
+
+# stored whole; what was written whole stays as written
+query T
+SELECT rls FROM store.acl.role_object_caps WHERE vname = 't';
+----
+id IN (SELECT k FROM memory.main.tenants)
+
+query T
+SELECT columns FROM store.acl.role_object_caps WHERE vname = 'm';
+----
+id, note = (SELECT max(k)::VARCHAR FROM memory.main.tenants)
+
+query T
+SELECT view_sql FROM store.acl.relations WHERE vname = 'v';
+----
+SELECT id FROM phys.main.t WHERE id IN (SELECT k FROM memory.main.tenants)
+
+query I
+ACL ROLE "r" SELECT id FROM t ORDER BY id;
+----
+1
+
+# a principal's CTE of the same name reads as itself, not in the policy's place
+query I
+ACL ROLE "r" WITH tenants AS (SELECT 2 AS k UNION ALL SELECT 3) SELECT id FROM t ORDER BY id;
+----
+1
+
+query I
+ACL ROLE "r" WITH tenants AS (SELECT 3 AS k) SELECT id FROM v ORDER BY id;
+----
+1
+
+query T
+ACL ROLE "r" WITH tenants AS (SELECT 9 AS k) SELECT note FROM m WHERE id = 1;
+----
+1
+
+# ... and so does a temp table of the same name
+statement ok
+ACL ROLE "r" CREATE TEMP TABLE tenants AS SELECT 2 AS k;
+
+query I
+ACL ROLE "r" SELECT id FROM t ORDER BY id;
+----
+1
+
+query I
+ACL ROLE "r" SELECT id FROM v ORDER BY id;
+----
+1
+
+# a body stored by the operator's own call keeps what it names as written - the check names it, with the whole form
+statement ok
+SELECT acl_grant_object('r', 'c', 'm', '', 'id IN (SELECT k FROM tenants)', '');
+
+query TT
+SELECT problem, detail LIKE '%id IN (SELECT k FROM memory.main.tenants)' FROM acl_check_catalog('c') WHERE problem = 'body_table_unqualified';
+----
+body_table_unqualified	true
+
+# ... and a principal's CTE does stand in for such a body (the negative control: the reads above would see it)
+query I
+ACL ROLE "r" WITH tenants AS (SELECT 2 AS k) SELECT id FROM m ORDER BY id;
+----
+2
+
+# only the name is rewritten: an alias, a column alias, a sample stay as written
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r RLS (EXISTS (SELECT 1 FROM tenants AS x(kk) TABLESAMPLE 100% WHERE x.kk = id));
+
+query T
+SELECT rls FROM store.acl.role_object_caps WHERE vname = 't';
+----
+EXISTS (SELECT 1 FROM memory.main.tenants AS x(kk) TABLESAMPLE 100% WHERE x.kk = id)
+
+query I
+ACL ROLE "r" SELECT id FROM t ORDER BY id;
+----
+1
+
+statement ok
+ACL ADMIN CREATE ROLE r2; GRANT CATALOG c TO ROLE r2; ALTER GRANT CATALOG c TO ROLE r2 SET RLS 'id IN (SELECT y.k FROM tenants y)';
+
+query T
+SELECT rls FROM store.acl.role_catalogs WHERE role = 'r2';
+----
+id IN (SELECT y.k FROM memory.main.tenants y)
+
+# a name of the body's own CTE stays bare; a SHOW (its table written whole) before another table keeps each name in
+# its own place
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.w AS 'WITH tenants AS (SELECT 5 AS k) SELECT k FROM tenants';
+
+query T
+SELECT view_sql FROM store.acl.relations WHERE vname = 'w';
+----
+WITH tenants AS (SELECT 5 AS k) SELECT k FROM tenants
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.sh AS 'SELECT count(*) AS n FROM (SHOW memory.main.tenants) s, tenants';
+
+query T
+SELECT view_sql FROM store.acl.relations WHERE vname = 'sh';
+----
+SELECT count(*) AS n FROM (SHOW memory.main.tenants) s, memory.main.tenants
+
+# a list that is no select list as a whole (a path into a list of structs): each mask is qualified where it is written
+statement ok
+CREATE TABLE phys.main.s (id INTEGER, items STRUCT(price INTEGER)[], note VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.s AS phys.main.s; GRANT TABLE c.s TO ROLE r COLUMNS (id, items[].price, note = (SELECT max(k)::VARCHAR FROM tenants));
+
+query T
+SELECT columns LIKE '%FROM memory.main.tenants)%' FROM store.acl.role_object_caps WHERE vname = 's';
+----
+true
+
+# a table named in a form not rewritten in place is refused where written: write it whole
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW c.f1 AS 'SELECT k FROM ''tenants'' q';
+----
+write it as memory.main.tenants
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE r RLS (id IN (SELECT k FROM `tenants`));
+----
+write it as memory.main.tenants
+
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW c.f2 AS 'SELECT k FROM main/*c*/.tenants';
+----
+write it as memory.main.tenants
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE r RLS (id IN (SELECT max::INTEGER FROM (SUMMARIZE tenants)));
+----
+write it as memory.main.tenants
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r RLS (id IN (SELECT max::INTEGER FROM (SUMMARIZE memory.main.tenants)));

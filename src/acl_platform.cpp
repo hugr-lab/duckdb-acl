@@ -1847,6 +1847,68 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 	}
 }
 
+vector<string> BodyItemExpressions(const string &text, BodyShape shape) {
+	vector<string> out;
+	try {
+		if (shape == BodyShape::COLUMNS) {
+			for (auto &item : acl_detail::ParseColumnList(text)) {
+				if (!item.second.empty()) {
+					out.push_back(item.second);
+				}
+			}
+		} else if (shape == BodyShape::DECLARED_COLUMNS) {
+			for (auto &column : SplitDeclaredColumns(text, "the object's column list")) {
+				if (!column.expr.empty()) {
+					out.push_back(column.expr);
+				}
+			}
+		}
+	} catch (std::exception &) {
+		out.clear(); // a list that does not read is refused where it is written
+	}
+	return out;
+}
+
+void QualifyBodies(vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store) {
+	if (!store.catalog) {
+		return; // the memory store keeps names as written
+	}
+	for (auto &statement : statements) {
+		auto &call = CompiledCall(*statement);
+		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		for (auto &body : BodiesOf(target, call)) {
+			if (body.shape == BodyShape::FUNCTION_NAME) {
+				continue;
+			}
+			auto &arguments = call.GetArgumentsMutable();
+			if (body.index >= arguments.size()) {
+				continue;
+			}
+			auto &argument = arguments[body.index].GetExpressionMutable();
+			if (argument->GetExpressionClass() != ExpressionClass::CONSTANT) {
+				continue;
+			}
+			auto value = argument->Cast<ConstantExpression>().GetLiteral().ToValue();
+			if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
+				continue;
+			}
+			auto text = value.ToString();
+			vector<string> unwritable;
+			auto qualified = QualifiedBodyTables(*store.catalog->Db(), text, body.shape == BodyShape::SELECT,
+			                                     BodyItemExpressions(text, body.shape), &unwritable);
+			if (!unwritable.empty()) {
+				throw BinderException(
+				    "acl admin: a policy's tables are stored whole (spec 160), and this body names %s "
+				    "in a form that is not - write it as %s",
+				    unwritable[0], unwritable[0]);
+			}
+			if (qualified != text) {
+				argument = ConstantExpression::FromValue(Value(qualified));
+			}
+		}
+	}
+}
+
 void AuthorizeBodies(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
                      PolicyStore &store, const Principal &author) {
 	if (rights.passthrough) {
@@ -2654,7 +2716,8 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 	vector<unique_ptr<SQLStatement>> judged;
 	judged.push_back(std::move(statement));
 	// spec 122: a read function carrying a body (check_grant's RLS and columns) is judged by its author's function
-	// gate as the write it stands for would be
+	// gate as the write it stands for would be - and answers what the write stores (spec 160)
+	QualifyBodies(judged, store);
 	AuthorizeBodies(judged, rights, store, principal);
 	sql = judged[0]->ToString();
 	return true;

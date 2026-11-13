@@ -867,6 +867,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);
 		AuthorizeRoleTargets(statements, rights, store);
+		QualifyBodies(statements, store); // spec 160
 		AuthorizeBodies(statements, rights, store, principal);
 		AuthorizeSources(statements, rights, store);
 		return ParserOverrideResult(std::move(statements));
@@ -971,6 +972,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			audit.phase = Reason::MGMT_UNAUTHORIZED;
 			AuthorizeMgmt(compiled, rights);
 			AuthorizeRoleTargets(compiled, rights, store);
+			QualifyBodies(compiled, store); // spec 160
 			AuthorizeBodies(compiled, rights, store, principal);
 			AuthorizeSources(compiled, rights, store);
 			return ParserOverrideResult(std::move(compiled));
