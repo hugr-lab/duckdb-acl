@@ -139,11 +139,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     found` (a cast / mask over a dropped column), and `DELETE … RETURNING k` heads its column with the physical `id`.
   - Spec 155's scrub is lost when its registry evicts a text: a principal that sends 65,536 other statements before
     executing its prepared statement reads duckdb's raw error (physical column names) - found by spec 157's re-review.
-  - `acl_arg` splices a call's argument into the template's physical SQL (a virtual table function, a scalar
-    template): evaluate it in the caller's scope and pass only its value (spec 159's review). Such a call stays in place
-    in a principal's view body too (spec 162).
   - Views a principal stored before spec 162 keep their bodies (policy reads in place) until created again; nothing
     lists them yet.
+  - A virtual table function called with the caller's columns (spec 163's carrier) is not bound alone first (spec 159
+    guards closed calls only): a template's or its grant's RLS name its source lost can bind to the caller's columns,
+    in a statement and in a principal's view body. Bind the call with its arguments as typed NULLs (spec 163's review).
+  - Spec 155's scrub does not cover spec 163's carrier names (`__acl_arg_1`, `__acl_args`) in an argument's errors.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

@@ -764,6 +764,19 @@ struct PolicyStore {
 	bool SystemTypeExists(const string &name);
 	mutex system_types_lock;
 	case_insensitive_set_t system_types;
+	//! spec 163: whether a function of that name is the system catalog's (a builtin: its arguments are values, never
+	//! names bound in a body of its own over a table); read once
+	bool SystemFunctionExists(const string &name);
+	//! spec 163: a system function of that name that is a plain scalar - no aggregate, window or macro of that name
+	bool SystemScalarFunction(const string &name);
+	//! spec 163: a system function of that name with a macro overload
+	bool SystemMacroFunction(const string &name);
+	mutex system_functions_lock;
+	case_insensitive_set_t system_functions;
+	case_insensitive_set_t system_aggregates; // names with an aggregate or window overload
+	case_insensitive_set_t system_macros;     // names with a macro overload (its body may read a table)
+	bool system_functions_loaded = false;
+	void LoadSystemFunctions();
 	//! Read one listing of the active policy source for an operator (spec 010 part 3). `listing` names
 	//! a table of the policy model ("relations", "grants", …) or "status". Throws when the active
 	//! source cannot enumerate - silence on an admin surface reads as "nothing is configured".
