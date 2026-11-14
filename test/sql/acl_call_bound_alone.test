@@ -1,0 +1,119 @@
+# name: test/sql/acl_call_bound_alone.test
+# description: spec 164 - a virtual table function called with the caller's columns is bound alone first, its
+#   arguments NULL, like a closed call (spec 159): a name its template or its grant's policy lost refuses rather than
+#   binding to a column of the caller's query
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.logs (id INTEGER, region VARCHAR, msg VARCHAR);
+
+statement ok
+INSERT INTO phys.main.logs VALUES (1, 'eu', 'a'), (2, 'us', 'b'), (3, 'us', 'c');
+
+statement ok
+CREATE MACRO phys.main.lm(k) AS TABLE SELECT *, k AS key FROM phys.main.logs;
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.tfa(p VARCHAR) AS 'SELECT *, acl_arg(1) AS key FROM phys.main.logs';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.mac ALIAS OF phys.main.lm;
+
+statement ok
+CREATE TABLE phys.main.ev (id INTEGER, ts TIMESTAMP, tags VARCHAR[]);
+
+statement ok
+INSERT INTO phys.main.ev VALUES (1, TIMESTAMP '2026-01-01 10:00', ['x', 'y']);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ev AS phys.main.ev;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.byday(d TIMESTAMP) AS 'SELECT id FROM phys.main.ev WHERE date_trunc(''day'', ts) = date_trunc(''day'', acl_arg(1))';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.unn(l VARCHAR[]) AS 'SELECT * FROM unnest(acl_arg(1))';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.aunn ALIAS OF unnest;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.tfm(p VARCHAR) AS 'SELECT *, acl_arg(1) AS key FROM phys.main.logs';
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT OBJECT c.tfa TO ROLE r RLS (region = 'eu'); GRANT OBJECT c.mac TO ROLE r RLS (region = 'eu'); GRANT OBJECT c.tfm TO ROLE r COLUMNS (id, msg = upper(msg), key);
+
+# a probe whose untyped NULL leaves an overload or an UNNEST without a type is no refusal: only a lost name is
+query I
+ACL ROLE "r" SELECT f.id FROM ev e, byday(e.ts) f;
+----
+1
+
+query T
+ACL ROLE "r" SELECT f.* FROM ev e, unn(e.tags) f ORDER BY 1;
+----
+x
+y
+
+query T
+ACL ROLE "r" SELECT f.* FROM ev e, aunn(e.tags) f ORDER BY 1;
+----
+x
+y
+
+query IT
+ACL ROLE "r" SELECT f.id, f.key FROM (SELECT 'k' AS key) s, tfa(s.key) f;
+----
+1	k
+
+query IT
+ACL ROLE "r" SELECT f.id, f.key FROM (SELECT 'k' AS key) s, mac(s.key) f;
+----
+1	k
+
+query IT
+ACL ROLE "r" SELECT f.id, f.msg FROM (SELECT 'k' AS key) s, tfm(s.key) f ORDER BY 1;
+----
+1	A
+2	B
+3	C
+
+statement ok
+ALTER TABLE phys.main.logs DROP COLUMN region;
+
+# the call alone no longer binds: refused before the grant's RLS can bind to the caller's `region`
+statement error
+ACL ROLE "r" SELECT f.id FROM (SELECT 'eu' AS region, 'k' AS key) s, tfa(s.key) f;
+----
+not found
+
+statement error
+ACL ROLE "r" SELECT f.id FROM (SELECT 'eu' AS region, 'k' AS key) s, mac(s.key) f;
+----
+not found
+
+# a mask over a column the source dropped refuses too, never reading the caller's own `msg`
+statement ok
+ALTER TABLE phys.main.logs DROP COLUMN msg;
+
+statement error
+ACL ROLE "r" SELECT f.id, f.msg FROM (SELECT 'SECRET' AS msg, 'k' AS key) s, tfm(s.key) f;
+----
+not found

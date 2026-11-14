@@ -894,6 +894,18 @@ struct WriteGuardInfo : public OptimizerExtensionInfo {
 	weak_ptr<PolicyStore> store;
 };
 
+//! spec 164: an error that a name did not resolve - a column, a table, a REPLACE / EXCLUDE item
+bool NameNotFound(const ErrorData &error) {
+	if (error.Type() == ExceptionType::CATALOG) {
+		return true;
+	}
+	auto subtype = error.ExtraInfo().find("error_subtype");
+	if (subtype != error.ExtraInfo().end() && subtype->second == "COLUMN_NOT_FOUND") {
+		return true;
+	}
+	return error.Type() == ExceptionType::BINDER && StringUtil::Contains(error.RawMessage(), "not found");
+}
+
 void WriteGuardPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	if (!plan || !input.info) {
 		return;
@@ -912,6 +924,9 @@ void WriteGuardPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		reads.push_back(std::move(read));
 	}
 	for (auto &read : reads) {
+		// spec 164: a call's probe (its caller's arguments NULL) refuses only a name it cannot resolve - an untyped
+		// NULL may leave an overload or an UNNEST without a type, which says nothing about scope
+		bool names_only = StringUtil::StartsWith(read, WRITE_GUARD_NAMES_ONLY);
 		// a statement of its own: no name of the write is in scope to bind a name the source lost to
 		Parser parser(ParserOptions::Builtin());
 		parser.ParseQuery(read);
@@ -920,6 +935,9 @@ void WriteGuardPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 			binder->Bind(*parser.statements[0]);
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
+			if (names_only && !NameNotFound(error)) {
+				continue;
+			}
 			auto info = error.ExtraInfo();
 			info.erase("position"); // an offset into the read, not into the client's text
 			info.erase("location");

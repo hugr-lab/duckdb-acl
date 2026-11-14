@@ -2338,6 +2338,15 @@ private:
 			// spec 163: `f(…) AS a(c1, …)` renames what the caller reads - the outermost reference, around the grant's
 			// wrapper, never the call inside it (there the wrapper's own names would read the caller's)
 			auto column_aliases = std::move(tf.column_name_alias);
+			bool system_target = !policy.subquery_form && SystemTableCall(ParsePhysName(policy.phys));
+			if (!closed && !view_reads && !system_target) {
+				// spec 164: the call as the caller's arguments leave it - each of those a NULL - bound alone first like
+				// a closed call (spec 159): a name of the template's or the grant's that its source lost refuses
+				// instead of binding to the caller's columns. A system table function's columns are fixed: nothing to
+				// lose there
+				guards.push_back(string(WRITE_GUARD_NAMES_ONLY) + ProbeCall(ref, leaf, policy, alias));
+			}
+
 			if (policy.subquery_form) {
 				ref = BuildFunctionSubquery(leaf, policy, function, tf);
 			} else {
@@ -2675,6 +2684,34 @@ private:
 		BakeMarkersInNode(*select_stmt->node, &refs);
 		return CallWithArguments(make_uniq<SubqueryRef>(std::move(select_stmt)), args, alias,
 		                         std::move(tf.column_name_alias));
+	}
+
+	//! spec 164: the read a non-closed call stands for, its non-spliceable arguments NULL, as text to bind alone
+	string ProbeCall(const unique_ptr<TableRef> &call, const string &leaf, const TablePolicy &policy,
+	                 const Identifier &alias) {
+		auto probe = call->Copy();
+		auto &probe_tf = probe->Cast<TableFunctionRef>();
+		auto &probe_function = probe_tf.function->Cast<FunctionExpression>();
+		for (auto &arg : probe_function.GetArgumentsMutable()) {
+			if (!Spliceable(*arg.GetExpressionMutable(), false)) {
+				arg.GetExpressionMutable() = ConstantExpression::Null();
+			}
+		}
+		unique_ptr<TableRef> read;
+		if (policy.subquery_form) {
+			read = BuildFunctionSubquery(leaf, policy, probe_function, probe_tf);
+		} else {
+			probe_function.SetQualifiedName(ParsePhysName(policy.phys));
+			if (SystemTableCall(probe_function.GetQualifiedName())) {
+				QualifySystemCall(probe_function);
+			}
+			read = std::move(probe);
+		}
+		WrapWithGrantPolicy(read, policy, alias);
+		if (read->type == TableReferenceType::SUBQUERY) {
+			return read->Cast<SubqueryRef>().subquery->ToString();
+		}
+		return "SELECT * FROM " + read->ToString();
 	}
 
 	//! spec 163: an argument spliced into a template as written - constants, casts, operators and the system's plain
