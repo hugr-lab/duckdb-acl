@@ -141,10 +141,10 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     executing its prepared statement reads duckdb's raw error (physical column names) - found by spec 157's re-review.
   - Views a principal stored before spec 162 keep their bodies (policy reads in place) until created again; nothing
     lists them yet.
-  - A virtual table function called with the caller's columns (spec 163's carrier) is not bound alone first (spec 159
-    guards closed calls only): a template's or its grant's RLS name its source lost can bind to the caller's columns,
-    in a statement and in a principal's view body. Bind the call with its arguments as typed NULLs (spec 163's review).
   - Spec 155's scrub does not cover spec 163's carrier names (`__acl_arg_1`, `__acl_args`) in an argument's errors.
+  - A virtual table function called with the caller's columns inside a principal's view body (spec 162) is not probed
+    (spec 164 probes statements): the stored body is bound alone as one read, so the call's grant RLS can bind to a
+    relation of the body that carries a name its source lost.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

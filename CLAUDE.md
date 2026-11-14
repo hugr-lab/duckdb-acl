@@ -873,6 +873,12 @@ call's column alias list goes outermost, around the grant's wrapper. A builtin a
 `system.main.<name>` (`QualifySystemCall`; a default-database macro must not stand in), and a system macro counts as a
 macro. Test `acl_call_arguments_scope.test`.
 
+**Spec 164 — a call with the caller's arguments is bound alone too**: `ProbeCall` builds a non-closed table function call
+(spec 163) with its non-spliceable arguments NULL - template or alias target, plus the grant's wrapper - and adds it to the
+statement's guards (spec 159), so a name its template or policy lost refuses instead of binding to the caller's columns;
+the probe refuses only a name not found (`WRITE_GUARD_NAMES_ONLY` - an untyped NULL may fail an overload), and a system
+table function is not probed. Test `acl_call_bound_alone.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

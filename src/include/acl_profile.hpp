@@ -128,6 +128,8 @@ private:
 uint64_t StatementTextHash(const string &text);
 //! spec 157 / 159: a read's key (128 bits of its SHA-256, hex); the marker a guarded text ends with
 //! (`\n/* acl:guard:<key>[,<key>…] */`, a line of its own); the keys a text ends with (empty when none)
+//! spec 164: the first line of a call's probe read - a guard that refuses only a name it cannot resolve
+static constexpr const char *WRITE_GUARD_NAMES_ONLY = "-- acl:names\n";
 string WriteGuardKey(const string &read);
 string WriteGuardMarker(const string &keys);
 vector<string> WriteGuardKeys(const string &text);
