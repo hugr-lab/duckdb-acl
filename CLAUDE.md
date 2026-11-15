@@ -889,6 +889,16 @@ CTE only when referenced); the resolver splits it off the body before a grant wr
 reserved in a principal's view body and refused at the root of an operator's. Test
 `acl_view_call_probes.test`.
 
+**Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
+<t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
+v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`
+/ `ReadVersions` with duckdb's parser) -, an object's unstated = its catalog grant's, unstated = every version (as
+before). `ApplyGrantVersions` unites the roles (`UniteVersions`: every version wins, different clauses refuse -
+`versions_differ`); `VersionedAt` refuses a client's AT under CURRENT / a pinned AT, pins the grant's, checks a window's
+constant TIMESTAMP (`CASE … ELSE error()`, none = `least(now, end)`); `SourceAt` puts the AT on the base table under
+the subquery forms (it was dropped there), a parameter refused there (spec 159's guard binds alone); a view refuses an
+AT and a VERSIONS grant; `RefuseVersionedWrite`: AT / BETWEEN write nothing. Test `acl_versioned_tables.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

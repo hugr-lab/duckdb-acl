@@ -133,6 +133,11 @@ struct TablePolicy {
 	string query; // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
 	//! spec 165: a principal's view body's call probes, split off `query` before a grant wraps it - each bound alone
 	vector<string> probes;
+	//! spec 167: the versions of a time-travel table the roles' grants admit - '' every version, else the stored clause
+	//! (`CURRENT`, `AT (…)`, `BETWEEN … AND …`, acl_versions.hpp); `versions_differ` when the roles' clauses differ,
+	//! which refuses the read (never one role's clause over another's)
+	string versions;
+	bool versions_differ = false;
 	//! The object is a virtual view (its SQL is its definition). Never read off `query`, which a grant's column list
 	//! sets on a table with no declared columns too (review 145: DROP left the physical table, RENAME refused it)
 	bool is_view = false;
@@ -359,6 +364,8 @@ struct UnionWidening {
 	vector<string> columns; // items of B as listed; `*` = beyond the lists read on A's rows
 	//! how many pairs an event names; past it, "and more" (the reason is cut at 512 bytes anyway)
 	static constexpr idx_t REPORTED = 16;
+	//! spec 167: the item of a pair where B reads every version of a time-travel table and A a limited one
+	static constexpr const char *EVERY_VERSION = "\x01every version";
 };
 
 //! spec 155: the statements decided for a principal (not NATIVE, not the anonymous operator) on this instance, by the
@@ -834,9 +841,10 @@ struct PolicyStore {
 	                         const string &comment);
 	void CatalogDropReference(const string &vcat, const string &name);
 	//! `judge_columns` / `judge_caps`: only where that part itself is being written - never re-judging a stored one
+	//! `versions` (spec 167): the grant's VERSIONS as written, normalized where written; nullptr keeps the stored one
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
 	                  const string &rls = "", const string &columns = "", bool judge_columns = true,
-	                  bool judge_caps = true);
+	                  bool judge_caps = true, optional_ptr<const string> versions = nullptr);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname, optional_ptr<RecordWrite> write = nullptr);
 	//! spec 154: a client's ROLLBACK of a record written on the store's own connection, in one write of the store:
@@ -1017,9 +1025,13 @@ struct PolicyStore {
 	//! transaction, and the difference is written as rows
 	void CatalogEditIdentity(const std::function<void(IdentityModel &)> &apply);
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
+	//! `versions` (spec 167): as CatalogGrant's
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
 	                          const string &rls = "", const string &columns = "", bool judge_caps = true,
-	                          bool ensure_grant = false, bool written_list = true);
+	                          bool ensure_grant = false, bool written_list = true,
+	                          optional_ptr<const string> versions = nullptr);
+	//! spec 167: a grant's VERSIONS as written -> as stored (acl_versions.hpp), its values evaluated on the store
+	string NormalizeGrantVersions(const string &written);
 	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function);
 	//! `strict` where they are written (spec 150 stage 3d: a name twice, a NUL in a name)
 	void CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json, bool strict = true);

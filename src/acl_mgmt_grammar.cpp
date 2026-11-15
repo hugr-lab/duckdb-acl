@@ -25,6 +25,7 @@
 #include "duckdb/parser/peg/special_string_utils.hpp"
 #include "duckdb/parser/peg/tokenizer/parser_tokenizer.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
+#include "duckdb/parser/tableref/at_clause.hpp"
 
 #include <atomic>
 #include <mutex>
@@ -1567,11 +1568,29 @@ struct GrantClauses {
 	optional_idx caps;
 	optional_idx rls;
 	optional_idx columns;
+	optional_idx versions;
 	bool main = false;
 	//! a clause that is present and not empty (a schema grant carries capabilities only)
 	bool rls_written = false;
 	bool columns_written = false;
+	bool versions_written = false;
 };
+
+//! spec 167: `AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord` as the clause the grant functions
+//! read - `CURRENT` / `ANY`, duckdb's AT clause as duckdb prints it, `BETWEEN <a> AND <b>` with duckdb's BETWEEN
+//! operands (`OtherOperatorExpression`, so the AND is the window's)
+string VersionsText(PEGTransformer &transformer, ParseResult &result) {
+	auto &node = Strip(result);
+	if (node.Name() == "AtClause") {
+		return transformer.Transform<unique_ptr<AtClause>>(node)->ToString();
+	}
+	if (node.Name() == "AclVersionsBetween") {
+		auto &list = node.Cast<ListParseResult>();
+		return "BETWEEN " + transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(1))->ToString() +
+		       " AND " + transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(3))->ToString();
+	}
+	return StringUtil::Upper(KeywordOf(node));
+}
 
 //! Whether a list clause's value (`AclList`) is empty as written - `()` or `''`
 bool ListIsEmpty(PEGTransformer &transformer, ParseResult &result) {
@@ -1818,6 +1837,13 @@ void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t 
 			continue;
 		}
 		auto &parts = ClauseList(clause);
+		if (keyword == "versions") {
+			clauses.versions_written = true;
+			if (clauses.versions.IsValid()) {
+				data.args[clauses.versions.GetIndex()] = Value(VersionsText(transformer, parts.GetChild(1)));
+			}
+			continue;
+		}
 		if (keyword == "with") {
 			data.args[clauses.caps.GetIndex()] = Value(CapsListJson(parts.GetChild(1)));
 		} else if (keyword == "caps") {
@@ -1875,8 +1901,8 @@ unique_ptr<MgmtParseData> PlatformViewGrant(ListParseResult &list, const string 
 	}
 	auto data = PlatformGrantCall("view", PathOf(list.GetChild(2)), verb, RoleTargetOf(list.GetChild(4)));
 	if (data && clauses.IsValid() && list.Child<OptionalParseResult>(clauses.GetIndex()).HasResult()) {
-		throw BinderException("acl admin: a grant on a view of the platform catalog takes no WITH, CAPS, RLS or "
-		                      "COLUMNS - it is the view, granted or denied");
+		throw BinderException("acl admin: a grant on a view of the platform catalog takes no WITH, CAPS, RLS, "
+		                      "COLUMNS or VERSIONS - it is the view, granted or denied");
 	}
 	return data;
 }
@@ -1892,6 +1918,7 @@ arena_ptr<TransformResultValue> FinalizeGrantCatalog(PEGTransformer &transformer
 	auto main = AddArg(*data);
 	clauses.rls = AddArg(*data);
 	clauses.columns = AddArg(*data);
+	clauses.versions = AddArg(*data);
 	GrantClausesInto(transformer, list, 6, clauses, *data);
 	data->args[main] = Value::BOOLEAN(clauses.main);
 	return MgmtResult(transformer, std::move(data));
@@ -1912,9 +1939,9 @@ arena_ptr<TransformResultValue> FinalizeGrantSchema(PEGTransformer &transformer,
 	auto into = AddArg(*data);
 	auto virtual_only = AddArg(*data, Value::BOOLEAN(false));
 	GrantClausesInto(transformer, list, 6, clauses, *data);
-	if (clauses.rls_written || clauses.columns_written) {
-		throw BinderException("acl admin: a schema grant carries capabilities only - RLS and COLUMNS belong to the "
-		                      "catalog or to the object (spec 015)");
+	if (clauses.rls_written || clauses.columns_written || clauses.versions_written) {
+		throw BinderException("acl admin: a schema grant carries capabilities only - RLS, COLUMNS and VERSIONS belong "
+		                      "to the catalog or to the object (spec 015)");
 	}
 	auto &home = list.Child<OptionalParseResult>(7);
 	if (home.HasResult()) {
@@ -1954,6 +1981,7 @@ arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer,
 	clauses.caps = AddArg(*data);
 	clauses.rls = AddArg(*data);
 	clauses.columns = AddArg(*data);
+	clauses.versions = AddArg(*data);
 	GrantClausesInto(transformer, list, 5, clauses, *data);
 	return MgmtResult(transformer, std::move(data));
 }
@@ -3063,8 +3091,14 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclDeclaredItems <- '(' AclDeclaredEntry AclDeclaredMore* ')'"));
 		changes.push_back(
 		    GrammarChange::AddRule("AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue"));
+		// spec 167: the versions of a time-travel table - duckdb's AT clause, its BETWEEN operands
+		changes.push_back(GrammarChange::AddRule("AclVersionsWord <- 'CURRENT' / 'ANY'"));
 		changes.push_back(GrammarChange::AddRule(
-		    "AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / AclGrantColumnsClause"));
+		    "AclVersionsBetween <- 'BETWEEN' OtherOperatorExpression 'AND' OtherOperatorExpression"));
+		changes.push_back(GrammarChange::AddRule("AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord"));
+		changes.push_back(GrammarChange::AddRule("AclVersionsClause <- 'VERSIONS' AclVersionsSpec"));
+		changes.push_back(GrammarChange::AddRule("AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / "
+		                                         "AclGrantColumnsClause / AclVersionsClause"));
 		changes.push_back(GrammarChange::AddRule("AclGrantClause <- AclObjectClause / AclMainClause"));
 		changes.push_back(
 		    GrammarChange::AddRule("AclGrantCatalog <- 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName AclGrantClause*",

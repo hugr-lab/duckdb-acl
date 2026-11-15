@@ -5,10 +5,12 @@
 #include "acl_platform.hpp"
 
 #include "acl_profile.hpp"
+#include "acl_versions.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
@@ -1853,6 +1855,7 @@ private:
 			         " is not allowed - an ON CONFLICT DO UPDATE / INSERT OR REPLACE updates the row "
 			         "already there");
 		}
+		RefuseVersionedWrite(key, "update", update); // spec 167
 		if (update.exposes_nothing) {
 			// spec 156: its column sets are empty, which below reads as "no column policy"
 			Deny(Reason::POLICY_ERROR, "update on " + Shown(key) +
@@ -2219,6 +2222,14 @@ private:
 			Note(policy.canonical.empty() ? key : policy.canonical, "select");
 			if (!policy.caps.count("select")) {
 				Deny(Reason::CAPABILITY, "select on " + Shown(key) + " is not allowed");
+			}
+			// spec 167: the version the read names, under the grants' VERSIONS - carried to the source below
+			if (policy.is_view) {
+				if (base.at_clause) {
+					Deny(Reason::STATEMENT_TYPE, "AT (...) names a version of a table - " + Shown(key) + " is a view");
+				}
+			} else {
+				base.at_clause = VersionedAt(key, policy, std::move(base.at_clause));
 			}
 			if (policy.subquery_form) {
 				ref = BuildTableSubquery(base.Table().GetIdentifierName(), policy, base);
@@ -3004,6 +3015,7 @@ private:
 		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr);
+		SourceAt(*select_stmt->node, std::move(original.at_clause), vname);
 		for (auto &text : policy.probes) {
 			// spec 165: a stored view body's probes (its calls with the caller's arguments, spec 164), split off its
 			// SQL by the resolver - bound alone like a statement's, or carried to the root of the principal's view
@@ -3081,7 +3093,113 @@ private:
 		auto sql = "SELECT " + items + policy.ReadFrom();
 		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		SourceAt(*select_stmt->node, std::move(original.at_clause), vname);
 		return ReadRef(std::move(select_stmt), vname, original);
+	}
+
+	//! spec 167: the AT a read of `key` carries to its source under the grants' VERSIONS (`written` the client's, its
+	//! expression rewritten): every version - the client's AT as it is; CURRENT - none, an AT refused; AT - the
+	//! grant's, a client's refused; BETWEEN - the client's TIMESTAMP (a constant or a parameter) checked against the
+	//! window where duckdb evaluates it (`CASE … ELSE error(…)`), none = the window's latest (`least(now, end)`)
+	unique_ptr<AtClause> VersionedAt(const string &key, const TablePolicy &policy, unique_ptr<AtClause> written) {
+		if (policy.versions_differ) {
+			Deny(Reason::CAPABILITY, "the roles' grants on " + Shown(key) +
+			                             " admit different versions (VERSIONS) - which one this read takes is not "
+			                             "decided; read under one role");
+		}
+		auto limit = ReadVersions(policy.versions);
+		switch (limit.kind) {
+		case VersionLimit::Kind::ANY:
+			return written;
+		case VersionLimit::Kind::CURRENT:
+			if (written) {
+				Deny(Reason::CAPABILITY, Shown(key) + " is read at its current version only - AT (...) is not allowed");
+			}
+			return nullptr;
+		case VersionLimit::Kind::AT:
+			if (written) {
+				Deny(Reason::CAPABILITY, Shown(key) + " is read at the version its grant names only - AT (...) is not "
+				                                      "allowed");
+			}
+			return std::move(limit.at);
+		case VersionLimit::Kind::BETWEEN:
+			break;
+		}
+		unique_ptr<ParsedExpression> value;
+		if (written) {
+			if (!StringUtil::CIEquals(written->Unit().GetIdentifierName(), "TIMESTAMP")) {
+				Deny(Reason::CAPABILITY, Shown(key) +
+				                             " is read inside a window of time - AT (TIMESTAMP => ...) names a "
+				                             "version of it, AT (VERSION => ...) does not");
+			}
+			// evaluated twice below (the test and the value), and where the statement binds - a parameter has no value
+			// there: a constant
+			if (!ConstantOnly(*written->ExpressionMutable())) {
+				Deny(Reason::CAPABILITY, Shown(key) + " is read inside a window of time - the AT (TIMESTAMP => ...) "
+				                                      "it is read at is a constant");
+			}
+			value = make_uniq<CastExpression>(LogicalType::TIMESTAMP_TZ, std::move(written->ExpressionMutable()));
+		} else {
+			auto now = make_uniq<FunctionExpression>(Identifier("get_current_timestamp"),
+			                                         vector<unique_ptr<ParsedExpression>>());
+			QualifySystemCall(*now);
+			vector<unique_ptr<ParsedExpression>> pair;
+			pair.push_back(std::move(now));
+			pair.push_back(limit.hi->Copy());
+			value = make_uniq<FunctionExpression>(Identifier("least"), std::move(pair));
+			QualifySystemCall(value->Cast<FunctionExpression>());
+		}
+		vector<unique_ptr<ParsedExpression>> message;
+		message.push_back(ConstantExpression::String("acl_rewrite: " + Shown(key) +
+		                                             " is read inside the window of time its grant names - the "
+		                                             "version asked for is outside it"));
+		auto raise = make_uniq<FunctionExpression>(Identifier("error"), std::move(message));
+		QualifySystemCall(*raise);
+		auto checked = make_uniq<CaseExpression>();
+		CaseCheck check;
+		check.when_expr = make_uniq<BetweenExpression>(value->Copy(), std::move(limit.lo), std::move(limit.hi));
+		check.then_expr = std::move(value);
+		checked->CaseChecksMutable().push_back(std::move(check));
+		checked->ElseMutable() = std::move(raise);
+		return make_uniq<AtClause>(Identifier("TIMESTAMP"), std::move(checked));
+	}
+
+	//! spec 167: `at` onto the source a read of `vname` built from the policy reads - the base table at the end of its
+	//! FROM chain (` FROM phys`, or the cast's / the grant's subqueries over it)
+	void SourceAt(QueryNode &node, unique_ptr<AtClause> at, const string &vname) {
+		if (!at) {
+			return;
+		}
+		if (HasParameter(*at->ExpressionMutable())) {
+			// the read is bound alone too (spec 159) - with no value for the parameter, never against the version
+			Deny(Reason::STATEMENT_TYPE, "AT (...) over " + Shown(vname) +
+			                                 " is read through its grant's policy - write the version as a constant, "
+			                                 "not a parameter");
+		}
+		reference<QueryNode> current = node;
+		while (current.get().type == QueryNodeType::SELECT_NODE) {
+			auto &from = current.get().Cast<SelectNode>().from_table;
+			if (!from) {
+				break;
+			}
+			if (from->type == TableReferenceType::BASE_TABLE) {
+				auto &source = from->Cast<BaseTableRef>();
+				if (source.at_clause) {
+					break;
+				}
+				source.at_clause = std::move(at);
+				return;
+			}
+			if (from->type != TableReferenceType::SUBQUERY) {
+				break;
+			}
+			auto &sub = from->Cast<SubqueryRef>();
+			if (!sub.subquery || !sub.subquery->node) {
+				break;
+			}
+			current = *sub.subquery->node;
+		}
+		Deny(Reason::STATEMENT_TYPE, "AT (...) cannot be carried to the source of " + Shown(vname));
 	}
 
 	//! Replace a metadata surface with the principal's own catalog in the same shape
@@ -4312,6 +4430,14 @@ private:
 	}
 
 	//! Resolve a DML target in place (name -> physical), enforcing the required capability
+	//! spec 167: a grant that reads a snapshot or a window of a table (VERSIONS AT / BETWEEN) writes none of it
+	void RefuseVersionedWrite(const string &key, const string &capability, const TablePolicy &policy) {
+		if (policy.versions_differ || !ReadVersions(policy.versions).AdmitsWrites()) {
+			Deny(Reason::CAPABILITY, capability + " on " + Shown(key) +
+			                             " is not allowed: its grant reads it at a version it names (VERSIONS)");
+		}
+	}
+
 	TablePolicy ResolveDmlTarget(unique_ptr<TableRef> &target, const string &capability) {
 		if (!target || target->type != TableReferenceType::BASE_TABLE) {
 			return TablePolicy();
@@ -4355,6 +4481,9 @@ private:
 		if (!policy.caps.count(capability)) {
 			Deny(Reason::CAPABILITY, capability + " on " + Shown(key) + " is not allowed");
 		}
+		// spec 167: a write reads and writes the current rows - a grant that reads a snapshot or a window writes
+		// nothing
+		RefuseVersionedWrite(key, capability, policy);
 		// spec 156: the grants leave none of the object's columns - every column set below would be empty, which
 		// reads as "no column policy" (the whole physical row written, read in WHERE, returned): no write at all
 		if (policy.exposes_nothing) {
@@ -4364,6 +4493,10 @@ private:
 		// under the read policy where the principal reads the object (the verb's RLS stays AND-ed in), the verb's
 		// where it only writes; a read that does not resolve refuses RETURNING alone, never the write
 		dml_read_policy = policy;
+		// spec 167: the read's versions - judged outside the read's own try, so a stored clause that does not read
+		// back refuses the write too
+		bool read_resolved = false;
+		TablePolicy read_scope;
 		if (!policy.caps.count("select")) {
 			policy.returning_refused = "select on " + Shown(key) + " is not allowed";
 		} else {
@@ -4371,8 +4504,13 @@ private:
 				TablePolicy read;
 				// only where every role the verb unites reads: the verb's slice then lies inside the read's - else a
 				// condition would read the read's columns on rows only the verb reaches (the re-review's oracle)
-				if (store.ResolveTable(principal, key, read) && policy.capability_rows_read) {
-					dml_read_policy = read;
+				if (store.ResolveTable(principal, key, read)) {
+					read_resolved = true;
+					read_scope.versions = read.versions;
+					read_scope.versions_differ = read.versions_differ;
+					if (policy.capability_rows_read) {
+						dml_read_policy = read;
+					}
 				}
 			} catch (std::exception &ex) {
 				TakeDenyReason();
@@ -4383,6 +4521,10 @@ private:
 				policy.returning_refused = "a role that may " + capability + " " + Shown(key) +
 				                           " but not read it would widen what RETURNING returns";
 			}
+		}
+		if (read_resolved) {
+			// what the write's own conditions read is the current rows, which the role does not read
+			RefuseVersionedWrite(key, capability, read_scope);
 		}
 		if (!policy.capability_rows_read) {
 			bool restricted = false;

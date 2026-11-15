@@ -35,9 +35,9 @@ CREATE TABLE IF NOT EXISTS acl."roles"("role" VARCHAR PRIMARY KEY, "comment" VAR
 
 CREATE TABLE IF NOT EXISTS acl."role_claims"("role" VARCHAR, "claim" VARCHAR, "value" VARCHAR, PRIMARY KEY ("role", "claim"));
 
-CREATE TABLE IF NOT EXISTS acl."role_catalogs"("role" VARCHAR, "vcat" VARCHAR, "is_main" BOOLEAN, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, PRIMARY KEY ("role", "vcat"));
+CREATE TABLE IF NOT EXISTS acl."role_catalogs"("role" VARCHAR, "vcat" VARCHAR, "is_main" BOOLEAN, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, "versions" VARCHAR, PRIMARY KEY ("role", "vcat"));
 
-CREATE TABLE IF NOT EXISTS acl."role_object_caps"("role" VARCHAR, "vcat" VARCHAR, "vname" VARCHAR, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, PRIMARY KEY ("role", "vcat", "vname"));
+CREATE TABLE IF NOT EXISTS acl."role_object_caps"("role" VARCHAR, "vcat" VARCHAR, "vname" VARCHAR, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, "versions" VARCHAR, PRIMARY KEY ("role", "vcat", "vname"));
 
 -- spec 072: what a principal may call. A function's key is (database, schema, name, kind) - kind is
 -- 'scalar' or 'table', what the rewriter knows before bind - and a category is a named set of keys.
@@ -151,7 +151,7 @@ INSERT INTO acl."function_grants" SELECT * FROM (VALUES ('', 'base', '', '', '',
 
 INSERT INTO acl."meta" SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'function_seed');
 
-INSERT INTO acl."meta" SELECT 'schema_version', '23' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '24' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
 
@@ -159,4 +159,4 @@ INSERT INTO acl."meta" SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 F
 
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO acl."meta" SELECT 'min_reader_version', '21' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');
+INSERT INTO acl."meta" SELECT 'min_reader_version', '24' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');

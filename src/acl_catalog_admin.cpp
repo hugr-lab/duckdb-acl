@@ -6,6 +6,7 @@
 #include "acl_door_common.hpp"
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_versions.hpp"
 #include "acl_platform.hpp"
 #include "acl_scan_util.hpp"
 #include "acl_lineage.hpp"
@@ -2580,9 +2581,41 @@ void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const str
 
 } // namespace
 
+string PolicyStore::NormalizeGrantVersions(const string &written) {
+	RequireCatalog(catalog, "acl grant");
+	return NormalizeVersions(written, [&](const string &sql) {
+		auto result = catalog->Query("SELECT CAST((" + sql + ") AS VARCHAR)");
+		auto value = result->Collection().GetValue(0, 0);
+		return value.IsNull() ? string() : value.ToString();
+	});
+}
+
+namespace {
+
+//! spec 167: the versions a grant row keeps - `versions` normalized where written, else what the row stored (a
+//! rewrite of its other parts: ALTER GRANT, a repair), read in the write's own transaction
+string GrantVersionsSql(const ReadFn &read, const string &table, const string &where,
+                        optional_ptr<const string> normalized) {
+	if (normalized) {
+		return normalized->empty() ? string("NULL") : Lit(*normalized);
+	}
+	auto stored = read("SELECT \"versions\" FROM " + table + " WHERE " + where);
+	if (stored->RowCount() == 0 || stored->Collection().GetValue(0, 0).IsNull()) {
+		return "NULL";
+	}
+	return Lit(stored->Collection().GetValue(0, 0).ToString());
+}
+
+} // namespace
+
 void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
-                               const string &rls, const string &columns, bool judge_columns, bool judge_caps) {
+                               const string &rls, const string &columns, bool judge_columns, bool judge_caps,
+                               optional_ptr<const string> versions) {
 	RequireCatalog(catalog, "acl_grant_catalog");
+	string normalized;
+	if (versions) {
+		normalized = NormalizeGrantVersions(*versions);
+	}
 	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls,
 	                             judge_columns ? acl_detail::ParseWrittenColumnList(columns)
 	                                           : acl_detail::ParseColumnList(columns));
@@ -2597,14 +2630,17 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 	// against is the catalog this grant commits into
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto checked = catalog->CatalogPredicateChecked(read, vcat, rls);
-		statements.push_back("DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
-		                     " AND \"vcat\" = " + Lit(vcat));
-		statements.push_back("INSERT INTO " + catalog->Tbl("role_catalogs") +
-		                     "(\"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\", \"rls_checked\")"
-		                     " VALUES (" +
-		                     Lit(role) + ", " + Lit(vcat) + ", " + (is_main ? "true" : "false") + ", " +
-		                     Lit(caps_json) + ", " + Lit(rls) + ", " + Lit(columns) + ", " +
-		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
+		auto where = "\"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat);
+		auto kept = GrantVersionsSql(read, catalog->Tbl("role_catalogs"), where,
+		                             versions ? optional_ptr<const string>(&normalized) : nullptr);
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE " + where);
+		statements.push_back(
+		    "INSERT INTO " + catalog->Tbl("role_catalogs") +
+		    "(\"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\", \"rls_checked\", \"versions\")"
+		    " VALUES (" +
+		    Lit(role) + ", " + Lit(vcat) + ", " + (is_main ? "true" : "false") + ", " + Lit(caps_json) + ", " +
+		    Lit(rls) + ", " + Lit(columns) + ", " + (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ", " +
+		    kept + ")");
 	});
 	NoteGrantLineage(vcat); // spec 107: what the role sees changed
 }
@@ -4230,8 +4266,26 @@ string ExposedColumnList(CatalogBackend &catalog, const ReadFn &read, const stri
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
                                        const string &caps_json, const string &rls, const string &columns,
-                                       bool judge_caps, bool ensure_grant, bool written_list) {
+                                       bool judge_caps, bool ensure_grant, bool written_list,
+                                       optional_ptr<const string> versions) {
 	RequireCatalog(catalog, "acl catalog");
+	string normalized;
+	if (versions) {
+		normalized = NormalizeGrantVersions(*versions);
+		if (!normalized.empty()) {
+			// a view reads what its body reads (the constructor's, spec 138) and a function what its template does:
+			// only a table has versions of its own
+			auto other = catalog->Query("SELECT 1 FROM " + catalog->Tbl("relations") +
+			                            " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+			                            " AND \"form\" = 'view' UNION ALL SELECT 1 FROM " + catalog->Tbl("functions") +
+			                            " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+			if (other->RowCount() > 0) {
+				throw BinderException("acl admin: VERSIONS names the versions of a table - \"%s.%s\" is a view or a "
+				                      "function, which reads what its definition reads",
+				                      vcat, vname);
+			}
+		}
+	}
 	// a list given by a caller is judged as written; one rebuilt from a stored row (a repair) is read as stored
 	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls,
 	                             written_list ? acl_detail::ParseWrittenColumnList(columns)
@@ -4243,14 +4297,16 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 			statements.push_back(EnsureGrantSql(role, vcat, false));
 		}
 		auto plan = PlanObjectGrant(*catalog, read, role, vcat, vname, rls, columns, statements);
-		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
-		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-		statements.push_back("INSERT INTO " + catalog->Tbl("role_object_caps") +
-		                     "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\")"
-		                     " VALUES (" +
-		                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " +
-		                     Lit(rls) + ", " + Lit(plan.listed) + ", " +
-		                     (rls.empty() ? "NULL" : (plan.checked ? "true" : "false")) + ")");
+		auto where = "\"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname);
+		auto kept = GrantVersionsSql(read, catalog->Tbl("role_object_caps"), where,
+		                             versions ? optional_ptr<const string>(&normalized) : nullptr);
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE " + where);
+		statements.push_back(
+		    "INSERT INTO " + catalog->Tbl("role_object_caps") +
+		    "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\", \"versions\")"
+		    " VALUES (" +
+		    Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " + Lit(rls) + ", " +
+		    Lit(plan.listed) + ", " + (rls.empty() ? "NULL" : (plan.checked ? "true" : "false")) + ", " + kept + ")");
 	});
 	NoteGrantLineage(vcat, vname); // spec 107
 }

@@ -15,6 +15,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_versions.hpp"
 #include "acl_platform.hpp"
 #include "acl_types.hpp"
 #include "acl_placement.hpp"
@@ -801,7 +802,70 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
 	NoteUnionWidens(out.canonical.empty() ? vname : out.canonical, capability, united, known);
+	if (!out.is_view) { // a view reads what its body reads: the constructor's (spec 138), and refuses an AT
+		ApplyGrantVersions(united, result->Collection().GetValue(result->ColumnCount() - 3, 0).ToString(),
+		                   result->Collection().GetValue(result->ColumnCount() - 2, 0).ToString(),
+		                   out.canonical.empty() ? vname : out.canonical, capability, out);
+	}
 	return true;
+}
+
+void CatalogBackend::ApplyGrantVersions(const vector<std::pair<string, GrantPolicy>> &united, const string &vcat,
+                                        const string &vname, const string &object, const string &capability,
+                                        TablePolicy &out) {
+	if (function_mode || united.empty()) {
+		return;
+	}
+	vector<string> roles;
+	for (auto &role : united) {
+		roles.push_back(role.first);
+	}
+	auto result =
+	    Query("SELECT g.\"role\", oc.\"versions\", g.\"versions\" FROM " + Tbl("role_catalogs") + " g LEFT JOIN " +
+	          Tbl("role_object_caps") + " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = g.\"vcat\" AND " +
+	          KeyEqSql("oc.\"vname\"", Lit(vname)) + " WHERE " + KeyEqSql("g.\"vcat\"", Lit(vcat)) +
+	          " AND g.\"role\" IN (" + LitList(roles) + ")");
+	ResultRows rows(*result);
+	vector<string> stated;
+	std::unordered_map<string, string> by_role;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		auto object_versions = rows.GetValue(1, row);
+		auto catalog_versions = rows.GetValue(2, row);
+		auto text = !object_versions.IsNull()    ? object_versions.ToString()
+		            : !catalog_versions.IsNull() ? catalog_versions.ToString()
+		                                         : string();
+		stated.push_back(text);
+		by_role[rows.GetValue(0, row).ToString()] = text;
+	}
+	out.versions = UniteVersions(stated, out.versions_differ);
+	if (!on_union_widens || !out.versions.empty() || out.versions_differ) {
+		return;
+	}
+	// every version won: a limited role's slice read in history through a role that reads every version but another
+	// slice (spec 146 - the union is per object, documented and audited, never refused)
+	auto every = [&](const string &role) {
+		auto text = by_role[role];
+		StringUtil::Trim(text);
+		return text.empty() || StringUtil::CIEquals(text, "ANY");
+	};
+	auto same = [](const GrantPolicy &a, const GrantPolicy &b) {
+		return a.restricts == b.restricts && a.Predicate() == b.Predicate() && a.columns == b.columns;
+	};
+	vector<UnionWidening> pairs;
+	for (auto &limited : united) {
+		if (every(limited.first)) {
+			continue;
+		}
+		for (auto &wide : united) {
+			if (every(wide.first) && (wide.second.restricts || !wide.second.Predicate().empty()) &&
+			    !same(wide.second, limited.second) && pairs.size() <= UnionWidening::REPORTED) {
+				pairs.push_back({limited.first, wide.first, {UnionWidening::EVERY_VERSION}});
+			}
+		}
+	}
+	if (!pairs.empty()) {
+		on_union_widens(object, capability, pairs);
+	}
 }
 
 void CatalogBackend::ApplyTypeFacts(ResultRows &row, TablePolicy &out) {
@@ -1149,6 +1213,9 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	ApplyGrantPolicy(vname, grants, no_columns, out);
 	// the alias is the object: a tail is the client's text, and the alias's policy is one for every tail
 	NoteUnionWidens(NamePath::JoinKeys(vcat, alias_path), capability, united, {});
+	// spec 167: an object grant on the table under the alias, else the catalog grant's
+	ApplyGrantVersions(united, vcat, NamePath::JoinKeys(alias_path, tail), NamePath::JoinKeys(vcat, alias_path),
+	                   capability, out);
 	return true;
 }
 
