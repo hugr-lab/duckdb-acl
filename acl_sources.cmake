@@ -46,6 +46,7 @@ set(EXTENSION_SOURCES
     ${ACL_ROOT}/src/acl_catalog_maintenance.cpp
     ${ACL_ROOT}/src/acl_sql_text.cpp
     ${ACL_ROOT}/src/acl_types.cpp
+    ${ACL_ROOT}/src/acl_versions.cpp
     ${ACL_ROOT}/src/acl_lineage_walker.cpp
     ${ACL_ROOT}/src/acl_lineage.cpp
     ${ACL_ROOT}/src/acl_lineage_runtime.cpp

@@ -521,7 +521,7 @@ Functions: `acl_map_role(scope_kind, scope, source, external_value, role)` and
 
 ```
 GRANT CATALOG <catalog> TO ROLE <role>
-    [WITH (<capability>, …) | CAPS '<json>'] [MAIN] [RLS (<predicate>)] [COLUMNS (<item>, …)]
+    [WITH (<capability>, …) | CAPS '<json>'] [MAIN] [RLS (<predicate>)] [COLUMNS (<item>, …)] [VERSIONS <versions>]
 ALTER GRANT CATALOG <catalog> TO ROLE <role>
     SET CAPS '<json>' | SET RLS '<predicate>' | SET COLUMNS '<list>' | SET MAIN true | false
 REVOKE CATALOG <catalog> FROM ROLE <role>
@@ -531,6 +531,8 @@ REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>
 The grant that makes a catalog resolve for a role. `REVOKE TABLE | VIEW | OBJECT` (spec 120) takes one object's own
 grant (`GRANT TABLE … CAPS …`) - its caps, policy and columns; the catalog's or a schema's grant then decides that
 object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like every grant. Clauses after the role come in any order, each once.
+`VERSIONS` limits the versions of the catalog's time-travel tables the role reads ([below](#versions-of-a-time-travel-table-spec-167));
+an object grant that states none takes the catalog grant's, and `ALTER GRANT` keeps it.
 
 - **Capabilities.** `WITH (…)` is the list form of `CAPS '{"select": true, …}'`. A grant that states
   nothing holds every data capability - `select`, `insert`, `update`, `delete`, `merge` - and never
@@ -669,7 +671,7 @@ nearest ancestor that states capabilities (function only).
 
 ```
 GRANT TABLE | VIEW | OBJECT <catalog>.<name> TO ROLE <role>
-    [WITH (<capability>, …) | CAPS '<json>'] [RLS (<predicate>)] [COLUMNS (<item>, …)]
+    [WITH (<capability>, …) | CAPS '<json>'] [RLS (<predicate>)] [COLUMNS (<item>, …)] [VERSIONS <versions>]
 ```
 
 The three keywords are the same statement: the name may be a table, a view, a table function or a
@@ -701,7 +703,7 @@ A `COLUMNS` item with a value on a writable table is an assignment as well as a 
 `tenant = acl_claim('tenant')` is added to an `INSERT` when absent, overrides a supplied value, and
 is applied to an `UPDATE`'s `SET`.
 
-Writing the grant again replaces it whole (caps, `RLS`, `COLUMNS`); `REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM
+Writing the grant again replaces it whole (caps, `RLS`, `COLUMNS`, `VERSIONS`); `REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM
 ROLE <role>` takes it away (spec 120), and the catalog's or a schema's grant decides the object again.
 
 ### Fields of a structured column (spec 102)
@@ -758,7 +760,49 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE inj WITH (select, insert, update)
 ACL ADMIN GRANT TABLE sales.shout TO ROLE ingest CAPS '{"select": true}';   -- read on one function only
 ```
 
-Function: `acl_grant_object(role, vcat, vname, caps_json[, rls, columns])`.
+Function: `acl_grant_object(role, vcat, vname, caps_json[, rls, columns[, versions]])`.
+
+### Versions of a time-travel table (spec 167)
+
+A table of a catalog that keeps its history (DuckLake, Iceberg) is read at an older version with duckdb's
+`AT (VERSION => n)` / `AT (TIMESTAMP => t)`. A grant's `VERSIONS` says which versions the role reads:
+
+| `VERSIONS` | the role reads |
+| --- | --- |
+| not stated | the catalog grant's; on a catalog grant, every version (as before) |
+| `ANY` | every version: the role's own `AT (…)` as it is written |
+| `CURRENT` | the current version; any `AT (…)` is refused |
+| `AT (VERSION => 42)` / `AT (TIMESTAMP => TIMESTAMP '2026-06-30')` | that snapshot: a read without `AT` reads it, any other `AT` is refused |
+| `BETWEEN TIMESTAMP '2026-01-01' AND TIMESTAMP '2026-06-30'` | an `AT (TIMESTAMP => t)` with `t` inside the window; a read without `AT` reads the window's latest version (`least(now(), end)`) |
+
+```sql
+ACL ADMIN GRANT CATALOG lake TO ROLE analyst MAIN VERSIONS CURRENT;
+ACL ADMIN GRANT TABLE lake.orders TO ROLE auditor VERSIONS BETWEEN TIMESTAMP '2026-01-01' AND TIMESTAMP '2026-06-30';
+ACL ADMIN GRANT TABLE lake.orders TO ROLE closing VERSIONS AT (VERSION => 1204);
+```
+
+- **Values are constants.** They are evaluated where the grant is written and stored as constants. A version is an
+  integer. A timestamp is a finite instant, stored in UTC. A `TIMESTAMP` without an offset is read in the node's time
+  zone (UTC on a build without ICU), so write an offset (`TIMESTAMPTZ '2026-06-30 00:00:00+00'`) to be exact.
+- **The version is read below the policy.** The grant's `RLS`, masks and columns apply to the version read, as they
+  do to the current one.
+- **Inside a window**, the role's `AT (TIMESTAMP => …)` is a constant. `AT (VERSION => …)` is refused there: a
+  version number says nothing about its time.
+- **Parameters.** A read through the grant's policy (an `RLS`, a mask, a column list) takes a constant `AT`, not a
+  parameter. Such a read is also bound alone before the statement runs (spec 159), where a parameter has no value.
+- **Writes.** A role whose grant reads a snapshot or a window (`AT`, `BETWEEN`) writes nothing to the table: a write
+  reads and writes the current rows.
+- **Several roles.** A principal's roles unite: when one of them reads every version, the principal does. Two
+  different limits are refused (read under one role), as two masks of one column are. When the role that reads every
+  version sees another slice than a limited role (another `RLS`, other columns), the union reads the limited role's
+  slice in history. That is audited as `role_union_widens` (spec 146), never refused.
+- **The virtual name decides.** `VERSIONS` follows the object the name resolves to. A live schema alias reaching the
+  same physical table takes the alias's grants, the catalog grant's `VERSIONS` included, not the table object's.
+- **Views and functions.** A view or a table function reads what its definition reads, so it takes no `VERSIONS`.
+  An `AT` on a virtual view is refused.
+- **Other ways to name a version.** DuckLake's own functions (`ducklake_*`, its snapshot listings and change feeds)
+  are in the never set. A scan function that takes a version (`iceberg_scan(…, version => …)`) is in no category
+  until an operator puts it in one.
 
 ## Function categories
 

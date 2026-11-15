@@ -1,0 +1,435 @@
+# name: test/sql/acl_versioned_tables.test
+# description: spec 167 - a grant's VERSIONS limits the versions of a time-travel table a role reads: CURRENT (no AT),
+#   AT (that snapshot only), BETWEEN (a TIMESTAMP inside the window), unstated = every version, as before; the AT is
+#   carried to the source below the grant's row filter (it used to be dropped there), a view refuses an AT, a grant
+#   that reads a snapshot or a window writes nothing, roles whose clauses differ refuse. The token names two roles:
+#   analyst and auditor (test/idp/rs).
+# group: [sql]
+
+require acl
+
+require parquet
+
+require ducklake
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+SET GLOBAL acl_audit_level = 'decisions';
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/versions_lake.ducklake' AS lk (DATA_PATH '{TEST_DIR}/versions_lake');
+
+statement ok
+CREATE TABLE lk.t (id INTEGER, region VARCHAR);
+
+# snapshot 2: (1, eu); snapshot 3: (1, eu), (2, us); snapshot 4 (current): (2, us)
+statement ok
+INSERT INTO lk.t VALUES (1, 'eu');
+
+statement ok
+INSERT INTO lk.t VALUES (2, 'us');
+
+statement ok
+DELETE FROM lk.t WHERE id = 1;
+
+query I
+SELECT max(snapshot_id) FROM ducklake_snapshots('lk');
+----
+4
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE VIRTUAL TABLE c.t AS lk.main.t; CREATE VIRTUAL SCHEMA c.raw AS lk.main;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.v AS 'SELECT * FROM lk.main.t';
+
+statement ok
+ACL ADMIN CREATE ROLE every; CREATE ROLE everyrls; CREATE ROLE cur; CREATE ROLE pin; CREATE ROLE pinrls; CREATE ROLE win; CREATE ROLE old; CREATE ROLE analyst; CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE every MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE everyrls MAIN; GRANT TABLE c.t TO ROLE everyrls RLS (region = 'eu');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cur MAIN VERSIONS CURRENT;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE pin MAIN; GRANT TABLE c.t TO ROLE pin VERSIONS AT (VERSION => 2);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE pinrls MAIN VERSIONS AT (VERSION => 3); GRANT TABLE c.t TO ROLE pinrls RLS (region = 'eu');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE win MAIN VERSIONS BETWEEN TIMESTAMP '2000-01-01' AND TIMESTAMP '2100-01-01';
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE old MAIN VERSIONS BETWEEN TIMESTAMP '2000-01-01' AND TIMESTAMP '2000-01-02';
+
+# stored as the clause, its values constants
+query TT
+SELECT role, versions FROM store.acl.role_catalogs WHERE versions IS NOT NULL AND role IN ('cur', 'pinrls') ORDER BY role;
+----
+cur	CURRENT
+pinrls	AT (VERSION => 3)
+
+query T
+SELECT versions FROM store.acl.role_object_caps WHERE role = 'pin';
+----
+AT (VERSION => 2)
+
+# --- unstated: every version, as before - and the AT is now carried below a grant's row filter --------------------
+
+query IT
+ACL ROLE "every" SELECT * FROM t AT (VERSION => 2);
+----
+1	eu
+
+query IT
+ACL ROLE "every" SELECT * FROM raw.t AT (VERSION => 3) ORDER BY id;
+----
+1	eu
+2	us
+
+# the subquery form (an RLS) read the current rows whatever AT asked for
+query IT
+ACL ROLE "everyrls" SELECT * FROM t AT (VERSION => 3);
+----
+1	eu
+
+query I
+ACL ROLE "everyrls" SELECT count(*) FROM t;
+----
+0
+
+# --- CURRENT -------------------------------------------------------------------------------------------------------
+
+query IT
+ACL ROLE "cur" SELECT * FROM t;
+----
+2	us
+
+statement error
+ACL ROLE "cur" SELECT * FROM t AT (VERSION => 2);
+----
+is read at its current version only
+
+statement error
+ACL ROLE "cur" SELECT * FROM raw.t AT (VERSION => 2);
+----
+is read at its current version only
+
+statement ok
+ACL ROLE "cur" INSERT INTO t VALUES (3, 'eu');
+
+statement ok
+ACL ROLE "cur" DELETE FROM t WHERE id = 3;
+
+# --- AT: the grant's snapshot, no other ----------------------------------------------------------------------------
+
+query IT
+ACL ROLE "pin" SELECT * FROM t;
+----
+1	eu
+
+statement error
+ACL ROLE "pin" SELECT * FROM t AT (VERSION => 4);
+----
+is read at the version its grant names only
+
+query IT
+ACL ROLE "pinrls" SELECT * FROM t;
+----
+1	eu
+
+# a write reads and writes the current rows
+statement error
+ACL ROLE "pin" DELETE FROM t WHERE id = 2;
+----
+its grant reads it at a version it names
+
+statement error
+ACL ROLE "pin" INSERT INTO t VALUES (9, 'eu');
+----
+its grant reads it at a version it names
+
+statement error
+ACL ROLE "pinrls" UPDATE t SET region = 'x';
+----
+its grant reads it at a version it names
+
+# --- BETWEEN: a TIMESTAMP inside the window; none = the window's latest --------------------------------------------
+
+query IT
+ACL ROLE "win" SELECT * FROM t;
+----
+2	us
+
+statement error
+ACL ROLE "win" SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '1999-01-01');
+----
+the version asked for is outside it
+
+statement error
+ACL ROLE "win" SELECT * FROM raw.t AT (TIMESTAMP => TIMESTAMP '1999-01-01');
+----
+the version asked for is outside it
+
+# evaluated twice (the test, the value) and where the statement binds: a constant
+statement error
+ACL ROLE "win" SELECT * FROM t AT (TIMESTAMP => now());
+----
+is a constant
+
+statement error
+ACL ROLE "win" SELECT * FROM t AT (VERSION => 2);
+----
+AT (VERSION => ...) does not
+
+# the window's latest is before the table: no snapshot, never the current one
+statement error
+ACL ROLE "old" SELECT * FROM t;
+----
+No snapshot found
+
+statement error
+ACL ROLE "win" DELETE FROM t;
+----
+its grant reads it at a version it names
+
+# --- a view reads what its body reads ------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "every" SELECT * FROM v AT (VERSION => 2);
+----
+is a view
+
+statement error
+ACL ADMIN GRANT TABLE c.v TO ROLE every VERSIONS CURRENT;
+----
+is a view or a function
+
+statement error
+ACL ADMIN GRANT SCHEMA c.raw TO ROLE every VERSIONS CURRENT;
+----
+RLS, COLUMNS and VERSIONS belong to the catalog or to the object
+
+# --- several roles: every version wins, different clauses refuse ---------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN VERSIONS CURRENT;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor MAIN VERSIONS AT (VERSION => 3);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t;
+----
+admit different versions
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN;
+
+query IT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t AT (VERSION => 2);
+----
+1	eu
+
+# every version won over a limited role whose slice differs: its slice read in history - audited (spec 146), beside the
+# union of columns of the same roles, each its own event
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN VERSIONS CURRENT; GRANT TABLE c.t TO ROLE analyst RLS (region = 'us') COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor MAIN; GRANT TABLE c.t TO ROLE auditor RLS (region = 'eu');
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT count(*) FROM t AT (VERSION => 3);
+----
+2
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'role_union_widens' ORDER BY reason;
+----
+the union of roles analyst, auditor may show cells none of them reads: analyst's rows in every version auditor reads
+the union of roles analyst, auditor may show cells none of them reads: auditor's columns outside the lists read on analyst's rows
+
+statement ok
+ACL ADMIN REVOKE TABLE c.t FROM ROLE analyst; GRANT TABLE c.t TO ROLE auditor RLS (region = 'us');
+
+query IT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t AT (VERSION => 2);
+----
+1	eu
+
+# a stored clause of the read that does not read back refuses the write too
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN VERSIONS AT (VERSION => 2); REVOKE TABLE c.t FROM ROLE auditor; GRANT CATALOG c TO ROLE auditor WITH (delete) MAIN;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' DELETE FROM t WHERE id = 2;
+----
+its grant reads it at a version it names
+
+statement ok
+SET GLOBAL acl_version_check_interval = 0;
+
+statement ok
+UPDATE store.acl.role_catalogs SET versions = 'AT (VERSION => 2) garbage' WHERE role = 'analyst';
+
+statement ok
+UPDATE store.acl.meta SET "value" = (CAST("value" AS BIGINT) + 1)::VARCHAR WHERE "key" = 'policy_version';
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' DELETE FROM t WHERE id = 2;
+----
+do not read as a VERSIONS clause
+
+query I
+SELECT count(*) FROM lk.t;
+----
+1
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN; GRANT CATALOG c TO ROLE auditor MAIN;
+
+# --- an object grant states its own, else the catalog grant's; a rewrite of another part keeps them ---------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE cur VERSIONS ANY;
+
+query IT
+ACL ROLE "cur" SELECT * FROM t AT (VERSION => 2);
+----
+1	eu
+
+statement ok
+ACL ADMIN ALTER GRANT CATALOG c TO ROLE win SET CAPS '{"select": true}';
+
+statement error
+ACL ROLE "win" SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '1999-01-01');
+----
+the version asked for is outside it
+
+# a re-grant states the grant whole
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE win MAIN;
+
+query IT
+ACL ROLE "win" SELECT * FROM t AT (VERSION => 2);
+----
+1	eu
+
+# --- what a grant's VERSIONS may be --------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS AT (VERSION => random());
+----
+is not a constant
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS BETWEEN TIMESTAMP '2001-01-01' AND TIMESTAMP '2000-01-01';
+----
+its start is after its end
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS AT (VERSION => 1) VERSIONS ANY;
+----
+VERSIONS is written twice
+
+statement error
+SELECT acl_grant_object('pin', 'c', 't', '', '', '', 'AT (VERSION => (SELECT 1))');
+----
+is not a constant
+
+statement error
+SELECT acl_grant_object('pin', 'c', 't', '', '', '', 'AT (VERSION => 1) WHERE true');
+----
+does not read as AT
+
+statement error
+SELECT acl_grant_object('pin', 'c', 't', '', '', '', 'BETWEEN 1 AND 2 OR true');
+----
+does not read as BETWEEN
+
+statement error
+SELECT acl_grant_object('pin', 'c', 't', '', '', '', 'AT (VERSION => NULL)');
+----
+is NULL
+
+statement error
+SELECT acl_grant_object('pin', 'c', 't', '', '', '', 'LATEST');
+----
+is no VERSIONS clause
+
+statement error
+SELECT acl_grant_object('pin', 'c', 't', '', '', '', 'AT (VERSION => 5) GROUP BY ALL');
+----
+does not read as AT
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS AT (VERSION => 1.9);
+----
+a VERSION is an integer
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS AT (VERSION => true);
+----
+a VERSION is an integer
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS AT (VERSION => '42');
+----
+a VERSION is an integer
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS AT (TIMESTAMP => 'infinity');
+----
+a TIMESTAMP is finite
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE pin VERSIONS BETWEEN 1 AND 2;
+----
+is no value of that kind
+
+# an instant is stored in UTC, whatever time zone wrote it
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE old VERSIONS AT (TIMESTAMP => TIMESTAMPTZ '2026-06-30 09:00:00+09');
+
+query T
+SELECT versions FROM store.acl.role_object_caps WHERE role = 'old';
+----
+AT (TIMESTAMP => TIMESTAMPTZ '2026-06-30 00:00:00.000000+00')
+
+# a stored row that is not constants (no writer of ours stores one) refuses the read
+statement ok
+UPDATE store.acl.role_object_caps SET versions = 'AT (VERSION => (SELECT 2))' WHERE role = 'old';
+
+statement error
+ACL ROLE "old" SELECT * FROM t;
+----
+do not read as a VERSIONS clause
+
+# the pin stands: nothing refused changed it
+query IT
+ACL ROLE "pin" SELECT * FROM t;
+----
+1	eu

@@ -681,6 +681,12 @@ struct CatalogBackend {
 	//! spec 099: the casts a relation's read needs - its type facts (columns 14..16 of the lookup)
 	//! under its own policy, else the node's; a view's are applied by ApplyGrantPolicy
 	void ApplyTypeFacts(ResultRows &row, TablePolicy &out);
+	//! spec 167: the versions the roles whose rows the policy united (`united`) read of object `vname` of `vcat` - each
+	//! role's object grant's VERSIONS, else its catalog grant's, united (UniteVersions); a driver states none
+	//! A role reading every version beside a limited one whose rows or columns differ unites into cells neither reads
+	//! (the history of the limited role's slice): reported as spec 146's union widening, `object` / `capability` its
+	void ApplyGrantVersions(const vector<std::pair<string, GrantPolicy>> &united, const string &vcat,
+	                        const string &vname, const string &object, const string &capability, TablePolicy &out);
 	string ColumnsSource(const Principal &principal, const vector<string> &names);
 	string AliasesSource(const Principal &principal);
 	string FunctionsSource(const Principal &principal, const vector<string> &names);

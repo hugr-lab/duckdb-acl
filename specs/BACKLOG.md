@@ -39,15 +39,11 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - mirror / pull-through / publish, everything re-signed with our key;
   - public vs private extensions (a token through an http secret, tresor-issued);
   - air-gapped bundles.
-- **Before the platform's release: RLS for versioned tables** (DuckLake, Iceberg; the owner, 2026-11-05). A grant says,
-  per role, which versions of a time-travel table the role reads:
-  - only the current one (any `AT (…)` refused);
-  - strictly one snapshot (the rewrite pins `AT (VERSION => n)`, any other refused);
-  - a date range (an `AT (TIMESTAMP => t)` / `AT (VERSION => v)` admitted only inside it).
-  It needs the grant's syntax and the rewrite of `BaseTableRef::at_clause`, which spec 139 already walks. It also
-  covers the reads that name a version some other way: a scan function's version argument, and the snapshot listings.
-  Today an `AT (…)` on a virtual object read through a subquery (a projection, an RLS, a rename or a cast) is dropped
-  silently - neither read form carries `at_clause` (found by spec 159's review).
+- **Versioned tables after spec 167** (a grant's `VERSIONS`, built 2026-11-15):
+  - `platform.effective_rights` / `check_grant` do not show a role's versions;
+  - there is no `ALTER GRANT … SET VERSIONS` (a re-grant changes them);
+  - Iceberg is not exercised (no Iceberg catalog in the test build);
+  - an `AT` read through a grant's policy takes a constant, never a parameter (spec 159's guard binds it alone).
 - **Still open with the owner**:
   - 017 §7.4: rebuild others' extensions, or mirror the official binaries;
   - §7.9: the repository's licence;

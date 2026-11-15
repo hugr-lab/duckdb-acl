@@ -5,6 +5,9 @@
 
 #include "acl_test_util.hpp"
 
+#include <cstdlib>
+#include <unistd.h>
+
 using namespace duckdb;
 using namespace acl_test;
 
@@ -171,6 +174,66 @@ void PlatformCallParameters() {
 	}
 }
 
+//! spec 167: an AT's parameter stays the client's (the rewrite adds none), carried to the source below a grant's row
+//! filter, and a grant's window checks it where duckdb evaluates it - at each execution
+void VersionsAtParameter() {
+	char directory[] = "/tmp/acl-versions-XXXXXX";
+	if (!Check(mkdtemp(directory) != nullptr, "a lake directory of the test's own")) {
+		return;
+	}
+	std::string lake = directory;
+	// the lake's own extension, as the build made it (the test binaries link duckdb without it); a build without it
+	// has no time travel to test
+	const std::string ducklake = "build/release/extension/ducklake/ducklake.duckdb_extension";
+	if (access(ducklake.c_str(), R_OK) != 0) {
+		std::cout << "  skip: no " << ducklake << std::endl;
+		return;
+	}
+	DBConfig config;
+	config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	Exec(con, "LOAD acl");
+	Exec(con, "LOAD parquet");
+	Exec(con, "LOAD '" + ducklake + "'");
+	Exec(con, "ATTACH 'ducklake:" + lake + "/meta.ducklake' AS lk (DATA_PATH '" + lake + "/data')");
+	Exec(con, "CREATE TABLE lk.t (id INTEGER, region VARCHAR)");
+	Exec(con, "INSERT INTO lk.t VALUES (1, 'eu')"); // snapshot 2
+	Exec(con, "INSERT INTO lk.t VALUES (2, 'us')"); // snapshot 3
+	Exec(con, "DELETE FROM lk.t WHERE id = 1");     // snapshot 4
+	Exec(con, "ATTACH ':memory:' AS store");
+	Exec(con, "SELECT acl_use_db('store', 'acl', true)");
+	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE VIRTUAL TABLE c.t AS lk.main.t; CREATE ROLE rls; "
+	          "CREATE ROLE win; CREATE ROLE every");
+	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE every MAIN");
+	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE rls MAIN; GRANT TABLE c.t TO ROLE rls RLS (region = 'eu')");
+	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE win MAIN VERSIONS BETWEEN TIMESTAMP '2000-01-01' AND TIMESTAMP "
+	          "'2100-01-01'");
+
+	// the in-place read (no policy text): the client's parameter, rebound at each execution as duckdb does
+	auto every = con.Prepare("ACL ROLE \"every\" SELECT id FROM t AT (VERSION => $1) ORDER BY id");
+	if (CheckOk(*every, "an AT with a parameter prepares")) {
+		Check(every->GetParameterCount() == 1, "...with the client's one parameter");
+		auto old = every->Execute(3);
+		CheckColumn(*old, {1, 2}, "AT (VERSION => 3): that snapshot");
+		auto now = every->Execute(4);
+		CheckColumn(*now, {2}, "AT (VERSION => 4): the current one");
+	}
+	// a read through the grant's policy is bound alone too (spec 159), where a parameter has no value: refused
+	auto rls = con.Prepare("ACL ROLE \"rls\" SELECT id FROM t AT (VERSION => $1)");
+	Check(rls->HasError() && rls->GetError().find("not a parameter") != std::string::npos,
+	      "an AT parameter under a row filter is refused: " + (rls->HasError() ? rls->GetError() : "it prepared"));
+	auto window = con.Prepare("ACL ROLE \"win\" SELECT id FROM t AT (TIMESTAMP => $1)");
+	Check(window->HasError() && window->GetError().find("is a constant") != std::string::npos,
+	      "an AT parameter under a window is refused: " + (window->HasError() ? window->GetError() : "it prepared"));
+	auto constant = con.Prepare("ACL ROLE \"rls\" SELECT id FROM t AT (VERSION => 3) WHERE id > $1");
+	if (CheckOk(*constant, "a constant AT beside a parameter prepares")) {
+		auto rows = constant->Execute(0);
+		CheckColumn(*rows, {1}, "AT (VERSION => 3) under the row filter: the eu row of that snapshot");
+	}
+}
+
 void Run() {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -196,6 +259,7 @@ void Run() {
 	// would change what the scenarios above resolve against
 	Scenario("params-through-injected-insert", []() { ParamsThroughInjectedInsert(); });
 	Scenario("platform-call-parameters", []() { PlatformCallParameters(); });
+	Scenario("versions-at-parameter", []() { VersionsAtParameter(); });
 }
 
 } // namespace

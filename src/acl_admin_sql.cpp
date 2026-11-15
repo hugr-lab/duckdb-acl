@@ -325,7 +325,7 @@ struct HeadWords {
 	bool grant = verb == "grant";
 	if (kind == "catalog") {
 		RefuseMovedForm(grant ? "write GRANT CATALOG <catalog> TO ROLE <role> [WITH (<capability>, ...) | CAPS "
-		                        "'<json>'] [RLS (<predicate>)] [COLUMNS (<list>)] [MAIN]"
+		                        "'<json>'] [RLS (<predicate>)] [COLUMNS (<list>)] [VERSIONS <versions>] [MAIN]"
 		                      : "write REVOKE CATALOG <catalog> FROM ROLE <role>");
 	}
 	if (kind == "schema") {
@@ -336,7 +336,7 @@ struct HeadWords {
 	if (kind == "table" || kind == "view" || kind == "object") {
 		RefuseMovedForm(grant
 		                    ? "write GRANT TABLE | VIEW | OBJECT <catalog>.<name> TO ROLE <role> [WITH (<capability>, "
-		                      "...) | CAPS '<json>'] [RLS (<predicate>)] [COLUMNS (<list>)]"
+		                      "...) | CAPS '<json>'] [RLS (<predicate>)] [COLUMNS (<list>)] [VERSIONS <versions>]"
 		                    : "write REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>");
 	}
 	RefuseMovedForm(grant

@@ -1033,7 +1033,10 @@ void PolicyStore::AuditRoleUnionWidens(const string &object, const string &capab
 		if (union_floor.size() > 4096) {
 			union_floor.clear();
 		}
-		auto &last = union_floor[StringUtil::Lower(object) + '\x1f' + capability + '\x1f' + role_list];
+		// spec 167: a union of versions is its own event - the columns' event of the same roles must not floor it
+		bool versions = pairs[0].columns.size() == 1 && pairs[0].columns[0] == UnionWidening::EVERY_VERSION;
+		auto &last = union_floor[StringUtil::Lower(object) + '\x1f' + capability + '\x1f' + role_list +
+		                         (versions ? "\x1fversions" : "")];
 		if (last != 0 && now - last < 60) {
 			return; // counted above, recorded once a minute
 		}
@@ -1043,6 +1046,11 @@ void PolicyStore::AuditRoleUnionWidens(const string &object, const string &capab
 	vector<string> parts;
 	for (idx_t i = 0; i < pairs.size() && i < UnionWidening::REPORTED; i++) {
 		auto &pair = pairs[i];
+		if (pair.columns.size() == 1 && pair.columns[0] == UnionWidening::EVERY_VERSION) {
+			// spec 167: B reads every version, A another slice of the current one only
+			parts.push_back(pair.role_a + "'s rows in every version " + pair.role_b + " reads");
+			continue;
+		}
 		parts.push_back(pair.role_b + "'s " +
 		                (pair.columns.size() == 1 && pair.columns[0] == "*"
 		                     ? string("columns outside the lists read")

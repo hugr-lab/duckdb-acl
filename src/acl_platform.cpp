@@ -257,8 +257,15 @@ vector<PlatformView> BuildViews() {
 	    {"role_claims", PV::POLICY, {{"role", V}, {"claim", V}, {"value", V}}, "the default claims of each role"},
 	    {"grants",
 	     PV::CATALOG,
-	     {{"role", V}, {"catalog", V}, {"is_main", B}, {"caps", CAPS}, {"rls", V}, {"rls_checked", B}, {"columns", LV}},
-	     "the catalog grants; caps NULL = unstated (every data capability)"},
+	     {{"role", V},
+	      {"catalog", V},
+	      {"is_main", B},
+	      {"caps", CAPS},
+	      {"rls", V},
+	      {"rls_checked", B},
+	      {"columns", LV},
+	      {"versions", V}},
+	     "the catalog grants; caps NULL = unstated (every data capability), versions NULL = every version (spec 167)"},
 	    {"schema_grants",
 	     PV::CATALOG,
 	     {{"role", V},
@@ -272,8 +279,15 @@ vector<PlatformView> BuildViews() {
 	     "the schema grants (spec 015)"},
 	    {"object_grants",
 	     PV::CATALOG,
-	     {{"role", V}, {"catalog", V}, {"object", V}, {"caps", CAPS}, {"rls", V}, {"rls_checked", B}, {"columns", LV}},
-	     "the object grants; caps NULL = inherited from the catalog grant"},
+	     {{"role", V},
+	      {"catalog", V},
+	      {"object", V},
+	      {"caps", CAPS},
+	      {"rls", V},
+	      {"rls_checked", B},
+	      {"columns", LV},
+	      {"versions", V}},
+	     "the object grants; caps / versions NULL = the catalog grant's"},
 	    {"grant_columns",
 	     PV::CATALOG,
 	     {{"role", V}, {"catalog", V}, {"object", V}, {"pos", I}, {"name", V}, {"type", V}},
@@ -675,8 +689,8 @@ vector<PlatformFunction> BuildFunctions() {
 	    // handing out access: the policy bundle (spec 009 - managing a catalog does not include it)
 	    {"grant_catalog",
 	     "acl_grant_catalog",
-	     {role, catalog, P("caps"), P("main", B), P("rls"), P("columns")},
-	     {3, 4, 6},
+	     {role, catalog, P("caps"), P("main", B), P("rls"), P("columns"), P("versions")},
+	     {3, 4, 6, 7},
 	     1,
 	     PR::HANDS_OUT,
 	     false,
@@ -693,8 +707,8 @@ vector<PlatformFunction> BuildFunctions() {
 	     "revoke a catalog grant"},
 	    {"grant_object",
 	     "acl_grant_object",
-	     {role, catalog, name, P("caps"), P("rls"), P("columns")},
-	     {4, 6},
+	     {role, catalog, name, P("caps"), P("rls"), P("columns"), P("versions")},
+	     {4, 6, 7},
 	     1,
 	     PR::HANDS_OUT,
 	     false,
@@ -2520,7 +2534,7 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 	}
 	if (view == "grants") {
 		return "SELECT \"role\", \"vcat\" AS \"catalog\", \"is_main\", acl_platform_caps(\"caps\") AS \"caps\", "
-		       "\"rls\", \"rls_checked\", acl_platform_list(\"columns\") AS \"columns\" FROM " +
+		       "\"rls\", \"rls_checked\", acl_platform_list(\"columns\") AS \"columns\", \"versions\" FROM " +
 		       table("role_catalogs") + where("\"vcat\"");
 	}
 	if (view == "schema_grants") {
@@ -2530,7 +2544,7 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 	}
 	if (view == "object_grants") {
 		return "SELECT \"role\", \"vcat\" AS \"catalog\", \"vname\" AS \"object\", acl_platform_caps(\"caps\") AS "
-		       "\"caps\", \"rls\", \"rls_checked\", acl_platform_list(\"columns\") AS \"columns\" FROM " +
+		       "\"caps\", \"rls\", \"rls_checked\", acl_platform_list(\"columns\") AS \"columns\", \"versions\" FROM " +
 		       table("role_object_caps") + where("\"vcat\"");
 	}
 	if (view == "grant_columns") {
