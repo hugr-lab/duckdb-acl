@@ -1,0 +1,197 @@
+# name: test/sql/acl_view_call_probes.test
+# description: spec 165 - a virtual table function called with the body's columns inside a principal's view (spec 113)
+#   keeps its probe (spec 164) at the stored body's root; the view's reader binds it alone, so a name the call's
+#   template or grant lost refuses rather than binding to a relation of the body
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.logs (id INTEGER, region VARCHAR, msg VARCHAR);
+
+statement ok
+INSERT INTO phys.lake.logs VALUES (1, 'eu', 'a'), (2, 'us', 'b'), (3, 'us', 'c');
+
+statement ok
+CREATE MACRO phys.lake.lm(k) AS TABLE SELECT *, k AS key FROM phys.lake.logs;
+
+statement ok
+CREATE TABLE phys.lake.ev (id INTEGER, ts TIMESTAMP);
+
+statement ok
+INSERT INTO phys.lake.ev VALUES (1, TIMESTAMP '2026-01-01 10:00');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales; CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake; CREATE ROLE w;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.tfa(p VARCHAR) AS 'SELECT *, acl_arg(1) AS key FROM phys.lake.logs';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.mac ALIAS OF phys.lake.lm;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.byday(d TIMESTAMP) AS 'SELECT id FROM phys.lake.ev WHERE date_trunc(''day'', ts) = date_trunc(''day'', acl_arg(1))';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE w MAIN; GRANT SCHEMA sales.vs TO ROLE w WITH (select, create, drop); GRANT OBJECT sales.tfa TO ROLE w RLS (region = 'eu'); GRANT OBJECT sales.mac TO ROLE w RLS (region = 'eu');
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.viat AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, tfa(s.key) f;
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.viam AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, mac(s.key) f;
+
+# a view over that view carries its probe to its own root
+statement ok
+ACL ROLE "w" CREATE VIEW vs.outer AS SELECT v.id FROM (SELECT 1 AS one) x, vs.viat v;
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.days AS SELECT f.id FROM vs.ev e, byday(e.ts) f;
+
+query I
+SELECT view_sql LIKE 'WITH __acl_probe_1 AS NOT MATERIALIZED (%' FROM aclcat.acl.relations WHERE vname = 'vs.viat';
+----
+true
+
+query I
+SELECT view_sql LIKE '%__acl_probe_%' FROM aclcat.acl.relations WHERE vname = 'vs.outer';
+----
+true
+
+# a probe is never the view's own name
+statement error
+ACL ROLE "w" CREATE VIEW vs.named AS WITH __acl_probe_1 AS (SELECT 1 AS x) SELECT x FROM __acl_probe_1;
+----
+reserved
+
+query I
+ACL ROLE "w" SELECT * FROM vs.viat;
+----
+1
+
+query I
+ACL ROLE "w" SELECT * FROM vs.viam;
+----
+1
+
+query I
+ACL ROLE "w" SELECT * FROM vs.outer;
+----
+1
+
+# an untyped NULL leaving an overload without a type is no refusal
+query I
+ACL ROLE "w" SELECT * FROM vs.days;
+----
+1
+
+statement ok
+ALTER TABLE phys.lake.logs DROP COLUMN region;
+
+# the call alone no longer binds: refused before the grant's RLS can bind to the body's `region`
+statement error
+ACL ROLE "w" SELECT count(*) FROM vs.viat;
+----
+does not exist in its source
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM vs.viam;
+----
+does not exist in its source
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM vs.outer;
+----
+does not exist in its source
+
+query I
+ACL ROLE "w" SELECT * FROM vs.days;
+----
+1
+
+# a grant wrapping the view's read (an object grant's RLS or COLUMNS, a catalog grant's predicate) keeps the probes
+statement ok
+ALTER TABLE phys.lake.logs ADD COLUMN region VARCHAR DEFAULT 'eu';
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.vg AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, tfa(s.key) f;
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.vc AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, tfa(s.key) f;
+
+statement ok
+ACL ADMIN GRANT OBJECT sales.vs.vg TO ROLE w RLS (id > 0); GRANT OBJECT sales.vs.vc TO ROLE w COLUMNS (id);
+
+statement ok
+ACL ROLE "w" CREATE VIEW vs.ovg AS SELECT v.id FROM (SELECT 1 AS one) x, vs.vg v;
+
+statement ok
+ACL ADMIN CREATE ROLE r2; GRANT CATALOG sales TO ROLE r2 MAIN RLS 'id > 0'; GRANT SCHEMA sales.vs TO ROLE r2 WITH (select); GRANT OBJECT sales.tfa TO ROLE r2 RLS (region = 'eu');
+
+query I
+ACL ROLE "w" SELECT count(*) FROM vs.vg;
+----
+3
+
+query I
+ACL ROLE "w" SELECT count(*) FROM vs.ovg;
+----
+3
+
+query I
+ACL ROLE "r2" SELECT count(*) FROM vs.viat;
+----
+3
+
+statement ok
+ALTER TABLE phys.lake.logs DROP COLUMN region;
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM vs.vg;
+----
+does not exist in its source
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM vs.vc;
+----
+does not exist in its source
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM vs.ovg;
+----
+does not exist in its source
+
+statement error
+ACL ROLE "r2" SELECT count(*) FROM vs.viat;
+----
+does not exist in its source
+
+# an operator's view body names no probe
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW sales.vs.ov AS WITH __acl_probe_1 AS (SELECT 1 AS id) SELECT id FROM __acl_probe_1;
+----
+reserved
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.vs.ov AS SELECT 1 AS id;
+
+statement error
+ACL ADMIN ALTER VIRTUAL VIEW sales.vs.ov SET AS WITH __acl_probe_1 AS (SELECT 1 AS id) SELECT id FROM __acl_probe_1;
+----
+reserved

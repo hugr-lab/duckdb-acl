@@ -879,6 +879,13 @@ statement's guards (spec 159), so a name its template or policy lost refuses ins
 the probe refuses only a name not found (`WRITE_GUARD_NAMES_ONLY` - an untyped NULL may fail an overload), and a system
 table function is not probed. Test `acl_call_bound_alone.test`.
 
+**Spec 165 — a call in a principal's view keeps its probe**: in a principal's view body spec 164's probe of a call with
+the body's columns is kept at the body's root as an unreferenced `NOT MATERIALIZED` CTE `__acl_probe_<n>` (duckdb binds a
+CTE only when referenced); the resolver splits it off the body before a grant wraps it (`SplitViewProbes` -> `TablePolicy::probes`), and
+`BuildTableSubquery` adds it to the guards - or, reading inside a principal's view, to that body's root. The prefix is
+reserved in a principal's view body and refused at the root of an operator's. Test
+`acl_view_call_probes.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

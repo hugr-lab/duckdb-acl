@@ -105,6 +105,12 @@ vector<string> TempCatalogNames(ClientContext &context);
 //! (the 2026-09-03 review).
 string MintRandomHex(idx_t bytes);
 
+//! spec 165: the root CTEs a principal's view body keeps its calls' probes in (spec 164), never referenced
+constexpr const char *VIEW_PROBE_PREFIX = "__acl_probe_";
+//! spec 165: a view body's root CTEs named with the prefix, taken off `body` (rewritten without them) into `probes`
+//! as SELECTs; false (the body untouched) when it holds none
+bool SplitViewProbes(string &body, vector<string> &probes);
+
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement
 //! form: RENAME (subquery_form=false) swaps the name in place for a physical object - it stays a real
 //! table, so it is writable; SUBQUERY (subquery_form=true) wraps a SELECT - projection with computed
@@ -125,6 +131,8 @@ struct TablePolicy {
 	//! subquery whose free names could resolve against the source instead of the target (spec 020).
 	bool rls_unchecked = false;
 	string query; // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
+	//! spec 165: a principal's view body's call probes, split off `query` before a grant wraps it - each bound alone
+	vector<string> probes;
 	//! The object is a virtual view (its SQL is its definition). Never read off `query`, which a grant's column list
 	//! sets on a table with no declared columns too (review 145: DROP left the physical table, RENAME refused it)
 	bool is_view = false;

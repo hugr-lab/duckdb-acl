@@ -1370,6 +1370,7 @@ private:
 		// their own rows rather than the author's (spec 018).
 		keep_claim_markers = true;
 		view_reads = make_uniq<vector<std::pair<Identifier, unique_ptr<CommonTableExpressionInfo>>>>();
+		view_probes.clear();
 		view_leftmost = nullptr;
 		if (info.query->node->type == QueryNodeType::SELECT_NODE) {
 			// the root's first FROM item has nothing before it and no query around it: its read stays in place
@@ -1537,8 +1538,10 @@ private:
 		auto saved_scope = cte_scope;
 		for (auto &entry : node.cte_map.map) {
 			auto &name = entry.first.GetIdentifierName();
-			if (view_reads && StringUtil::StartsWith(StringUtil::Lower(name), "__acl_read_")) {
-				// spec 162: the names a view body's reads take - a CTE of the body's own would shadow one
+			if (view_reads && (StringUtil::StartsWith(StringUtil::Lower(name), "__acl_read_") ||
+			                   StringUtil::StartsWith(StringUtil::Lower(name), VIEW_PROBE_PREFIX))) {
+				// spec 162: the names a view body's reads take - a CTE of the body's own would shadow one (spec 165:
+				// and its probes')
 				Deny(Reason::STATEMENT_TYPE, "the name " + name + " is reserved in a view");
 			}
 			cte_scope.insert(name);
@@ -1644,12 +1647,23 @@ private:
 	//! the reads' prefix was refused in RewriteQueryNode)
 	void AttachViewReads(QueryNode &root) {
 		auto reads = std::move(view_reads);
-		if (!reads || reads->empty()) {
+		auto probes = std::move(view_probes);
+		view_probes.clear();
+		if ((!reads || reads->empty()) && probes.empty()) {
 			return;
 		}
 		CommonTableExpressionMap map;
-		for (auto &read : *reads) {
-			map.map[read.first] = std::move(read.second);
+		if (reads) {
+			for (auto &read : *reads) {
+				map.map[read.first] = std::move(read.second);
+			}
+		}
+		for (auto &probe : probes) {
+			// spec 165: nothing references a probe, so duckdb never binds it; the view's reader takes it off
+			auto info = make_uniq<CommonTableExpressionInfo>();
+			info->query_node = std::move(probe->node);
+			info->materialized = CTEMaterialize::CTE_MATERIALIZE_NEVER;
+			map.map[Identifier(VIEW_PROBE_PREFIX + std::to_string(map.map.size() + 1))] = std::move(info);
 		}
 		for (auto &entry : root.cte_map.map) {
 			map.map[entry.first] = std::move(entry.second);
@@ -2339,12 +2353,12 @@ private:
 			// wrapper, never the call inside it (there the wrapper's own names would read the caller's)
 			auto column_aliases = std::move(tf.column_name_alias);
 			bool system_target = !policy.subquery_form && SystemTableCall(ParsePhysName(policy.phys));
-			if (!closed && !view_reads && !system_target) {
+			if (!closed && !system_target) {
 				// spec 164: the call as the caller's arguments leave it - each of those a NULL - bound alone first like
 				// a closed call (spec 159): a name of the template's or the grant's that its source lost refuses
 				// instead of binding to the caller's columns. A system table function's columns are fixed: nothing to
-				// lose there
-				guards.push_back(string(WRITE_GUARD_NAMES_ONLY) + ProbeCall(ref, leaf, policy, alias));
+				// lose there. In a principal's view body the probe is kept with the body (spec 165)
+				NoteProbe(ProbeCall(ref, leaf, policy, alias));
 			}
 
 			if (policy.subquery_form) {
@@ -2687,8 +2701,8 @@ private:
 	}
 
 	//! spec 164: the read a non-closed call stands for, its non-spliceable arguments NULL, as text to bind alone
-	string ProbeCall(const unique_ptr<TableRef> &call, const string &leaf, const TablePolicy &policy,
-	                 const Identifier &alias) {
+	unique_ptr<SelectStatement> ProbeCall(const unique_ptr<TableRef> &call, const string &leaf,
+	                                      const TablePolicy &policy, const Identifier &alias) {
 		auto probe = call->Copy();
 		auto &probe_tf = probe->Cast<TableFunctionRef>();
 		auto &probe_function = probe_tf.function->Cast<FunctionExpression>();
@@ -2709,9 +2723,14 @@ private:
 		}
 		WrapWithGrantPolicy(read, policy, alias);
 		if (read->type == TableReferenceType::SUBQUERY) {
-			return read->Cast<SubqueryRef>().subquery->ToString();
+			return std::move(read->Cast<SubqueryRef>().subquery);
 		}
-		return "SELECT * FROM " + read->ToString();
+		auto node = make_uniq<SelectNode>();
+		node->select_list.push_back(make_uniq<StarExpression>());
+		node->from_table = std::move(read);
+		auto stmt = make_uniq<SelectStatement>();
+		stmt->node = std::move(node);
+		return stmt;
 	}
 
 	//! spec 163: an argument spliced into a template as written - constants, casts, operators and the system's plain
@@ -2950,7 +2969,25 @@ private:
 		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr);
+		for (auto &text : policy.probes) {
+			// spec 165: a stored view body's probes (its calls with the caller's arguments, spec 164), split off its
+			// SQL by the resolver - bound alone like a statement's, or carried to the root of the principal's view
+			// being created
+			auto probe = store.InstantiateSelect(text, template_options);
+			BakeMarkersInNode(*probe->node, nullptr);
+			NoteProbe(std::move(probe));
+		}
 		return ReadRef(std::move(select_stmt), vname, original);
+	}
+
+	//! spec 164: a call's probe - a guard of the statement's, or (spec 165) a CTE at the root of the principal's view
+	//! being created, taken off and bound alone when the view is read
+	void NoteProbe(unique_ptr<SelectStatement> probe) {
+		if (view_reads) {
+			view_probes.push_back(std::move(probe));
+		} else {
+			guards.push_back(string(WRITE_GUARD_NAMES_ONLY) + probe->ToString());
+		}
 	}
 
 	//! The SELECT a principal reads a relation through - a view's SQL, or the projection over the source
@@ -4920,6 +4957,8 @@ public:
 	//! root's first FROM item (whose read stays in place)
 	unique_ptr<vector<std::pair<Identifier, unique_ptr<CommonTableExpressionInfo>>>> view_reads;
 	optional_ptr<TableRef> view_leftmost;
+	//! spec 165: the probes of the principal's view being created, CTEs at its root
+	vector<unique_ptr<SelectStatement>> view_probes;
 	//! spec 157 / 159: the reads this statement binds alone first - its writes' targets (NoteReadableGuard), every
 	//! policy read (ReadRef)
 	vector<string> guards;
