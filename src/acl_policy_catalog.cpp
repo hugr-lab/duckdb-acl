@@ -838,7 +838,7 @@ void CatalogBackend::ApplyGrantVersions(const vector<std::pair<string, GrantPoli
 		by_role[rows.GetValue(0, row).ToString()] = text;
 	}
 	out.versions = UniteVersions(stated, out.versions_differ);
-	if (!on_union_widens || !out.versions.empty() || out.versions_differ) {
+	if (!on_union_widens || out.versions != "ANY" || out.versions_differ) {
 		return;
 	}
 	// every version won: a limited role's slice read in history through a role that reads every version but another
@@ -846,7 +846,7 @@ void CatalogBackend::ApplyGrantVersions(const vector<std::pair<string, GrantPoli
 	auto every = [&](const string &role) {
 		auto text = by_role[role];
 		StringUtil::Trim(text);
-		return text.empty() || StringUtil::CIEquals(text, "ANY");
+		return StringUtil::CIEquals(text, "ANY");
 	};
 	auto same = [](const GrantPolicy &a, const GrantPolicy &b) {
 		return a.restricts == b.restricts && a.Predicate() == b.Predicate() && a.columns == b.columns;

@@ -7,8 +7,8 @@
 //
 // A grant states one of `CURRENT` (no AT), `ANY` (every version), `AT (VERSION => n)` / `AT (TIMESTAMP => t)` (that
 // snapshot only: a read without AT gets it, any other AT is refused) or `BETWEEN t1 AND t2` (an `AT (TIMESTAMP => t)`
-// inside the window; a read without AT reads the window's latest). It is stored as the clause, normalized - every
-// value a constant - and read back by duckdb's parser, never ours.
+// inside the window; a read without AT reads the window's latest); one that states none reads `CURRENT` (spec 168).
+// It is stored as the clause, normalized - every value a constant - and read back by duckdb's parser, never ours.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -36,7 +36,7 @@ struct VersionLimit {
 	}
 };
 
-//! A stored clause ('' = every version) read with duckdb's parser
+//! A stored clause ('' = not stated = CURRENT, spec 168) read with duckdb's parser
 VersionLimit ReadVersions(const string &stored);
 
 //! The clause an operator wrote (`CURRENT`, `ANY`, `AT (…)`, `BETWEEN … AND …`; '' = not stated) as stored: every value
@@ -44,8 +44,9 @@ VersionLimit ReadVersions(const string &stored);
 //! what to write otherwise.
 string NormalizeVersions(const string &written, const std::function<string(const string &)> &evaluate);
 
-//! What a role reads where several roles' grants unite (spec 146's per object union): every version when one of them
-//! admits every version, else their one clause; clauses that differ refuse (`differ`), as two masks of one column do
+//! What a role reads where several roles' grants unite (spec 146's per object union): `ANY` when one of them admits
+//! every version, else their one clause (an unstated one is `CURRENT`, spec 168); clauses that differ refuse
+//! (`differ`), as two masks of one column do
 string UniteVersions(const vector<string> &stored, bool &differ);
 
 //! Whether an expression is made of constants and casts only

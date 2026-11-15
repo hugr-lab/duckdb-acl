@@ -265,7 +265,8 @@ vector<PlatformView> BuildViews() {
 	      {"rls_checked", B},
 	      {"columns", LV},
 	      {"versions", V}},
-	     "the catalog grants; caps NULL = unstated (every data capability), versions NULL = every version (spec 167)"},
+	     "the catalog grants; caps NULL = unstated (every data capability), versions NULL = the current version (spec "
+	     "168)"},
 	    {"schema_grants",
 	     PV::CATALOG,
 	     {{"role", V},
