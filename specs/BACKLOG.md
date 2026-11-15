@@ -144,7 +144,8 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - `acl_check_catalog` gives no finding for a principal's view whose probe (spec 165) no longer binds: it binds the
     view's SQL, where nothing references a probe (reads refuse). A macro alias's grant RLS over a dropped column has no
     finding of its own either.
-  - Spec 155's scrub does not cover spec 163's carrier names (`__acl_arg_1`, `__acl_args`) in an argument's errors.
+  - Spec 155's scrub keeps a struct-key error's `Candidate Entries:` lines (found by spec 166's review); decide whether
+    they are cut like `Candidate bindings`.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

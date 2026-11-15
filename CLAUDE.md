@@ -866,12 +866,15 @@ CTE with the `__acl_read_` prefix is refused at any level. Test `acl_principal_v
 
 **Spec 163 — a call's arguments are the caller's**: only `Spliceable` arguments (constants, casts, operators, CASE, the
 system's plain scalars - `SystemScalarFunction` - and parameters) are spliced into a template; others are evaluated beside
-the call in `(VALUES (…)) AS __acl_args(__acl_arg_1, …)` (`ArgumentsRef`; one name, so equal calls stay equal) and
+the call in `(VALUES (…)) AS __acl_args(<names>)` (`ArgumentsRef`; one alias, so equal calls stay equal) and
 `acl_arg(n)` reads its column: a table function (`CallWithArguments`), an alias of a non-system macro, a scalar template
 that may bind a name of its own (`TemplateCaptures`: subquery, lambda, non-system call; one that aggregates refuses). A
 call's column alias list goes outermost, around the grant's wrapper. A builtin an alias or a template calls is written
 `system.main.<name>` (`QualifySystemCall`; a default-database macro must not stand in), and a system macro counts as a
-macro. Test `acl_call_arguments_scope.test`.
+macro. Test `acl_call_arguments_scope.test`. Since spec 166 a carrier column is named as duckdb names its
+argument AS THE CLIENT WROTE IT, taken before the arguments are rewritten (`CarrierNames`: a column's name, an
+expression's text, a repeat `_<k>` - a rewritten argument's text names physical objects and policy), so what reads it
+is named as if spliced (`acl_carrier_names.test`).
 
 **Spec 164 — a call with the caller's arguments is bound alone too**: `ProbeCall` builds a non-closed table function call
 (spec 163) with its non-spliceable arguments NULL - template or alias target, plus the grant's wrapper - and adds it to the
