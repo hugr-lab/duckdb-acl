@@ -1,0 +1,148 @@
+# name: test/sql/acl_carrier_names.test
+# description: spec 166 - an argument carried beside a call (spec 163) is carried under the name duckdb gives it, so a
+#   template's or a macro's item that reads it is named as if the argument were spliced in, and an error about its value
+#   names the caller's column - never the carrier's
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.logs (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO phys.main.logs VALUES (1, 'eu');
+
+statement ok
+CREATE MACRO phys.main.lk(k) AS TABLE SELECT k FROM phys.main.logs;
+
+statement ok
+CREATE MACRO phys.main.l2(a, b) AS TABLE SELECT a, b FROM phys.main.logs;
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SET acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.raw(p VARCHAR) AS 'SELECT acl_arg(1) FROM phys.main.logs';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.two(p VARCHAR, q VARCHAR) AS 'SELECT acl_arg(1), acl_arg(2) FROM phys.main.logs';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.eq(p VARCHAR) AS 'SELECT * FROM phys.main.logs WHERE id = acl_arg(1)';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.lk ALIAS OF phys.main.lk;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.l2 ALIAS OF phys.main.l2;
+
+statement ok
+CREATE TABLE phys.main.secret_orders (id INTEGER, tenant VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO phys.main.secret_orders VALUES (1, 'acme', 10);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.secret_orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.lookup(k INTEGER) RETURNS VARCHAR AS (SELECT max(region) FROM phys.main.logs WHERE id = acl_arg(1));
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT TABLE c.orders TO ROLE r RLS (tenant = 'acme' AND amount < 4242);
+
+# a column argument names the item after the column, an expression after its text - as duckdb names them
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 'x' AS key) s, raw(s.key) f);
+----
+key
+
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 'x' AS key) s, lk(s.key) f);
+----
+key
+
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 'x' AS key) s, raw(s.key || 'y') f);
+----
+(s."key" || 'y')
+
+# a repeated name takes duckdb's suffix; a caller's column named like a carrier keeps its name
+query TT
+ACL ROLE "r" SELECT f.* FROM (SELECT 'x' AS key) s, l2(s.key, s.key) f;
+----
+x	x
+
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 'x' AS key) s, l2(s.key, s.key) f) ORDER BY 1;
+----
+key
+key_1
+
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 'x' AS key, 'y' AS __acl_arg_2) s, two(s.__acl_arg_2, s.key) f) ORDER BY 1;
+----
+__acl_arg_2
+key
+
+query TT
+ACL ROLE "r" SELECT f.* FROM (SELECT 'x' AS key, 'y' AS __acl_arg_2) s, two(s.__acl_arg_2, s.key) f;
+----
+y	x
+
+# an error about the argument's value names the caller's column
+statement error
+ACL ROLE "r" SELECT * FROM (SELECT 'x' AS key) s, eq(s.key) f;
+----
+source column key
+
+# a carrier is named by the argument as the client wrote it, never by its rewritten text (physical names, a grant's
+# predicate, a scalar's template)
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 1 AS key) s, raw((SELECT max(o.amount) + s.key FROM orders o)) f);
+----
+(SELECT (max(o.amount) + s."key") FROM orders AS o)
+
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 1 AS key) s, lk((SELECT max(o.amount) + s.key FROM orders o)) f);
+----
+(SELECT (max(o.amount) + s."key") FROM orders AS o)
+
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE SELECT f.* FROM (SELECT 1 AS key) s, raw(lookup(s.key)) f);
+----
+lookup(s."key")
+
+statement error
+ACL ROLE "r" SELECT * FROM (SELECT 1 AS key) s, eq(lookup(s.key) || 'x') f;
+----
+source column (lookup(s."key") || 'x')
+
+statement error
+ACL ROLE "r" SELECT lookup((SELECT max(o.tenant) FROM orders o WHERE o.id = s.key)) FROM (SELECT 1 AS key) s;
+----
+source column (SELECT max(o.tenant) FROM orders AS o WHERE (o.id = s."key"))
+
+# a principal's own view keeps its author's written names (spec 162's body: its reads are CTEs, never in a name)
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM phys.main; GRANT SCHEMA c.vs TO ROLE r WITH (select, create, drop); CREATE ROLE r2; GRANT CATALOG c TO ROLE r2 MAIN; GRANT SCHEMA c.vs TO ROLE r2 WITH (select);
+
+statement ok
+ACL ROLE "r" CREATE VIEW vs.v1 AS SELECT f.* FROM (SELECT 1 AS k) s, raw((SELECT max(o.amount) + s.k FROM orders o)) f;
+
+query T
+ACL ROLE "r2" SELECT column_name FROM (DESCRIBE vs.v1);
+----
+(SELECT (max(o.amount) + s.k) FROM orders AS o)

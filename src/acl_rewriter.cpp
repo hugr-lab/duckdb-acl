@@ -2346,6 +2346,8 @@ private:
 			if (!policy.caps.count("select")) {
 				Deny(Reason::CAPABILITY, "select on table function " + Shown(vname) + " is not allowed");
 			}
+			// spec 166: named as the client wrote them - a rewritten argument's text names physical objects
+			auto carrier_names = CarrierNames(function);
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
 			Identifier alias = tf.alias.empty() ? Identifier(leaf) : tf.alias;
 			bool closed = ClosedArguments(function);
@@ -2362,7 +2364,7 @@ private:
 			}
 
 			if (policy.subquery_form) {
-				ref = BuildFunctionSubquery(leaf, policy, function, tf);
+				ref = BuildFunctionSubquery(leaf, policy, function, tf, carrier_names);
 			} else {
 				// RENAME-alias: retarget the call to a physical/system function, keep the arguments
 				function.SetQualifiedName(ParsePhysName(policy.phys));
@@ -2377,10 +2379,10 @@ private:
 					if (NamesCallerColumns(args)) {
 						idx_t i = 0;
 						for (auto &arg : function.GetArgumentsMutable()) {
-							arg.GetExpressionMutable() = make_uniq<ColumnRefExpression>(
-							    Identifier("__acl_arg_" + std::to_string(++i)), Identifier("__acl_args"));
+							arg.GetExpressionMutable() =
+							    make_uniq<ColumnRefExpression>(carrier_names[i++], Identifier("__acl_args"));
 						}
-						ref = CallWithArguments(std::move(ref), args, alias, {});
+						ref = CallWithArguments(std::move(ref), args, alias, {}, carrier_names);
 					}
 				}
 			}
@@ -2672,7 +2674,8 @@ private:
 	//! Expand a virtual table function `vfunc(args)` into `(SELECT ... ) AS vfunc`: the template's
 	//! acl_arg(n) markers are replaced by the call arguments' AST, claims are baked, result is read-only.
 	unique_ptr<TableRef> BuildFunctionSubquery(const string &vname, const TablePolicy &policy,
-	                                           FunctionExpression &function, TableFunctionRef &tf) {
+	                                           FunctionExpression &function, TableFunctionRef &tf,
+	                                           const vector<Identifier> &carrier_names) {
 		if (policy.query.empty()) {
 			Deny(Reason::POLICY_ERROR, "virtual table function " + Shown(vname) + " has no template");
 		}
@@ -2691,13 +2694,12 @@ private:
 		// spec 163: an argument naming the caller's columns is evaluated beside the call, in the caller's scope - the
 		// template reads its value, never its names (spliced in, they bound to the template's own source first)
 		vector<unique_ptr<ParsedExpression>> refs;
-		for (idx_t i = 0; i < args.size(); i++) {
-			refs.push_back(make_uniq<ColumnRefExpression>(Identifier("__acl_arg_" + std::to_string(i + 1)),
-			                                              Identifier("__acl_args")));
+		for (auto &name : carrier_names) {
+			refs.push_back(make_uniq<ColumnRefExpression>(name, Identifier("__acl_args")));
 		}
 		BakeMarkersInNode(*select_stmt->node, &refs);
 		return CallWithArguments(make_uniq<SubqueryRef>(std::move(select_stmt)), args, alias,
-		                         std::move(tf.column_name_alias));
+		                         std::move(tf.column_name_alias), carrier_names);
 	}
 
 	//! spec 164: the read a non-closed call stands for, its non-spliceable arguments NULL, as text to bind alone
@@ -2713,7 +2715,8 @@ private:
 		}
 		unique_ptr<TableRef> read;
 		if (policy.subquery_form) {
-			read = BuildFunctionSubquery(leaf, policy, probe_function, probe_tf);
+			// every argument of the probe is spliceable: it builds no carrier
+			read = BuildFunctionSubquery(leaf, policy, probe_function, probe_tf, CarrierNames(probe_function));
 		} else {
 			probe_function.SetQualifiedName(ParsePhysName(policy.phys));
 			if (SystemTableCall(probe_function.GetQualifiedName())) {
@@ -2776,16 +2779,47 @@ private:
 		return false;
 	}
 
-	//! spec 163: `(VALUES (<arg 1>, …)) AS __acl_args(__acl_arg_1, …)` - the arguments in the caller's scope (VALUES:
+	//! spec 166: the column each argument is carried in - the name duckdb gives the argument as the client wrote it (a
+	//! column's own name, an expression's text), so a template's or a macro's item that reads it is named as if it were
+	//! spliced in; a repeated name takes duckdb's `_<k>`. Taken BEFORE the arguments are rewritten: a rewritten
+	//! argument's text names physical objects and policy. Derived from the arguments alone: equal calls stay equal
+	static vector<Identifier> CarrierNames(const FunctionExpression &function) {
+		vector<Identifier> names;
+		case_insensitive_set_t taken;
+		auto &args = function.GetArguments();
+		for (idx_t i = 0; i < args.size(); i++) {
+			string name = args[i].GetExpression().GetName().GetIdentifierName();
+			if (name.empty()) {
+				name = "__acl_arg_" + std::to_string(i + 1);
+			}
+			if (taken.count(name)) {
+				// duckdb's own rule for a result's repeated name
+				idx_t suffix = 1;
+				while (taken.count(name + "_" + std::to_string(suffix))) {
+					suffix++;
+				}
+				name += "_" + std::to_string(suffix);
+			}
+			taken.insert(name);
+			names.emplace_back(name);
+		}
+		return names;
+	}
+
+	//! spec 163: `(VALUES (<arg 1>, …)) AS __acl_args(<name 1>, …)` - the arguments in the caller's scope (VALUES:
 	//! an aggregate or a window there refuses rather than being evaluated over no row) - and, in `refs`, the column of
-	//! each, which the template's acl_arg(n) becomes. One name for every call: the same call is the same expression
+	//! each, which the template's acl_arg(n) becomes (named by spec 166's CarrierNames)
 	static unique_ptr<TableRef> ArgumentsRef(vector<unique_ptr<ParsedExpression>> &args,
-	                                         vector<unique_ptr<ParsedExpression>> &refs) {
+	                                         vector<unique_ptr<ParsedExpression>> &refs,
+	                                         const vector<Identifier> &names) {
+		if (names.size() != args.size()) {
+			throw BinderException("acl: a call's carrier names do not match its arguments"); // fails the statement only
+		}
 		Identifier alias("__acl_args");
 		auto values = make_uniq<ExpressionListRef>();
 		vector<unique_ptr<ParsedExpression>> row;
 		for (idx_t i = 0; i < args.size(); i++) {
-			auto name = Identifier("__acl_arg_" + std::to_string(i + 1));
+			auto &name = names[i];
 			row.push_back(std::move(args[i]));
 			values->expected_names.push_back(name);
 			values->column_name_alias.push_back(name);
@@ -2892,10 +2926,11 @@ private:
 	//! spec 163: `(SELECT __acl_call.* FROM (VALUES …) AS __acl_args(…), <call> AS __acl_call) AS <alias>` - a table
 	//! call reading its arguments' values from beside it
 	unique_ptr<TableRef> CallWithArguments(unique_ptr<TableRef> call, vector<unique_ptr<ParsedExpression>> &args,
-	                                       const Identifier &alias, vector<Identifier> column_aliases) {
+	                                       const Identifier &alias, vector<Identifier> column_aliases,
+	                                       const vector<Identifier> &carrier_names) {
 		vector<unique_ptr<ParsedExpression>> unused;
 		auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
-		join->left = ArgumentsRef(args, unused);
+		join->left = ArgumentsRef(args, unused, carrier_names);
 		// the user's alias inside too: duckdb names a one-column table function's column after it
 		call->alias = alias;
 		join->right = std::move(call);
@@ -4600,12 +4635,13 @@ private:
 				if (!spolicy.caps.count("select")) {
 					Deny(Reason::CAPABILITY, "select on scalar function \"" + resolved_name + "\" is not allowed");
 				}
-				RewriteFunctionArgs(function); // resolve virtual names inside the arguments first
+				auto carrier_names = CarrierNames(function); // spec 166: as the client wrote them
+				RewriteFunctionArgs(function);               // resolve virtual names inside the arguments first
 				if (spolicy.subquery_form) {
 					// the caller's alias names the select item, not the call: `tenant_tag(x) AS tag` is
 					// still the column `tag` after the macro expands (the harness demo lost it)
 					auto alias = function.GetAlias();
-					expr = BuildScalarExpr(name, spolicy, function);
+					expr = BuildScalarExpr(name, spolicy, function, carrier_names);
 					expr->SetAlias(std::move(alias));
 				} else {
 					function.SetQualifiedName(ParsePhysName(spolicy.phys));
@@ -4619,7 +4655,7 @@ private:
 						// spec 163: a macro binds its arguments inside its body - they are read beside the call
 						auto alias = function.GetAlias();
 						vector<unique_ptr<ParsedExpression>> refs;
-						auto args_ref = ArgumentsRef(args, refs);
+						auto args_ref = ArgumentsRef(args, refs, carrier_names);
 						idx_t i = 0;
 						for (auto &arg : function.GetArgumentsMutable()) {
 							arg.GetExpressionMutable() = std::move(refs[i++]);
@@ -4781,7 +4817,8 @@ private:
 	//! Expand a virtual scalar function `vfunc(args)` into its template expression, substituting the
 	//! call arguments via acl_arg(n) markers and baking claims via acl_claim.
 	unique_ptr<ParsedExpression> BuildScalarExpr(const string &vname, const TablePolicy &policy,
-	                                             FunctionExpression &function) {
+	                                             FunctionExpression &function,
+	                                             const vector<Identifier> &carrier_names) {
 		if (policy.query.empty()) {
 			Deny(Reason::POLICY_ERROR, "virtual scalar function " + Shown(vname) + " has no template");
 		}
@@ -4804,7 +4841,7 @@ private:
 			                                 " aggregates over its argument, so it takes constants only here");
 		}
 		vector<unique_ptr<ParsedExpression>> refs;
-		auto args_ref = ArgumentsRef(args, refs);
+		auto args_ref = ArgumentsRef(args, refs, carrier_names);
 		QualifyTemplateCalls(replacement);
 		BakeMarkers(replacement, &refs);
 		return ScalarWithArguments(std::move(replacement), std::move(args_ref));

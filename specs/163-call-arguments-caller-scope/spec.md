@@ -31,8 +31,9 @@ call evaluated where it stands. Everything else names something of the caller's 
 
 Spec 159's closed calls are this allowlist without parameters.
 
-**How it is read.** The arguments are evaluated in `(VALUES (<arg 1>, …)) AS __acl_args(__acl_arg_1, …)`
-(`ArgumentsRef`). `acl_arg(n)` in the template becomes `__acl_args.__acl_arg_n`. In `VALUES`, an aggregate or a window
+**How it is read.** The arguments are evaluated in `(VALUES (<arg 1>, …)) AS __acl_args(<name 1>, …)`
+(`ArgumentsRef`; the names are spec 166's, `__acl_arg_<n>` before it). `acl_arg(n)` in the template becomes
+`__acl_args.<name n>`. In `VALUES`, an aggregate or a window
 refuses ("cannot contain …") instead of being evaluated over no row. The name is the same for every call, so the same
 call is the same expression (`GROUP BY lookup(id)`).
 
@@ -58,8 +59,8 @@ wrapper (spec 011). Inside it, the wrapper's own names had read the caller's col
 **Costs.** A subquery argument loses the filter pushdown the splice gave (a non-correlated `f((SELECT max(k) FROM
 t))`), and a correlated scalar template with a subquery gains a delim join. Lambda and star arguments, and a window
 or an aggregate, refuse ("INSERT statement cannot contain …", duckdb's VALUES wording). A wrapped scalar call inside a
-caller's lambda refuses (duckdb takes no subquery in a lambda). An error about an argument's value can name the carrier
-(`__acl_arg_1`).
+caller's lambda refuses (duckdb takes no subquery in a lambda). An error about an argument's value named the carrier
+(`__acl_arg_1`) until spec 166 named it after the argument as written.
 
 ## Enforcement & security
 
