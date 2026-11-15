@@ -1107,6 +1107,15 @@ void RequirePolicyFreeExpressions(CatalogBackend &catalog, const char *what, con
 	}
 }
 
+//! spec 165: an operator's view body names no root CTE as a principal view's probe - a reader takes such a CTE off
+void RequireNoProbeCte(const string &view_sql) {
+	auto body = view_sql;
+	vector<string> probes;
+	if (!view_sql.empty() && SplitViewProbes(body, probes)) {
+		throw BinderException("acl admin: the name %s<n> is reserved in a view", VIEW_PROBE_PREFIX);
+	}
+}
+
 } // namespace
 
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form_p, const string &phys,
@@ -1116,6 +1125,7 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
 	RequireNotPolicyStore(*catalog, "the relation", phys, false, view_sql);
+	RequireNoProbeCte(view_sql);
 	RequirePolicyFreeExpressions(*catalog, "the relation's RLS or column list", rls, columns_p);
 	auto columns = columns_p;
 	auto form = form_p;
@@ -3560,6 +3570,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		RequireNotPolicyStore(*catalog, "the relation", value, false);
 	} else if (field == "view") {
 		RequireNotPolicyStore(*catalog, "the view", string(), false, value);
+		RequireNoProbeCte(value);
 	}
 	RequirePolicyFreeExpressions(*catalog, "the relation's RLS or column list", field == "rls" ? value : string(),
 	                             columns);

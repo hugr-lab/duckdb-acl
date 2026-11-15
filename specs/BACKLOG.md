@@ -139,12 +139,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
     found` (a cast / mask over a dropped column), and `DELETE … RETURNING k` heads its column with the physical `id`.
   - Spec 155's scrub is lost when its registry evicts a text: a principal that sends 65,536 other statements before
     executing its prepared statement reads duckdb's raw error (physical column names) - found by spec 157's re-review.
-  - Views a principal stored before spec 162 keep their bodies (policy reads in place) until created again; nothing
-    lists them yet.
+  - Views a principal stored before spec 162 keep their bodies (policy reads in place) until created again, and those
+    stored before spec 165 keep no probes for their calls; nothing lists them yet.
+  - `acl_check_catalog` gives no finding for a principal's view whose probe (spec 165) no longer binds: it binds the
+    view's SQL, where nothing references a probe (reads refuse). A macro alias's grant RLS over a dropped column has no
+    finding of its own either.
   - Spec 155's scrub does not cover spec 163's carrier names (`__acl_arg_1`, `__acl_args`) in an argument's errors.
-  - A virtual table function called with the caller's columns inside a principal's view body (spec 162) is not probed
-    (spec 164 probes statements): the stored body is bound alone as one read, so the call's grant RLS can bind to a
-    relation of the body that carries a name its source lost.
 - **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later

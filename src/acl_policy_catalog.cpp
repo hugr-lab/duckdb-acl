@@ -730,6 +730,9 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	out.phys = phys.IsNull() ? string() : phys.ToString();
 	out.query = view_sql.IsNull() ? string() : view_sql.ToString();
 	out.is_view = form == "view";
+	if (out.is_view) {
+		SplitViewProbes(out.query, out.probes); // spec 165: before a grant wraps the body
+	}
 	out.rls = rls.IsNull() ? string() : rls.ToString();
 	auto rchk = result->Collection().GetValue(13, 0);
 	out.rls_unchecked = !out.rls.empty() && (rchk.IsNull() || !rchk.GetValue<bool>());
