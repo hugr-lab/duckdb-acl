@@ -106,6 +106,11 @@ read the view.
   the binder's; a name a view's query names that no policy answers is refused at create.
 - **A recursive CTE's `USING KEY` targets** (older than this spec): expressions duckdb binds, walked by neither
   duckdb's iterator nor the rewriter - now gated like any expression.
+- **`recurring.<name>`** (a compatibility review against duckdb's binder): a recursive CTE's right side reads
+  itself under that name too (duckdb binds a name by its last two parts); the rewriter refused it as a catalog name -
+  now read as the CTE there, and only there. The review found the rest of the scope rule equal to the binder's. Two
+  differences stay, both failing closed: a CTE nothing references is still gated (duckdb never binds it), and a
+  DELETE / UPDATE / MERGE target named like a CTE resolves as the virtual object (duckdb refuses it).
 - The shape is replaced only where it occurs once (a mask holding its text is refused); a refusal inside a nested view
   names the outermost view; the rewriter's state is restored on a refusal.
 

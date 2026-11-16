@@ -1449,15 +1449,18 @@ private:
 		}
 		bool outermost = invoker_views.empty();
 		auto saved_scope = std::move(cte_scope);
+		auto saved_recurring = std::move(recurring_scope);
 		auto saved_catalog = std::move(use_catalog);
 		auto saved_schema = std::move(use_schema);
 		cte_scope.clear();
+		recurring_scope.clear();
 		use_catalog.clear();
 		use_schema.clear();
 		invoker_views.push_back(view);
 		auto restore = [&]() {
 			invoker_views.pop_back();
 			cte_scope = std::move(saved_scope);
+			recurring_scope = std::move(saved_recurring);
 			use_catalog = std::move(saved_catalog);
 			use_schema = std::move(saved_schema);
 		};
@@ -1640,6 +1643,7 @@ private:
 		// sees its own name (RECURSIVE_CTE_NODE below). A name the binder reads in the catalog is resolved here too -
 		// a self or forward reference skipped as a CTE read a physical table or a file past the gate
 		auto saved_scope = cte_scope;
+		auto saved_recurring = recurring_scope;
 		for (auto &entry : node.cte_map.map) {
 			if (entry.second->query_node) {
 				RewriteQueryNode(*entry.second->query_node);
@@ -1680,6 +1684,8 @@ private:
 				RewriteQueryNode(*rcte.left);
 			}
 			cte_scope.insert(rcte.ctename.GetIdentifierName()); // its right side reads itself, its left side does not
+			// and, under USING KEY, as `recurring.<name>` (duckdb binds it by its last two parts)
+			recurring_scope.insert(rcte.ctename.GetIdentifierName());
 			if (rcte.right) {
 				RewriteQueryNode(*rcte.right);
 			}
@@ -1706,6 +1712,7 @@ private:
 			Deny(Reason::STATEMENT_TYPE, "query node type is not permitted under ACL");
 		}
 		cte_scope = saved_scope;
+		recurring_scope = saved_recurring;
 	}
 
 	//! spec 159: a policy read, in place of the object (its alias, column aliases and sample kept), and noted to be
@@ -3107,6 +3114,11 @@ private:
 	}
 
 	bool IsCteName(BaseTableRef &base) {
+		auto parts = NameParts(base.GetQualifiedName());
+		if (parts.size() >= 2 && StringUtil::CIEquals(parts[parts.size() - 2], "recurring") &&
+		    recurring_scope.count(parts.back()) > 0) {
+			return true; // a recursive CTE's right side reads `recurring.<name>` (duckdb binds it by schema + table)
+		}
 		auto &name = base.GetQualifiedName();
 		if (!name.Catalog().empty() || !name.Schema().empty()) {
 			return false; // a qualified name never refers to a CTE
@@ -5307,6 +5319,8 @@ public:
 		trail->physical.push_back(phys);
 	}
 	case_insensitive_set_t cte_scope;
+	//! the recursive CTEs whose right side is being rewritten: `recurring.<name>` reads one
+	case_insensitive_set_t recurring_scope;
 };
 
 } // namespace
