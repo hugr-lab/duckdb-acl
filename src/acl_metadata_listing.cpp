@@ -886,16 +886,13 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    alias_vname + " AND ocv.\"name\" = c.\"name\" LEFT JOIN " + Tbl("column_comments") +
 	    " cc ON c.\"name\" IS NULL AND cc.\"vcat\" = o.vcat AND cc.\"vname\" = " + alias_vname +
 	    " AND cc.\"column_name\" = i.\"column_name\""
-	    " WHERE len(o.parts) = 3 AND (o.form = 'alias' OR (o.form = 'subquery' AND NOT EXISTS"
+	    // spec 171: the source's row for an object with no list of its own (an alias, an RLS-only relation); an object
+	    // that declares its columns - whatever its form - is described by its snapshot below (spec 158)
+	    " WHERE len(o.parts) = 3 AND o.form IN ('alias', 'subquery') AND NOT EXISTS"
 	    " (SELECT 1 FROM " +
 	    Tbl("relation_columns") +
 	    " c3 WHERE c3.\"vcat\" = o.vcat AND c3.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
-	    " ELSE o.vschema || '.' || o.vname END)))"
-	    " AND (c.\"name\" IS NOT NULL OR NOT EXISTS"
-	    " (SELECT 1 FROM " +
-	    Tbl("relation_columns") +
-	    " c2 WHERE c2.\"vcat\" = o.vcat AND c2.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
-	    " ELSE o.vschema || '.' || o.vname END))"
+	    " ELSE o.vschema || '.' || o.vname END)"
 	    " UNION ALL BY NAME"
 	    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
 	    " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position,"
@@ -906,26 +903,28 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " THEN 'NO' ELSE NULL END AS is_nullable,"
 	    // `COLUMN_COMMENT` is what information_schema.columns calls it; a `comment` of our own
 	    // added a 46th column to a surface whose shape is fixed (spec 035)
-	    " oc.\"comment\" AS \"COLUMN_COMMENT\", ip.acl_tags AS acl_tags FROM objects o JOIN " +
+	    // spec 171 (143's rule): the column's own comment, else - a column read by name - its source column's
+	    " coalesce(oc.\"comment\", ip.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\", ip.acl_tags AS acl_tags FROM objects o"
+	    " JOIN " +
 	    Tbl("object_columns") +
 	    " oc ON oc.\"vcat\" = o.vcat AND oc.\"kind\" = 'relation'"
 	    " AND oc.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
 	    " ELSE o.vschema || '.' || o.vname END"
 	    // spec 143: a declared list's column carries its source column's tags - a column it reads by name
 	    " LEFT JOIN " +
-	    Tbl("relation_columns") +
-	    " rc ON o.form = 'subquery' AND rc.\"vcat\" = o.vcat AND rc.\"vname\" = " + alias_vname +
+	    Tbl("relation_columns") + " rc ON o.form <> 'view' AND rc.\"vcat\" = o.vcat AND rc.\"vname\" = " + alias_vname +
 	    " AND rc.\"name\" = oc.\"name\" AND " + reads_by_name("rc") +
 	    // spec 158 stage 2: a column a star passes (no named item of its name) carries its source column's by name
-	    " LEFT JOIN " + Tbl("relation_columns") +
-	    " rs ON o.form = 'subquery' AND rc.\"name\" IS NULL AND rs.\"vcat\" = " + "o.vcat AND rs.\"vname\" = " +
-	    alias_vname + " AND rs.\"name\" IS NULL AND NOT EXISTS (SELECT 1 FROM " + Tbl("relation_columns") +
-	    " rn WHERE rn.\"vcat\" = o.vcat AND rn.\"vname\" = " + alias_vname + " AND " + KeyFoldSql("rn.\"name\"") +
-	    " = " + KeyFoldSql("oc.\"name\"") + ") LEFT JOIN " + icolumns +
+	    " LEFT JOIN " + Tbl("relation_columns") + " rs ON o.form <> 'view' AND rc.\"name\" IS NULL AND rs.\"vcat\" = " +
+	    "o.vcat AND rs.\"vname\" = " + alias_vname + " AND rs.\"name\" IS NULL AND NOT EXISTS (SELECT 1 FROM " +
+	    Tbl("relation_columns") + " rn WHERE rn.\"vcat\" = o.vcat AND rn.\"vname\" = " + alias_vname + " AND " +
+	    KeyFoldSql("rn.\"name\"") + " = " + KeyFoldSql("oc.\"name\"") + ") LEFT JOIN " + icolumns +
 	    " ip ON (rc.\"name\" IS NOT NULL OR rs.\"expr\" IS NOT NULL) AND len(o.parts) = 3 AND ip.\"table_catalog\" = "
 	    "o.parts[1] AND ip.\"table_schema\" = o.parts[2] AND ip.\"table_name\" = o.parts[3] AND " +
 	    KeyFoldSql("ip.\"column_name\"") + " = " + KeyFoldSql("coalesce(" + read_name("rc") + ", oc.\"name\")") +
-	    " WHERE o.form <> 'alias'"
+	    " WHERE o.form <> 'alias' OR EXISTS (SELECT 1 FROM " + Tbl("relation_columns") +
+	    " c4 WHERE c4.\"vcat\" = o.vcat AND c4.\"vname\" = " + alias_vname +
+	    ")"
 	    " UNION ALL BY NAME"
 	    " SELECT * FROM (SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
 	    KeyQuotePartSql("i.\"table_name\"") +

@@ -106,24 +106,21 @@ SELECT * FROM remote.main.orders ORDER BY id;
 1	acme
 2	globex
 
-# --- streamed ingest is enforced, and this object cannot take it ------------------------------------------
-# the generated INSERT is rewritten under the principal recovered from its stream id (spec 042), so it is
-# refused for the reason any write to this object is refused: the object narrows its columns, which makes
-# it a projection, and a projection is read-only. Bulk loading into a writable object is proven in
-# acl_quack_ingest.test.
+# --- streamed ingest is enforced -----------------------------------------------------------------------
+# the generated INSERT is rewritten under the principal recovered from its stream id (spec 042). The object's list
+# names two physical columns as they are, so it is writable (spec 171): the stream writes the columns it was shown,
+# and the one the list leaves out (`ssn`) is not the principal's to write - it gets its default
 
 statement ok
 CREATE TABLE bulk AS SELECT i AS id, 'bulk' AS tenant FROM range(5000) t(i);
 
-statement error
+statement ok
 INSERT INTO remote.main.orders SELECT * FROM bulk;
-----
-<REGEX>:.*read-only relation.*
 
-query I
-SELECT count(*) FROM phys.main.orders;
+query II
+SELECT count(*), count(ssn) FROM phys.main.orders;
 ----
-2
+5002	2
 
 # --- closing the door closes what it served --------------------------------------------------------------
 # the sessions are bound to connections that will never come back, and nothing else can tell they are

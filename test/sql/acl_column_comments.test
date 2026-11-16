@@ -239,7 +239,8 @@ ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.co
 ----
 amount	PHYS amount
 
-# a declared list keeps its own comments (object_columns), never the source's
+# a declared list keeps its own comments (object_columns), over the source's for a column it reads by name (spec 171:
+# the rule a renaming list had - nothing shown is taken away, spec 143)
 statement ok
 ACL ADMIN COMMENT ON VIRTUAL TABLE c.narrow COLUMN id IS 'the order';
 
@@ -247,7 +248,7 @@ query II
 ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'narrow' ORDER BY ordinal_position;
 ----
 id	the order
-amount	NULL
+amount	PHYS amount
 
 # a commented column the source drops: the comment is kept and the check says so, with the repair
 statement ok

@@ -308,10 +308,11 @@ ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.created_scalar AS SELECT 1 AS one;
 statement ok
 ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.created COLUMNS 'id';
 
+# a list of bare names keeps the writable alias form (spec 171)
 query I
 SELECT form FROM aclcat.acl.relations WHERE vname = 'created';
 ----
-subquery
+alias
 
 # --- DROP ... IF EXISTS -------------------------------------------------------------------------------
 

@@ -4237,7 +4237,8 @@ private:
 			// too narrow and REPLACE names a column that does not exist, too wide and the width no
 			// longer matches this list.
 			for (auto &column : policy.write_order) {
-				node.columns.emplace_back(column);
+				// the published names, mapped onto the physical table as a client's own list is (spec 171)
+				node.columns.emplace_back(MapWrittenColumn(policy, Identifier(column), vname));
 			}
 		}
 		if (node.columns.empty() || node.default_values || node.column_order == InsertColumnOrder::INSERT_BY_NAME) {
