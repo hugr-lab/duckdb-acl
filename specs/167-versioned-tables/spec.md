@@ -58,7 +58,8 @@ would ignore the column and serve every version. The clause is stored normalized
 
 **Resolved** (`CatalogBackend::ApplyGrantVersions`, after a relation's or a live alias's union of grant rows).
 
-- **Per role:** the object grant's clause, else the catalog grant's, else every version.
+- **Per role:** the object grant's clause, else the catalog grant's, else every version (since spec 168: else
+  `CURRENT`).
 - **United** (`UniteVersions`): every version when one role reads every version, else the roles' one clause.
   Different clauses set `TablePolicy::versions_differ`, which refuses the read, as two masks of one column do
   (spec 102). The roles are the rows that hold the capability exercised (spec 145).
@@ -110,7 +111,8 @@ window (`AT`, `BETWEEN`) refuses every verb. This is judged on:
 - **Values in the window are bounded.** A client's value in a window is a constant, so the value checked is the value
   read.
 - **Default unchanged.** Unstated means every version, as before. The rule is that nothing that works today is taken
-  away automatically: an operator states `CURRENT` where history must not be read.
+  away automatically: an operator states `CURRENT` where history must not be read. **Superseded by spec 168**: before
+  the release unstated is `CURRENT`.
 - **Other version paths.**
   - DuckLake's own functions (`ducklake_snapshots`, `ducklake_table_changes`, …) are in the never set.
   - A scan function that takes a version (`iceberg_scan(…, version => …)`) is in no category by default, so it is

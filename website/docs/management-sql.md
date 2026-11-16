@@ -769,18 +769,21 @@ A table of a catalog that keeps its history (DuckLake, Iceberg) is read at an ol
 
 | `VERSIONS` | the role reads |
 | --- | --- |
-| not stated | the catalog grant's; on a catalog grant, every version (as before) |
+| not stated | the catalog grant's; on a catalog grant, the current version, as `CURRENT` (spec 168) |
 | `ANY` | every version: the role's own `AT (…)` as it is written |
 | `CURRENT` | the current version; any `AT (…)` is refused |
 | `AT (VERSION => 42)` / `AT (TIMESTAMP => TIMESTAMP '2026-06-30')` | that snapshot: a read without `AT` reads it, any other `AT` is refused |
 | `BETWEEN TIMESTAMP '2026-01-01' AND TIMESTAMP '2026-06-30'` | an `AT (TIMESTAMP => t)` with `t` inside the window; a read without `AT` reads the window's latest version (`least(now(), end)`) |
 
 ```sql
-ACL ADMIN GRANT CATALOG lake TO ROLE analyst MAIN VERSIONS CURRENT;
+ACL ADMIN GRANT CATALOG lake TO ROLE analyst MAIN;                 -- the current version
+ACL ADMIN GRANT CATALOG lake TO ROLE historian MAIN VERSIONS ANY;  -- every version
 ACL ADMIN GRANT TABLE lake.orders TO ROLE auditor VERSIONS BETWEEN TIMESTAMP '2026-01-01' AND TIMESTAMP '2026-06-30';
 ACL ADMIN GRANT TABLE lake.orders TO ROLE closing VERSIONS AT (VERSION => 1204);
 ```
 
+- **History is granted.** A grant that states no `VERSIONS` reads the current version only, so a role reads older
+  versions only where a grant says `ANY`, `AT` or `BETWEEN`. `platform.grants` shows `versions` NULL for such a grant.
 - **Values are constants.** They are evaluated where the grant is written and stored as constants. A version is an
   integer. A timestamp is a finite instant, stored in UTC. A `TIMESTAMP` without an offset is read in the node's time
   zone (UTC on a build without ICU), so write an offset (`TIMESTAMPTZ '2026-06-30 00:00:00+00'`) to be exact.
@@ -792,9 +795,10 @@ ACL ADMIN GRANT TABLE lake.orders TO ROLE closing VERSIONS AT (VERSION => 1204);
   parameter. Such a read is also bound alone before the statement runs (spec 159), where a parameter has no value.
 - **Writes.** A role whose grant reads a snapshot or a window (`AT`, `BETWEEN`) writes nothing to the table: a write
   reads and writes the current rows.
-- **Several roles.** A principal's roles unite: when one of them reads every version, the principal does. Two
-  different limits are refused (read under one role), as two masks of one column are. When the role that reads every
-  version sees another slice than a limited role (another `RLS`, other columns), the union reads the limited role's
+- **Several roles.** A principal's roles unite: when one of them reads every version (`ANY`), the principal does. Two
+  different limits are refused (read under one role), as two masks of one column are. An unstated grant is `CURRENT`
+  here too, so beside another role's `AT` or `BETWEEN` on the same table the read is refused. When the role that reads
+  every version sees another slice than a limited role (another `RLS`, other columns), the union reads the limited role's
   slice in history. That is audited as `role_union_widens` (spec 146), never refused.
 - **The virtual name decides.** `VERSIONS` follows the object the name resolves to. A live schema alias reaching the
   same physical table takes the alias's grants, the catalog grant's `VERSIONS` included, not the table object's.

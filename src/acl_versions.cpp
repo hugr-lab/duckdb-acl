@@ -131,10 +131,10 @@ VersionLimit ReadVersions(const string &stored) {
 	VersionLimit limit;
 	auto text = stored;
 	StringUtil::Trim(text);
-	if (text.empty() || StringUtil::CIEquals(text, "ANY")) {
+	if (StringUtil::CIEquals(text, "ANY")) {
 		return limit;
 	}
-	if (StringUtil::CIEquals(text, "CURRENT")) {
+	if (text.empty() || StringUtil::CIEquals(text, "CURRENT")) { // spec 168: unstated = the current version
 		limit.kind = VersionLimit::Kind::CURRENT;
 		return limit;
 	}
@@ -242,8 +242,11 @@ string UniteVersions(const vector<string> &stored, bool &differ) {
 	for (auto &one : stored) {
 		auto text = one;
 		StringUtil::Trim(text);
-		if (text.empty() || StringUtil::CIEquals(text, "ANY")) {
-			return string(); // one role reads every version: the union does
+		if (StringUtil::CIEquals(text, "ANY")) {
+			return "ANY"; // one role reads every version: the union does
+		}
+		if (text.empty()) {
+			text = "CURRENT"; // spec 168: unstated = the current version
 		}
 		if (first) {
 			united = text;

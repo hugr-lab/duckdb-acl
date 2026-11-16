@@ -133,9 +133,10 @@ struct TablePolicy {
 	string query; // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
 	//! spec 165: a principal's view body's call probes, split off `query` before a grant wraps it - each bound alone
 	vector<string> probes;
-	//! spec 167: the versions of a time-travel table the roles' grants admit - '' every version, else the stored clause
-	//! (`CURRENT`, `AT (…)`, `BETWEEN … AND …`, acl_versions.hpp); `versions_differ` when the roles' clauses differ,
-	//! which refuses the read (never one role's clause over another's)
+	//! spec 167: the versions of a time-travel table the roles' grants admit - the stored clause (`ANY` every version,
+	//! `CURRENT`, `AT (…)`, `BETWEEN … AND …`, acl_versions.hpp; '' - nothing stated, a driver, the memory store - is
+	//! `CURRENT`, spec 168); `versions_differ` when the roles' clauses differ, which refuses the read (never one role's
+	//! clause over another's)
 	string versions;
 	bool versions_differ = false;
 	//! The object is a virtual view (its SQL is its definition). Never read off `query`, which a grant's column list

@@ -746,7 +746,7 @@ void AclAddScalarAliasCatalogFunc(DataChunk &args, ExpressionState &state, Vecto
 //! acl_grant_catalog(role, vcat, caps_json, is_main[, rls, columns[, versions]]): grant a virtual catalog to a
 //! role. rls/columns are the grant's own policy (spec 011): they narrow every object of the catalog
 //! for this role - the predicate is AND-ed onto the objects', the column list intersects theirs; versions (spec 167)
-//! the versions of a time-travel table it reads ('' = every version).
+//! the versions of a time-travel table it reads ('' = not stated: the current version, spec 168).
 void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RoleArg(args, 0, row, "acl_grant_catalog");

@@ -206,8 +206,9 @@ void VersionsAtParameter() {
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE VIRTUAL TABLE c.t AS lk.main.t; CREATE ROLE rls; "
 	          "CREATE ROLE win; CREATE ROLE every");
-	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE every MAIN");
-	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE rls MAIN; GRANT TABLE c.t TO ROLE rls RLS (region = 'eu')");
+	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE every MAIN VERSIONS ANY");
+	Exec(con,
+	     "ACL ADMIN GRANT CATALOG c TO ROLE rls MAIN VERSIONS ANY; GRANT TABLE c.t TO ROLE rls RLS (region = 'eu')");
 	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE win MAIN VERSIONS BETWEEN TIMESTAMP '2000-01-01' AND TIMESTAMP "
 	          "'2100-01-01'");
 

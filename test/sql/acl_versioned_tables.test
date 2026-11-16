@@ -1,6 +1,7 @@
 # name: test/sql/acl_versioned_tables.test
 # description: spec 167 - a grant's VERSIONS limits the versions of a time-travel table a role reads: CURRENT (no AT),
-#   AT (that snapshot only), BETWEEN (a TIMESTAMP inside the window), unstated = every version, as before; the AT is
+#   AT (that snapshot only), BETWEEN (a TIMESTAMP inside the window), ANY (every version), unstated = CURRENT (spec
+#   168); the AT is
 #   carried to the source below the grant's row filter (it used to be dropped there), a view refuses an AT, a grant
 #   that reads a snapshot or a window writes nothing, roles whose clauses differ refuse. The token names two roles:
 #   analyst and auditor (test/idp/rs).
@@ -58,13 +59,16 @@ statement ok
 ACL ADMIN CREATE VIRTUAL VIEW c.v AS 'SELECT * FROM lk.main.t';
 
 statement ok
-ACL ADMIN CREATE ROLE every; CREATE ROLE everyrls; CREATE ROLE cur; CREATE ROLE pin; CREATE ROLE pinrls; CREATE ROLE win; CREATE ROLE old; CREATE ROLE analyst; CREATE ROLE auditor;
+ACL ADMIN CREATE ROLE every; CREATE ROLE everyrls; CREATE ROLE plain; CREATE ROLE cur; CREATE ROLE pin; CREATE ROLE pinrls; CREATE ROLE win; CREATE ROLE old; CREATE ROLE analyst; CREATE ROLE auditor;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE every MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE every MAIN VERSIONS ANY;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE everyrls MAIN; GRANT TABLE c.t TO ROLE everyrls RLS (region = 'eu');
+ACL ADMIN GRANT CATALOG c TO ROLE plain MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE everyrls MAIN VERSIONS ANY; GRANT TABLE c.t TO ROLE everyrls RLS (region = 'eu');
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE cur MAIN VERSIONS CURRENT;
@@ -93,7 +97,29 @@ SELECT versions FROM store.acl.role_object_caps WHERE role = 'pin';
 ----
 AT (VERSION => 2)
 
-# --- unstated: every version, as before - and the AT is now carried below a grant's row filter --------------------
+# --- unstated: the current version only (spec 168) ----------------------------------------------------------------
+
+query T
+SELECT versions FROM store.acl.role_catalogs WHERE role = 'plain';
+----
+NULL
+
+query IT
+ACL ROLE "plain" SELECT * FROM t;
+----
+2	us
+
+statement error
+ACL ROLE "plain" SELECT * FROM t AT (VERSION => 2);
+----
+is read at its current version only - AT (...) is not allowed
+
+statement error
+ACL ROLE "plain" SELECT * FROM raw.t AT (VERSION => 2);
+----
+is read at its current version only
+
+# --- ANY: every version - and the AT is now carried below a grant's row filter --------------------------------------
 
 query IT
 ACL ROLE "every" SELECT * FROM t AT (VERSION => 2);
@@ -242,8 +268,31 @@ ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiO
 ----
 admit different versions
 
+# an unstated clause is CURRENT where roles unite: beside a stated CURRENT it differs from nothing
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN; GRANT CATALOG c TO ROLE auditor MAIN VERSIONS CURRENT;
+
+query IT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t;
+----
+2	us
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t AT (VERSION => 2);
+----
+is read at its current version only
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor MAIN VERSIONS AT (VERSION => 3);
+
+# ... and beside another role's AT the limits differ: refused, the current rows too
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t;
+----
+admit different versions
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN VERSIONS ANY;
 
 query IT
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t AT (VERSION => 2);
@@ -256,7 +305,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN VERSIONS CURRENT; GRANT TABLE c.t TO ROLE analyst RLS (region = 'us') COLUMNS (id);
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE auditor MAIN; GRANT TABLE c.t TO ROLE auditor RLS (region = 'eu');
+ACL ADMIN GRANT CATALOG c TO ROLE auditor MAIN VERSIONS ANY; GRANT TABLE c.t TO ROLE auditor RLS (region = 'eu');
 
 query I
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT count(*) FROM t AT (VERSION => 3);
@@ -329,14 +378,14 @@ ACL ROLE "win" SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '1999-01-01');
 ----
 the version asked for is outside it
 
-# a re-grant states the grant whole
+# a re-grant states the grant whole: unstated is the current version again
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE win MAIN;
 
-query IT
+statement error
 ACL ROLE "win" SELECT * FROM t AT (VERSION => 2);
 ----
-1	eu
+is read at its current version only
 
 # --- what a grant's VERSIONS may be --------------------------------------------------------------------------------
 
