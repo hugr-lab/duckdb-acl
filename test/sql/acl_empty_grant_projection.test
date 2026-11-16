@@ -48,7 +48,7 @@ ACL ADMIN GRANT TABLE c.narrow TO ROLE r COLUMNS (id);
 statement error
 ACL ADMIN GRANT TABLE c.wide TO ROLE r COLUMNS (* EXCLUDE (id));
 ----
-<REGEX>:.*empty set of columns.*
+the grant's COLUMNS leaves no column of "wide"
 
 statement ok
 ACL ADMIN GRANT TABLE c.narrow TO ROLE r COLUMNS (k); GRANT TABLE c.wide TO ROLE r COLUMNS (id);

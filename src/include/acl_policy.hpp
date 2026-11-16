@@ -880,7 +880,10 @@ struct PolicyStore {
 	                  const string &rls = "", const string &columns = "", bool judge_columns = true,
 	                  bool judge_caps = true, optional_ptr<const string> versions = nullptr);
 	void CatalogRevoke(const string &role, const string &vcat);
-	void CatalogDropRelation(const string &vcat, const string &vname, optional_ptr<RecordWrite> write = nullptr);
+	//! `record` (a principal's DDL record, spec 151): its grants go with it; otherwise (spec 170) a drop is refused
+	//! while the name holds object grants a live alias's object would take over
+	void CatalogDropRelation(const string &vcat, const string &vname, optional_ptr<RecordWrite> write = nullptr,
+	                         bool record = false);
 	//! spec 154: a client's ROLLBACK of a record written on the store's own connection, in one write of the store:
 	//! - a record the write created goes as a drop takes it (what was written on it meanwhile too), while it is still
 	//!   that record (its form, physical name, body and probed facts); so does a rename of such a record

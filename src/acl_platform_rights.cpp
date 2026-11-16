@@ -862,7 +862,10 @@ unique_ptr<GlobalTableFunctionState> CheckGrantInit(ClientContext &, TableFuncti
 	// names as the write takes them: the stored spelling (spec 116)
 	auto vcat = store.SpellCatalog(text(1));
 	auto vname = text(2).empty() ? string() : store.SpellName(vcat, text(2));
-	auto has_caps = bind.arguments.size() > 5 && !bind.arguments[5].IsNull();
+	// spec 170: '' states no caps, as a grant written without CAPS (the platform form passes it for an omitted one)
+	auto caps_text = text(5);
+	StringUtil::Trim(caps_text);
+	auto has_caps = !caps_text.empty();
 	auto value = [](const string &text) {
 		return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
 	};

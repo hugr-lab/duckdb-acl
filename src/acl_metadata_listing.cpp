@@ -1236,12 +1236,12 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"keys", "SELECT \"vcat\", \"vname\", \"kind\", \"pos\", \"column\" FROM %s"},
 	    {"roles", "SELECT \"role\", \"comment\" FROM %s"},
 	    {"role_claims", "SELECT \"role\", \"claim\", \"value\" FROM %s"},
-	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"rls_checked\", \"columns\""
-	               " FROM %s"},
+	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"rls_checked\", \"columns\","
+	               " \"versions\" FROM %s"},
 	    {"schema_grants", "SELECT \"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"into\","
 	                      " \"virtual_only\", \"comment\" FROM %s"},
-	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"rls_checked\", \"columns\""
-	                      " FROM %s"},
+	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"rls_checked\", \"columns\","
+	                      " \"masks\", \"versions\" FROM %s"}, // spec 170: what spec 158 / 167 store
 	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
 	    // spec 095: what is stored - a value kept in a secret is NULL here, beside the secret's name;
 	    // nothing in these tables is a key or a credential
