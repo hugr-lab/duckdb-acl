@@ -583,6 +583,20 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 
 using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 
+//! Whether a relation's grant rows (keyed by name) also belong to something else of that name once it goes: a function
+//! of the same name, or - spec 170 - the object of a live schema alias the relation shadowed. Dropping them would leave
+//! that object read by its catalog grant alone: its COLUMNS and MASK gone, the role reading it whole
+bool GrantsSharedByName(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname) {
+	if (read("SELECT 1 FROM " + catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+	         " AND \"vname\" = " + Lit(vname) + " LIMIT 1")
+	        ->RowCount() > 0) {
+		return true;
+	}
+	return read("SELECT 1 FROM " + catalog.Tbl("schemas") + " s WHERE s.\"vcat\" = " + Lit(vcat) +
+	            " AND s.\"phys_path\" IS NOT NULL AND " + KeyPrefixSql(Lit(vname), "s.\"path\"") + " LIMIT 1")
+	           ->RowCount() > 0;
+}
+
 //! spec 158 stage 2: where a list holding a star is written over a source that binds here, it must bind over it and
 //! read no name twice (the read refuses both: a duplicate is suffixed in a subquery, `ssn_1`, where a grant's test and
 //! masks name only the first)
@@ -830,6 +844,12 @@ void CheckGrantProjection(CatalogBackend &catalog, const ReadFn &read, const str
 		}
 		if (!probed) {
 			return; // accepted unprobed, exactly as spec 026 wrote it
+		}
+		if (StringUtil::Contains(error, "resulted in an empty set of columns")) {
+			// spec 170: said in the grant's words, not as the COLUMNS selector duckdb was handed
+			throw InvalidInputException("acl: the grant's COLUMNS leaves no column of \"%s\" - a grant shows at least "
+			                            "one (REVOKE it to take the object away)",
+			                            vname);
 		}
 		throw InvalidInputException("acl: the projection of the grant on \"%s\" does not bind against it: %s", vname,
 		                            error);
@@ -2623,11 +2643,9 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname, o
 	auto version = catalog->WriteWithReads(
 	    [&](const ReadFn &read, vector<string> &statements) {
 		    CaptureBefore(read, *catalog, write, vcat, {vname});
-		    // a function of the same name keeps the grant, because the grant row cannot tell them apart
-		    auto same_named_function =
-		        read("SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
-		             " AND \"vname\" = " + Lit(vname) + " LIMIT 1")
-		            ->RowCount() > 0;
+		    // a function of the same name keeps the grant, because the grant row cannot tell them apart - and so does
+		    // an object of a live alias the relation shadowed (spec 170)
+		    auto same_named_function = GrantsSharedByName(*catalog, read, vcat, vname);
 		    // spec 154: the same tables a record's undo reads, so neither can miss one the other has
 		    for (auto &source : RelationRowSources(*catalog, vcat, vname)) {
 			    if (!source.mark && !(source.grants && same_named_function)) {
@@ -2678,9 +2696,7 @@ bool SameRecord(const vector<RelationRowSource> &sources, const PolicyStore::Rel
 //! else since may have meant to end
 void TakeName(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname,
               const PolicyStore::RelationChange &change, vector<string> &statements) {
-	bool same_named_function = read("SELECT 1 FROM " + catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                                " AND \"vname\" = " + Lit(vname) + " LIMIT 1")
-	                               ->RowCount() > 0;
+	bool same_named_function = GrantsSharedByName(catalog, read, vcat, vname);
 	auto sources = RelationRowSources(catalog, vcat, vname);
 	for (idx_t table = 0; table < sources.size(); table++) {
 		if (!(sources[table].grants && same_named_function)) {

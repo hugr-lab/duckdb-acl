@@ -39,14 +39,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - mirror / pull-through / publish, everything re-signed with our key;
   - public vs private extensions (a token through an http secret, tresor-issued);
   - air-gapped bundles.
-- **Columns after spec 158 stage 1** (found by its test migration):
-  - `DROP RELATION` of a relation that shadows a live alias's object (same name) also deletes that object's grants -
-    their COLUMNS and MASK go with it, and the role then reads the alias object whole (grants are keyed by name);
-  - a non-ASCII bare column in an object's list (`COLUMNS (größe)`) makes the relation the read-only subquery form;
-  - `acl_object_grants()` (the legacy listing) shows no masks - `platform.object_grants` does;
-  - `platform.check_grant` answers a `caps ok NULL` row when no caps are given; an `* EXCLUDE` that leaves no column is
-    refused with duckdb's raw binder message;
-  - stage 2: live stars in an object's list (stage 3, spec 102's machinery removed, is built).
+- **Columns after spec 158** (spec 170 closed the rest):
+  - an object's list of bare names (`COLUMNS (id, x)`) is the read-only subquery form, while the docs say a list of
+    bare names and renames keeps the writable alias form (only a list made only of renames does); making it alias
+    touches the listings' alias branch (joined on the list's expressions) and makes such objects writable - decide;
+  - spec 158 stage 2's known limits (a broken star is not marked in the listing; a `COLUMNS` selector reading the
+    session; a RENAME's tags).
 - **Versioned tables after spec 167** (a grant's `VERSIONS`, built 2026-11-15):
   - `platform.effective_rights` / `check_grant` do not show a role's versions;
   - there is no `ALTER GRANT … SET VERSIONS` (a re-grant changes them);

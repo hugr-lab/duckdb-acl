@@ -1,0 +1,95 @@
+# name: test/sql/acl_columns_followups.test
+# description: spec 170 - spec 158 stage 1's follow-ups: DROP RELATION of a relation that shadowed a live alias's
+#   object keeps that object's grants (their COLUMNS and MASK); acl_object_grants() shows masks and versions;
+#   platform.check_grant with no caps answers no caps row; a COLUMNS that leaves no column is said in the grant's words.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t (id INTEGER, ssn VARCHAR, note VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, '123-45-6789', 'n');
+
+statement ok
+CREATE TABLE phys.main.t2 (id INTEGER, ssn VARCHAR, note VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t2 VALUES (2, '987-65-4321', 'm');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r; CREATE ROLE boss;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT ADMIN policy TO ROLE boss;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.raw AS phys.main;
+
+# the alias's object raw.t, narrowed and masked by its object grant
+statement ok
+ACL ADMIN GRANT TABLE c.raw.t TO ROLE r COLUMNS (id, ssn) MASK (ssn AS '***');
+
+query IT
+ACL ROLE "r" SELECT * FROM raw.t;
+----
+1	***
+
+# a relation of the same name shadows it, then goes: the grant on the name stays - the alias's object is read as before
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.raw.t AS phys.main.t2;
+
+query IT
+ACL ROLE "r" SELECT * FROM raw.t;
+----
+2	***
+
+statement ok
+ACL ADMIN DROP RELATION c.raw.t;
+
+query IT
+ACL ROLE "r" SELECT * FROM raw.t;
+----
+1	***
+
+# --- acl_object_grants() shows what spec 158 / 167 store -----------------------------------------------------------
+
+query TTT
+SELECT vname, columns, masks FROM acl_object_grants() WHERE role = 'r';
+----
+raw.t	id, ssn	ssn AS CAST(('***') AS VARCHAR)
+
+query T
+SELECT count(*) FROM acl_grants() WHERE role = 'r' AND versions IS NULL;
+----
+1
+
+# --- platform.check_grant: no caps given, no caps row --------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o AS phys.main.t;
+
+query I
+ACL ROLE "boss" SELECT count(*) FROM platform.check_grant('r', 'c', 'o', '', 'id', '') WHERE item = 'caps';
+----
+0
+
+# --- a COLUMNS that leaves no column ----------------------------------------------------------------------------
+
+statement error
+ACL ADMIN GRANT TABLE c.o TO ROLE r COLUMNS (* EXCLUDE (id, ssn, note));
+----
+the grant's COLUMNS leaves no column of "o"

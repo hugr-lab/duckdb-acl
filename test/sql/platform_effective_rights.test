@@ -448,7 +448,7 @@ ACL ROLE "pol" SELECT object, columns FROM platform.effective_rights('r', 'c') W
 statement error
 ACL ADMIN GRANT TABLE c."T.x" TO ROLE w COLUMNS (* EXCLUDE (sku));
 ----
-<REGEX>:.*the projection of the grant on .*T\.x.* does not bind against it.*
+<REGEX>:.*the grant's COLUMNS leaves no column of .*T\.x.*
 
 statement ok
 INSERT INTO store.acl.role_object_caps ("role", "vcat", "vname", "caps", "rls", "columns") VALUES ('w', 'c', '"T.x"', NULL, '', '* EXCLUDE (sku)');
