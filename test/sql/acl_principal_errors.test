@@ -260,18 +260,44 @@ ACL ROLE "wide" INSERT INTO money VALUES (1, 'a', -1);
 ----
 Constraint Error: acl: the write breaks a CHECK constraint of the table it writes
 
-# --- a grant whose column list meets nothing: the star duckdb expanded (the source's every column) is not said ----
+# --- a star that meets no column: the star duckdb expanded (the source's every column) is not said ---------------
+# (spec 158: a catalog grant takes no column list, and an object grant whose test leaves no column is refused where
+# written - so the cases are the client's own star that excludes every column it may read, and a stored grant)
 
 statement ok
 ACL ADMIN CREATE ROLE narrow;
 
 statement ok
-ACL ADMIN GRANT CATALOG sales TO ROLE narrow WITH (select) MAIN COLUMNS (nothing_here);
+ACL ADMIN GRANT CATALOG sales TO ROLE narrow WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.money TO ROLE narrow WITH (select) COLUMNS (id);
+
+statement error
+ACL ROLE "narrow" SELECT * EXCLUDE (id) FROM money;
+----
+Binder Error: SELECT list is empty after resolving * expressions!
+
+statement error
+ACL ROLE "narrow" SELECT COLUMNS(lambda c: c <> 'id') FROM money;
+----
+Binder Error: acl: a star in this statement selects no column it may read
+
+# a stored grant whose test meets no column (as a source that lost the column it names leaves it): the star duckdb
+# expanded is not said either
+statement ok
+UPDATE aclcat.acl.role_object_caps SET "columns" = 'nothing_here' WHERE "role" = 'narrow' AND "vname" = 'money';
+
+statement ok
+SET GLOBAL acl_version_check_interval = 0;
+
+statement ok
+UPDATE aclcat.acl.meta SET "value" = (CAST("value" AS BIGINT) + 1)::VARCHAR WHERE "key" = 'policy_version';
 
 statement error
 ACL ROLE "narrow" SELECT * FROM money;
 ----
-Binder Error: acl: a star in this statement selects no column it may read
+<REGEX>:Binder Error: acl: a star in this statement selects no column it may read.*
 
 # --- the operator's own SQL and NATIVE keep duckdb's text ---------------------------------------------------------
 

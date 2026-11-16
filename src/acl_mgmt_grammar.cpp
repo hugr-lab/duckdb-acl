@@ -1711,8 +1711,8 @@ string CapsListJson(ParseResult &result) {
 void GrantColumnsInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg, MgmtParseData &data) {
 	auto &node = Strip(result);
 	if (node.Name() == "AclParenList" && !ListIsEmpty(transformer, result)) {
-		throw BinderException("acl admin: a grant's column list is a SELECT list - `name`, `<expression> AS name` or "
-		                      "`name: <expression>`, each name an identifier as duckdb reads one");
+		throw BinderException("acl admin: a grant's COLUMNS is `name, …`, `*` or `* EXCLUDE (name, …)` - each name an "
+		                      "identifier as duckdb reads one (a mask is MASK (<column> AS <expression>))");
 	}
 	if (node.Name() == "AclParenList" || node.Name() == "AclGrantColumnItems") {
 		ParensInto(node, arg, MgmtParsed::TextKind::TEXT, true, data);

@@ -654,30 +654,75 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 	if (test.All() && mask_items.empty()) {
 		return stored();
 	}
+	// the object's columns and their types: a relation's (its list, else its source's), a table function's declared or
+	// probed result, or - a table under a live schema alias - its physical table's; `probe` is the object's read, a
+	// grant over which must bind (a relation's is probed with its projection below, GrantProjectionStatements)
+	vector<string> exposed;
+	vector<std::pair<string, LogicalType>> types;
+	vector<string> type_texts; // a table function's declared result types, as written (`types` then names only)
+	string probe;
 	auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog.Tbl("relations") +
 	                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-	if (shape->RowCount() == 0) {
-		return stored();
-	}
-	auto text = [&](idx_t column) {
-		auto value = shape->Collection().GetValue(column, 0);
-		return value.IsNull() ? string() : value.ToString();
-	};
-	auto form = text(0);
-	string source = form == "view" ? "(" + text(2) + ")" : NamePath::KeyToSql(text(1));
-	if (source.empty()) {
-		return stored();
-	}
-	vector<string> declared;
-	auto rows = read("SELECT \"name\" FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                 " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
-	ResultRows rows_rows(*rows);
-	for (idx_t i = 0; i < rows->RowCount(); i++) {
-		declared.push_back(rows_rows.GetValue(0, i).ToString());
-	}
-	vector<string> exposed;
-	if (!catalog.ExposedColumns(source, declared, exposed)) {
-		return stored();
+	if (shape->RowCount() > 0) {
+		auto text = [&](idx_t column) {
+			auto value = shape->Collection().GetValue(column, 0);
+			return value.IsNull() ? string() : value.ToString();
+		};
+		auto form = text(0);
+		string source = form == "view" ? "(" + text(2) + ")" : NamePath::KeyToSql(text(1));
+		if (source.empty()) {
+			return stored();
+		}
+		vector<string> declared;
+		auto rows = read("SELECT \"name\" FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                 " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+		ResultRows rows_rows(*rows);
+		for (idx_t i = 0; i < rows->RowCount(); i++) {
+			declared.push_back(rows_rows.GetValue(0, i).ToString());
+		}
+		if (!catalog.ExposedColumns(source, declared, exposed)) {
+			return stored();
+		}
+		if (!mask_items.empty()) {
+			types = ExposedTypes(catalog, read, vcat, vname, source);
+		}
+	} else {
+		auto function =
+		    read("SELECT \"name\", \"type\" FROM " + catalog.Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		         " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'table' ORDER BY \"pos\"");
+		ResultRows function_rows(*function);
+		if (function_rows.Count() > 0) {
+			vector<string> items;
+			for (idx_t i = 0; i < function_rows.Count(); i++) {
+				auto name = function_rows.GetValue(0, i).ToString();
+				auto type_text = function_rows.GetValue(1, i);
+				if (type_text.IsNull()) {
+					return stored(); // a result not typed here: the read decides
+				}
+				exposed.push_back(name);
+				types.emplace_back(name, LogicalType::VARCHAR);
+				type_texts.push_back(type_text.ToString());
+				items.push_back("NULL::" + type_text.ToString() + " AS " + acl_detail::Ident(name));
+			}
+			probe = "SELECT " + StringUtil::Join(items, ", ");
+		} else {
+			// a table under a live schema alias: the longest alias path the name continues
+			auto alias = read("SELECT \"path\", \"phys_path\" FROM " + catalog.Tbl("schemas") + " WHERE \"vcat\" = " +
+			                  Lit(vcat) + " AND \"phys_path\" IS NOT NULL AND substr(" + Lit(vname) +
+			                  ", 1, length(\"path\") + 1) = \"path\" || '.' ORDER BY length(\"path\") DESC LIMIT 1");
+			ResultRows alias_rows(*alias);
+			if (alias_rows.Count() == 0) {
+				return stored();
+			}
+			auto path = alias_rows.GetValue(0, 0).ToString();
+			auto source = NamePath::KeyToSql(
+			    NamePath::JoinKeys(alias_rows.GetValue(1, 0).ToString(), vname.substr(path.size() + 1)));
+			if (!catalog.ExposedColumns(source, {}, exposed)) {
+				return stored();
+			}
+			catalog.ProbeTypes("SELECT * FROM " + source, types);
+			probe = "SELECT * FROM " + source;
+		}
 	}
 	auto spelled = [&](const string &name) {
 		for (auto &column : exposed) {
@@ -701,7 +746,6 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 	}
 	test.names = names;
 	if (!mask_items.empty()) {
-		auto types = ExposedTypes(catalog, read, vcat, vname, source);
 		for (auto &mask : mask_items) {
 			mask.first = spelled(mask.first);
 			if (!test.Admits(mask.first)) {
@@ -713,7 +757,8 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 					continue;
 				}
 				// cast to the column's type, once (a stored mask written again keeps its cast)
-				auto cast_to = type.second.ToString();
+				auto at = NumericCast<idx_t>(&type - &types[0]);
+				auto cast_to = type_texts.empty() ? type.second.ToString() : type_texts[at];
 				auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask.second);
 				bool cast = parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CAST &&
 				            parsed[0]->Cast<CastExpression>().TargetType().ToString() == cast_to;
@@ -722,6 +767,19 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 				}
 				break;
 			}
+		}
+	}
+	if (!probe.empty()) {
+		// spec 158: the grant over the object's read binds - a mask that does not is refused where it is written
+		acl_detail::RoleColumns granted;
+		granted.test = test;
+		granted.masks = mask_items;
+		auto instance = catalog.Db();
+		Connection con(*instance);
+		auto bound = con.Query("SELECT * FROM (" + GrantOverSql(granted, probe) + ") WHERE false");
+		if (bound->HasError()) {
+			throw InvalidInputException("acl: the projection of the grant on \"%s\" does not bind against it: %s",
+			                            vname, bound->GetError());
 		}
 	}
 	return stored();
@@ -3220,6 +3278,13 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			if (!columns.empty() || !masks.empty()) {
 				try {
 					GrantProjectionStatements(*catalog, read, role, vcat, object, columns, masks, statements, false);
+					// spec 158: a mask written while its object could not be judged is cast to its column's type now
+					auto normalised = NormaliseObjectGrant(*catalog, read, vcat, object, columns, masks);
+					if (normalised.masks != masks) {
+						statements.push_back("UPDATE " + catalog->Tbl("role_object_caps") + " SET \"masks\" = " +
+						                     Lit(normalised.masks) + " WHERE \"role\" = " + Lit(role) +
+						                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object));
+					}
 				} catch (std::exception &) {
 					// spec 158: a stored grant that does not read stays as it is - the check names it
 				}
@@ -4333,9 +4398,10 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 		statements.push_back("INSERT INTO " + catalog->Tbl("role_object_caps") +
 		                     "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\", "
 		                     "\"versions\", \"masks\") VALUES (" +
-		                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " + Lit(rls) +
-		                     ", " + Lit(plan.listed) + ", " + (rls.empty() ? "NULL" : (plan.checked ? "true" : "false")) +
-		                     ", " + kept + ", " + (plan.masks.empty() ? string("NULL") : Lit(plan.masks)) + ")");
+		                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " +
+		                     Lit(rls) + ", " + Lit(plan.listed) + ", " +
+		                     (rls.empty() ? "NULL" : (plan.checked ? "true" : "false")) + ", " + kept + ", " +
+		                     (plan.masks.empty() ? string("NULL") : Lit(plan.masks)) + ")");
 	});
 	NoteGrantLineage(vcat, vname); // spec 107
 }

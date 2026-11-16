@@ -1,7 +1,7 @@
 # name: test/sql/acl_listing_read_parity.test
 # description: spec 144 - a listing says what the read returns: a live schema alias's columns under a narrowing grant
-#   (the catalog grant's list, an object grant's on the alias object, both, two roles), a catalog grant's struct path
-#   in the listed type (a relation, an alias object, a masked field), and a star filter's column names
+#   (an object grant's on the alias object, two roles), a masked struct in the listed type (a relation, an alias
+#   object), a mask's type (spec 158: the column's), and a star filter's column names
 # group: [sql]
 
 require acl
@@ -39,12 +39,19 @@ ACL ADMIN CREATE VIRTUAL SCHEMA c.raw AS phys.main;
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.orders;
 
-# --- a live alias under the catalog grant's list: the read returns id, amount (masked) - and so does the listing ----
+# --- a live alias under an object grant's list: the read returns id, amount (masked) - and so does the listing -----
+# (spec 158: a catalog grant takes no COLUMNS - the list moved to the grants of the objects concerned)
 statement ok
 ACL ADMIN CREATE ROLE r_cat;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_cat WITH (select) MAIN COLUMNS (id, 0 AS amount);
+ACL ADMIN GRANT CATALOG c TO ROLE r_cat WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_cat WITH (select) COLUMNS (id, amount) MASK (amount AS 0);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_cat WITH (select) COLUMNS (id, amount) MASK (amount AS 0);
 
 query II
 ACL ROLE 'r_cat' SELECT * FROM raw.orders;
@@ -83,25 +90,7 @@ ACL ROLE 'r_obj' SELECT column_name, COLUMN_COMMENT FROM information_schema.colu
 id	NULL
 note	PHYS note
 
-# --- both levels: what both keep -----------------------------------------------------------------------------------
-statement ok
-ACL ADMIN CREATE ROLE r_both;
-
-statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_both WITH (select) MAIN COLUMNS (id, note);
-
-statement ok
-ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_both WITH (select) COLUMNS (id, amount);
-
-query I
-ACL ROLE 'r_both' SELECT * FROM raw.orders;
-----
-1
-
-query T
-ACL ROLE 'r_both' SELECT column_name FROM information_schema.columns WHERE table_schema = 'raw' ORDER BY ordinal_position;
-----
-id
+# spec 158: the "both levels" case is gone - a catalog grant has no column list, so there is no second level
 
 # --- two roles, one of them unrestricted: the union is everything (a token naming analyst and auditor) -------------
 statement ok
@@ -111,7 +100,10 @@ statement ok
 ACL ADMIN CREATE ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN COLUMNS (id, 0 AS amount);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE analyst WITH (select) COLUMNS (id, amount) MASK (amount AS 0);
 
 statement ok
 ACL ADMIN CREATE ROLE auditor;
@@ -133,60 +125,62 @@ ACL ADMIN CREATE ROLE r_all;
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r_all WITH (select) MAIN;
 
-# --- a catalog grant's struct path: the listed type is the read's ----------------------------------------------------
+# --- a masked struct field: the listed type is the read's (spec 158: a field path is a struct_update MASK, and the
+# column keeps its type - the hidden field reads NULL, never vanishes from the type) ----------------------------------
 statement ok
 ACL ADMIN CREATE ROLE r_path;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_path WITH (select) MAIN COLUMNS (id, addr.city);
+ACL ADMIN GRANT CATALOG c TO ROLE r_path WITH (select) MAIN;
 
-query T
-ACL ROLE 'r_path' SELECT typeof(addr) FROM t;
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_path WITH (select) COLUMNS (id, addr) MASK (addr AS struct_update(addr, secret := NULL::VARCHAR));
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_path WITH (select) COLUMNS (id, addr) MASK (addr AS struct_update(addr, secret := NULL::VARCHAR));
+
+query TT
+ACL ROLE 'r_path' SELECT typeof(addr), addr FROM t;
 ----
-STRUCT(city VARCHAR)
+STRUCT(city VARCHAR, "secret" VARCHAR)	{'city': A, 'secret': NULL}
+
+query TT
+ACL ROLE 'r_path' SELECT typeof(addr), addr FROM raw.orders;
+----
+STRUCT(city VARCHAR, "secret" VARCHAR)	{'city': A, 'secret': NULL}
 
 query TT
 ACL ROLE 'r_path' SELECT table_schema, data_type FROM information_schema.columns WHERE column_name = 'addr' ORDER BY 1;
 ----
-main	STRUCT(city VARCHAR)
-raw	STRUCT(city VARCHAR)
+main	STRUCT(city VARCHAR, "secret" VARCHAR)
+raw	STRUCT(city VARCHAR, "secret" VARCHAR)
 
 query T
 ACL ROLE 'r_path' SELECT data_type FROM duckdb_columns() WHERE schema_name = 'raw' AND column_name = 'addr';
 ----
-STRUCT(city VARCHAR)
+STRUCT(city VARCHAR, "secret" VARCHAR)
 
-# a masked field keeps its place, typed as the field (no probe for a catalog grant's mask)
+# a masked field keeps its place and the field's type
 statement ok
 ACL ADMIN CREATE ROLE r_field_mask;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_field_mask WITH (select) MAIN COLUMNS (id, addr.city, addr.secret = '***');
+ACL ADMIN GRANT CATALOG c TO ROLE r_field_mask WITH (select) MAIN;
 
-query T
-ACL ROLE 'r_field_mask' SELECT typeof(addr) FROM t;
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_field_mask WITH (select) COLUMNS (id, addr) MASK (addr AS struct_update(addr, secret := '***'));
+
+query TT
+ACL ROLE 'r_field_mask' SELECT typeof(addr), addr FROM t;
 ----
-STRUCT(city VARCHAR, "secret" VARCHAR)
+STRUCT(city VARCHAR, "secret" VARCHAR)	{'city': A, 'secret': ***}
 
 query T
 ACL ROLE 'r_field_mask' SELECT data_type FROM information_schema.columns WHERE table_name = 't' AND column_name = 'addr';
 ----
 STRUCT(city VARCHAR, "secret" VARCHAR)
 
-# an object grant's path was right before (its projection is probed, spec 026) and stays so
-statement ok
-ACL ADMIN CREATE ROLE r_obj_path;
-
-statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_obj_path WITH (select) MAIN;
-
-statement ok
-ACL ADMIN GRANT TABLE c.t TO ROLE r_obj_path WITH (select) COLUMNS (id, addr.city);
-
-query T
-ACL ROLE 'r_obj_path' SELECT data_type FROM information_schema.columns WHERE table_name = 't' AND column_name = 'addr';
-----
-STRUCT(city VARCHAR)
+# spec 158: "an object grant's path" (r_obj_path) is gone with field paths - r_path above is an object grant now
 
 # --- a star filter: the columns it reads are named as duckdb names them (the virtual names) ------------------------
 query T
@@ -215,73 +209,70 @@ amount
 note
 
 # --- the reviews' cases ---------------------------------------------------------------------------------------------
-# levels whose paths leave nothing of a column: the read has no such column, nor does the listing (no field name of
-# one level's own probe either)
-statement ok
-ACL ADMIN CREATE ROLE r_disjoint;
+# spec 158: "levels whose paths leave nothing of a column" (r_disjoint) is gone - no catalog list, no field paths
 
-statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_disjoint WITH (select) MAIN COLUMNS (id, addr.city);
-
-statement ok
-ACL ADMIN GRANT TABLE c.t TO ROLE r_disjoint WITH (select) COLUMNS (id, addr.secret);
-
-statement ok
-ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_disjoint WITH (select) COLUMNS (id, addr.secret);
-
-query I
-ACL ROLE 'r_disjoint' SELECT * FROM t;
-----
-1
-
-query I
-ACL ROLE 'r_disjoint' SELECT * FROM raw.orders;
-----
-1
-
-query TT
-ACL ROLE 'r_disjoint' SELECT table_schema, column_name FROM information_schema.columns ORDER BY 1, ordinal_position;
-----
-main	id
-raw	id
-
-# a mask is typed as its own text says - a constant's type, never a nested source type naming the fields
+# a mask is typed as the column it masks (spec 158: stored cast to the column's type) - never the mask's own type
 statement ok
 ACL ADMIN CREATE ROLE r_mask_types;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_mask_types WITH (select) MAIN COLUMNS (id, NULL AS amount, addr.city, addr.secret = 0);
+ACL ADMIN GRANT CATALOG c TO ROLE r_mask_types WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_mask_types WITH (select) COLUMNS (id, amount, addr) MASK (amount AS NULL, addr AS struct_update(addr, secret := 0));
 
 query TT
 ACL ROLE 'r_mask_types' SELECT typeof(amount), typeof(addr) FROM t;
 ----
-"NULL"	STRUCT(city VARCHAR, "secret" INTEGER)
+INTEGER	STRUCT(city VARCHAR, "secret" VARCHAR)
 
 query TT
 ACL ROLE 'r_mask_types' SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position;
 ----
 id	INTEGER
-amount	"NULL"
-addr	STRUCT(city VARCHAR, "secret" INTEGER)
+amount	INTEGER
+addr	STRUCT(city VARCHAR, "secret" VARCHAR)
 
 statement ok
 ACL ADMIN CREATE ROLE r_whole_mask;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_whole_mask WITH (select) MAIN COLUMNS (id, NULL AS addr);
+ACL ADMIN GRANT CATALOG c TO ROLE r_whole_mask WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_whole_mask WITH (select) COLUMNS (id, addr) MASK (addr AS NULL);
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_whole_mask WITH (select) COLUMNS (id, addr) MASK (addr AS NULL);
+
+query TT
+ACL ROLE 'r_whole_mask' SELECT typeof(addr), addr FROM raw.orders;
+----
+STRUCT(city VARCHAR, "secret" VARCHAR)	NULL
 
 query TT
 ACL ROLE 'r_whole_mask' SELECT table_schema, data_type FROM information_schema.columns WHERE column_name = 'addr' ORDER BY 1;
 ----
-main	"NULL"
-raw	"NULL"
+main	STRUCT(city VARCHAR, "secret" VARCHAR)
+raw	STRUCT(city VARCHAR, "secret" VARCHAR)
 
 # the positions of what a list keeps close up, as the read's (spec 036)
 statement ok
 ACL ADMIN CREATE ROLE r_positions;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_positions WITH (select) MAIN COLUMNS (id, note, addr);
+ACL ADMIN GRANT CATALOG c TO ROLE r_positions WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_positions WITH (select) COLUMNS (id, note, addr);
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_positions WITH (select) COLUMNS (id, note, addr);
+
+query ITT
+ACL ROLE 'r_positions' SELECT * FROM raw.orders;
+----
+1	n	{'city': A, 'secret': S}
 
 query TTI
 ACL ROLE 'r_positions' SELECT table_schema, column_name, ordinal_position FROM information_schema.columns ORDER BY 1, 3;
@@ -293,12 +284,23 @@ raw	id	1
 raw	note	2
 raw	addr	3
 
-# a list of nothing but separators narrows nothing - as the read reads it
+# a list of nothing but separators: spec 158 - a catalog grant takes no list at all, and an object grant's list must
+# read as one (it used to narrow nothing); an empty list is no list
 statement ok
 ACL ADMIN CREATE ROLE r_separators;
 
-statement ok
+statement error
 SELECT acl_grant_catalog('r_separators', 'c', '{"select": true}', true, '', ' , ');
+----
+a catalog grant takes no column list
+
+statement ok
+SELECT acl_grant_catalog('r_separators', 'c', '{"select": true}', true, '', '');
+
+statement error
+SELECT acl_grant_object('r_separators', 'c', 't', '{"select": true}', '', ' , ');
+----
+does not read as a SELECT list
 
 query I
 ACL ROLE 'r_separators' SELECT count(*) FROM information_schema.columns WHERE table_name = 't';
@@ -329,6 +331,10 @@ ACL ROLE 'r_all' SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'raw' 
 
 statement ok
 ACL ADMIN DROP RELATION c.raw.orders;
+
+# (the drop took the object grants on that name with it - r_cat's on the alias object among them; grant it again)
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_cat WITH (select) COLUMNS (id, amount) MASK (amount AS 0);
 
 # star names: a qualified count star is one count, headed as duckdb heads it; a COLUMNS() inside an expression expands
 query T
@@ -392,7 +398,10 @@ statement ok
 ACL ADMIN CREATE ROLE r_insl;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_insl WITH (insert) MAIN COLUMNS (id);
+ACL ADMIN GRANT CATALOG c TO ROLE r_insl WITH (insert) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_insl WITH (insert) COLUMNS (id);
 
 statement ok
 ACL ADMIN CREATE ROLE r_none;
@@ -437,7 +446,10 @@ statement ok
 ACL ADMIN CREATE ROLE r_d;
 
 statement ok
-ACL ADMIN GRANT CATALOG d TO ROLE r_d WITH (select) COLUMNS (id, note);
+ACL ADMIN GRANT CATALOG d TO ROLE r_d WITH (select);
+
+statement ok
+ACL ADMIN GRANT TABLE d.raw.orders TO ROLE r_d WITH (select) COLUMNS (id, note);
 
 query TT
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1OCIsInJvbGVzIjpbInJfY2F0Iiwicl93cml0ZXIiLCJyX2QiXX0.A-YeoKBQAiKaEi43SXOmHxHIcggwQWk34yNkgKcENcXnQtlkYSzlFlnweeinJYpeG07lNFmoco0ug9IIQBrLGQyeB4TyrHPydj5WWIBtBiPhxHGFR6Z3E9dWNr7dFSFtK-O3nFHDAriCa6daedJcvWTZRmj3ynEX132f8QNtwfvI9Naf6NWbex7_LjTsbQPX9nhFdQiT_oNa_QoYVUBiWFdVxgGVZY8MocjXy-3j49QcFibWwjaD6ksRYt8O2AU-i65k698d6VbogHHQZiZ0Cvyx4EPxQokYiq6aJo1UT_mMN9xRMpqZHkaTLWV-_tJXvso5msED8FO5hXj_9Erjcg' SELECT table_catalog, list(column_name ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders' GROUP BY 1 ORDER BY 1;

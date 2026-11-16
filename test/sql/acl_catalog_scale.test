@@ -944,27 +944,39 @@ ACL ADMIN ADD SCALAR c.sc MACRO 'acl_arg(1) + 1';
 statement ok
 ACL ADMIN CREATE ROLE lister;
 
-# a plain column, a constant mask, a cast mask and a mask that reads a column
+# a plain column, a constant mask, a cast mask and a mask that reads a column - spec 158: a catalog grant takes no
+# list, so each function's own grant carries it (written by one statement over the 300 names)
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE lister WITH (select) MAIN COLUMNS (c0, 0 AS c1, NULL::BIGINT AS c2, tenant * 2 AS tenant);
+ACL ADMIN GRANT CATALOG c TO ROLE lister WITH (select) MAIN;
+
+query I
+SELECT count(*) FILTER (WHERE acl_grant_object('lister', 'c', printf('f%03d', i), '{"select": true}', '', 'c0, c1, c2, tenant', '', 'c1 AS 0, c2 AS NULL::BIGINT, tenant AS tenant * 2')) FROM range(300) t(i);
+----
+300
 
 statement ok
 ACL ADMIN GRANT TABLE c.f001 TO ROLE lister WITH ();
 
-# the listing: every table function the role may call - not the '{}' one, not the scalar
-# (a scalar under a grant that carries a column list refuses its call)
+# the listing: every function the role may call - not the '{}' one; the scalar too (spec 158: the catalog grant
+# carries no column list, so nothing refuses its call - it is listed and called alike)
 query II
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(*), count(*) FILTER (WHERE function_name IN ('f001', 'sc')) FROM duckdb_functions() WHERE database_name = 'c';
 ----
-299	0
+300	1
 
-# a function's columns as the read returns them, without the read bound: the listing and DESCRIBE agree
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT sc(1);
+----
+2
+
+# a function's columns as the read returns them, without the read bound: the listing and DESCRIBE agree (spec 158: a
+# mask keeps the column's type - c2's NULL::BIGINT lists and reads as the VARCHAR it masks)
 query TT
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT column_name, data_type FROM acl_function_columns() WHERE function_name = 'f000' AND column_kind = 'column' ORDER BY position;
 ----
 c0	INTEGER
 c1	INTEGER
-c2	BIGINT
+c2	VARCHAR
 tenant	INTEGER
 
 query TT
@@ -972,24 +984,24 @@ ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiO
 ----
 c0	INTEGER
 c1	INTEGER
-c2	BIGINT
+c2	VARCHAR
 tenant	INTEGER
 
 query I
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(DISTINCT function_name) FROM acl_function_columns() WHERE database_name = 'c';
 ----
-299
+300
 
 # the rows' oids are the listings' (computed in C++ the way the SQL writes them)
 query I
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(*) FROM duckdb_functions() f JOIN duckdb_databases() d ON d.database_name = f.database_name AND d.database_oid::VARCHAR = f.database_oid WHERE f.database_name = 'c';
 ----
-299
+300
 
 query I
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(DISTINCT function_oid) FROM duckdb_functions() WHERE database_name = 'c';
 ----
-299
+300
 
 # a policy write is seen by the next listing (the listing's cache is per policy version)
 statement ok
@@ -998,7 +1010,7 @@ ACL ADMIN ADD TABLE FUNCTION c.f300 MACRO 'SELECT * FROM phys.main.t';
 query I
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(*) FROM duckdb_functions() WHERE database_name = 'c';
 ----
-300
+301
 
 # a relation one role reads and another holds '{}' on: listed once, by the role that sees it
 statement ok
@@ -1040,8 +1052,9 @@ ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiO
 ----
 2
 
-# review: a cast mask is listed with the type the read binds (not as written), a masked item is named as the grant
-# writes it, and a mask is bound as ONE expression - a FROM after it runs nothing while the listing binds
+# review: a cast mask is listed with the type the read binds - spec 158: the column's own, a mask being cast to it
+# where the grant is written (a grant no longer renames a column) - and a mask is bound as ONE expression - a FROM
+# after it runs nothing while the listing binds
 statement ok
 CREATE TABLE phys.main.w(c0 INTEGER, c1 INTEGER, c2 VARCHAR, d DECIMAL(18, 3));
 
@@ -1058,27 +1071,30 @@ statement ok
 ACL ADMIN CREATE ROLE masker;
 
 statement ok
-ACL ADMIN GRANT CATALOG m TO ROLE masker WITH (select) MAIN COLUMNS (c0::INT8 AS C0, c1::TEXT AS c1, c2, d::DECIMAL AS d);
+ACL ADMIN GRANT CATALOG m TO ROLE masker WITH (select) MAIN;
 
-# (spec 148 refuses such a mask where it is written; the listing's own guard is pinned by fy below)
+statement ok
+ACL ADMIN GRANT OBJECT m.fw TO ROLE masker WITH (select) COLUMNS (c0, c1, c2, d) MASK (c0 AS c0::INT8, c1 AS c1::TEXT, d AS d::DECIMAL);
+
+# (refused where it is written - spec 158 reads a MASK as a SELECT list, before spec 148's one-expression rule)
 statement error
-SELECT acl_grant_object('masker', 'm', 'fx', '{"select": true}', '', 'c0, c2', NULL, 'c0 AS j AS m FROM range(3) j --');
+SELECT acl_grant_object('masker', 'm', 'fx', '{"select": true}', '', 'c0, c2', '', 'c0 AS j AS m FROM range(3) j --');
 ----
-spec 148
+the grant's MASK holds a comment
 
 query TT
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT column_name, data_type FROM acl_function_columns() WHERE function_name = 'fw' AND column_kind = 'column' ORDER BY position;
 ----
-C0	BIGINT
-c1	VARCHAR
+c0	INTEGER
+c1	INTEGER
 c2	VARCHAR
 d	DECIMAL(18,3)
 
 query TT
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fw());
 ----
-C0	BIGINT
-c1	VARCHAR
+c0	INTEGER
+c1	INTEGER
 c2	VARCHAR
 d	DECIMAL(18,3)
 
@@ -1090,30 +1106,32 @@ ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiO
 statement ok
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fx();
 
-# re-review: a mask the read refuses (an aggregate) lists no columns either; an alias in its text is refused where it
-# is written (spec 148), so fz keeps the catalog grant's columns
+# re-review: a mask the read would refuse (an aggregate) - spec 158: refused where the grant is written (the mask is
+# cast-checked over the object's columns there), so fy keeps the catalog grant's columns; an alias in its text is
+# refused where it is written too (the MASK does not read as a SELECT list), so fz keeps them as well
 statement ok
 ACL ADMIN ADD TABLE FUNCTION m.fy MACRO 'SELECT * FROM phys.main.w';
 
 statement ok
 ACL ADMIN ADD TABLE FUNCTION m.fz MACRO 'SELECT * FROM phys.main.w';
 
-statement ok
-SELECT acl_grant_object('masker', 'm', 'fy', '{"select": true}', '', 'c0, c2', NULL, 'c0 AS count(*)');
+statement error
+SELECT acl_grant_object('masker', 'm', 'fy', '{"select": true}', '', 'c0, c2', '', 'c0 AS count(*)');
+----
+does not bind
 
 statement error
-SELECT acl_grant_object('masker', 'm', 'fz', '{"select": true}', '', 'c0, c2', NULL, 'c0 AS c1 AS m');
+SELECT acl_grant_object('masker', 'm', 'fz', '{"select": true}', '', 'c0, c2', '', 'c0 AS c1 AS m');
 ----
-spec 148
+the grant's MASK does not read as a SELECT list
 
 query T
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT list(DISTINCT function_name ORDER BY function_name) FROM acl_function_columns() WHERE function_name IN ('fy', 'fz') AND column_kind = 'column';
 ----
-[fz]
+[fy, fz]
 
-statement error
+statement ok
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fy();
-----
 
 statement ok
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fz();

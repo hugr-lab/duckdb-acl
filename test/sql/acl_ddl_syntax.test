@@ -230,10 +230,11 @@ query II
 SELECT name, expr FROM aclcat.acl.relation_columns WHERE vname = 'labelled' ORDER BY pos;
 ----
 id	(empty)
-label	coalesce(tenant, 'none')
+label	COALESCE(tenant, 'none')
 
+# spec 158: a mask reads the object's columns (tenant is not one of labelled's), so it reads label itself
 statement ok
-ACL ADMIN GRANT TABLE sales.labelled TO ROLE analyst WITH (select) COLUMNS (id, label) MASK (label AS coalesce(tenant, 'none'));
+ACL ADMIN GRANT TABLE sales.labelled TO ROLE analyst WITH (select) COLUMNS (id, label) MASK (label AS coalesce(label, 'none'));
 
 query II
 ACL ROLE "analyst" SELECT id, label FROM labelled ORDER BY id;

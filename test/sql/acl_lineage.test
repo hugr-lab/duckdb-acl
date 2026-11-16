@@ -818,12 +818,13 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE clerk WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.people TO ROLE clerk COLUMNS (id, name, ssn, address.city) MASK (ssn AS NULL);
+ACL ADMIN GRANT TABLE c.people TO ROLE clerk COLUMNS (id, name, ssn, address) MASK (ssn AS NULL, address AS struct_update(address, zip := NULL::VARCHAR));
 
 statement ok
 SELECT acl_lineage_flush();
 
-# the newest event of c.people carries clerk's tags: what it reads, masked or plain, field by field
+# the newest event of c.people carries clerk's tags: what it reads, masked or plain, column by column (spec 158: no
+# field paths - a struct narrowed by a mask is a masked column)
 query TTT
 SELECT t->>'key', coalesce(t->>'field', '-'), t->>'value'
 FROM (SELECT unnest(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'tags', '["JSON"]')) AS t
@@ -834,7 +835,7 @@ WHERE (t->>'key') = 'acl.role.clerk'
 ORDER BY 2;
 ----
 acl.role.clerk	-	select
-acl.role.clerk	address.city	visible
+acl.role.clerk	address	masked
 acl.role.clerk	id	visible
 acl.role.clerk	name	visible
 acl.role.clerk	ssn	masked

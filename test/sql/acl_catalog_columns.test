@@ -1,7 +1,8 @@
 # name: test/sql/acl_catalog_columns.test
-# description: a column list a grant states applies where the object has the column, and a mask it
-#   cannot apply refuses (spec 038) - for objects that state their columns, for plain aliases, and for
-#   table functions alike
+# description: spec 038's catalog-wide column list is gone with spec 158 - a catalog grant takes no
+#   COLUMNS and no MASK (refused where written), and one an older build stored refuses every read under
+#   that grant and is reported. What remains of the rest: an object grant's list and mask on a table
+#   function, and the object's order for a union of roles.
 # group: [sql]
 
 require acl
@@ -50,66 +51,69 @@ ACL ADMIN CREATE VIRTUAL TABLE c.shaped AS phys.main.items COLUMNS (id, sku);
 statement ok
 ACL ADMIN CREATE ROLE r;
 
-# --- a bare name applies where the object has it, and intersects away where it does not -------------
+# spec 158: the catalog-wide list (a bare name applying where an object has it, a mask refusing where it
+# cannot be applied) is removed - which columns a role sees is said per object. What stays of it:
 
-statement ok
+# --- a catalog grant takes no COLUMNS and no MASK, in either form -----------------------------------
+
+statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'ssn, id');
-
-# note the order: the grant says `ssn, id`, every object answers in its own order
-query II
-ACL ROLE "r" SELECT * FROM orders;
 ----
-1	secret
+<REGEX>:.*a catalog grant takes no column list.*
 
-query I
-ACL ROLE "r" SELECT * FROM items;
+statement error
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN COLUMNS (ssn, id);
 ----
-1
+<REGEX>:.*a catalog grant takes no COLUMNS or MASK.*
 
-query I
-ACL ROLE "r" SELECT * FROM shaped;
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, NULL AS ssn');
 ----
-1
-
-# and the metadata says exactly what the read gives, on all three
-query II
-ACL ROLE "r" SELECT table_name, string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns()
-GROUP BY 1 ORDER BY 1;
-----
-items	id
-orders	id,ssn
-shaped	id
-
-query II
-ACL ROLE "r" SELECT table_name, sql FROM duckdb_tables() ORDER BY 1;
-----
-items	CREATE TABLE "items"("id" INTEGER);
-orders	CREATE TABLE "orders"("id" INTEGER, "ssn" VARCHAR);
-shaped	CREATE TABLE "shaped"("id" INTEGER);
-
-# --- a mask refuses where it cannot be applied ------------------------------------------------------
-# the asymmetry: a bare name is permission, and absent means there is none to give; a mask is an
-# obligation, and absent means it cannot be met - which must never pass silently
+<REGEX>:.*a catalog grant takes no column list.*
 
 statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, NULL AS ssn');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', '');
 
-query II
+query III
 ACL ROLE "r" SELECT * FROM orders;
 ----
-1	NULL
+1	acme	secret
+
+# --- a list an older build stored refuses every read under the grant, and the check names it ---------
+
+statement ok
+SET GLOBAL acl_version_check_interval = 0;
+
+statement ok
+UPDATE store.acl.role_catalogs SET "columns" = 'ssn, id' WHERE role = 'r' AND vcat = 'c';
+
+statement ok
+UPDATE store.acl.meta SET "value" = (CAST("value" AS BIGINT) + 1)::VARCHAR WHERE "key" = 'policy_version';
 
 statement error
-ACL ROLE "r" SELECT * FROM items;
+ACL ROLE "r" SELECT * FROM orders;
 ----
-<REGEX>:.*ssn.*
+<REGEX>:.*cannot be read: a catalog grant states COLUMNS \("ssn, id"\), which only an object grant states since spec 158.*
 
 statement error
 ACL ROLE "r" SELECT * FROM shaped;
 ----
-<REGEX>:.*masks column "ssn", which the object does not have.*
+<REGEX>:.*cannot be read: a catalog grant states COLUMNS \("ssn, id"\), which only an object grant states since spec 158.*
 
-# --- an object grant still narrows a catalog grant, and cannot widen it ------------------------------
+query II
+SELECT object, problem FROM acl_check_catalog('c') WHERE role = 'r';
+----
+*	catalog_columns
+
+statement ok
+SELECT acl_alter_grant('r', 'c', 'columns', '');
+
+query III
+ACL ROLE "r" SELECT * FROM orders;
+----
+1	acme	secret
+
+# --- an object grant narrows to the object's columns --------------------------------------------------
 
 statement ok
 ACL ADMIN GRANT OBJECT c.orders TO ROLE r WITH (select) COLUMNS (id);
@@ -119,14 +123,20 @@ ACL ROLE "r" SELECT * FROM orders;
 ----
 1
 
+# and the metadata says exactly what the read gives
+query II
+ACL ROLE "r" SELECT table_name, string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns()
+GROUP BY 1 ORDER BY 1;
+----
+items	id,sku
+orders	id
+shaped	id,sku
+
 # --- a table function: hide and mask, never rename or add --------------------------------------------
 
 statement ok
 SELECT acl_add_table_function('c', 'by_tenant',
     'SELECT id, tenant, ssn FROM phys.main.orders WHERE tenant = acl_arg(1)');
-
-statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', '');
 
 query III
 ACL ROLE "r" SELECT * FROM by_tenant('acme');
@@ -135,30 +145,39 @@ ACL ROLE "r" SELECT * FROM by_tenant('acme');
 
 # a grant hides and masks - and answers in the function's own order, not the grant's
 statement ok
-SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'ssn, id', NULL, 'ssn AS ''***''');
+SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'ssn, id', '', 'ssn AS ''***''');
 
 query II
 ACL ROLE "r" SELECT * FROM by_tenant('acme');
 ----
 1	***
 
-# a name the function does not return grants nothing ...
-statement ok
-SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'id, nosuch');
-
-query I
-ACL ROLE "r" SELECT * FROM by_tenant('acme');
-----
-1
-
-# ... while a mask it cannot apply refuses
-statement ok
-SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'id, nosuch', NULL, 'nosuch AS 1');
-
+# spec 158: a name the function does not return, and a mask of one, are refused where written (it was: a name
+# granted nothing, a mask refused the read); the grant before stands
 statement error
-ACL ROLE "r" SELECT * FROM by_tenant('acme');
+SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'id, nosuch');
 ----
 <REGEX>:.*nosuch.*
+
+statement error
+SELECT acl_grant_object('r', 'c', 'orders', '{"select": true}', '', 'id, nosuch');
+----
+<REGEX>:.*nosuch.*
+
+statement error
+SELECT acl_grant_object('r', 'c', 'orders', '{"select": true}', '', 'id', '', 'ssn AS ''x''');
+----
+<REGEX>:.*ssn.*
+
+statement error
+SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'id', '', 'nosuch AS 1');
+----
+<REGEX>:.*nosuch.*
+
+query II
+ACL ROLE "r" SELECT * FROM by_tenant('acme');
+----
+1	***
 
 # --- the order a union of roles gets is the object's -------------------------------------------------
 
@@ -166,13 +185,19 @@ statement ok
 ACL ADMIN CREATE ROLE r2;
 
 statement ok
-SELECT acl_grant_catalog('r2', 'c', '{"select": true}', true, '', 'ssn, id');
+SELECT acl_grant_catalog('r2', 'c', '{"select": true}', true, '', '');
+
+statement ok
+SELECT acl_grant_object('r2', 'c', 'orders', '{"select": true}', '', 'ssn, id');
 
 statement ok
 ACL ADMIN CREATE ROLE r3;
 
 statement ok
-SELECT acl_grant_catalog('r3', 'c', '{"select": true}', true, '', 'tenant, id');
+SELECT acl_grant_catalog('r3', 'c', '{"select": true}', true, '', '');
+
+statement ok
+SELECT acl_grant_object('r3', 'c', 'orders', '{"select": true}', '', 'tenant, id');
 
 statement ok
 SELECT acl_define_issuer('test/idp/cat', '{"url": "test/idp/cat", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');

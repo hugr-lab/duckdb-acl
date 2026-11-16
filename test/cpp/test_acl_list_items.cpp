@@ -140,11 +140,12 @@ void StoredWithComment() {
 	Check(items.size() == 2 && items[1].text == "x(], ssn", "a closer of another bracket does not end a (");
 }
 
-//! spec 150 4f: an object's declared list - `name`, `name = expr`, `expr AS name`, the NULL marks - on duckdb's tokens
+//! spec 158: an object's declared list is a SELECT list read by duckdb's parser - `name`, `<expr> AS name`,
+//! `name: <expr>`, `a.b` a column `b`; the expression as duckdb prints it
 std::string Declared(const std::string &list) {
 	std::string out;
 	for (auto &column : SplitDeclaredColumns(list, "the list")) {
-		out += "[" + column.name + "|" + column.expr + "|" + std::to_string(column.nullable) + "]";
+		out += "[" + column.name + "|" + column.expr + "]";
 	}
 	return out;
 }
@@ -160,22 +161,14 @@ bool Refused(const std::string &list) {
 
 void DeclaredColumns() {
 	std::vector<std::pair<std::string, std::string>> cases = {
-	    {"id, name", "[id||-1][name||-1]"},
-	    {"id NOT NULL, note NULL", "[id||0][note||1]"},
-	    {"k = id + 1 NOT NULL, v = x IS NOT NULL, w = NULL", "[k|id + 1|0][v|x IS NOT NULL|-1][w|NULL|-1]"},
-	    {"upper(ssn) AS u, cast(x AS INT) AS y", "[u|upper(ssn)|-1][y|cast(x AS INT)|-1]"},
-	    {"id + 0 NOT NULL AS z, x AS y NOT NULL", "[z|id + 0|0][y|x|0]"},
-	    {"\"odd name\", \"a,b\" NOT NULL, \"x\"\"y\" = 1", "[odd name||-1][a,b||0][x\"y|1|-1]"},
-	    {"x AS \"As\", 'a,b' AS s", "[As|x|-1][s|'a,b'|-1]"},
-	    {"s . x, items [ ] . price, s.y", "[s.x||-1][items[].price||-1][s.y||-1]"},
-	    {"t = ['a', 'b'], m = MAP {'k': 1}, d = $$x,y$$", "[t|['a', 'b']|-1][m|MAP {'k': 1}|-1][d|$$x,y$$|-1]"},
-	    {"odd name", "[odd name||-1]"},
-	    // spec 150 4f's re-review: the alias one word and a mark after it, as the rule reads it; a backtick name
-	    // quoted; a `=` after the AS keeps the function form's raw name, as the text reader read it
-	    {"id AS NOT NULL, x AS odd name NOT NULL", "[NOT|id|1][odd name|x|0]"},
-	    {"`odd name`, id AS `k k`", "[odd name||-1][k k|id|-1]"},
-	    {"name as text = upper(a)", "[name as text|upper(a)|-1]"},
-	    {"CASE WHEN a = 1 THEN x END AS u, k = id AS y", "[u|CASE WHEN a = 1 THEN x END|-1][y|k = id|-1]"},
+	    {"id, name", "[id|][name|]"},
+	    {"upper(ssn) AS u, cast(x AS INT) AS y", "[u|upper(ssn)][y|CAST(x AS INTEGER)]"},
+	    {"w: id * 2", "[w|(id * 2)]"},
+	    {"\"odd name\", \"a,b\", 1 AS \"x\"\"y\"", "[odd name|][a,b|][x\"y|1]"},
+	    {"x AS \"As\", 'a,b' AS s", "[As|x][s|'a,b']"},
+	    {"s.x, s . y", "[x|s.x][y|s.y]"},
+	    {"['a', 'b'] AS t, MAP {'k': 1} AS m", "[t|list_value('a', 'b')][m|\"map\"(list_value('k'), list_value(1))]"},
+	    {"id AS id", "[id|id]"},
 	};
 	for (auto &entry : cases) {
 		auto got = Declared(entry.first);
@@ -184,10 +177,14 @@ void DeclaredColumns() {
 	Check(Refused("id -- note"), "a comment is refused");
 	Check(Refused("id, /* x */ y"), "a closed comment is refused");
 	Check(Refused("id, 'open"), "an open literal is refused");
-	Check(Refused("\"a.b\""), "a quoted name holding . is refused");
-	Check(Refused("x AS \"a[1]\""), "a quoted name holding [ is refused");
-	Check(Refused("= 1"), "an item naming nothing is refused");
-	Check(Refused("id NOT NULL AS z NULL"), "two NULL marks are refused");
+	Check(Refused("x AS \"a.b\""), "a name holding . is refused");
+	Check(Refused("x AS \"a[1]\""), "a name holding [ is refused");
+	Check(Refused("ssn = NULL"), "an expression without a name (the old `name = expr`) is refused");
+	Check(Refused("id NOT NULL"), "a NULL mark is refused");
+	Check(Refused("*"), "a star is refused");
+	Check(Refused("#2 AS b"), "a positional reference is refused");
+	Check(Refused("id FROM t"), "a clause after the list is refused");
+	Check(Refused("id, upper(id) AS id"), "a name written twice is refused");
 }
 
 } // namespace

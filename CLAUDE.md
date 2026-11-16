@@ -614,7 +614,8 @@ table functions, the memory store. `acl_check_catalog` adds `types_stale`, `enum
 that does not bind over the exposed type) and `types_mismatch` (an entry that makes a type of its own).
 e2e: `test/e2e/door/types.sh` (a quack client without mssql reads an mssql table), Flight run.sh.
 
-**Spec 102 — fields of structured types per role**: a COLUMNS item (grant or object list) may be a
+**Spec 102 — fields of structured types per role** (superseded by spec 158: the paths are gone; what follows is
+history until stage 3 removes the code): a COLUMNS item (grant or object list) may be a
 path - `address.city`, `address.geo.lat`, `items[].price`, `address.ssn = <mask>`; a column's items
 form a tree (`acl_field_paths.hpp`: parse, `IntersectNodes` for levels, `UniteNodes` for roles - a
 visible field beats a masked one, different masks refuse - `CompileNode` read via struct_pack /
@@ -888,6 +889,23 @@ CTE only when referenced); the resolver splits it off the body before a grant wr
 `BuildTableSubquery` adds it to the guards - or, reading inside a principal's view, to that body's root. The prefix is
 reserved in a principal's view body and refused at the root of an operator's. Test
 `acl_view_call_probes.test`.
+
+**Spec 158 — columns: the object's shape, the grant's test and masks** (owner, 2026-11-16; stage 1 built): every
+column list is read by duckdb's parser. An object's list is a SELECT list (`ReadSelectList`, acl_list_items.cpp: `name`,
+`<expr> AS name`, `name: <expr>`, `a.b` a column `b`; no NULL marks, no `name = expr`, a star refused until stage 2). A
+catalog grant states no columns (a stored list refuses every read under it - `GrantUnion::refusal`, check
+`catalog_columns`). An object grant's `COLUMNS` is a test on names (`acl_grant_columns.hpp`: `ColumnTest` ALL | ONLY |
+EXCEPT from `a, b` / `*` / `* EXCLUDE (…)`, `ReadColumnTest`) and `MASK (<column> AS <expr>, …)` its masks
+(`role_object_caps.masks`, schema v25 / min_reader 25; `ReadMasks`), each written over the object's columns and stored
+cast to the column's type (`NormaliseObjectGrant`) - a grant never adds, renames or retypes a column, so `grant_columns`
+is no longer written and a listing filters the object's columns by the test (`keeps`). Roles unite in
+`UniteRoleColumns`: visible = some role's test admits it, unmasked = some role shows it without a mask, else one
+common mask, two different masks refuse. `ApplyGrantPolicy`: a declared list keeps the admitted columns in its order,
+a mask substituted onto the object's expressions (`OverObject`); an object read live gets `GrantOver` - `SELECT
+COLUMNS(lambda …) FROM (SELECT * REPLACE (masks) FROM <read>)` - and its DML judged by exclusion
+(`TablePolicy::columns_excluded` / `excluded_columns`, `Readable` / `Writable`). `acl_has_role('r')` is a marker baked
+from the principal's roles. Function forms: `acl_grant_object(…, versions, masks)`, `acl_check_grant(…, caps, masks)`;
+`platform.object_grants.columns` STRUCT(mode, names) and `masks` LIST(STRUCT(column, mask)) for the editors.
 
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema

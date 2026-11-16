@@ -44,8 +44,8 @@ vector<ListItemText> SplitListItems(const string &text, bool *open = nullptr, bo
 
 //! One item of a column list read as a SELECT list (spec 158): `name` (expr ''), `<expression> AS name` or
 //! `name: <expression>` (expr the expression as duckdb prints it), `a.b` a column of its own named as SELECT names it
-//! (`b`, expr `a.b`), or - where admitted - a star (`*`, `* EXCLUDE (…)`, `COLUMNS(…)`: `star`, expr its text). The name
-//! is the identifier itself, never quoted
+//! (`b`, expr `a.b`), or - where admitted - a star (`*`, `* EXCLUDE (…)`, `COLUMNS(…)`: `star`, expr its text). The
+//! name is the identifier itself, never quoted
 struct SelectListItem {
 	string name;
 	string expr;
@@ -66,7 +66,8 @@ string ColumnTestText(const acl_detail::ColumnTest &test);
 
 //! An object grant's `MASK` items (spec 158): `<column> AS <expression>`, each split on duckdb's tokens, the
 //! expression one expression read by duckdb's parser and kept as it prints it; a column named twice refuses
-acl_detail::GrantMasks ReadMasks(const string &text);
+//! `written`, when given, receives each mask's expression as it stands in `text` (where spec 160 qualifies its tables)
+acl_detail::GrantMasks ReadMasks(const string &text, vector<string> *written = nullptr);
 
 //! The masks as their rows store them (`"ssn" AS <expr>, …`), read back by `ReadMasks`
 string MasksText(const acl_detail::GrantMasks &masks);

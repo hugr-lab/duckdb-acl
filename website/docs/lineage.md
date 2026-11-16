@@ -142,7 +142,7 @@ Each target field lists its sources. A source carries OpenLineage's transformati
 
 A grant's own predicate and masks are per role, so they are the role's tags (below), not edges.
 
-A field path follows the `COLUMNS` spelling of spec 102: `address.city`, `items[].price` (an
+A field path names a field of a struct column read through it: `address.city`, `items[].price` (an
 element read through `unnest` or an index is `[]`). An event that could not derive every edge
 exactly (a table function, a source that does not bind) says `approximate`.
 

@@ -221,16 +221,22 @@ ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select) COLUMNS (order_id, tenan
 ----
 <REGEX>:.*lists "tenant", which the object does not have.*
 
-# ... while a mask's expression still runs over the physical row, so it may read what the object
-# dropped - it just has to be a mask of a column the object does expose
-statement ok
+# ... and a mask's expression reads the object's columns, not the physical row (spec 158): what the
+# object dropped is not there for it either, refused where it is written
+statement error
 ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select, insert, update)
     COLUMNS (order_id) MASK (order_id AS coalesce(tenant, 'none'));
+----
+<REGEX>:.*tenant.*
+
+statement ok
+ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select, insert, update)
+    COLUMNS (order_id) MASK (order_id AS -total);
 
 query I
 ACL ROLE "r" SELECT * FROM renamed;
 ----
-acme
+-10
 
 # --- a grant's list replaces the object's, it never adds to it --------------------------------------------
 # the object allows two columns to be written and the grant allows one: the union would let a write

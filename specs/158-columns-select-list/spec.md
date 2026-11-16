@@ -1,6 +1,6 @@
 # Spec 158: columns - the object's shape, the grant's visibility and masks
 
-- **Status**: accepted (stage 1 in progress)
+- **Status**: accepted (stage 1 built)
 - **Date**: 2026-11-16
 - **Author**: duckdb-acl
 - **Supersedes**: spec 011's column lists at the catalog level, spec 038's catalog-wide list, spec 102's field paths
@@ -103,6 +103,14 @@ stand in an object's expression, an RLS or a mask.
 - The union is monotone: a role adds what it sees, never takes away. The only refusal is two different masks.
 - A mask is a cast-checked expression over the object's columns; it is judged by the author's function gate (spec 117)
   and its tables qualified (spec 160).
+
+## Known limits (stage 1)
+
+- A mask is cast to its column's type where the grant is written, and that the cast holds is judged where duckdb binds
+  it: a mask duckdb binds but cannot cast at run time (`[1, 2]` to an INTEGER) refuses the read, not the write.
+- A mask written while its object cannot be judged (a source not attached yet) is kept as written and cast when the
+  object is analyzed (`ANALYZE VIRTUAL …`).
+- A comment in any column list or mask is refused, written or stored (spec 148: a stored `a--b, c` read `a`).
 
 ## Stages
 

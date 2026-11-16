@@ -51,10 +51,10 @@ SELECT rls FROM store.acl.role_object_caps WHERE vname = 't';
 ----
 id IN (SELECT k FROM memory.main.tenants)
 
-query T
-SELECT columns FROM store.acl.role_object_caps WHERE vname = 'm';
+query TT
+SELECT columns, masks FROM store.acl.role_object_caps WHERE vname = 'm';
 ----
-id, (SELECT CAST(max(k) AS VARCHAR) FROM memory.main.tenants) AS note
+id, note	note AS CAST(((SELECT CAST(max(k) AS VARCHAR) FROM memory.main.tenants)) AS VARCHAR)
 
 query T
 SELECT view_sql FROM store.acl.relations WHERE vname = 'v';
@@ -150,6 +150,8 @@ query T
 SELECT view_sql FROM store.acl.relations WHERE vname = 'sh';
 ----
 SELECT count(*) AS n FROM (SHOW memory.main.tenants) s, memory.main.tenants
+
+# spec 158: the section on a list that is no select list as a whole (a struct field path) is gone with spec 102's paths
 
 # a table named in a form not rewritten in place is refused where written: write it whole
 statement error

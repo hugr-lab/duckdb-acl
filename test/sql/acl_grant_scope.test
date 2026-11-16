@@ -51,7 +51,7 @@ ACL ROLE "r" SELECT *, 1 FROM plain;
 ----
 1	acme	NULL	1
 
-# a mask's expression still runs over the physical row, so it may read a column the grant hides
+# a mask's expression runs over the object's columns, so it may read a column the grant hides
 statement ok
 ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, tenant) MASK (tenant AS tenant || '/' || ssn);
 
@@ -111,13 +111,14 @@ id,amount,ssn
 query I
 ACL ROLE "r" SELECT sql FROM duckdb_tables() WHERE table_name = 'plain';
 ----
-CREATE TABLE "plain"("id" INTEGER, "amount" INTEGER, "ssn" "NULL");
+CREATE TABLE "plain"("id" INTEGER, "amount" INTEGER, "ssn" VARCHAR);
 
-# what the operator sees stored is the normalised list, not the order it was typed in
+# what the operator sees stored is the normalised list, not the order it was typed in (spec 158: in the object's
+# order; the mask is stored apart from the list)
 query I
 SELECT columns FROM acl_object_grants() WHERE vname = 'plain';
 ----
-id, amount, ssn = NULL
+id, amount, ssn
 
 # --- the catalog keeps every power the grant lost -------------------------------------------------------
 # rename, compute and order, all three, on the object

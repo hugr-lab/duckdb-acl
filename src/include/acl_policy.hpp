@@ -214,15 +214,8 @@ struct TablePolicy {
 		if (!columns_excluded) {
 			return write_columns.empty() || write_columns.count(name) > 0;
 		}
-		if (excluded_columns.count(name)) {
-			return false;
-		}
-		for (auto &injection : injections) {
-			if (StringUtil::CIEquals(injection.first, name)) {
-				return false;
-			}
-		}
-		return true;
+		return !excluded_columns.count(
+		    name); // a masked one is written its mask (`injections`), never the client's value
 	}
 	//! spec 102 part B: columns a grant narrows to some of their fields, still written through -
 	//! physical column -> the COLUMNS items of its tree (rooted at that name). A write keeps the hidden

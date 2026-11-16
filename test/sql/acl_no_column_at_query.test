@@ -13,10 +13,10 @@ statement ok
 CREATE TABLE phys.main.t (id INTEGER, b INTEGER);
 
 statement ok
-CREATE TABLE phys.main.logs (region VARCHAR, msg VARCHAR);
+CREATE TABLE phys.main.logs (region VARCHAR, msg VARCHAR, tag VARCHAR);
 
 statement ok
-INSERT INTO phys.main.logs VALUES ('eu', 'a'), ('eu', 'b'), ('us', 'c');
+INSERT INTO phys.main.logs VALUES ('eu', 'a', 't'), ('eu', 'b', 't'), ('us', 'c', 't');
 
 statement ok
 ATTACH ':memory:' AS store;
@@ -30,7 +30,9 @@ SELECT acl_use_db('store', 'acl', true);
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r; CREATE ROLE wr; CREATE ROLE d; CREATE ROLE e;
 
-# `logs` declares no list (every source column); `wide` declares id, so a catalog-wide `COLUMNS (id)` is accepted
+# `logs` declares no list (every source column); `wide` declares id. Spec 158: a catalog grant takes no list (a
+# catalog-wide `COLUMNS (id)` left r no column of logs) and an object grant names only what its object exposes, so r's
+# grant on logs is left with none by the source losing the column it names
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.logs AS phys.main.logs;
 
@@ -38,10 +40,13 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.wide AS phys.main.t COLUMNS (id);
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r MAIN COLUMNS (id) RLS 'true';
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN RLS 'true'; GRANT TABLE c.logs TO ROLE r COLUMNS (tag);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE wr MAIN;
+
+statement ok
+ALTER TABLE phys.main.logs DROP COLUMN tag;
 
 # r reads no column of logs: the read refused at bind, as before
 statement error
@@ -242,7 +247,7 @@ statement ok
 ACL ADMIN GRANT TABLE c.logs TO ROLE e COLUMNS (msg);
 
 # the check names a role whose object grant is left with no column of its object, with the grant to restate - the
-# source changed under it (drift), or the object's list did (`SET COLUMNS`)
+# source changed under it (drift, logs), or the object's list did (`SET COLUMNS`)
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.sc AS phys.main.t COLUMNS (id, b);
 
@@ -257,6 +262,7 @@ SELECT object, repair LIKE 'SELECT acl_grant_object(%''<columns>'')%' FROM acl_c
 WHERE problem = 'grant_exposes_nothing' ORDER BY object;
 ----
 drift	true
+logs	true
 sc	true
 
 query T
@@ -285,19 +291,11 @@ SELECT problem FROM acl_check_catalog('c') WHERE role = 'w' AND object = 'drift2
 ----
 grant_exposes_nothing
 
-# the levels intersecting to nothing: the catalog grant lists id, the object grant b
-statement ok
-ACL ADMIN CREATE ROLE ix; GRANT CATALOG c TO ROLE ix MAIN COLUMNS (id); CREATE VIRTUAL TABLE c.bth AS phys.main.t COLUMNS (id, b); GRANT TABLE c.bth TO ROLE ix COLUMNS (b);
-
+# spec 158: the levels can no longer intersect to nothing - a catalog grant takes no COLUMNS
 statement error
-ACL ROLE "ix" SELECT * FROM bth;
+ACL ADMIN CREATE ROLE ix; GRANT CATALOG c TO ROLE ix MAIN COLUMNS (id);
 ----
-exposes no readable columns
-
-query T
-SELECT problem FROM acl_check_catalog('c') WHERE role = 'ix' AND object = 'bth';
-----
-grant_exposes_nothing
+a catalog grant takes no COLUMNS or MASK
 
 # a cast-only read (spec 099: an ENUM exposed as VARCHAR) - no column list, yet the read binds the column it casts
 statement ok

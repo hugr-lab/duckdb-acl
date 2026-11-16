@@ -6,6 +6,7 @@
 #include "duckdb/parser/peg/tokenizer/tokenizer.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -233,6 +234,21 @@ constexpr const char *LIST_TABLE = "__acl_list";
 	                      what, why);
 }
 
+//! Whether a parsed `SELECT <list> FROM __acl_list` holds nothing but the list over the one table: the node with its
+//! list set aside prints as a bare `SELECT 1 FROM __acl_list` (a WHERE, a GROUP BY, a DISTINCT, a second FROM item -
+//! anything written after the list - would not). The list itself is not printed back: a star's EXCLUDE set prints
+//! its names in no fixed order
+bool OnlyTheList(const SelectNode &node) {
+	auto copy = node.Copy();
+	auto &shape = copy->Cast<SelectNode>();
+	shape.select_list.clear();
+	shape.select_list.push_back(ConstantExpression::FromValue(Value::INTEGER(1)));
+	SelectNode bare;
+	bare.select_list.push_back(ConstantExpression::FromValue(Value::INTEGER(1)));
+	bare.from_table = node.from_table->Copy();
+	return shape.ToString() == bare.ToString();
+}
+
 bool HoldsPositional(const ParsedExpression &expr) {
 	if (expr.GetExpressionClass() == ExpressionClass::POSITIONAL_REFERENCE) {
 		return true;
@@ -252,6 +268,12 @@ vector<SelectListItem> ReadSelectList(const string &text_p, const char *what, bo
 	if (text.empty()) {
 		return items;
 	}
+	bool open = false, comment = false;
+	ListTokens(text, &open, &comment);
+	if (comment || open) {
+		// spec 148: a list is read as written, item by item - a comment (a stored one: `a--b, c` read `a`) is refused
+		RefuseList(what, "holds a comment or ends inside a literal or a quoted name");
+	}
 	Parser parser(ParserOptions::Builtin());
 	try {
 		parser.ParseQuery("SELECT " + text + "\nFROM " + LIST_TABLE);
@@ -267,18 +289,8 @@ vector<SelectListItem> ReadSelectList(const string &text_p, const char *what, bo
 		RefuseList(what, "holds more than a column list");
 	}
 	auto &node = select.node->Cast<SelectNode>();
-	// nothing but the items over the one table: a node rebuilt of only those prints the same (a WHERE, a GROUP BY, a
-	// second FROM item, a DISTINCT - anything written after the list - would not)
-	SelectNode bare;
-	for (auto &item : node.select_list) {
-		bare.select_list.push_back(item->Copy());
-	}
 	if (!node.from_table || node.from_table->type != TableReferenceType::BASE_TABLE ||
-	    node.from_table->ToString() != LIST_TABLE) {
-		RefuseList(what, "holds more than a column list");
-	}
-	bare.from_table = node.from_table->Copy();
-	if (bare.ToString() != node.ToString()) {
+	    node.from_table->ToString() != LIST_TABLE || !OnlyTheList(node)) {
 		RefuseList(what, "holds more than a column list");
 	}
 	for (auto &expr : node.select_list) {
@@ -335,6 +347,11 @@ acl_detail::ColumnTest ReadColumnTest(const string &text_p) {
 	if (text.empty()) {
 		return test;
 	}
+	bool open = false, comment = false;
+	ListTokens(text, &open, &comment);
+	if (comment || open) {
+		RefuseList(what, "holds a comment or ends inside a literal or a quoted name");
+	}
 	Parser parser(ParserOptions::Builtin());
 	try {
 		parser.ParseQuery("SELECT " + text + "\nFROM " + LIST_TABLE);
@@ -354,15 +371,7 @@ acl_detail::ColumnTest ReadColumnTest(const string &text_p) {
 		refuse();
 	}
 	auto &node = select.node->Cast<SelectNode>();
-	SelectNode bare;
-	for (auto &item : node.select_list) {
-		bare.select_list.push_back(item->Copy());
-	}
-	if (!node.from_table || node.from_table->ToString() != LIST_TABLE) {
-		refuse();
-	}
-	bare.from_table = node.from_table->Copy();
-	if (bare.ToString() != node.ToString()) {
+	if (!node.from_table || node.from_table->ToString() != LIST_TABLE || !OnlyTheList(node)) {
 		refuse();
 	}
 	for (auto &expr : node.select_list) {
@@ -375,8 +384,8 @@ acl_detail::ColumnTest ReadColumnTest(const string &text_p) {
 			    !star.ReplaceList().empty() || !star.RenameList().empty() || star.Expression()) {
 				refuse();
 			}
-			test.kind = star.ExcludeList().empty() ? acl_detail::ColumnTest::Kind::ALL
-			                                        : acl_detail::ColumnTest::Kind::EXCEPT;
+			test.kind =
+			    star.ExcludeList().empty() ? acl_detail::ColumnTest::Kind::ALL : acl_detail::ColumnTest::Kind::EXCEPT;
 			for (auto &excluded : star.ExcludeList()) {
 				if (!excluded.catalog.empty() || !excluded.schema.empty() || !excluded.table.empty()) {
 					refuse();
@@ -416,13 +425,17 @@ string ColumnTestText(const acl_detail::ColumnTest &test) {
 	return string();
 }
 
-acl_detail::GrantMasks ReadMasks(const string &text) {
+acl_detail::GrantMasks ReadMasks(const string &text, vector<string> *written) {
 	const char *what = "the grant's MASK";
 	acl_detail::GrantMasks masks;
 	bool open = false, comment = false;
 	auto tokens = ListTokens(text, &open, &comment);
 	if (open) {
 		throw BinderException("acl admin: %s ends inside a literal, a quoted name or a comment", what);
+	}
+	if (comment) {
+		// spec 148: a mask is one expression - a comment in it is refused as an RLS's is
+		throw BinderException("acl admin: %s holds a comment - write each mask as one expression", what);
 	}
 	for (auto &item : SplitOnTokens(text, tokens)) {
 		vector<MatcherToken> words;
@@ -439,8 +452,8 @@ acl_detail::GrantMasks ReadMasks(const string &text) {
 		// the column read as duckdb reads an identifier, the expression as one item of a SELECT list naming it
 		auto column_items = ReadSelectList(item.text.substr(0, words[0].offset + words[0].length), what, false);
 		if (column_items.size() != 1 || !column_items[0].expr.empty()) {
-			throw BinderException("acl admin: %s is items `<column> AS <expression>` - \"%s\" is no column name",
-			                      what, words[0].text);
+			throw BinderException("acl admin: %s is items `<column> AS <expression>` - \"%s\" is no column name", what,
+			                      words[0].text);
 		}
 		auto &column = column_items[0].name;
 		auto expression = item.text.substr(words[2].offset);
@@ -452,6 +465,9 @@ acl_detail::GrantMasks ReadMasks(const string &text) {
 			throw BinderException("acl admin: %s masks \"%s\" twice", what, column);
 		}
 		masks.emplace_back(column, read[0].expr);
+		if (written) {
+			written->push_back(expression);
+		}
 	}
 	return masks;
 }
@@ -466,7 +482,11 @@ string MasksText(const acl_detail::GrantMasks &masks) {
 
 vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what) {
 	vector<DeclaredColumnText> columns;
+	case_insensitive_set_t named;
 	for (auto &item : ReadSelectList(text, what, false)) {
+		if (!named.insert(item.name).second) {
+			throw BinderException("acl admin: %s declares the column \"%s\" twice", what, item.name);
+		}
 		if (item.name.find_first_of(".[") != string::npos || item.name[0] == '"') {
 			throw BinderException("acl admin: %s declares the column \"%s\" - a declared column's name holds no '.' "
 			                      "or '[' and starts with no '\"'",

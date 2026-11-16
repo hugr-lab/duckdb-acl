@@ -1887,9 +1887,7 @@ vector<string> BodyItemExpressions(const string &text, BodyShape shape) {
 	vector<string> out;
 	try {
 		if (shape == BodyShape::COLUMNS) {
-			for (auto &mask : ReadMasks(text)) {
-				out.push_back(mask.second); // spec 158: a grant's MASK items
-			}
+			ReadMasks(text, &out); // spec 158: a grant's MASK items, as they stand in the text
 		} else if (shape == BodyShape::DECLARED_COLUMNS) {
 			for (auto &column : SplitDeclaredColumns(text, "the object's column list")) {
 				if (!column.expr.empty()) {
@@ -3241,8 +3239,8 @@ void AttributesFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
-//! acl_platform_grant_columns(text) - spec 158: an object grant's stored COLUMNS as GRANT_COLUMNS; NULL when it does not
-//! read
+//! acl_platform_grant_columns(text) - spec 158: an object grant's stored COLUMNS as GRANT_COLUMNS; NULL when it does
+//! not read
 void GrantColumnsFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto value = args.GetValue(0, row);

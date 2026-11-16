@@ -511,15 +511,15 @@ vector<CatalogBackend::GrantDecisionRow> CatalogBackend::GrantDecisions(const st
 	                            Tbl("role_schemas") + " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = " + cat +
 	                            " AND " + KeyPrefixSql(name, "sc.\"schema_path\"") +
 	                            " ORDER BY length(sc.\"schema_path\") DESC LIMIT 1)";
-	auto sql = GrantsCte(principal) + "SELECT q.\"i\", " + CapsExpr(name, cat) + ", " + object_term + ", " +
-	           (schema_term.empty() ? string("NULL") : schema_term) + ", " + schema_row +
-	           ", g.\"is_main\" AND (SELECT unique_main FROM main_ok), " +
-	           (function_mode ? string("NULL, NULL, NULL, NULL, NULL")
-	                          : string("g.\"rls\", ") + (HasObjectCaps() ? "oc.\"rls\"" : "NULL") +
-	                                ", g.\"columns\", " + (HasObjectCaps() ? "oc.\"columns\"" : "NULL") + ", " +
-	                                (HasObjectCaps() ? "oc.\"masks\"" : "NULL")) +
-	           " FROM (VALUES " + values + ") q(\"i\", \"vname\") JOIN grants g ON " + KeyEqSql("g.\"vcat\"", cat) +
-	           oc_join;
+	auto sql =
+	    GrantsCte(principal) + "SELECT q.\"i\", " + CapsExpr(name, cat) + ", " + object_term + ", " +
+	    (schema_term.empty() ? string("NULL") : schema_term) + ", " + schema_row +
+	    ", g.\"is_main\" AND (SELECT unique_main FROM main_ok), " +
+	    (function_mode
+	         ? string("NULL, NULL, NULL, NULL, NULL")
+	         : string("g.\"rls\", ") + (HasObjectCaps() ? "oc.\"rls\"" : "NULL") + ", g.\"columns\", " +
+	               (HasObjectCaps() ? "oc.\"columns\"" : "NULL") + ", " + (HasObjectCaps() ? "oc.\"masks\"" : "NULL")) +
+	    " FROM (VALUES " + values + ") q(\"i\", \"vname\") JOIN grants g ON " + KeyEqSql("g.\"vcat\"", cat) + oc_join;
 	auto result = Query(sql);
 	ResultRows rows(*result);
 	for (idx_t r = 0; r < rows.Count(); r++) {
@@ -864,8 +864,7 @@ void CatalogBackend::ApplyGrantVersions(const vector<std::pair<string, GrantPoli
 		return StringUtil::CIEquals(text, "ANY");
 	};
 	auto same = [](const GrantPolicy &a, const GrantPolicy &b) {
-		return a.Predicate() == b.Predicate() && a.columns.test == b.columns.test &&
-		       a.columns.masks == b.columns.masks;
+		return a.Predicate() == b.Predicate() && a.columns.test == b.columns.test && a.columns.masks == b.columns.masks;
 	};
 	vector<UnionWidening> pairs;
 	for (auto &limited : united) {
@@ -952,14 +951,25 @@ string OverObject(const string &mask, const vector<std::pair<string, string>> &o
 			}
 			return;
 		}
-		ParsedExpressionIterator::EnumerateChildren(
-		    *expr, [&](unique_ptr<ParsedExpression> &child) { walk(child, params); });
+		ParsedExpressionIterator::EnumerateChildren(*expr,
+		                                            [&](unique_ptr<ParsedExpression> &child) { walk(child, params); });
 	};
 	walk(parsed[0], case_insensitive_set_t());
 	return parsed[0]->ToString();
 }
 
 //! spec 158: the roles' test as a COLUMNS selector over a read's own columns ("*" for every column)
+//! spec 158, 099: a mask is stored cast to its column's source type; where the object exposes that column as another
+//! type (`TablePolicy::casts`), the mask is read as that type too - a mask never changes what a column is
+string ExposedMask(const string &mask, const string &column, const vector<std::pair<string, string>> &casts) {
+	for (auto &cast : casts) {
+		if (StringUtil::CIEquals(cast.first, column)) {
+			return "CAST((" + mask + ") AS " + cast.second + ")";
+		}
+	}
+	return mask;
+}
+
 string ColumnsSelector(const ColumnTest &test) {
 	if (test.All()) {
 		return "*";
@@ -1020,8 +1030,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 	}
 	if (!out.query.empty()) {
 		// a view has no column list of its own: the grant's columns and predicate apply to the view's output
-		auto filtered = "SELECT * FROM (" + out.query + ") AS __acl_viewed" +
-		                (predicate.empty() ? "" : " WHERE " + predicate);
+		auto filtered =
+		    "SELECT * FROM (" + out.query + ") AS __acl_viewed" + (predicate.empty() ? "" : " WHERE " + predicate);
 		out.query = restricts ? GrantOver(columns, filtered) : filtered;
 		return;
 	}
@@ -1058,7 +1068,11 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		// the object's columns are its source's, read live (no list of its own): the test and the masks go to duckdb
 		// over the read (a mask of a column the source lost refuses at bind); the predicate stays inside, so RLS
 		// reads the source's values
-		out.query = GrantOver(columns, "SELECT *" + out.ReadFrom());
+		auto exposed = columns;
+		for (auto &mask : exposed.masks) {
+			mask.second = ExposedMask(mask.second, mask.first, out.casts);
+		}
+		out.query = GrantOver(exposed, "SELECT *" + out.ReadFrom());
 		if (columns.test.kind != ColumnTest::Kind::ONLY) {
 			// the columns are every one but those left out: a write and its conditions are judged by exclusion
 			out.columns_excluded = true;
@@ -1076,10 +1090,10 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			if (!out.writable) {
 				continue;
 			}
+			// a masked column is written too: its mask is assigned, never the client's value (spec 024)
 			auto mask = MaskOf(columns.masks, name);
 			if (mask) {
 				out.injections.emplace_back(name, *mask);
-				continue;
 			}
 			out.write_columns.insert(name);
 			out.write_order.push_back(name);
@@ -1102,15 +1116,18 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			}
 		}
 		auto mask = MaskOf(columns.masks, defined.first);
-		auto expr = mask ? OverObject(*mask, object_columns) : source_is_name ? Ident(source) : source;
+		// the exposed type is the source column's the object reads (its type facts are by physical name)
+		auto cast_key = defined.second.empty() || PlainColumnName(defined.second) ? source : defined.first;
+		auto expr = mask             ? ExposedMask(OverObject(*mask, object_columns), cast_key, out.casts)
+		            : source_is_name ? Ident(source)
+		                             : source;
 		out.projection.push_back(expr == Ident(defined.first) ? expr : expr + " AS " + Ident(defined.first));
 		out.visible_columns.insert(source);
 		if (!out.writable) {
 			continue;
 		}
 		if (mask) {
-			out.injections.emplace_back(source, expr);
-			continue;
+			out.injections.emplace_back(source, expr); // assigned on a write, never the client's value (spec 024)
 		}
 		out.write_columns.insert(source);
 		out.write_order.push_back(defined.first);

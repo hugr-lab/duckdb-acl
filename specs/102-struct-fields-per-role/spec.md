@@ -1,6 +1,7 @@
 # Spec 102: fields of structured types per role
 
-- **Status**: implemented (2026-10-07; accepted by the owner 2026-10-06, decisions at the end)
+- **Status**: superseded by spec 158 (2026-11-16: a column list is a SELECT list, a grant masks by expression; the
+  field paths are gone)
 - **Date**: 2026-10-06
 - **Follows**: spec 099 (types under the ACL, its follow-up), spec 011 (grant levels and the union of
   roles), spec 026 (a grant's projection is probed where it is written), spec 037/038 (a grant hides

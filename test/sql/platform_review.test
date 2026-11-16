@@ -118,8 +118,15 @@ ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET RLS 'acl_grant_admin
 ----
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 
+# spec 158: a catalog grant takes no column list at all; the mask that replaced its expressions is the object
+# grant's MASK, judged like any stored body
 statement error
 ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET COLUMNS 'id, acl_grant_admin(''pol'', ''observe'')::VARCHAR AS tenant';
+----
+<REGEX>:.*a catalog grant takes no column list.*
+
+statement error
+ACL ROLE "pol" GRANT TABLE sales.orders TO ROLE reader MASK (tenant AS acl_grant_admin('pol', 'observe')::VARCHAR);
 ----
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 

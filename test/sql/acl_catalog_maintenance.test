@@ -225,10 +225,10 @@ ACL ADMIN REPAIR VIRTUAL TABLE c.customers DROP MISSING COLUMNS AND MASKS;
 ----
 2
 
-query I
-SELECT "columns" FROM store.acl.role_object_caps WHERE role = 'analyst' AND vname = 'customers';
+query II
+SELECT "columns", coalesce(masks, '') FROM store.acl.role_object_caps WHERE role = 'analyst' AND vname = 'customers';
 ----
-id, tenant, amount
+id, tenant, amount	(empty)
 
 query I
 SELECT count(*) FROM store.acl.relation_columns WHERE vname = 'customers';
@@ -239,10 +239,10 @@ SELECT count(*) FROM store.acl.relation_columns WHERE vname = 'customers';
 query IIII
 SELECT object, role, problem, repair FROM acl_check_catalog('c') WHERE kind = 'grant' ORDER BY role;
 ----
-customers	poor	grant_column_missing	SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id')
+customers	poor	grant_column_missing	SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id', '', '')
 
 statement ok
-SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id');
+SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id', '', '');
 
 query I
 SELECT count(*) FROM acl_check_catalog('c') WHERE kind = 'grant';
@@ -310,13 +310,18 @@ SELECT count(*) FROM acl_check_catalog('c');
 ----
 0
 
-# a mask and a bare item on the bare alias's column - from an object grant and from a catalog grant -
-# and a table macro over it, all fine while the column exists
+# a mask and a bare item on the bare alias's column, and a table macro over it, all fine while the
+# column exists (spec 158: a catalog grant takes no COLUMNS - the list is the object grant's)
 statement ok
 ACL ADMIN CREATE ROLE masker;
 
-statement ok
+statement error
 ACL ADMIN GRANT CATALOG c TO ROLE masker WITH (select) MAIN COLUMNS (id, sku);
+----
+<REGEX>:.*a catalog grant takes no COLUMNS or MASK.*
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE masker WITH (select) MAIN;
 
 statement ok
 ACL ADMIN GRANT OBJECT c.items TO ROLE masker COLUMNS (id, sku) MASK (sku AS NULL);
@@ -333,23 +338,32 @@ statement ok
 ALTER TABLE phys.main.items DROP COLUMN sku;
 
 query IIII
-SELECT kind, object, role, problem FROM acl_check_catalog('c') ORDER BY kind, object, role;
+SELECT kind, object, role, problem FROM acl_check_catalog('c') ORDER BY kind, object, role, problem;
 ----
 function	skus	NULL	definition_broken
-grant	*	masker	grant_column_missing
+grant	items	masker	grant_column_missing
 grant	items	masker	mask_broken
 grant	items	poor	rls_broken
 view	stock	NULL	schema_stale
 
 query II
-SELECT detail, repair FROM acl_check_catalog('c') WHERE role = 'masker' ORDER BY object;
+SELECT detail, repair FROM acl_check_catalog('c') WHERE role = 'masker' ORDER BY problem;
 ----
-the catalog-wide COLUMNS item "sku" matches no column of any object of "c" - the role reads less than the grant says	ALTER GRANT CATALOG c TO ROLE masker SET COLUMNS 'id'
-the mask "NULL AS sku" names a column "c.items" does not expose - every read of it by this role refuses (spec 038)	SELECT acl_grant_object('masker', 'c', 'items', '', '', 'id')
+the COLUMNS item "sku" matches no column of "c.items" - the role reads less than the grant says	SELECT acl_grant_object('masker', 'c', 'items', '', '', 'id', '', '')
+the mask of "sku" names a column "c.items" does not expose - every read of it by this role refuses (spec 038)	SELECT acl_grant_object('masker', 'c', 'items', '', '', 'id', '', '')
 
-# the catalog grant's repair, as the row names it
+# a catalog grant's list an older build stored (spec 038's catalog-wide list) refuses every read under
+# that grant, and the check names it with the repair that clears it
 statement ok
-ACL ADMIN ALTER GRANT CATALOG c TO ROLE masker SET COLUMNS 'id';
+UPDATE store.acl.role_catalogs SET "columns" = 'id' WHERE role = 'masker' AND vcat = 'c';
+
+query IIII
+SELECT object, problem, detail, repair FROM acl_check_catalog('c') WHERE object = '*';
+----
+*	catalog_columns	the catalog grant states COLUMNS ("id"), which only an object grant states since spec 158 - every read under this grant refuses	SELECT acl_alter_grant('masker', 'c', 'columns', '')  -- then GRANT TABLE <object> TO ROLE masker COLUMNS (…)
+
+statement ok
+SELECT acl_alter_grant('masker', 'c', 'columns', '');
 
 query I
 SELECT count(*) FROM acl_check_catalog('c') WHERE object = '*';
@@ -447,9 +461,10 @@ ACL ADMIN GRANT OBJECT c.items TO ROLE poor RLS (sku <> '');
 <REGEX>:.*does not bind against it.*
 
 query IIII
-SELECT object, role, problem, detail FROM acl_check_catalog('c') WHERE kind = 'grant' ORDER BY role;
+SELECT object, role, problem, detail FROM acl_check_catalog('c') WHERE kind = 'grant' ORDER BY role, problem;
 ----
-items	masker	mask_broken	the mask "NULL AS sku" names a column "c.items" does not expose - every read of it by this role refuses (spec 038)
+items	masker	grant_column_missing	the COLUMNS item "sku" matches no column of "c.items" - the role reads less than the grant says
+items	masker	mask_broken	the mask of "sku" names a column "c.items" does not expose - every read of it by this role refuses (spec 038)
 items	poor	rls_broken	the predicate of role "poor" does not bind against "c.items": Binder Error: Referenced column "sku" not found in FROM clause!
 
 # a reference whose column the object no longer declares
@@ -474,7 +489,7 @@ ACL ADMIN CREATE VIRTUAL VIEW d.nowhere AS 'SELECT 1 FROM phys.main.nothing';
 query II
 SELECT vcat, count(*) FROM acl_check_catalog() GROUP BY 1 ORDER BY 1;
 ----
-c	6
+c	7
 d	1
 
 query IIIIIII rowsort

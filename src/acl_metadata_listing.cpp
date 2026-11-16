@@ -560,8 +560,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 			}
 		}
 	}
-	// spec 158: whether an object grant's stored COLUMNS (`column_expr`) admits the column `name_expr` - a constant CASE
-	// over the texts read above; a text read after this was composed admits nothing (fail closed)
+	// spec 158: whether an object grant's stored COLUMNS (`column_expr`) admits the column `name_expr` - a constant
+	// CASE over the texts read above; a text read after this was composed admits nothing (fail closed)
 	auto keeps = [&](const string &column_expr, const string &name_expr) {
 		string cases;
 		for (auto &list : stated_lists) {
@@ -569,10 +569,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 			for (auto &name : list.second.names) {
 				names.push_back(Lit(acl_detail::FoldColumn(name)));
 			}
-			auto in = "list_contains([" + StringUtil::Join(names, ", ") + "]::VARCHAR[], " + KeyFoldSql(name_expr) + ")";
-			string admits = list.second.All()                                           ? string("true")
+			auto in =
+			    "list_contains([" + StringUtil::Join(names, ", ") + "]::VARCHAR[], " + KeyFoldSql(name_expr) + ")";
+			string admits = list.second.All()                                          ? string("true")
 			                : list.second.kind == acl_detail::ColumnTest::Kind::EXCEPT ? "NOT " + in
-			                                                                            : in;
+			                                                                           : in;
 			cases += " WHEN " + Lit(list.first) + " THEN " + admits;
 		}
 		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = ''" +
@@ -923,11 +924,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	string alias_roles = "(SELECT list(struct_pack(cat := ag.cat, obj := ag.obj, probed := NULL::VARCHAR) ORDER BY "
 	                     "ag.role) FROM " +
 	                     alias_grants + ")";
-	string alias_visible =
-	    !catalog_lists && !alias_object_lists
-	        ? string()
-	        : " AND EXISTS (SELECT 1 FROM " + alias_grants + " AND " + keeps_catalog("ag.cat") +
-	              (alias_object_lists ? " AND " + keeps("ag.obj", "i.\"column_name\"") : string()) + ")";
+	string alias_visible = !catalog_lists && !alias_object_lists
+	                           ? string()
+	                           : " AND EXISTS (SELECT 1 FROM " + alias_grants + " AND " + keeps_catalog("ag.cat") +
+	                                 (alias_object_lists ? " AND " + keeps("ag.obj", "i.\"column_name\"") : string()) +
+	                                 ")";
 	// review 144: an object a relation of the catalog names is that relation's, read through it (LookupRelation wins
 	// over an alias) - the alias leg leaves it alone
 	alias_visible += " AND NOT EXISTS (SELECT 1 FROM " + Tbl("relations") + " ar WHERE ar.\"vcat\" = a.vcat AND " +
@@ -1176,8 +1177,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		string fkey = "gf.vcat = k.\"vcat\" AND gf.vname = k.\"vname\"";
 		string fcolumn_visible = "(NOT EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey +
 		                         ") OR EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey + " AND " +
-		                         keeps_catalog("gf.cat_columns") + " AND " +
-		                         keeps("gf.obj_columns", "k2.\"column\"") + "))";
+		                         keeps_catalog("gf.cat_columns") + " AND " + keeps("gf.obj_columns", "k2.\"column\"") +
+		                         "))";
 		return prelude + ", vcolumns AS (" + effective_columns + "), " + gfcolumns + " " +
 		       named("SELECT k.\"vcat\" AS vcat, k.\"vname\" AS object, k.\"kind\" AS kind,"
 		             " k.\"pos\" + 1 AS key_sequence, k.\"column\" AS \"column\" FROM " +

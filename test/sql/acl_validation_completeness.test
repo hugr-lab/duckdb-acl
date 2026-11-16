@@ -216,44 +216,40 @@ SELECT rls_checked FROM acl_relations() WHERE vname = 'own';
 ----
 true
 
-# --- and the refresh re-probes a grant projection that could not bind before ------------------------------
-# spec 026 accepts an unprobed projection for the same reason spec 021 accepts an unjudged predicate
+# --- and a grant written while its object could not bind lists what it admits once the object binds -------
+# spec 026 accepted an unprobed grant projection for the same reason spec 021 accepts an unjudged predicate.
+# Since spec 158 a grant computes no column (its COLUMNS is a test on the object's names, a mask keeps the
+# column's type): the listing is the object's columns the test admits, with the object's types.
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.masked AS pending.main.t;
 
 statement ok
-ACL ADMIN GRANT TABLE c.masked TO ROLE r WITH (select) COLUMNS (id, label) MASK (label AS coalesce(tenant, 'none'));
+ACL ADMIN GRANT TABLE c.masked TO ROLE r WITH (select) COLUMNS (id, tenant) MASK (tenant AS coalesce(tenant, 'none'));
 
 query I
-SELECT count(*) FROM acl_grant_columns() WHERE vname = 'masked';
+SELECT "columns" FROM aclcat.acl.role_object_caps WHERE vname = 'masked';
 ----
-0
+id, tenant
 
 statement ok
 ATTACH ':memory:' AS pending;
 
 statement ok
-CREATE TABLE pending.main.t(id INT, tenant VARCHAR);
+CREATE TABLE pending.main.t(id INT, tenant VARCHAR, secret VARCHAR);
 
 statement ok
 SELECT acl_refresh_schema('c');
 
+# the role's metadata says what it reads: the grant's columns, with the object's types - never `secret`
 query II
-SELECT name, type FROM acl_grant_columns() WHERE vname = 'masked' ORDER BY pos;
+ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
+    WHERE table_name = 'masked' ORDER BY ordinal_position;
 ----
 id	INTEGER
-label	VARCHAR
+tenant	VARCHAR
 
-# and that is what the role's metadata says it reads
-query I
-ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns
-    WHERE table_name = 'masked';
-----
-id,label
-
-# a refresh that cannot re-probe leaves what an earlier probe found: losing the rows would make the
-# metadata describe the physical table again, which is the leak spec 026 closed
+# a source that goes away never makes the metadata describe more than the grant admits
 
 statement ok
 DETACH pending;
@@ -261,11 +257,11 @@ DETACH pending;
 statement ok
 SELECT acl_refresh_schema('c');
 
-query II
-SELECT name, type FROM acl_grant_columns() WHERE vname = 'masked' ORDER BY pos;
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.columns
+    WHERE table_name = 'masked' AND column_name NOT IN ('id', 'tenant');
 ----
-id	INTEGER
-label	VARCHAR
+0
 
 # --- the catalog level of the chain is judged against every object it filters -----------------------------
 

@@ -149,33 +149,33 @@ CREATE [OR REPLACE] VIRTUAL TABLE [IF NOT EXISTS] <catalog>.<name> AS <phys>
 ADD TABLE <phys> AS <catalog>.<name> [COLUMNS (<item>, …)] [RLS (<predicate>)]        -- legacy, upsert
 ```
 
-The four clauses after `AS <phys>` come in any order, each once. A `COLUMNS` item is one of:
+The four clauses after `AS <phys>` come in any order, each once. `COLUMNS` is a **SELECT list** over the source, read by
+duckdb's parser (spec 158):
 
-| Item                       | Meaning                                                                                      |
-| -------------------------- | -------------------------------------------------------------------------------------------- |
-| `name`                     | expose the physical column                                                                   |
-| `new_name = column`        | rename                                                                                       |
-| `name = <expression>`      | a mask (`ssn = NULL`) or a computed column (`total = amount * 2`), evaluated over the physical row |
-| `<expression> AS name`     | the same as `name = <expression>`, in SQL's spelling                                         |
-| `name NOT NULL` / `name NULL` | expose and declare nullability (spec 048); `name = <expr> NOT NULL` (or `<expr> NOT NULL AS name`, `<expr> AS name NOT NULL`) is the promise that lets a masked column be a key - `IS NOT NULL` stays the expression's |
-| `"odd name"`               | a quoted identifier means the name it quotes (spec 065), `,` or `=` in it included; a quoted name holding `.` or `[` is refused - the list reads it as a path into a column |
+| Item                         | Meaning                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------ |
+| `name`                       | expose the physical column                                                           |
+| `column AS new_name`         | rename                                                                               |
+| `<expression> AS name`       | a computed column (`amount * 2 AS total`), evaluated over the physical row           |
+| `name: <expression>`         | the same, in duckdb's prefix spelling                                                |
+| `a.b`                        | a column of its own named `b` (`struct_extract`), as in SELECT                       |
 
-Each name is an identifier as duckdb reads one (quote a keyword or a name holding other characters), each expression one
-duckdb expression - so `['a', 'b']`, `{'k': 1}`, `$$x,y$$` and a lambda are read as duckdb reads them. The legacy quoted
-form `COLUMNS '<list>'`, `SET COLUMNS '<list>'`, `REMAP` and the function forms (`acl_add_relation`,
-`acl_alter_relation`) read their text with the same reader; there a comment is refused (spec 150 4f).
+Each name is an identifier as duckdb reads one (quote a keyword or a name holding other characters); an expression is
+any duckdb expression - `['a', 'b']`, `{'k': 1}`, a lambda. An expression without a name, a positional reference
+(`#2`), a star (until stage 2) and anything after the list (`FROM`, `WHERE`) are refused. A column's nullability is its
+source's: the list carries no `NULL` / `NOT NULL` marks. The legacy quoted form `COLUMNS '<list>'`, `SET COLUMNS`,
+`REMAP` and the function forms (`acl_add_relation`, `acl_alter_relation`) read their text the same way.
 
-A mask, a computed column and an `RLS` predicate are each **one SQL expression**: text with a comment left open, an
-alias, a parameter or a clause after it (`FROM`, `WHERE`, a second statement) is refused where it is written (spec
-148), on a relation, a catalog grant, an object grant, a `REMAP` and a scalar function's template alike; a stored one
-refuses the reads it would have shaped, and `acl_check_catalog` names it.
+A computed column and an `RLS` predicate are each **one SQL expression**: text with a comment left open, a parameter
+or a clause after it is refused where it is written (spec 148); a stored one refuses the reads it would have shaped,
+and `acl_check_catalog` names it.
 
 Any column not listed is hidden. With no `COLUMNS` and no `RLS` the relation is an **alias**
-(RENAME in place, writable); a list made only of bare names and renames keeps the alias form; a mask,
-a computed column or an `RLS` predicate makes it a read-only **subquery**. `RLS` is a predicate over
+(RENAME in place, writable); a list made only of bare names and renames keeps the alias form; a computed
+column or an `RLS` predicate makes it a read-only **subquery**. `RLS` is a predicate over
 the physical columns, AND-ed into every read and write; `acl_claim('<name>')` inside it is replaced
 by the principal's claim. `PRIMARY KEY` is declared, never enforced; it may name only columns the
-declaration has, and a masked or explicitly nullable column is refused as a key. The physical
+declaration has, and a computed column is refused as a key (nothing vouches that it is never NULL). The physical
 `<phys>` is not checked at write time: a source attached later is fine - except for a catalog admin, whose
 `<phys>` must lie in a source granted to it (spec 118.3), which a grant requires to be attached.
 A two-part `<phys>` over an attached database (`pg.orders`) is stored whole, as duckdb finds the object there:
@@ -187,14 +187,14 @@ is kept as written, since the default database is that node's own (spec 137).
 ACL ADMIN CREATE VIRTUAL TABLE sales.created AS phys.main.orders_physical
     COLUMNS (id, amount) RLS (amount > 0) COMMENT 'positive orders';
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders
-    COLUMNS (id = pk, tenant = internal_tenant, "odd name" = "odd name");
-ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders
-    COLUMNS (id = CASE WHEN id > 0 THEN id END NOT NULL, tenant) PRIMARY KEY (id);
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS (id, amount, ssn = NULL) RLS (tenant = acl_claim('tenant'));
+    COLUMNS (pk AS id, internal_tenant AS tenant, "odd name") PRIMARY KEY (id);
+ACL ADMIN CREATE VIRTUAL TABLE c.totals AS phys.main.orders
+    COLUMNS (id, amount * 2 AS total, address.city);
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS (id, amount) RLS (tenant = acl_claim('tenant'));
 ```
 
-Function: `acl_add_relation(vcat, vname, phys, columns_csv, rls[, comment[, mode[, pk_csv]]])` -
-`columns_csv` is the item list as csv (`id, ssn = NULL`), `pk_csv` the key columns.
+Function: `acl_add_relation(vcat, vname, phys, columns, rls[, comment[, mode[, pk_csv]]])` -
+`columns` is the SELECT list as text (`id, amount * 2 AS total`), `pk_csv` the key columns.
 
 Related: `ALTER VIRTUAL TABLE`, `DROP VIRTUAL TABLE` / `DROP RELATION`, `COMMENT ON VIRTUAL TABLE`
 below.
@@ -521,9 +521,9 @@ Functions: `acl_map_role(scope_kind, scope, source, external_value, role)` and
 
 ```
 GRANT CATALOG <catalog> TO ROLE <role>
-    [WITH (<capability>, …) | CAPS '<json>'] [MAIN] [RLS (<predicate>)] [COLUMNS (<item>, …)] [VERSIONS <versions>]
+    [WITH (<capability>, …) | CAPS '<json>'] [MAIN] [RLS (<predicate>)] [VERSIONS <versions>]
 ALTER GRANT CATALOG <catalog> TO ROLE <role>
-    SET CAPS '<json>' | SET RLS '<predicate>' | SET COLUMNS '<list>' | SET MAIN true | false
+    SET CAPS '<json>' | SET RLS '<predicate>' | SET MAIN true | false
 REVOKE CATALOG <catalog> FROM ROLE <role>
 REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>
 ```
@@ -550,8 +550,10 @@ an object grant that states none takes the catalog grant's, and `ALTER GRANT` ke
 - **`MAIN`** marks the catalog whose objects the role addresses unqualified. A principal with more than
   one main catalog across its roles resolves only qualified names.
 - **`RLS`** is the grant's own predicate, AND-ed onto every object of the catalog for this role (and
-  onto the object's own). **`COLUMNS`** is the grant's own column list, intersected with the object's;
-  a name the object hides cannot be re-exposed here; when the intersection leaves no column, every read and every
+  onto the object's own). A catalog grant states **no columns** (spec 158): which columns a role sees, and masked how,
+  is the object grant's (`COLUMNS` / `MASK` [below](#object-grants)). A list stored on a catalog grant by an older build
+  refuses every read under that grant, and `acl_check_catalog` reports it (`catalog_columns`, the repair
+  `acl_alter_grant(role, vcat, 'columns', '')`). When an object grant leaves no column, every read and every
   write of the object by the role refuses, whatever the `RLS` (spec 156). A `DELETE`, `UPDATE` or `MERGE`
   binds the role's read of its target first: one whose columns are gone from the source - or, over an object without a
   list, never were there - refuses rather than writing (spec 157). A grant narrows, it never widens. Across roles the
@@ -562,8 +564,7 @@ an object grant that states none takes the catalog grant's, and `ALTER GRANT` ke
   `INSERT OR REPLACE`) updates the row already there: it needs `update`, under the update's policy;
   `OR REPLACE` is refused under a row or column policy. `RETURNING` of a row already there (UPDATE,
   DELETE, MERGE, an upsert) reads: it needs `select`, and is refused where a role whose policy the verb
-  unites may not read; a plain INSERT's returns what was written. A catalog-level column list is not
-  probed for its types.
+  unites may not read; a plain INSERT's returns what was written.
 - `CAPS '{"manage": true}'` is the catalog-scoped administration scope: the role may run the
   management grammar over this catalog's content (and only that - see *Batches and authorization*).
   Managing a catalog does not imply reading it.
@@ -573,13 +574,14 @@ an object grant that states none takes the catalog grant's, and `ALTER GRANT` ke
 ```sql
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select, insert) MAIN;
 ACL ADMIN GRANT CATALOG sales TO ROLE compliance CAPS '{"select": true}' MAIN RLS 'tenant = acl_claim(''tenant'')';
-ACL ADMIN GRANT CATALOG c TO ROLE fnarrow WITH (select, explain) MAIN COLUMNS (amount, tenant);
+ACL ADMIN GRANT CATALOG c TO ROLE fnarrow WITH (select, explain) MAIN;
 ACL ADMIN ALTER GRANT CATALOG sales TO ROLE analyst SET CAPS '{"select": true, "manage": true}';
 ACL ADMIN REVOKE CATALOG sales FROM ROLE auditor;
 ```
 
-Functions: `acl_grant_catalog(role, vcat, caps_json[, is_main[, rls, columns]])`,
-`acl_alter_grant(role, vcat, field, value)` with `field` = `caps` | `rls` | `columns` | `main`,
+Functions: `acl_grant_catalog(role, vcat, caps_json[, is_main[, rls, columns[, versions]]])` (`columns` empty, spec
+158), `acl_alter_grant(role, vcat, field, value)` with `field` = `caps` | `rls` | `main` (and `columns` to clear a
+stored list),
 `acl_revoke_catalog(role, vcat)` - the revoke also removes the role's object grants and probed grant
 columns in that catalog. A role that holds no grant there is refused (`holds no grant on catalog`), as
 `REVOKE TABLE` and `REVOKE ADMIN` are: a revoke never answers success for a name it did not find.
@@ -593,7 +595,7 @@ REVOKE SCHEMA <catalog>.<path> FROM ROLE <role>
 ```
 
 The middle level of the grant chain: capabilities for everything under a schema path, including
-objects that appear in it later. It carries capabilities only - `RLS` and `COLUMNS` are refused
+objects that appear in it later. It carries capabilities only - `RLS`, `COLUMNS` and `MASK` are refused
 unless empty, and `manage` is refused at this level. Capabilities resolve by the longest granted prefix of
 a name (`object -> schema -> catalog`); a level that states none inherits from the nearest ancestor
 that does, and the inheritance is materialised when a grant or a schema changes. `REVOKE` re-points
@@ -671,96 +673,64 @@ nearest ancestor that states capabilities (function only).
 
 ```
 GRANT TABLE | VIEW | OBJECT <catalog>.<name> TO ROLE <role>
-    [WITH (<capability>, …) | CAPS '<json>'] [RLS (<predicate>)] [COLUMNS (<item>, …)] [VERSIONS <versions>]
+    [WITH (<capability>, …) | CAPS '<json>'] [RLS (<predicate>)]
+    [COLUMNS (<name>, … | * | * EXCLUDE (<name>, …))] [MASK (<column> AS <expression>, …)] [VERSIONS <versions>]
 ```
 
 The three keywords are the same statement: the name may be a table, a view, a table function or a
 scalar of the catalog (not a bare schema alias). An object grant refines the catalog grant for this
 role: capabilities it does not state are inherited from the catalog grant, never widened by omission;
 `CAPS '{}'` takes every capability away. `RLS` is AND-ed onto the catalog grant's predicate and the
-object's own; `COLUMNS` intersects, and a bare name the object does not expose is refused. On a view
-the policy applies to the view's output, on a table function to its result; `RLS`/`COLUMNS` on a
-scalar is refused. The target must exist. When the grant states columns, its projection is bound
-where it is written and stored, so `DESCRIBE` and `information_schema.columns` describe what the
-role reads (a mask that changes a type, a computed column the object never had).
+object's own. On a view the policy applies to the view's output, on a table function to its result;
+`RLS` / `COLUMNS` / `MASK` on a scalar is refused. The target must exist.
 
-A grant's `COLUMNS` item is `name` or `name = <mask>`. The name is a column or a path into one
-(below), each part an identifier as duckdb reads one - a keyword or a name holding other characters
-is quoted (`"order"`, `"odd name"`, `"a.b"` - one column whose name holds a dot). The mask is one
-expression as duckdb reads it, list and struct literals, `MAP` and lambdas included
-(`tags = ['a', 'b']`, `s = {'x': 1}`, `items = list_transform(items, lambda e: {'price': 0})`), and is
-stored as written (a comment in it a space) but for the tables it names, which are stored whole -
-`<db>.<schema>.<table>` - as are those of every policy text (an RLS, a view's SQL, a template; spec 160).
-The stored list is read back on duckdb's tokens; a
-name it would not read back bare is stored quoted (`"a,b"`, `"od'd"`), and a list that would read
-back as other items than written is refused where it is written. The legacy quoted form
-`COLUMNS '<list>'` and the function forms' text take any name and mask the same way; such a text that
-holds a comment, or ends inside a literal or a quoted name, is refused. A list stored by an earlier
-build that holds a comment (a name like `a--b` was stored as it is), a `$…$` or `E'…'` string or a
-backtick name is read as that build read it.
+**What the role sees** (spec 158). The object says what its columns are; the grant says which of them the role
+sees and what it reads in place of some:
 
-A `COLUMNS` item with a value on a writable table is an assignment as well as a mask:
-`tenant = acl_claim('tenant')` is added to an `INSERT` when absent, overrides a supplied value, and
-is applied to an `UPDATE`'s `SET`.
+- **`COLUMNS`** is one of three forms, a test on a column's name - never a list of new columns:
+  - `COLUMNS (id, amount)`: only those columns;
+  - `COLUMNS (*)`, or no `COLUMNS`: every column of the object;
+  - `COLUMNS (* EXCLUDE (salary, ssn))`: every column but those.
 
-Writing the grant again replaces it whole (caps, `RLS`, `COLUMNS`, `VERSIONS`); `REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM
-ROLE <role>` takes it away (spec 120), and the catalog's or a schema's grant decides the object again.
-
-### Fields of a structured column (spec 102)
-
-A `COLUMNS` item may name **fields** of a `STRUCT` column, at any depth, and through a list of
-structs. Paths work in a catalog grant, an object grant, and an object's own `COLUMNS`. A field mask
-(`address.ssn = …`) is a grant's only.
-
-| item | the role reads |
-| --- | --- |
-| `address.city, address.zip` | `STRUCT(city, zip)`: only those fields (a NULL struct stays NULL) |
-| `address.geo.lat` | `STRUCT(geo STRUCT(lat))` |
-| `address, address.ssn = '***'` | the whole struct with `ssn` masked |
-| `items[].price` | `LIST(STRUCT(price))`: every element narrowed |
-
-```sql
-ACL ADMIN GRANT TABLE c.customers TO ROLE support COLUMNS (id, address.city, address.zip, orders[].total);
-ACL ADMIN GRANT TABLE c.customers TO ROLE audit  COLUMNS (id, address, address.tax_id = '***');
-```
-
-- **Checked where it is written.** Every step is checked against the column's type and must be a
-  STRUCT field or `[]` of a list. A path into a `MAP` or a `UNION` is refused: those are shown or
-  masked whole. The fields are stored in the source's order.
-- **Levels and roles.** Levels narrow: an object grant never re-exposes a field the catalog grant
-  dropped. A principal's roles unite: `{city}` and `{zip}` read `{city, zip}`, a visible field beats a
-  masked one, and two different masks on one field are refused. Every listing, `DESCRIBE`, the DDL a
-  quack client binds, and the Arrow schema describe what is read - a catalog grant's paths included, on a table
-  and on a live alias's objects alike (spec 144; a field a catalog grant masks is listed with the field's type).
-- **Writes.** A column a grant narrows stays writable, and a write touches only what the role sees:
-  - an `UPDATE`/`MERGE` keeps the stored values of the hidden fields;
-  - an `INSERT` leaves them NULL;
-  - a masked field is assigned (like a column mask);
-  - a written value that carries a field the role cannot see is refused.
-
-  `RETURNING` cannot read the column. A column narrowed through `[]`, or by the object's own
-  `COLUMNS`, is read-only. A field mask that reads the row (`left(ssn, 1) || '***'`) is a mask and not
-  an assignment, so it makes the column read-only too. `SET address = NULL` sets the visible fields to
-  NULL and keeps the hidden ones.
-- **A write statement reads what the role reads.** In an `UPDATE`'s `SET` and `WHERE`, a `DELETE`'s
-  `WHERE` and a `MERGE`'s conditions:
-  - a narrowed column has only its visible fields;
-  - a masked column is its mask;
-  - a column the grant does not list is refused.
-  
-  Beside another relation (`UPDATE … FROM`, `DELETE … USING`, `MERGE`), qualify the other relation's
-  columns. A `MERGE`'s `UPDATE SET *` / `UPDATE BY NAME` is refused under a column policy: name the
+  The names must be columns the object exposes (refused otherwise); they are stored in the object's spelling and
+  order. A column the source gains later is seen under `*` and `EXCLUDE`; one it loses disappears.
+- **`MASK (<column> AS <expression>, …)`**: what the role reads in place of a column the grant shows (a mask of a
+  column `COLUMNS` leaves out is refused). The expression reads the object's columns, not the physical row; it is one
+  expression as duckdb reads it, judged by its author's function gate (spec 117) with its tables stored whole (spec
+  160). It is stored cast to the column's type (`CAST((<expression>) AS <type>)`) - a mask never changes what a column
+  is, so a listing's type is the same for every role.
+- **`acl_has_role('<role>')`** in a mask (or an RLS, or an object's computed column) is `true` when the principal holds
+  that role, `false` otherwise - the constant is baked in where the statement is rewritten.
+- **Several roles** of a principal unite per object: a column is visible when some role's `COLUMNS` admits it; it
+  reads unmasked when some role shows it without a mask; otherwise, when every role that shows it masks it the same
+  way, it reads that mask; two different masks refuse the read.
+- **Writes.** A visible, unmasked column stays writable; a masked one is assigned its mask (spec 024) - added to an
+  `INSERT` when absent, overriding a supplied value and a `SET` - and a mask that reads the row makes the column
+  read-only. A column `COLUMNS` leaves out is neither written nor read by a write's conditions (`WHERE`, `SET`, `ON`):
+  a write statement reads what the role reads, a masked column as its mask. `RETURNING` reads only visible unmasked
   columns.
 
+Writing the grant again replaces it whole (caps, `RLS`, `COLUMNS`, `MASK`, `VERSIONS`); `ALTER GRANT` keeps the masks
+it does not state. `REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>` takes it away (spec 120), and the
+catalog's or a schema's grant decides the object again.
+
 ```sql
-ACL ADMIN GRANT TABLE c.orders TO ROLE narrow WITH (select, update, delete, merge) RLS (tenant = acl_claim('tenant'));
-ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst WITH (select) RLS (amount > 50) COLUMNS (id, amount);
+ACL ADMIN GRANT TABLE c.people TO ROLE analyst COLUMNS (* EXCLUDE (salary)) MASK (ssn AS '***-**-' || right(ssn, 4));
+ACL ADMIN GRANT TABLE c.people TO ROLE hr COLUMNS (*);
+ACL ADMIN GRANT TABLE c.people TO ROLE payroll COLUMNS (id, salary)
+    MASK (salary AS CASE WHEN acl_has_role('payroll_lead') THEN salary ELSE round(salary, -3) END);
 ACL ADMIN GRANT TABLE c.orders TO ROLE inj WITH (select, insert, update)
-    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant) MASK (tenant AS acl_claim('tenant'));
+ACL ADMIN GRANT TABLE c.customers TO ROLE support MASK (address AS struct_update(address, tax_id := NULL));
 ACL ADMIN GRANT TABLE sales.shout TO ROLE ingest CAPS '{"select": true}';   -- read on one function only
 ```
 
-Function: `acl_grant_object(role, vcat, vname, caps_json[, rls, columns[, versions]])`.
+A struct's fields are masked by an expression over the column (`struct_update`, `struct_pack`) or exposed as columns
+of the object (`address.city` in its list); spec 102's field paths are gone.
+
+Function: `acl_grant_object(role, vcat, vname, caps_json[, rls, columns[, versions[, masks]]])`. The platform's
+`object_grants` view shows `columns` as `STRUCT(mode, names)` (`all` | `only` | `except`) and `masks` as
+`LIST(STRUCT(column, mask))`, for an editor.
 
 ### Versions of a time-travel table (spec 167)
 
@@ -1217,10 +1187,12 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `definition_broken` | a view's SQL, a macro's template (with its declared parameter types), or an alias's target function does not bind / exist | `CREATE OR REPLACE VIRTUAL VIEW … AS` / `acl_alter_function` |
 | `schema_stale` | a query-defined object's stored (derived) schema - a view's, a macro's, or a declared-list table's projection - differs from what its definition binds to now | `ANALYZE VIRTUAL …` (re-derives a table's projection too since spec 039, keeping its marks and column comments) |
 | `rls_broken` / `rls_unchecked` | a predicate (object or grant) fails to bind / was accepted unchecked and binds now (spec 027) | `… SET RLS`, a re-grant / `ANALYZE VIRTUAL CATALOG` |
-| `grant_column_missing` | a bare item of a grant's `COLUMNS` list matches no column of the object (an object grant), or of any object of the catalog (a catalog grant) | `acl_grant_object(…)` / `ALTER GRANT CATALOG … SET COLUMNS` |
+| `grant_column_missing` | a name of an object grant's `COLUMNS` (listed or excluded) matches no column of the object | `acl_grant_object(…)` without it |
+| `catalog_columns` | a catalog grant stores a column list (an older build's; spec 158 writes none) - every read under that grant refuses | `acl_alter_grant(role, vcat, 'columns', '')`, then object grants |
+| `columns_unreadable` | an object grant's stored `COLUMNS` or `MASK` does not read (an older build's `name = expr`) - every read of the object by that role refuses | `acl_grant_object(…)` with the new forms |
 | `grant_exposes_nothing` | a role's object grant lists columns and its grants leave it none of the object's: the levels intersect to nothing, the object's list changed under the grant, or (an object without a list) the source dropped them - it replaces that grant's `grant_column_missing` rows (spec 157; a catalog-wide list naming nothing of an object is by design) | `acl_grant_object(…, '<columns>')` naming what the role reads |
 | `body_table_unqualified` | a stored body (an RLS, a view, a template, a declared column, a grant's RLS or list) names a table without its database - a principal's CTE or temp table of that name would stand in for it (spec 160) | redefine it; a write through the grammar stores the table whole |
-| `mask_broken` | a `name = expr` grant item names a column the object does not expose, or its expression does not bind - every read of that object by that role refuses (spec 038) | the same |
+| `mask_broken` | an object grant's `MASK` names a column the object does not expose, or its expression does not bind - every read of that object by that role refuses (spec 038) | `acl_grant_object(…)` without it |
 | `schema_missing` | a schema alias's or expansion's physical schema has no schema behind it | `ALTER VIRTUAL SCHEMA … SET PHYS` / `DROP VIRTUAL SCHEMA` |
 | `expansion_stale` | an expansion's source has tables it did not record (and did not exclude), or records whose source is gone | `ALTER VIRTUAL SCHEMA … REFRESH [PRUNE]` |
 | `reference_dangling` | a reference's end object, or a column it names, is not in the catalog (catalog facts only) | `DROP VIRTUAL REFERENCE` |
@@ -1230,7 +1202,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `source_not_granted` | an object whose current definition an administrator below `policy` wrote (spec 120) reads a physical source its roles are no longer granted (`REVOKE SOURCE`) - its physical name, an alias' schema, a function alias' database, the objects its view / template / RLS / computed columns / reference expression name (each as it resolves, spec 138); it goes on working | `GRANT SOURCE <db>.<schema> TO ROLE <r>` (a role that still administers), or - when those roles are gone - redefine or drop the object |
 | `body_function_denied` | a stored body (view, template, alias, RLS, column or mask, a grant's policy) calls a function no principal may call - written before spec 117 judged bodies by their author's gate | redefine it without the call, or drop it |
 | `comment_column_missing` | a column comment kept for a table without a column list (spec 143) that no listing shows: its source no longer has the column, or the table now declares its columns | `COMMENT ON VIRTUAL TABLE … COLUMN "<c>" IS ''` |
-| `types_mismatch` | a declared entry that makes a type of its own (`CAST(x AS ENUM(…))`) - described as the exposed type, read as its own | `REPAIR VIRTUAL TABLE … REMAP (n = CAST(… AS <type>))` |
+| `types_mismatch` | a declared entry that makes a type of its own (`CAST(x AS ENUM(…))`) - described as the exposed type, read as its own | `REPAIR VIRTUAL TABLE … REMAP (CAST(… AS <type>) AS n)` |
 
 A bare alias (no declared list) has no contract beyond "binds", so only `source_missing` (and spec 137's
 `phys_incomplete`, spec 143's `comment_column_missing`) can be found on it - declaring `COLUMNS` is the opt-in to `column_missing`, as it is to spec 065's clean
@@ -1239,14 +1211,12 @@ by design (docs/security.md, "a grant on the source's future").
 
 `REPAIR VIRTUAL TABLE` mends a declared list on purpose, and **never drops a mask silently**:
 
-- `REMAP (ssn = ssn_v2, …)` gives the named entries new expressions, each probed to bind before
+- `REMAP (ssn_v2 AS ssn, …)` gives the named entries new expressions, each probed to bind before
   anything is written (a name the list does not declare, or an expression that does not bind, is
   refused and nothing changes); the grants' projections on the object are re-probed after.
 - `DROP MISSING COLUMNS` removes every entry whose expression no longer binds. It is **refused**
   while an object grant on that object masks one of those names (`… would orphan the mask(s) on
   "ssn" (role "analyst") - REMAP the column, alter those grants, or DROP MISSING COLUMNS AND MASKS`).
-  A catalog grant's mask is not touched either way: it protects the column on every other object,
-  and spec 038 refuses this object's reads for it - which `CHECK` reports as `mask_broken`.
 - `DROP MISSING COLUMNS AND MASKS` also removes exactly those mask items from the object grants
   that carried them, by name; the count includes them. The mask protected a column that no longer
   exists; what the administrator acknowledges is that a column of that name is gone for good.
@@ -1302,7 +1272,7 @@ forms carry the `VIRTUAL` marker so duckdb's own `ALTER TABLE` stays native.
 | `ALTER VIRTUAL SCHEMA <c>.<path> SET PHYS <phys schema>`                                         | `acl_alter_schema_alias(vcat, path, phys)`                  |
 | `ALTER VIRTUAL SCHEMA <c>.<path> REFRESH [PRUNE]`                                                | `acl_refresh_schema_objects(vcat, path, prune)`             |
 | `CHECK VIRTUAL CATALOG <c>`                                                                        | `SELECT * FROM acl_check_catalog(vcat)` (spec 039)                                      |
-| `REPAIR VIRTUAL TABLE <c>.<n> REMAP (<v> = <expr>, …)` / `DROP MISSING COLUMNS [AND MASKS]`          | `acl_repair_relation(vcat, vname, 'remap', list)` / `(…, 'drop_missing[_and_masks]')`   |
+| `REPAIR VIRTUAL TABLE <c>.<n> REMAP (<expr> AS <v>, …)` / `DROP MISSING COLUMNS [AND MASKS]`        | `acl_repair_relation(vcat, vname, 'remap', list)` / `(…, 'drop_missing[_and_masks]')`   |
 | `ALTER VIRTUAL TABLE FUNCTION <c>.<n> SET MACRO <select>` / `SET ALIAS [OF] <fn>`                | `acl_alter_function(vcat, vname, 'table', 'macro' or 'alias', definition)` |
 | `ALTER VIRTUAL TABLE FUNCTION <c>.<n> SET PRIMARY KEY (…)` / `DROP PRIMARY KEY`                  | `acl_set_key(vcat, vname, 'table', pk_csv)`                 |
 | `ALTER VIRTUAL SCALAR <c>.<n> SET MACRO <expression>` / `SET ALIAS [OF] <fn>`                    | `acl_alter_function(vcat, vname, 'scalar', 'macro' or 'alias', definition)` |
@@ -1316,7 +1286,7 @@ object with `CREATE OR REPLACE` or `ALTER` carries its comment, declared key and
 unless the statement states them; a key whose column the new shape no longer has lapses.
 
 ```sql
-ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (order_id = id, total = amount);
+ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (id AS order_id, amount AS total);
 ACL ADMIN ALTER VIRTUAL TABLE c.orders SET PRIMARY KEY (id, tenant);
 ACL ADMIN ALTER VIRTUAL VIEW c.daily SET AS 'SELECT tenant AS day, count(*)::INTEGER AS total FROM phys.main.orders GROUP BY 1';
 ACL ADMIN ALTER VIRTUAL TABLE FUNCTION c.report SET MACRO 'SELECT id, amount FROM phys.main.orders WHERE amount > acl_arg(1)';

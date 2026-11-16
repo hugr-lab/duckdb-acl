@@ -1,7 +1,7 @@
 # name: test/sql/platform_check_grant.test
 # description: spec 122 - platform.check_grant answers what writing a grant would say, writes nothing, and agrees
-#   with the write: every case is checked, then written - refused exactly when the check refused, and the projection
-#   the write stores (grant_columns) is what the check answered
+#   with the write: every case is checked, then written - refused exactly when the check refused, and the test and
+#   masks the write stores (spec 158) are what the check answered
 # group: [sql]
 
 require acl
@@ -39,18 +39,21 @@ ACL ADMIN CREATE ROLE analyst;
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
 
-# --- a grant that is right: each column the role would read, with its type; a mask that changes the type; a path ---
+# --- a grant that is right: each column the role would read, with its type; a mask keeps the column's type (spec 158)
+# (a struct's field is hidden by a mask over the whole column - spec 102's field paths are gone)
 
 query TTTTT
 ACL ROLE "boss" SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', 'tenant = acl_claim(''tenant'')',
-    'id, amount, 42 AS ssn, address.city');
+    'id, amount, ssn, address', '{"select": true}', 'ssn AS 42, address AS struct_update(address, zip := NULL::VARCHAR)');
 ----
+caps	{"select": true}	NULL	ok	NULL
 rls	tenant = acl_claim('tenant')	NULL	ok	NULL
-columns	id, amount, ssn = 42, address.city	NULL	ok	NULL
+columns	id, amount, ssn, address	NULL	ok	NULL
+masks	ssn AS CAST((42) AS VARCHAR), address AS CAST((struct_update(address, zip := CAST(NULL AS VARCHAR))) AS STRUCT(city VARCHAR, zip VARCHAR))	NULL	ok	NULL
 column	id	INTEGER	ok	NULL
 column	amount	INTEGER	ok	NULL
-column	ssn	INTEGER	ok	42
-column	address	STRUCT(city VARCHAR)	ok	NULL
+column	ssn	VARCHAR	ok	CAST(42 AS VARCHAR)
+column	address	STRUCT(city VARCHAR, zip VARCHAR)	ok	CAST(struct_update(address, zip := CAST(NULL AS VARCHAR)) AS STRUCT(city VARCHAR, zip VARCHAR))
 
 # ... and it wrote nothing
 query I
@@ -58,18 +61,16 @@ ACL ROLE "boss" SELECT count(*) FROM platform.object_grants WHERE role = 'analys
 ----
 0
 
-# the write agrees: it succeeds, and stores the projection the check answered
+# the write agrees: it succeeds, and stores the test and the masks the check answered (spec 158: a grant's
+# projection is no longer stored as grant_columns - the listing reads the object's own snapshot)
 statement ok
 ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst WITH (select) RLS (tenant = acl_claim('tenant'))
-    COLUMNS (id, amount, ssn, address.city) MASK (ssn AS 42);
+    COLUMNS (id, amount, ssn, address) MASK (ssn AS 42, address AS struct_update(address, zip := NULL::VARCHAR));
 
 query TT
-ACL ROLE "boss" SELECT name, type FROM platform.grant_columns WHERE role = 'analyst' ORDER BY pos;
+ACL ROLE "boss" SELECT columns, masks FROM platform.object_grants WHERE role = 'analyst';
 ----
-id	INTEGER
-amount	INTEGER
-ssn	INTEGER
-address	STRUCT(city VARCHAR)
+{'mode': only, 'names': [id, amount, ssn, address]}	[{'column': ssn, 'mask': 'CAST(42 AS VARCHAR)'}, {'column': address, 'mask': 'CAST(struct_update(address, zip := CAST(NULL AS VARCHAR)) AS STRUCT(city VARCHAR, zip VARCHAR))'}]
 
 # no list: every column the object exposes, with its type - what the role reads (a tool shows them)
 query TTTT
@@ -149,13 +150,58 @@ ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst RLS (acl_session_count
 ----
 which its author may not call
 
-# --- a catalog grant: its predicate judged as the write judges it, its columns not probed ------------------------
+# spec 158: the grant's column forms - `*` and `* EXCLUDE (…)` - and the mask's own refusals, as the write's
+query TT
+ACL ROLE "boss" SELECT item, name FROM platform.check_grant('analyst', 'sales', 'orders', '', '* EXCLUDE (ssn)')
+    WHERE item <> 'column';
+----
+columns	* EXCLUDE (ssn)
+
+query TTT
+ACL ROLE "boss" SELECT item, status, message LIKE '%masks "ssn", which its COLUMNS do not show%'
+    FROM platform.check_grant('analyst', 'sales', 'orders', '', 'id', '{"select": true}', 'ssn AS NULL')
+    WHERE item <> 'caps';
+----
+columns	refused	true
+
+statement error
+ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst WITH (select) COLUMNS (id) MASK (ssn AS NULL);
+----
+which its COLUMNS do not show
+
+query TT
+ACL ROLE "boss" SELECT item, status
+    FROM platform.check_grant('analyst', 'sales', 'orders', '', 'id, 42 AS ssn');
+----
+columns	refused
+
+statement error
+ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst WITH (select) COLUMNS (id, 42 AS ssn);
+----
+acl admin: the grant's column list is
+
+# --- a catalog grant: its predicate judged as the write judges it; it takes no columns and no masks (spec 158) -----
+
+query TTTT
+ACL ROLE "boss" SELECT item, name, status, message FROM platform.check_grant('analyst', 'sales', '', 'amount > 0', '');
+----
+rls	amount > 0	ok	NULL
 
 query TTTT
 ACL ROLE "boss" SELECT item, name, status, message FROM platform.check_grant('analyst', 'sales', '', 'amount > 0', 'id');
 ----
-rls	amount > 0	ok	NULL
-columns	id	unchecked	a catalog grant's columns are not probed
+columns	id	refused	a catalog grant takes no column list or masks - the object's grant does (spec 158)
+
+query TT
+ACL ROLE "boss" SELECT item, status FROM platform.check_grant('analyst', 'sales', '', '', '', '{"select": true}',
+    'ssn AS NULL');
+----
+columns	refused
+
+statement error
+ACL ROLE "boss" GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN COLUMNS (id);
+----
+a catalog grant takes no COLUMNS or MASK
 
 # --- who may check: who may grant (HANDS_OUT) ---------------------------------------------------------------------
 

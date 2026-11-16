@@ -39,6 +39,14 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - mirror / pull-through / publish, everything re-signed with our key;
   - public vs private extensions (a token through an http secret, tresor-issued);
   - air-gapped bundles.
+- **Columns after spec 158 stage 1** (found by its test migration):
+  - `DROP RELATION` of a relation that shadows a live alias's object (same name) also deletes that object's grants -
+    their COLUMNS and MASK go with it, and the role then reads the alias object whole (grants are keyed by name);
+  - a non-ASCII bare column in an object's list (`COLUMNS (größe)`) makes the relation the read-only subquery form;
+  - `acl_object_grants()` (the legacy listing) shows no masks - `platform.object_grants` does;
+  - `platform.check_grant` answers a `caps ok NULL` row when no caps are given; an `* EXCLUDE` that leaves no column is
+    refused with duckdb's raw binder message;
+  - stage 2: live stars in an object's list; stage 3: spec 102's machinery removed.
 - **Versioned tables after spec 167** (a grant's `VERSIONS`, built 2026-11-15):
   - `platform.effective_rights` / `check_grant` do not show a role's versions;
   - there is no `ALTER GRANT … SET VERSIONS` (a re-grant changes them);
@@ -111,24 +119,14 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - An issuer whose URL comes from its `oidc_issuer` secret cannot be moved back to a URL of its own by `ALTER ISSUER`
     (found 2026-11-06 by acl-clients spec 008): `SET URL '…'` is refused as both, `DROP FROM SECRET` as no URL - the
     move the other way is one statement (`SET URL '' FROM SECRET s`), the way back has no form.
-  - (spec 158 takes it: COLUMNS becomes duckdb's select list, a star a live one) A grant's mask that is a star (`COLUMNS (id, note = *)`, `COLUMNS(*)`, `t.*`) is accepted where written and every
-    read of the object then fails at bind (`STAR expression is not supported here`) - fails closed, but the write
-    should refuse it (spec 148's `OneExpression` and the projection probe let it through; found by spec 150 4e's
-    review). Same review: `GRANT SCHEMA … COLUMNS ()` (an empty list) is accepted while a non-empty one is refused, and
-    a mask `#2` reads the physical table's column by position - neither widens; decide whether to refuse them.
-  - A catalog grant's list stored before spec 150 4e naming a column twice (`ssn, ssn = 'm'`) reads the column unmasked
-    (`GrantUnion::Add` merges one role's duplicates as two roles'), while `"ssn" = 'm'` beside `ssn` reads masked (the
-    tree path) and the screens say masked. 4e refuses such a list where written; the stored rows are not re-judged -
-    decide whether the read should take the narrower reading (found by 4e's second re-review).
+  - (closed by spec 158 stage 1) a grant's mask that was a star, a positional `#2` mask, and a catalog grant's list
+    stored naming a column twice: a mask is MASK's one expression, `#2` is refused, a catalog grant states no columns.
   - A physical column whose name holds `.` or `[` (Parquet's `odd.col`) cannot be declared in an object's own
     `COLUMNS`: a stored declared name is read as a path when it holds one, so spec 150 4f refuses `"a.b"` there (before
     4f it declared the path `a.b`, which read nothing). An object without a list, or a grant's list (where such a name
     is stored quoted), exposes it; decide whether `relation_columns` should store a quoted name.
-  - (spec 158 takes it) An object's own list, found by spec 150 4f's review (both pre-existing): a star (`COLUMNS (id, x = *)`, `* AS x`,
-    `x = COLUMNS('s.*')`) passes spec 148 and exposes every source column, and a grant's mask `x = *` on such an object
-    reads source columns the object never declared (the grant-side star is the item above); a NULL mark on a path
-    (`s.x NOT NULL`) is silently dropped (keyed by the path, the column is `s`); a name written twice
-    (`"n", "n" = upper("n")`) reads `n` and `n_1` - a grant's list refuses that since 4e.
+  - (closed by spec 158 stage 1) an object's own list: a star is refused until stage 2 makes it live, NULL marks are gone,
+    a name written twice is refused.
   - `acl_check_catalog`'s `grant_exposes_nothing` skips object grants under a live schema alias (spec 157: the guard
     covers them, the check reads only `relations`).
   - A broken projection's errors name physical columns past spec 155's scrub: duckdb's `Column "x" in REPLACE list not

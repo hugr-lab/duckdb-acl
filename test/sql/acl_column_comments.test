@@ -91,18 +91,18 @@ note	PHYS note
 statement ok
 ACL ADMIN REVOKE TABLE c.orders FROM ROLE narrowed;
 
-# review 143 (a negative test): a column the catalog grant's list hides is no column of the read, whatever an object
-# grant states for it - not listed, so neither its comment nor its tags
+# review 143 (a negative test): a column the grant's test hides is no column of the read - not listed, so neither its
+# comment nor its tags (spec 158: a catalog grant states no columns, the object grant's EXCLUDE hides it)
 statement ok
 ACL ADMIN CREATE ROLE both_levels;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE both_levels WITH (select) MAIN COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE both_levels WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE both_levels WITH (select) COLUMNS (id, note) MASK (note AS '***');
+ACL ADMIN GRANT TABLE c.orders TO ROLE both_levels WITH (select) COLUMNS (* EXCLUDE (note)) MASK (amount AS 0);
 
-query I
+query II
 ACL ROLE 'both_levels' SELECT * FROM orders;
 ----
 
@@ -110,6 +110,7 @@ query II
 ACL ROLE 'both_levels' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
 ----
 id	NULL
+amount	what the customer paid
 
 query I
 ACL ROLE 'both_levels' SELECT count(*) FROM duckdb_columns() WHERE table_name = 'orders' AND column_name = 'note';
@@ -122,7 +123,10 @@ statement ok
 ACL ADMIN CREATE ROLE comma_mask;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE comma_mask WITH (select) MAIN COLUMNS (id, concat(id, amount, 'x') AS note);
+ACL ADMIN GRANT CATALOG c TO ROLE comma_mask WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE comma_mask WITH (select) COLUMNS (id, note) MASK (note AS concat(id, amount, 'x'));
 
 query T
 ACL ROLE 'comma_mask' SELECT column_name FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
@@ -130,15 +134,15 @@ ACL ROLE 'comma_mask' SELECT column_name FROM information_schema.columns WHERE t
 id
 note
 
-# ... and the positions of what the levels keep close up, as the read's do (spec 036)
+# ... and the positions of what the grant keeps close up, as the read's do (spec 036)
 statement ok
 ACL ADMIN CREATE ROLE two_levels;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE two_levels WITH (select) MAIN COLUMNS (amount, note);
+ACL ADMIN GRANT CATALOG c TO ROLE two_levels WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE two_levels WITH (select) COLUMNS (id, amount, note) MASK (amount AS 0);
+ACL ADMIN GRANT TABLE c.orders TO ROLE two_levels WITH (select) COLUMNS (amount, note) MASK (amount AS 0);
 
 query TI
 ACL ROLE 'two_levels' SELECT column_name, ordinal_position FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;

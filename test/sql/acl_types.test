@@ -297,9 +297,9 @@ typed_rls	VARCHAR
 typed_rn	VARCHAR
 typed_view	VARCHAR
 
-# a mask over the ENUM column reads the cast value, and is described as what it reads
+# a mask over the ENUM column reads the cast value (spec 158: the object's columns), and is described as what it reads
 statement ok
-ACL ADMIN GRANT TABLE c.typed_rn TO ROLE r COLUMNS (ident, level) MASK (level AS CASE WHEN id = 1 THEN tier END);
+ACL ADMIN GRANT TABLE c.typed_rn TO ROLE r COLUMNS (ident, level) MASK (level AS CASE WHEN ident = 1 THEN level END);
 
 query II
 ACL ROLE "r" SELECT typeof(level), level FROM typed_rn ORDER BY ident;
@@ -501,7 +501,7 @@ query III
 SELECT object, problem, repair FROM acl_check_catalog('c') WHERE problem IN ('types_incompatible', 'types_mismatch') ORDER BY 1;
 ----
 inc_code	types_incompatible	ALTER VIRTUAL TABLE c.inc_code SET TYPES (enums = keep)  -- or rewrite the expression for the exposed type
-inc_made	types_mismatch	REPAIR VIRTUAL TABLE c.inc_made REMAP (CAST(CAST(name AS ENUM('a', 'b')) AS VARCHAR) AS n2)
+inc_made	types_mismatch	REPAIR VIRTUAL TABLE c.inc_made REMAP (CAST(CAST("name" AS ENUM('a', 'b')) AS VARCHAR) AS n2)
 
 statement ok
 SET GLOBAL acl_enum_types = 'keep';

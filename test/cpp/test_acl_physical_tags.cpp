@@ -93,13 +93,14 @@ int main() {
 		Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.sales.orders");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.sales.orders"
-		          " COLUMNS (id, paid = amount, doubled = amount * 2, \"note\")");
+		          " COLUMNS (id, amount AS paid, amount * 2 AS doubled, \"note\")");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL VIEW c.recent AS SELECT id, amount FROM phys.sales.orders");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA c.raw AS phys.sales");
 		Exec(con, "ACL ADMIN CREATE ROLE analyst");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN");
 		Exec(con, "ACL ADMIN CREATE ROLE masked");
-		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE masked WITH (select) MAIN COLUMNS (id, amount = 0)");
+		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE masked WITH (select) MAIN");
+		Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE masked COLUMNS (id, amount) MASK (amount AS 0)");
 
 		Scenario("the source's tags", [&]() {
 			Check(Rows(con, "SELECT tags FROM duckdb_tables() WHERE database_name = 'phys'") == "{owner=sales}",
