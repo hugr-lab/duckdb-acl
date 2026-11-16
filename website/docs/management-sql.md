@@ -710,8 +710,7 @@ sees and what it reads in place of some:
   a write statement reads what the role reads, a masked column as its mask. `RETURNING` reads only visible unmasked
   columns.
 
-Writing the grant again replaces it whole (caps, `RLS`, `COLUMNS`, `MASK`, `VERSIONS`); `ALTER GRANT` keeps the masks
-it does not state. `REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>` takes it away (spec 120), and the
+Writing the grant again replaces it whole (caps, `RLS`, `COLUMNS`, `MASK`, `VERSIONS`). `REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>` takes it away (spec 120), and the
 catalog's or a schema's grant decides the object again.
 
 ```sql
@@ -1242,7 +1241,7 @@ read the object - and the object stays listed with no physical columns. Nothing 
 
 ```sql
 ACL ADMIN CHECK VIRTUAL CATALOG sales;
-ACL ADMIN REPAIR VIRTUAL TABLE sales.customers REMAP (ssn = ssn_v2);
+ACL ADMIN REPAIR VIRTUAL TABLE sales.customers REMAP (ssn_v2 AS ssn);
 ACL ADMIN REPAIR VIRTUAL TABLE sales.customers DROP MISSING COLUMNS AND MASKS;
 ```
 

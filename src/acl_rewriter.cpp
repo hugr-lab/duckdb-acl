@@ -4359,23 +4359,34 @@ private:
 			if (names.empty()) {
 				return;
 			}
-			auto name = names.back().GetIdentifierName();
-			bool masked = false;
-			for (auto &injection : policy.injections) {
-				if (StringUtil::CIEquals(injection.first, name)) {
-					masked = true; // the grant computes this column, so the stored value is not readable
-					break;
-				}
+			// spec 158 review: the column is the first part, or the second after a qualifier (`t.s.f`) - never a field
+			// (`s.f` names column s); both are judged, so a qualifier named like a hidden column refuses (fail closed)
+			vector<string> candidates {names[0].GetIdentifierName()};
+			if (names.size() >= 2) {
+				candidates.push_back(names[1].GetIdentifierName());
 			}
-			for (auto &narrowed : policy.field_writes) {
-				if (StringUtil::CIEquals(narrowed.first, name)) {
-					masked = true; // the stored struct carries the fields the role does not see
-					break;
+			auto masked = [&](const string &name) {
+				for (auto &injection : policy.injections) {
+					if (StringUtil::CIEquals(injection.first, name)) {
+						return true; // the grant computes this column, so the stored value is not readable
+					}
 				}
+				for (auto &narrowed : policy.field_writes) {
+					if (StringUtil::CIEquals(narrowed.first, name)) {
+						return true; // the stored struct carries the fields the role does not see
+					}
+				}
+				return policy.columns_excluded && policy.excluded_columns.count(name) > 0;
+			};
+			bool listed = policy.columns_excluded;
+			for (auto &name : candidates) {
+				if (masked(name)) {
+					Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of " + Shown(vname) + " is not readable");
+				}
+				listed = listed || policy.write_columns.count(name) > 0;
 			}
-			if (masked || (policy.columns_excluded ? policy.excluded_columns.count(name) > 0
-			                                       : !policy.write_columns.count(name))) {
-				Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of " + Shown(vname) + " is not readable");
+			if (!listed) {
+				Deny(Reason::WRITE_POLICY, "column \"" + candidates[0] + "\" of " + Shown(vname) + " is not readable");
 			}
 			return;
 		}
@@ -5078,6 +5089,7 @@ private:
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+			// spec 158: a marker is the reader's - in a principal's stored body it is resolved by whoever reads it
 			if ((marker == "acl_claim" || marker == "acl_has_role") && keep_claim_markers) {
 				return; // stored body: this claim is resolved by whoever reads it, not by its author
 			}

@@ -93,7 +93,14 @@ bool ItemBinds(CatalogBackend &catalog, const string &source, const string &item
 		error = "the expression is " + problem + " (spec 148: one expression)";
 		return false;
 	}
-	return Binds(catalog, "SELECT " + item + " AS __acl_probe FROM " + source + " WHERE false", error);
+	// the markers a read bakes (acl_claim, acl_has_role, acl_arg) are NULLs here, as every probe has them
+	string baked;
+	try {
+		baked = BakeTemplateForProbe(item, ParserOptions::Builtin(), true, {});
+	} catch (std::exception &) {
+		baked = item;
+	}
+	return Binds(catalog, "SELECT " + baked + " AS __acl_probe FROM " + source + " WHERE false", error);
 }
 
 //! What the object's stored schema says (spec 010), and whether it was derived by a probe or declared
@@ -1509,6 +1516,9 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 				    vcat, vname, grant.role);
 			}
 			test.names = names;
+			if (test.kind == ColumnTest::Kind::EXCEPT && names.empty()) {
+				test.kind = ColumnTest::Kind::ALL; // nothing left to leave out
+			}
 			rewrites.emplace_back(ColumnTestText(test), MasksText(other));
 		}
 		// the object's list is cut first: a grant still masking a vanished column refuses its reads meanwhile (a mask

@@ -817,8 +817,8 @@ void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result
 //===--------------------------------------------------------------------===//
 
 //! acl_grant_table(role, vname, phys, cols_csv, rls, caps_csv): register a virtual-table policy.
-//! cols_csv items are `name` or `name=expr` (expr masks/renames as `expr AS name`); denied columns
-//! are simply omitted. caps_csv is a comma list of {select,insert,update,delete,merge}.
+//! cols_csv is a SELECT list (spec 158: `name`, `<expr> AS name`); denied columns are simply omitted. caps_csv is a
+//! comma list of {select,insert,update,delete,merge}.
 void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RoleArg(args, 0, row, "acl_grant_table");
@@ -836,7 +836,9 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			acl_detail::ParseCaps(CapsCsvToJson(cap_list), true); // judged before anything is written
 			store.CatalogEnsureGrant(role, "default", true);
 			store.CatalogAddRelation("default", vname, form, phys, "", rls, columns);
-			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));
+			static const string no_masks;
+			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list), "", "", true, false, true,
+			                           nullptr, &no_masks);
 			continue;
 		}
 		// spec 148: the memory store pastes this text at read too - each name as duckdb writes an identifier (the
@@ -878,7 +880,9 @@ void AclGrantViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		if (store.CatalogEnabled()) {
 			store.CatalogEnsureGrant(role, "default", true);
 			store.CatalogAddRelation("default", vname, "view", "", sql, "", {});
-			store.CatalogSetObjectCaps(role, "default", vname, "{\"select\": true}");
+			static const string no_masks;
+			store.CatalogSetObjectCaps(role, "default", vname, "{\"select\": true}", "", "", true, false, true, nullptr,
+			                           &no_masks);
 			continue;
 		}
 		TablePolicy policy;

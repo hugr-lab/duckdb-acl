@@ -232,8 +232,8 @@ mode of default-deny is a refusal, and the refusal names the function.
   relation, the aggregates and pivot expressions are gated, and the implicit form's column discovery
   (the parser's `CREATE TEMP TYPE ... AS ENUM (SELECT DISTINCT ...)`) runs under the same RLS, so a
   value only a hidden row carries never becomes a column (`test/sql/acl_pivot.test`).
-- A grant's projection is probed where it is written and stored in `grant_columns`, "so
-  `information_schema.columns` describes what the role reads" (spec 026). `duckdb_tables().sql` is
+- A grant's projection is probed where it is written (spec 026); since spec 158 a grant never adds or retypes a
+  column, so `information_schema.columns` lists the object's columns the grant's test admits. `duckdb_tables().sql` is
   never NULL and `is_insertable_into` "follows the grant, not the physical row" (spec 065,
   `test/sql/acl_listing_truth.test`).
 - References (spec 022) are "a hint an agent reads, never enforced and granting nothing; visible
@@ -739,9 +739,9 @@ is in force somewhere in the chain:
 | object form | grant | column added to the source | column dropped from the source |
 | --- | --- | --- | --- |
 | plain alias | whole-table (no `COLUMNS`) | **appears, ungranted** | the object adapts (the rest is readable) |
-| plain alias | `COLUMNS (id, tenant, ssn = NULL)` | invisible - not listed | a bare name intersects away (spec 038); a masked name that vanished **refuses** with duckdb's `Column "ssn" in REPLACE list not found` |
-| plain alias | `COLUMNS (ssn = NULL)` (mask only) | invisible - the list is the masked column alone | refuses, as above |
-| declared object (`COLUMNS (id = pk, tenant = internal_tenant, ssn = ssn_raw)`) | any | invisible until declared | **the object refuses, it does not narrow** - with `acl: a column this statement reads does not exist in its source` (spec 065 probe A; duckdb's own text named the source's columns until spec 155); `information_schema.columns` meanwhile lists `id, tenant` |
+| plain alias | `COLUMNS (id, tenant, ssn) MASK (ssn AS NULL)` | invisible - not listed | a bare name intersects away (spec 038); a masked name that vanished **refuses** with duckdb's `Column "ssn" in REPLACE list not found` |
+| plain alias | `COLUMNS (* EXCLUDE (salary))` | **appears** (every column but the excluded) | the object adapts |
+| declared object (`COLUMNS (pk AS id, internal_tenant AS tenant, ssn_raw AS ssn)`) | any | invisible until declared | **the object refuses, it does not narrow** - with `acl: a column this statement reads does not exist in its source` (spec 065 probe A; duckdb's own text named the source's columns until spec 155); `information_schema.columns` meanwhile lists `id, tenant` |
 | alias schema (`AS`) | whole-table | a **whole new table** appears and is listed | the table is gone |
 | expansion schema (`FROM`) | whole-table | invisible (`no access to object "cur.newtab"`) until `ALTER VIRTUAL SCHEMA c.cur REFRESH`, which reported `1` and made it readable | `REFRESH PRUNE` removes the record (spec 014) |
 

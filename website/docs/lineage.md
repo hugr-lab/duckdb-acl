@@ -142,7 +142,7 @@ Each target field lists its sources. A source carries OpenLineage's transformati
 
 A grant's own predicate and masks are per role, so they are the role's tags (below), not edges.
 
-A field path names a field of a struct column read through it: `address.city`, `items[].price` (an
+A field path names a field of a struct column an edge reads through: `address.city`, `items[].price` (an
 element read through `unnest` or an index is `[]`). An event that could not derive every edge
 exactly (a table function, a source that does not bind) says `approximate`.
 
@@ -151,7 +151,7 @@ exactly (a table function, a source that does not bind) says `approximate`.
 OpenLineage has no roles; it has tags. A virtual dataset carries, for each role that holds it:
 
 - `acl.role.<role>` = its capabilities, on the dataset;
-- `acl.role.<role>` = `visible` or `masked`, per field path;
+- `acl.role.<role>` = `visible` or `masked`, per column;
 - `acl.role.<role>.rls` = `true` when a predicate applies.
 
 A field the role does not see has no tag of that role.

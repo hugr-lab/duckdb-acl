@@ -1,0 +1,139 @@
+# name: test/sql/acl_grant_columns.test
+# description: spec 158 - an object grant's COLUMNS (a test on the object's names: a, b / * / * EXCLUDE (…)) and MASK
+#   (<column> AS <expression>, cast to the column's type), the union of roles, acl_has_role, a catalog grant without
+#   columns, and the review's negative tests (RETURNING a field of a hidden struct, a mask over an object's own list
+#   reading the physical row).
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t (id INTEGER, secret INTEGER, pub INTEGER, ssn VARCHAR, s STRUCT(f INTEGER));
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 1000, 7, '123-45-6789', {'f': 42});
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE VIRTUAL TABLE c.t AS phys.main.t; CREATE ROLE a; CREATE ROLE h; CREATE ROLE x; CREATE ROLE w;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE a MAIN; GRANT CATALOG c TO ROLE h MAIN; GRANT CATALOG c TO ROLE x MAIN; GRANT CATALOG c TO ROLE w MAIN;
+
+# --- the three forms and a mask ----------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE a COLUMNS (* EXCLUDE (secret, s)) MASK (ssn AS '***-' || right(ssn, 4));
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE h COLUMNS (*);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE x COLUMNS (id, ssn) MASK (ssn AS 'x');
+
+query TT
+SELECT columns, masks FROM store.acl.role_object_caps WHERE role = 'a';
+----
+* EXCLUDE ("secret", s)	ssn AS CAST((('***-' || "right"(ssn, 4))) AS VARCHAR)
+
+query IIT
+ACL ROLE "a" SELECT * FROM t;
+----
+1	7	***-6789
+
+query T
+ACL ROLE "a" SELECT string_agg(column_name || ':' || data_type, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 't';
+----
+id:INTEGER,pub:INTEGER,ssn:VARCHAR
+
+query IT
+ACL ROLE "x" SELECT * FROM t;
+----
+1	x
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE x COLUMNS (id) MASK (ssn AS 'y');
+----
+which its COLUMNS do not show
+
+statement error
+ACL ADMIN GRANT CATALOG c TO ROLE x MAIN COLUMNS (id);
+----
+a catalog grant takes no COLUMNS or MASK
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE x COLUMNS (id, upper(ssn) AS ssn);
+----
+the grant's column list is
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE x COLUMNS (* EXCLUDE (nosuch));
+----
+which the object does not have
+
+# --- review: RETURNING a field of a hidden struct column is refused ------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE w WITH (select, update) COLUMNS (* EXCLUDE (s, secret));
+
+statement error
+ACL ROLE "w" UPDATE t SET pub = 8 RETURNING s.f;
+----
+is not readable
+
+statement error
+ACL ROLE "w" UPDATE t SET pub = 8 RETURNING t.s.f;
+----
+is not readable
+
+statement ok
+ACL ROLE "w" UPDATE t SET pub = 8 RETURNING id, pub;
+
+# --- review: a mask over an object's own list names its columns plainly -----------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.v AS phys.main.t COLUMNS (id, pub AS secret, s);
+
+statement error
+ACL ADMIN GRANT TABLE c.v TO ROLE x MASK (secret AS (SELECT secret));
+----
+names those columns plainly
+
+statement error
+ACL ADMIN GRANT TABLE c.v TO ROLE x MASK (s AS {'f': s.f});
+----
+names those columns plainly
+
+statement ok
+ACL ADMIN GRANT TABLE c.v TO ROLE x MASK (secret AS secret + 1, s AS struct_update(s, f := NULL::INTEGER));
+
+query II
+ACL ROLE "x" SELECT secret, s.f FROM v;
+----
+9	NULL
+
+# --- acl_has_role is baked from the principal's roles -------------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.v TO ROLE h COLUMNS (id, secret) MASK (secret AS CASE WHEN acl_has_role('boss') THEN secret ELSE 0 END);
+
+query I
+ACL ROLE "h" SELECT secret FROM v;
+----
+0
+
+statement error
+ACL ROLE "h" SELECT acl_has_role('h');
+----
+acl_has_role

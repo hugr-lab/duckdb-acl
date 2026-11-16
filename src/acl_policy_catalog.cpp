@@ -915,6 +915,11 @@ string OverObject(const string &mask, const vector<std::pair<string, string>> &o
 	if (parsed.size() != 1) {
 		throw BinderException("acl: a mask is one expression (\"%s\")", mask);
 	}
+	string why;
+	if (!MaskReadsColumnsPlainly(mask, why)) {
+		NoteDenyReason(Reason::POLICY_ERROR);
+		throw BinderException("acl: %s", why);
+	}
 	std::function<void(unique_ptr<ParsedExpression> &, const case_insensitive_set_t &)> walk;
 	walk = [&](unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &params) {
 		if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
@@ -957,6 +962,62 @@ string OverObject(const string &mask, const vector<std::pair<string, string>> &o
 	walk(parsed[0], case_insensitive_set_t());
 	return parsed[0]->ToString();
 }
+
+} // namespace
+
+bool MaskReadsColumnsPlainly(const string &mask, string &why) {
+	vector<unique_ptr<ParsedExpression>> parsed;
+	try {
+		parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask);
+	} catch (std::exception &) {
+		why = "a mask is one expression";
+		return false;
+	}
+	bool plain = true;
+	std::function<void(const ParsedExpression &, const case_insensitive_set_t &)> walk;
+	walk = [&](const ParsedExpression &expr, const case_insensitive_set_t &params) {
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::SUBQUERY:
+		case ExpressionClass::STAR:
+			plain = false;
+			return;
+		case ExpressionClass::LAMBDA: {
+			auto &lambda = expr.Cast<LambdaExpression>();
+			auto inner = params;
+			if (lambda.Left().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				inner.insert(lambda.Left().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+			}
+			ParsedExpressionIterator::EnumerateChildren(lambda.Left(), [&](const ParsedExpression &child) {
+				if (child.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+					inner.insert(child.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+				}
+			});
+			walk(lambda.Right(), inner);
+			return;
+		}
+		case ExpressionClass::COLUMN_REF: {
+			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() > 1 && !params.count(names[0].GetIdentifierName())) {
+				plain = false; // a field path (`s.f`) or a qualified name: read as the physical row's
+			}
+			return;
+		}
+		default:
+			ParsedExpressionIterator::EnumerateChildren(expr,
+			                                            [&](const ParsedExpression &child) { walk(child, params); });
+		}
+	};
+	for (auto &expr : parsed) {
+		walk(*expr, case_insensitive_set_t());
+	}
+	if (!plain) {
+		why = "a mask over an object with its own column list names those columns plainly - no subquery, star or "
+		      "field path (write struct_extract(<column>, '<field>'), spec 158)";
+	}
+	return plain;
+}
+
+namespace {
 
 //! spec 158: the roles' test as a COLUMNS selector over a read's own columns ("*" for every column)
 //! spec 158, 099: a mask is stored cast to its column's source type; where the object exposes that column as another

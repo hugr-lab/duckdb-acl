@@ -210,6 +210,10 @@ struct GrantUnion {
 	}
 };
 
+//! spec 158 review: whether a mask over an object with its own column list reads those columns by plain name only -
+//! no subquery, star or field path (they would read the physical row the projection is built over); `why` otherwise
+bool MaskReadsColumnsPlainly(const string &mask, string &why);
+
 //! spec 158: `SELECT <the test as a COLUMNS selector> FROM (SELECT * REPLACE (<masks>) FROM (<inner>))` - a grant
 //! over a read whose columns are the object's
 string GrantOverSql(const RoleColumns &columns, const string &inner);

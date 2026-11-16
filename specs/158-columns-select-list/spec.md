@@ -52,7 +52,9 @@ GRANT TABLE c.people TO ROLE hr COLUMNS (*);
 - `COLUMNS` is one of three forms: names (`a, b`), every column (`*`, or none), or every column but some
   (`* EXCLUDE (a, b)`). Each form is a test on a column's name, never a list of new columns.
 - `MASK (<column> AS <expr>, …)`: what the role reads in place of a column.
-  - The expression reads the object's columns, not the physical row.
+  - The expression reads the object's columns, not the physical row. Over an object with its own list it names them
+    plainly (no subquery, star or field path - `struct_extract(c, 'f')`), since it is substituted onto the object's
+    expressions (review).
   - It names a column the grant shows.
   - It is cast to the column's type where the grant is written, and a mask that does not cast is refused. So a
     column's type never depends on the role.
@@ -76,7 +78,8 @@ SELECT COLUMNS(lambda c: <the roles' tests OR-ed>)
 - duckdb applies the test where it binds, in the object's column order.
 - A column the source gained appears for `*` and `EXCLUDE`. A column it lost disappears (spec 038's rule).
 - A mask of a column the object lost refuses at bind.
-- Writes: a visible, unmasked column of the object as it is stays writable; a masked one does not.
+- Writes: a visible column of the object as it is stays writable; a masked one is assigned its mask (spec 024's
+  injection), never the client's value, and is read-only when its mask reads the row.
 
 **`acl_has_role('r')`** is a marker, like `acl_claim`: baked into a constant `true` / `false` from the principal's
 roles where the statement is rewritten, never registered as a function, so a missed one fails closed at bind. It may

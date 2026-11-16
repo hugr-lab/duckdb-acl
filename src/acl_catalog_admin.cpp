@@ -680,6 +680,16 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 		for (idx_t i = 0; i < rows->RowCount(); i++) {
 			declared.push_back(rows_rows.GetValue(0, i).ToString());
 		}
+		if (!declared.empty() && form != "view") {
+			// spec 158 review: over an object's own list a mask reads those columns by name (it is substituted onto
+			// the object's expressions; a subquery, a star or a field path would read the physical row)
+			for (auto &mask : mask_items) {
+				string why;
+				if (!acl_detail::MaskReadsColumnsPlainly(mask.second, why)) {
+					throw InvalidInputException("acl: the grant on \"%s\" masks \"%s\": %s", vname, mask.first, why);
+				}
+			}
+		}
 		if (!catalog.ExposedColumns(source, declared, exposed)) {
 			return stored();
 		}
@@ -760,8 +770,16 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 				auto at = NumericCast<idx_t>(&type - &types[0]);
 				auto cast_to = type_texts.empty() ? type.second.ToString() : type_texts[at];
 				auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask.second);
+				// the type as duckdb prints a parsed one (`DECIMAL(18, 3)`), both sides alike - a re-grant, an ANALYZE
+				// or a repair writes the stored mask back unchanged
+				auto printed = [](const string &type) {
+					auto cast = Parser(ParserOptions::Builtin()).ParseExpressionList("CAST(NULL AS " + type + ")");
+					return cast.size() == 1 && cast[0]->GetExpressionClass() == ExpressionClass::CAST
+					           ? cast[0]->Cast<CastExpression>().TargetType().ToString()
+					           : type;
+				};
 				bool cast = parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CAST &&
-				            parsed[0]->Cast<CastExpression>().TargetType().ToString() == cast_to;
+				            parsed[0]->Cast<CastExpression>().TargetType().ToString() == printed(cast_to);
 				if (!cast) {
 					mask.second = "CAST((" + mask.second + ") AS " + cast_to + ")";
 				}
@@ -1327,6 +1345,9 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 			for (auto &field : fields) {
 				if (!policy.visible_columns.empty() && !policy.visible_columns.count(field) && !narrowed.count(field)) {
 					continue;
+				}
+				if (policy.columns_excluded && policy.excluded_columns.count(field)) {
+					continue; // spec 158: `* EXCLUDE (…)` over an object read live - the excluded ones are no field
 				}
 				field_tags(field, injected.count(field) > 0);
 			}
