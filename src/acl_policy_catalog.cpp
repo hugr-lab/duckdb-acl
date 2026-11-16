@@ -1123,7 +1123,6 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 	out.write_columns.clear();
 	out.write_order.clear();
 	out.visible_columns.clear();
-	out.narrowed_reads.clear();
 	for (auto &mask : columns.masks) {
 		if (!columns.test.Admits(mask.first)) {
 			continue; // masks a column no role shows: nothing to read

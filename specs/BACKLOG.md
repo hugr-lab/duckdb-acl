@@ -46,7 +46,7 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - `acl_object_grants()` (the legacy listing) shows no masks - `platform.object_grants` does;
   - `platform.check_grant` answers a `caps ok NULL` row when no caps are given; an `* EXCLUDE` that leaves no column is
     refused with duckdb's raw binder message;
-  - stage 2: live stars in an object's list; stage 3: spec 102's machinery removed.
+  - stage 2: live stars in an object's list (stage 3, spec 102's machinery removed, is built).
 - **Versioned tables after spec 167** (a grant's `VERSIONS`, built 2026-11-15):
   - `platform.effective_rights` / `check_grant` do not show a role's versions;
   - there is no `ALTER GRANT … SET VERSIONS` (a re-grant changes them);

@@ -86,61 +86,6 @@ void ExposedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
-//! The node of `tree` at `path` (`""`, `.city`, `.items[]`), or nothing
-optional_ptr<const acl_detail::FieldNode> NodeAt(const acl_detail::FieldNode &tree, const string &path) {
-	acl_detail::FieldPath parsed;
-	string error;
-	if (!acl_detail::ParseFieldPath("x" + path, parsed, error)) {
-		return nullptr;
-	}
-	optional_ptr<const acl_detail::FieldNode> node = &tree;
-	for (auto &step : parsed.steps) {
-		if (step.empty()) {
-			node = node->element.get();
-		} else {
-			node = node->Find(step).get();
-		}
-		if (!node) {
-			return nullptr;
-		}
-	}
-	return node;
-}
-
-//! acl_listed_type(source_type, column, roles) - spec 158: the type a principal reads of one column, as the read path
-//! computes it: the source's type when the roles' united COLUMNS admit the column (a mask keeps its column's type,
-//! cast to it where the grant is written), NULL when it does not or the grant does not read. `roles` is one
-//! STRUCT(cat, obj, probed) per role: the role's catalog and object column lists (`probed` is no longer read)
-void ListedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto source_text = args.data[0].GetValue(row);
-		auto column = args.data[1].GetValue(row);
-		auto roles = args.data[2].GetValue(row);
-		if (source_text.IsNull() || column.IsNull() || roles.IsNull()) {
-			result.SetValue(row, source_text);
-			continue;
-		}
-		acl_detail::GrantUnion grants;
-		for (auto &role : ListValue::GetChildren(roles)) {
-			auto &fields = StructValue::GetChildren(role);
-			acl_detail::GrantPolicy policy;
-			policy.catalog_columns = fields[0].IsNull() ? string() : fields[0].ToString();
-			StringUtil::Trim(policy.catalog_columns);
-			policy.ReadColumns(fields[1].IsNull() ? string() : fields[1].ToString(), string());
-			grants.Add(policy);
-		}
-		if (!grants.refusal.empty()) {
-			result.SetValue(row, Value(LogicalType(LogicalTypeId::SQLNULL).ToString()));
-			continue;
-		}
-		auto united = acl_detail::UniteRoleColumns(grants.roles, string());
-		result.SetValue(row, united.test.Admits(column.ToString())
-		                         ? source_text
-		                         : Value(LogicalType(LogicalTypeId::SQLNULL).ToString()));
-	}
-	(void)state;
-}
-
 } // namespace
 
 LogicalType ExposedType(const LogicalType &type, bool strip_alias, bool enums_to_varchar) {
@@ -312,14 +257,6 @@ void RegisterAclTypes(ExtensionLoader &loader, const shared_ptr<PolicyStore> &st
 	MarkAclScalar(function, store);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(function);
-	auto role_type = LogicalType::LIST(LogicalType::STRUCT({{Identifier("cat"), LogicalType::VARCHAR},
-	                                                        {Identifier("obj"), LogicalType::VARCHAR},
-	                                                        {Identifier("probed"), LogicalType::VARCHAR}}));
-	ScalarFunction listed(Identifier("acl_listed_type"), {LogicalType::VARCHAR, LogicalType::VARCHAR, role_type},
-	                      LogicalType::VARCHAR, ListedTypeFunc);
-	MarkAclScalar(listed, store);
-	listed.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(listed);
 }
 
 } // namespace acl

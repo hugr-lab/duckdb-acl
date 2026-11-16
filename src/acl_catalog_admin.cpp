@@ -570,14 +570,10 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	return statements;
 }
 
-//! What a grant's projection actually produces, folded the way the resolver folds it (spec 026), as
-//! the `grant_columns` rows for one grant. Shared by the write path, where a projection that cannot
-//! bind is a mistake worth refusing, and by `acl_refresh_schema`, where it is only a fact that has
-//! not become true yet (spec 027) - `strict` picks between the two.
 using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 
-//! The types of the columns an object exposes (spec 102's path check): its declared projection, or
-//! the source's own columns. Empty when it does not bind here - the read path decides then.
+//! The types of the columns an object exposes (what a grant's mask is cast to, spec 158): its declared projection,
+//! or the source's own columns. Empty when it does not bind here - the read path decides then.
 vector<std::pair<string, LogicalType>> ExposedTypes(CatalogBackend &catalog, const ReadFn &read, const string &vcat,
                                                     const string &vname, const string &source) {
 	auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
@@ -602,50 +598,6 @@ vector<std::pair<string, LogicalType>> ExposedTypes(CatalogBackend &catalog, con
 	catalog.ProbeTypes("SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + source,
 	                   types);
 	return types;
-}
-
-//! Every step of a column's tree against its type, the fields put in the type's order; a step into
-//! anything but a STRUCT field or a LIST / ARRAY element is refused (a MAP's keys are data, a UNION's
-//! members are not fields - spec 102, decision 5)
-void OrderAndCheckFields(acl_detail::FieldNode &node, const LogicalType &type, const string &vname,
-                         const string &path) {
-	if (node.masked) {
-		return;
-	}
-	if (node.element) {
-		if (type.id() != LogicalTypeId::LIST && type.id() != LogicalTypeId::ARRAY) {
-			throw InvalidInputException("acl: the grant on \"%s\" lists \"%s[]\", but \"%s\" is %s, not a list", vname,
-			                            path, path, type.ToString());
-		}
-		auto &child = type.id() == LogicalTypeId::LIST ? ListType::GetChildType(type) : ArrayType::GetChildType(type);
-		OrderAndCheckFields(*node.element, child, vname, path + "[]");
-	}
-	if (node.fields.empty()) {
-		return;
-	}
-	if (type.id() != LogicalTypeId::STRUCT) {
-		throw InvalidInputException("acl: the grant on \"%s\" lists fields of \"%s\", which is %s - only a STRUCT's "
-		                            "fields can be named (a MAP or a UNION is shown or masked whole)",
-		                            vname, path, type.ToString());
-	}
-	vector<unique_ptr<acl_detail::FieldNode>> ordered;
-	for (auto &field : StructType::GetChildTypes(type)) {
-		for (auto &child : node.fields) {
-			if (child && StringUtil::CIEquals(child->name, field.first.GetIdentifierName())) {
-				child->name = field.first.GetIdentifierName();
-				OrderAndCheckFields(*child, field.second, vname, path + "." + acl_detail::FieldName(child->name));
-				ordered.push_back(std::move(child));
-				break;
-			}
-		}
-	}
-	for (auto &child : node.fields) {
-		if (child) {
-			throw InvalidInputException("acl: the grant on \"%s\" lists \"%s.%s\", which the type %s does not have",
-			                            vname, path, child->name, type.ToString());
-		}
-	}
-	node.fields = std::move(ordered);
 }
 
 //! An object grant's COLUMNS and MASK as its row stores them (spec 158)
@@ -674,7 +626,7 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 	}
 	// the object's columns and their types: a relation's (its list, else its source's), a table function's declared or
 	// probed result, or - a table under a live schema alias - its physical table's; `probe` is the object's read, a
-	// grant over which must bind (a relation's is probed with its projection below, GrantProjectionStatements)
+	// grant over which must bind (a relation's is probed with its projection below, CheckGrantProjection)
 	vector<string> exposed;
 	vector<std::pair<string, LogicalType>> types;
 	vector<string> type_texts; // a table function's declared result types, as written (`types` then names only)
@@ -821,16 +773,11 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 	return stored();
 }
 
-void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, const string &role, const string &vcat,
-                               const string &vname, const string &columns, const string &masks,
-                               vector<string> &statements, bool strict,
-                               vector<std::pair<string, string>> *probed_out = nullptr) {
-	auto clear = "DELETE FROM " + catalog.Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
-	             " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname);
-	if (strict) {
-		// the grant is being rewritten, so whatever an earlier projection produced is gone either way
-		statements.push_back(clear);
-	}
+//! Whether a grant's projection binds over its object (spec 026, 158): refused on the write path (`strict`), only a
+//! fact not true yet for `acl_refresh_schema` (spec 027); nothing is stored per grant
+void CheckGrantProjection(CatalogBackend &catalog, const ReadFn &read, const string &role, const string &vcat,
+                          const string &vname, const string &columns, const string &masks, vector<string> &statements,
+                          bool strict, vector<std::pair<string, string>> *probed_out = nullptr) {
 	if (columns.empty() && masks.empty()) {
 		return;
 	}
@@ -879,9 +826,6 @@ void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, cons
 		throw InvalidInputException("acl: the projection of the grant on \"%s\" does not bind against it: %s", vname,
 		                            error);
 	}
-	if (!strict) {
-		statements.push_back(clear); // re-probed: replace the earlier rows rather than lose them
-	}
 	if (probed_out) {
 		*probed_out = derived; // spec 122: what the role would read, for a check
 	}
@@ -892,89 +836,6 @@ void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, cons
 } // namespace
 
 namespace {
-
-//! spec 102: a declared COLUMNS list may name fields (`address.city`): each such column becomes the
-//! expression that reads only them, checked against the source's type where it is written and in the
-//! source's field order, emitted once where the column first appears (a bare `address` beside its
-//! paths keeps it whole). The relation is then the projection form, and the narrowed column is
-//! read-only by design (spec 102 §7): a write narrows through a grant. A field mask is a grant's,
-//! never the object's. Untouched when no entry is a path.
-bool CompileDeclaredPaths(CatalogBackend &catalog, const string &phys, const string &vname,
-                          vector<std::pair<string, string>> &columns) {
-	auto is_path = [](const string &name) {
-		acl_detail::FieldPath path;
-		string error;
-		return acl_detail::HasFieldPaths({{name, string()}}) && acl_detail::ParseFieldPath(name, path, error) &&
-		       !path.IsColumn();
-	};
-	case_insensitive_set_t heads;
-	for (auto &column : columns) {
-		if (!is_path(column.first)) {
-			continue;
-		}
-		if (!column.second.empty()) {
-			throw InvalidInputException("acl: \"%s = %s\" masks a field in the object's own COLUMNS - a field mask "
-			                            "belongs to a grant (GRANT TABLE ... COLUMNS (...)); the object names fields",
-			                            column.first, column.second);
-		}
-		acl_detail::FieldPath path;
-		string error;
-		acl_detail::ParseFieldPath(column.first, path, error);
-		heads.insert(path.head);
-	}
-	if (heads.empty()) {
-		return false;
-	}
-	// the column's items - its paths, and a bare entry of it if there is one - as one tree
-	vector<std::pair<string, string>> items;
-	for (auto &column : columns) {
-		if (!column.second.empty()) {
-			continue;
-		}
-		acl_detail::FieldPath path;
-		string error;
-		auto head =
-		    is_path(column.first) && acl_detail::ParseFieldPath(column.first, path, error) ? path.head : column.first;
-		if (heads.count(head)) {
-			items.push_back(column);
-		}
-	}
-	auto trees = acl_detail::ColumnTrees::From(items);
-	vector<std::pair<string, LogicalType>> types;
-	if (!phys.empty()) {
-		catalog.ProbeTypes("SELECT * FROM " + phys, types);
-	}
-	for (auto &column : trees.columns) {
-		for (auto &type : types) {
-			if (StringUtil::CIEquals(type.first, column->name)) {
-				OrderAndCheckFields(*column, type.second, vname, column->name);
-				break;
-			}
-		}
-	}
-	vector<std::pair<string, string>> compiled;
-	case_insensitive_set_t emitted;
-	for (auto &column : columns) {
-		acl_detail::FieldPath path;
-		string error;
-		auto head =
-		    column.second.empty() && is_path(column.first) && acl_detail::ParseFieldPath(column.first, path, error)
-		        ? path.head
-		        : column.first;
-		if (!column.second.empty() || !heads.count(head)) {
-			compiled.push_back(column);
-			continue;
-		}
-		if (emitted.count(head)) {
-			continue; // the column's tree was emitted where it first appeared
-		}
-		emitted.insert(head);
-		auto tree = trees.Find(head);
-		compiled.emplace_back(head, tree->Plain() ? string() : acl_detail::CompileNode(*tree, acl_detail::Ident(head)));
-	}
-	columns = std::move(compiled);
-	return true;
-}
 
 //! A virtual object may not take a metadata surface's name: the surface wins when the name is
 //! written, so the object would be listed and unreachable (spec 010 part 3).
@@ -1012,7 +873,6 @@ const char *const POLICY_TABLES[] = {"meta",
                                      "references",
                                      "reference_columns",
                                      "keys",
-                                     "grant_columns",
                                      "resource_groups",
                                      "role_resource_groups",
                                      "cluster_items",
@@ -1223,9 +1083,6 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	RequirePolicyFreeExpressions(*catalog, "the relation's RLS or column list", rls, columns_p);
 	auto columns = columns_p;
 	auto form = form_p;
-	if (CompileDeclaredPaths(*catalog, phys, vname, columns)) {
-		form = "subquery";
-	}
 	bool existed = false;
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto existing = read("SELECT \"comment\", \"alias_types\", \"enum_types\" FROM " + catalog->Tbl("relations") +
@@ -1322,20 +1179,8 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 		if (!policy.rls.empty()) {
 			tags.push_back(AuditLineageTag {key + ".rls", "true", string()});
 		}
-		case_insensitive_map_t<string> narrowed;
-		for (auto &entry : policy.narrowed_reads) {
-			narrowed[entry.first] = entry.second;
-		}
 		auto field_tags = [&](const string &column, bool masked) {
-			auto entry = narrowed.find(column);
-			if (entry == narrowed.end()) {
-				tags.push_back(AuditLineageTag {key, masked ? "masked" : "visible", column});
-				return;
-			}
-			// spec 102: the column's own items - `address.city`, `address.ssn = NULL` - one tag per path
-			for (auto &item : acl_detail::ParseColumnList(entry->second)) {
-				tags.push_back(AuditLineageTag {key, item.second.empty() ? "visible" : "masked", item.first});
-			}
+			tags.push_back(AuditLineageTag {key, masked ? "masked" : "visible", column});
 		};
 		if (!policy.caps.count("select")) {
 			continue; // spec 145: a role that may not read reads no field - no visible or masked tag
@@ -1351,7 +1196,7 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 				injected.insert(entry.first);
 			}
 			for (auto &field : fields) {
-				if (!policy.visible_columns.empty() && !policy.visible_columns.count(field) && !narrowed.count(field)) {
+				if (!policy.visible_columns.empty() && !policy.visible_columns.count(field)) {
 					continue;
 				}
 				if (policy.columns_excluded && policy.excluded_columns.count(field)) {
@@ -2037,7 +1882,6 @@ vector<RelationRowSource> RelationRowSources(CatalogBackend &catalog, const stri
 	    {"column_comments", named},
 	    {"keys", named + " AND \"kind\" = 'relation'"},
 	    {"role_object_caps", named, true},
-	    {"grant_columns", named, true},
 	    {"reference_columns", in + "\"name\" IN (SELECT \"name\" FROM " + catalog.Tbl("references") + in + ends + ")"},
 	    {"references", in + ends},
 	    {"schema_dropped", in + "\"path\" = " + Lit(parent) + " AND \"name\" = " + Lit(leaf), false, true},
@@ -2187,7 +2031,7 @@ bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vnam
 	};
 	auto named = "\"vname\" = " + Lit(vname);
 	return is("relations", named + " AND coalesce(\"rls\", '') <> ''") || is("relation_columns", named) ||
-	       is("keys", named) || is("role_object_caps", named) || is("grant_columns", named) ||
+	       is("keys", named) || is("role_object_caps", named) ||
 	       is("references", "(\"from_vname\" = " + Lit(vname) + " OR \"to_vname\" = " + Lit(vname) + ")");
 }
 
@@ -2605,82 +2449,6 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 	}
 }
 
-namespace {
-
-//! spec 065: a grant's COLUMNS list is judged where it is written - against the shapes the catalog
-//! already knows, never by probing. Only the BARE items are judged: a `name = expr` entry defines a
-//! new column (a mask, a computed column - spec 026) and owes nothing to any existing name. Names
-//! come from relation_columns (declared mappings) and object_columns (declared/probed shapes,
-//! relations and functions alike), read with the same ParseColumnList the read path uses. The
-//! judgment fires only when it CAN be right: a scope with no declared shape at all (an empty
-//! catalog, a grant written before its objects), one shape-less object, an undeclared table
-//! function, or any alias schema - and the write is allowed, because the list may match there. A
-//! bare list that matches nothing anywhere known is certainly a typo, and the principal it
-//! misconfigures would otherwise meet the engine's error instead of this one.
-void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const string &columns,
-                          const string &object_scope) {
-	if (columns.empty() || catalog.FunctionMode()) {
-		return; // nothing listed, or a keyed-lookup driver with nothing to enumerate
-	}
-	vector<string> names;
-	for (auto &column : acl_detail::ParseColumnList(columns)) {
-		// the item's column as the read takes it - its quotes off (`"a,b"`, a stored name since spec 150 4f), a path's
-		// head (spec 150 4f's re-review: the quoted text matched no stored name)
-		bool is_path = false;
-		auto name = acl_detail::ItemHead(column.first, is_path);
-		if (!name.empty() && column.second.empty()) {
-			names.push_back(Lit(StringUtil::Lower(name)));
-		}
-	}
-	if (names.empty()) {
-		return; // every item defines its own column; there is nothing that must already exist
-	}
-	auto in_list = "(" + StringUtil::Join(names, ", ") + ")";
-	string scope = object_scope.empty() ? string() : " AND \"vname\" = " + Lit(object_scope);
-	// nothing declared in scope - a fresh catalog, a grant written before its objects - is not
-	// judgeable; neither is an object-scope target without a declared shape
-	auto shaped =
-	    catalog.Query("SELECT 1 FROM (SELECT 1 FROM " + catalog.Tbl("relation_columns") +
-	                  " WHERE \"vcat\" = " + Lit(vcat) + scope + " UNION ALL SELECT 1 FROM " +
-	                  catalog.Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) + scope + ") s LIMIT 1");
-	if (shaped->RowCount() == 0) {
-		return;
-	}
-	if (object_scope.empty()) {
-		// catalog scope: an alias schema or a shape-less object anywhere means we cannot judge
-		auto aliases = catalog.Query("SELECT 1 FROM " + catalog.Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                             " AND \"phys_path\" IS NOT NULL LIMIT 1");
-		if (aliases->RowCount() > 0) {
-			return;
-		}
-		auto shapeless = catalog.Query("SELECT 1 FROM (SELECT \"vname\" FROM " + catalog.Tbl("relations") +
-		                               " WHERE \"vcat\" = " + Lit(vcat) + " UNION ALL SELECT \"vname\" FROM " +
-		                               catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                               " AND \"kind\" = 'table') o WHERE NOT EXISTS (SELECT 1 FROM " +
-		                               catalog.Tbl("relation_columns") + " c WHERE c.\"vcat\" = " + Lit(vcat) +
-		                               " AND c.\"vname\" = o.\"vname\")"
-		                               " AND NOT EXISTS (SELECT 1 FROM " +
-		                               catalog.Tbl("object_columns") + " oc WHERE oc.\"vcat\" = " + Lit(vcat) +
-		                               " AND oc.\"vname\" = o.\"vname\") LIMIT 1");
-		if (shapeless->RowCount() > 0) {
-			return;
-		}
-	}
-	auto match =
-	    catalog.Query("SELECT 1 FROM (SELECT " + KeyFoldSql("\"name\"") + " AS n FROM " +
-	                  catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) + scope +
-	                  " UNION ALL SELECT " + KeyFoldSql("\"name\"") + " FROM " + catalog.Tbl("object_columns") +
-	                  " WHERE \"vcat\" = " + Lit(vcat) + scope + ") s WHERE n IN " + in_list + " LIMIT 1");
-	if (match->RowCount() == 0) {
-		throw BinderException(
-		    "acl admin: COLUMNS (%s) matches no column of %s - "
-		    "every shape this catalog declares was checked, and nothing the list names exists",
-		    columns, object_scope.empty() ? "any object of catalog \"" + vcat + "\"" : "\"" + object_scope + "\"");
-	}
-}
-
-} // namespace
-
 string PolicyStore::NormalizeGrantVersions(const string &written) {
 	RequireCatalog(catalog, "acl grant");
 	return NormalizeVersions(written, [&](const string &sql) {
@@ -2764,14 +2532,12 @@ void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 		                   " AND \"vcat\" = " + Lit(vcat) + " LIMIT 1")
 		           ->RowCount() > 0;
 	};
-	if (!held("role_catalogs") && !held("role_object_caps") && !held("grant_columns")) {
+	if (!held("role_catalogs") && !held("role_object_caps")) {
 		ThrowNothingToRevoke(role, "grant on catalog \"" + vcat + "\"");
 	}
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat),
 	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
-	                    " AND \"vcat\" = " + Lit(vcat),
-	                "DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat)});
 	NoteGrantLineage(vcat); // spec 107
 }
@@ -2812,9 +2578,7 @@ void DropReferencesNaming(CatalogBackend &catalog, const string &vcat, const Nam
 //! row for both - which is why this is only called once nothing of that name is left.
 void DropGrantRowsFor(CatalogBackend &catalog, const string &vcat, const NamePred &pred, vector<string> &statements) {
 	auto in_cat = " WHERE \"vcat\" = " + Lit(vcat) + " AND ";
-	for (auto table : {"role_object_caps", "grant_columns"}) {
-		statements.push_back("DELETE FROM " + catalog.Tbl(table) + in_cat + pred("vname"));
-	}
+	statements.push_back("DELETE FROM " + catalog.Tbl("role_object_caps") + in_cat + pred("vname"));
 }
 
 } // namespace
@@ -3310,7 +3074,7 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			auto masks = text(4);
 			if (!columns.empty() || !masks.empty()) {
 				try {
-					GrantProjectionStatements(*catalog, read, role, vcat, object, columns, masks, statements, false);
+					CheckGrantProjection(*catalog, read, role, vcat, object, columns, masks, statements, false);
 					// spec 158: a mask written while its object could not be judged is cast to its column's type now
 					auto normalised = NormaliseObjectGrant(*catalog, read, vcat, object, columns, masks);
 					if (normalised.masks != masks) {
@@ -3369,7 +3133,7 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
-			for (auto table : {"role_catalogs", "role_object_caps", "grant_columns", "role_schemas"}) {
+			for (auto table : {"role_catalogs", "role_object_caps", "role_schemas"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 			}
 		}
@@ -3453,8 +3217,8 @@ void PolicyStore::CatalogDropRole(const string &role) {
 			throw BinderException("acl admin: role \"%s\" does not exist", role);
 		}
 		// everything that points at a role goes with it - nothing may dangle
-		for (auto table : {"role_claims", "role_catalogs", "role_object_caps", "grant_columns", "role_schemas",
-		                   "admins", "role_mappings", "role_resource_groups"}) {
+		for (auto table : {"role_claims", "role_catalogs", "role_object_caps", "role_schemas", "admins",
+		                   "role_mappings", "role_resource_groups"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role));
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
@@ -3749,7 +3513,6 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		case_insensitive_map_t<int8_t> kept_marks = nullable_marks;
 		if (field == "columns") {
 			new_columns = columns;
-			CompileDeclaredPaths(*catalog, new_phys, vname, new_columns);
 		} else { // keep the current projection - and its nullability marks - when another property is set
 			auto rows = read("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 			                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
@@ -3936,7 +3699,6 @@ void PolicyStore::CatalogRevokeObject(const string &role, const string &vcat, co
 		                "grant of \"" + vcat + "." + vname + "\" to role \"" + role + "\"");
 		// the object's own grant and its columns - the catalog's (or a schema's) grant stays and decides again
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + where);
-		statements.push_back("DELETE FROM " + catalog->Tbl("grant_columns") + where);
 	});
 	NoteGrantLineage(vcat); // spec 107
 }
@@ -4331,15 +4093,12 @@ ObjectGrantPlan PlanObjectGrant(CatalogBackend &catalog, const ReadFn &read, con
 			}
 		}
 	}
-	// what this projection actually produces: names a mask renames the type of, and columns the
-	// object never had. Probed here, where it is written, so a listing can describe what the role
-	// reads rather than what the physical table holds (spec 026).
-	// spec 037: what the grant may say at all, and in whose order it is kept
+	// spec 037 / 158: what the grant may say at all, and in whose order it is kept; its projection must bind over the
+	// object (CheckGrantProjection below) - nothing of it is stored
 	auto normalised = NormaliseObjectGrant(catalog, read, vcat, vname, columns, masks);
 	plan.listed = normalised.columns;
 	plan.masks = normalised.masks;
-	GrantProjectionStatements(catalog, read, role, vcat, vname, plan.listed, plan.masks, statements, true,
-	                          &plan.probed);
+	CheckGrantProjection(catalog, read, role, vcat, vname, plan.listed, plan.masks, statements, true, &plan.probed);
 	return plan;
 }
 

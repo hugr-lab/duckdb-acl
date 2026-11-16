@@ -312,10 +312,6 @@ vector<PlatformView> BuildViews() {
 	      {"masks", GRANT_MASKS}},
 	     "the object grants; caps / versions NULL = the catalog grant's; columns: mode all | only | except and the "
 	     "names (spec 158)"},
-	    {"grant_columns",
-	     PV::CATALOG,
-	     {{"role", V}, {"catalog", V}, {"object", V}, {"pos", I}, {"name", V}, {"type", V}},
-	     "what each grant's projection produces (spec 026)"},
 	    {"admins", PV::POLICY, {{"role", V}, {"scope", V}, {"catalog", V}}, "the administration bundles of each role"},
 	    {"platform_grants",
 	     PV::POLICY,
@@ -2565,10 +2561,6 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 		       "\"caps\", \"rls\", \"rls_checked\", acl_platform_grant_columns(\"columns\") AS \"columns\", "
 		       "\"versions\", acl_platform_grant_masks(\"masks\") AS \"masks\" FROM " +
 		       table("role_object_caps") + where("\"vcat\"");
-	}
-	if (view == "grant_columns") {
-		return "SELECT \"role\", \"vcat\" AS \"catalog\", \"vname\" AS \"object\", \"pos\", \"name\", \"type\" FROM " +
-		       table("grant_columns") + where("\"vcat\"");
 	}
 	if (view == "admins") {
 		return "SELECT \"role\", \"scope\", nullif(\"vcat\", '') AS \"catalog\" FROM " + table("admins");

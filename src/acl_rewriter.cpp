@@ -1,6 +1,5 @@
 #include "acl_rewriter.hpp"
 #include "acl_lineage.hpp"
-#include "acl_field_paths.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_platform.hpp"
 
@@ -1879,9 +1878,6 @@ private:
 				for (auto &mask : own.injections) {
 					mine.erase(mask.first);
 				}
-				for (auto &tree : own.narrowed_reads) {
-					mine.erase(tree.first);
-				}
 			}
 			if (!restricted) {
 				allowed = std::move(mine);
@@ -1914,7 +1910,6 @@ private:
 		auto scope = verb_policy;
 		if (restricted) {
 			scope.injections.clear();
-			scope.narrowed_reads.clear();
 			if (except) {
 				scope.columns_excluded = true;
 				scope.excluded_columns = allowed;
@@ -1958,7 +1953,7 @@ private:
 		}
 		if (node.on_conflict_info->action_type == OnConflictAction::REPLACE &&
 		    (!update.rls.empty() || !update.injections.empty() || update.WritesNarrowed() ||
-		     !update.field_writes.empty() || update.ColumnsNarrowed())) {
+		     update.ColumnsNarrowed())) {
 			Deny(Reason::WRITE_POLICY, "INSERT OR REPLACE into " + Shown(key) +
 			                               " is not allowed under a row or column policy - write ON CONFLICT (…) DO "
 			                               "UPDATE SET …, which the policy confines");
@@ -1967,8 +1962,7 @@ private:
 		// is: MapReadable, field writes) - under a column policy, the update's or the one it reads under, refused as
 		// ApplyInsertPolicy refuses an insert's (the re-review: hidden columns read, a hidden field written)
 		auto column_policy = [](const TablePolicy &p) {
-			return p.ColumnsNarrowed() || !p.injections.empty() || !p.field_writes.empty() || p.WritesNarrowed() ||
-			       !p.narrowed_reads.empty();
+			return p.ColumnsNarrowed() || !p.injections.empty() || p.WritesNarrowed();
 		};
 		bool restricted = column_policy(update);
 		if (!restricted && update.caps.count("select") && update.capability_rows_read) {
@@ -2075,7 +2069,6 @@ private:
 					}
 				}
 			}
-			ApplyFieldWrites(*node.set_info, policy, vname, node.from_table ? TargetAliasOf(node.table) : Identifier());
 			ApplyUpdateCheck(*node.set_info, policy, vname, node.from_table ? TargetAliasOf(node.table) : Identifier());
 			RewriteExpr(node.set_info->condition);
 			MapColumnRefs(node.set_info->condition, policy, vname,
@@ -2166,7 +2159,6 @@ private:
 						MapReadable(expr, reads, vname, alias, false, others);
 					}
 					ApplySetInjections(*action->update_info, policy, vname);
-					ApplyFieldWrites(*action->update_info, policy, vname, alias);
 					ApplyUpdateCheck(*action->update_info, policy, vname, alias);
 					RewriteExpr(action->update_info->condition);
 					MapColumnRefs(action->update_info->condition, policy, vname, alias);
@@ -2215,14 +2207,6 @@ private:
 		for (auto &column : action.insert_columns) {
 			column = MapWrittenColumn(policy, column, vname);
 			RequireWritableColumn(policy, column, vname);
-		}
-		for (idx_t i = 0; i < action.insert_columns.size() && i < action.expressions.size(); i++) {
-			auto name = action.insert_columns[i].GetIdentifierName();
-			auto tree = FieldWriteTree(policy, name);
-			if (tree) {
-				action.expressions[i] = FieldWriteValue(*tree, std::move(action.expressions[i]), nullptr,
-				                                        VirtualColumn(policy, name), vname);
-			}
 		}
 		if (policy.injections.empty()) {
 			return;
@@ -3804,14 +3788,7 @@ private:
 				break;
 			}
 		}
-		optional_ptr<const std::pair<string, string>> narrowed;
-		for (auto &entry : policy.narrowed_reads) {
-			if (StringUtil::CIEquals(entry.first, column)) {
-				narrowed = &entry;
-				break;
-			}
-		}
-		bool plain = policy.Readable(column) && !mask && !narrowed;
+		bool plain = policy.Readable(column) && !mask;
 		if (!qualified && (scope.in_from_subquery || !scope.single) && !plain) {
 			// another relation may own the name - or, unqualified, the binder may give it to the target
 			Deny(Reason::WRITE_POLICY, "\"" + names[0].GetIdentifierName() + "\" in a write to \"" + vname +
@@ -3826,23 +3803,9 @@ private:
 		if (plain) {
 			return; // read as stored
 		}
-		// what the principal reads of the column, then any field steps after it
-		vector<Identifier> base(names.begin(), names.begin() + at + 1);
-		unique_ptr<ParsedExpression> read;
-		if (mask) {
-			read = store.InstantiateExpr(mask->second, template_options);
-			BakeMarkers(read, nullptr); // a read of the mask, not an assignment: it may read the row
-		} else {
-			auto trees = acl_detail::ColumnTrees::From(acl_detail::ParseColumnList(narrowed->second));
-			auto tree = trees.Find(narrowed->first);
-			if (!tree) {
-				return;
-			}
-			auto parsed =
-			    Parser(template_options).ParseExpressionList(acl_detail::CompileNode(*tree, "\"__acl_read\""));
-			read = std::move(parsed[0]);
-			SubstitutePlaceholder(read, "__acl_read", ColumnRefExpression(base));
-		}
+		// what the principal reads of the column (its mask), then any field steps after it
+		auto read = store.InstantiateExpr(mask->second, template_options);
+		BakeMarkers(read, nullptr); // a read of the mask, not an assignment: it may read the row
 		for (idx_t i = at + 1; i < names.size(); i++) {
 			vector<unique_ptr<ParsedExpression>> args;
 			args.push_back(std::move(read));
@@ -3891,56 +3854,6 @@ private:
 		return value;
 	}
 
-	//! spec 102 part B: the grant's tree for a narrowed column, or nothing
-	unique_ptr<acl_detail::FieldNode> FieldWriteTree(const TablePolicy &policy, const string &column) {
-		for (auto &entry : policy.field_writes) {
-			if (StringUtil::CIEquals(entry.first, column)) {
-				auto trees = acl_detail::ColumnTrees::From(acl_detail::ParseColumnList(entry.second));
-				auto tree = trees.Find(entry.first);
-				return tree ? tree->Clone() : nullptr;
-			}
-		}
-		return nullptr;
-	}
-
-	//! The value written into a narrowed column: the statement's `written`, folded into the stored
-	//! value (`stored` = the column's own reference for an UPDATE / a MERGE's update, null for an insert)
-	unique_ptr<ParsedExpression> FieldWriteValue(const acl_detail::FieldNode &tree,
-	                                             unique_ptr<ParsedExpression> written,
-	                                             unique_ptr<ParsedExpression> stored, const string &column,
-	                                             const string &vname) {
-		auto text = acl_detail::CompileWrite(tree, "\"__acl_written\"", stored ? "\"__acl_stored\"" : string(),
-		                                     "acl_rewrite: the value written to \"" + column + "\" of \"" + vname +
-		                                         "\" carries a field this role cannot write");
-		auto parsed = Parser(template_options).ParseExpressionList(text);
-		if (parsed.size() != 1) {
-			Deny(Reason::POLICY_ERROR, "the write policy of " + Shown(vname) + " did not compile");
-		}
-		auto value = std::move(parsed[0]);
-		BakeMarkers(value, nullptr); // a mask may read a claim
-		RequireFieldMasksAreValues(tree, column, vname);
-		SubstitutePlaceholder(value, "__acl_written", *written);
-		if (stored) {
-			SubstitutePlaceholder(value, "__acl_stored", *stored);
-		}
-		return value;
-	}
-
-	//! A field mask is an assignment on a write, like a column's: claims and constants only (spec 011)
-	void RequireFieldMasksAreValues(const acl_detail::FieldNode &node, const string &column, const string &vname) {
-		if (node.masked) {
-			auto mask = store.InstantiateExpr(node.mask, template_options);
-			RequireValueExpression(*mask, column, vname);
-			return;
-		}
-		for (auto &child : node.fields) {
-			RequireFieldMasksAreValues(*child, column, vname);
-		}
-		if (node.element) {
-			RequireFieldMasksAreValues(*node.element, column, vname);
-		}
-	}
-
 	static void SubstitutePlaceholder(unique_ptr<ParsedExpression> &expr, const string &name,
 	                                  const ParsedExpression &value) {
 		if (!expr) {
@@ -3955,27 +3868,6 @@ private:
 		}
 		ParsedExpressionIterator::EnumerateChildren(
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { SubstitutePlaceholder(child, name, value); });
-	}
-
-	//! A SET list's narrowed columns, folded into what is stored (`target` qualifies the stored value
-	//! where another relation is in scope)
-	void ApplyFieldWrites(UpdateSetInfo &set_info, const TablePolicy &policy, const string &vname,
-	                      const Identifier &target) {
-		for (idx_t i = 0; i < set_info.columns.size() && i < set_info.expressions.size(); i++) {
-			auto name = set_info.columns[i].GetIdentifierName();
-			auto tree = FieldWriteTree(policy, name);
-			if (!tree) {
-				continue;
-			}
-			vector<Identifier> stored_name;
-			if (!target.empty()) {
-				stored_name.push_back(target);
-			}
-			stored_name.push_back(set_info.columns[i]);
-			set_info.expressions[i] = FieldWriteValue(*tree, std::move(set_info.expressions[i]),
-			                                          make_uniq<ColumnRefExpression>(std::move(stored_name)),
-			                                          VirtualColumn(policy, name), vname);
-		}
 	}
 
 	//! The name the principal knows a physical column by - a refusal speaks the virtual catalog
@@ -4017,8 +3909,7 @@ private:
 
 	//! Whether a grant narrows what may be written at all
 	static bool HasWritePolicy(const TablePolicy &policy) {
-		return !policy.injections.empty() || policy.WritesNarrowed() || !policy.rls.empty() ||
-		       !policy.field_writes.empty();
+		return !policy.injections.empty() || policy.WritesNarrowed() || !policy.rls.empty();
 	}
 
 	//! spec 024: a grant's predicate confines what is written, not only what may be reached. Without
@@ -4240,16 +4131,6 @@ private:
 			}
 			replacements[Identifier("__acl_c" + to_string(position))] = InjectedValue(injection, vname);
 		}
-		// spec 102: a narrowed column of the stream, folded the same way, by its position
-		for (idx_t i = 0; i < node.columns.size(); i++) {
-			auto name = node.columns[i].GetIdentifierName();
-			auto tree = FieldWriteTree(policy, name);
-			if (tree) {
-				auto position = Identifier("__acl_c" + to_string(i));
-				replacements[position] = FieldWriteValue(*tree, make_uniq<ColumnRefExpression>(position), nullptr,
-				                                         VirtualColumn(policy, name), vname);
-			}
-		}
 		// The source's columns are aliased BY POSITION here, never trusted by name: since quack f4328c5
 		// the client names them (its NULL::STRUCT(...) prototype), and a client that named its second
 		// column `col2` and its third `col1` would have put the grant's value where it chose and its own
@@ -4359,7 +4240,7 @@ private:
 		for (auto &column : node.columns) {
 			RequireWritableColumn(policy, column, vname);
 		}
-		if (policy.injections.empty() && policy.field_writes.empty()) {
+		if (policy.injections.empty()) {
 			return;
 		}
 		if (SourceIsOwnDrain(node)) {
@@ -4378,10 +4259,7 @@ private:
 			}
 			if (!injected) {
 				columns.push_back(column);
-				auto tree = FieldWriteTree(policy, column.GetIdentifierName());
-				items.push_back(tree ? FieldWriteValue(*tree, make_uniq<ColumnRefExpression>(column), nullptr,
-				                                       VirtualColumn(policy, column.GetIdentifierName()), vname)
-				                     : make_uniq<ColumnRefExpression>(column));
+				items.push_back(make_uniq<ColumnRefExpression>(column));
 			}
 		}
 		for (auto &injection : policy.injections) {
@@ -4434,11 +4312,6 @@ private:
 				for (auto &injection : policy.injections) {
 					if (StringUtil::CIEquals(injection.first, name)) {
 						return true; // the grant computes this column, so the stored value is not readable
-					}
-				}
-				for (auto &narrowed : policy.field_writes) {
-					if (StringUtil::CIEquals(narrowed.first, name)) {
-						return true; // the stored struct carries the fields the role does not see
 					}
 				}
 				return policy.columns_excluded && policy.excluded_columns.count(name) > 0;
@@ -5362,7 +5235,7 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 			}
 			// The replacement is a different node, so the alias the marker carried has to be carried
 			// over: a probe reads the column *names* a projection produces, and dropping it stored a
-			// column with no name in `grant_columns` - which then appeared in every listing, sharing an
+			// column with no name (spec 026's projection rows) - which then appeared in every listing, sharing an
 			// ordinal with the column it was supposed to be (spec 042).
 			//
 			// The *type* is deliberately untyped where the signature does not give one: the baked

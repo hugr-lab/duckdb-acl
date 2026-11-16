@@ -462,9 +462,6 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// principal's roles, and written as a constant CASE over the stored text: no subquery for the planner to
 	// decorrelate under the listing's own
 	std::map<string, acl_detail::ColumnTest> stated_lists;
-	// spec 144: the columns some list narrows by a path (spec 102) or masks - their type is the read's projection,
-	// which nothing probed for a catalog grant (spec 026 probes an object grant's), folded
-	std::set<string> path_heads;
 	// spec 144: does any of the principal's roles hold a catalog grant's list, or an object grant's list on an object
 	// no relation names (an object under a live alias)? Only then the alias leg narrows - and only then by that level
 	bool catalog_lists = false, alias_object_lists = false;
@@ -594,66 +591,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		       " WHERE " +
 		       key + " AND " + keeps_catalog("gc.cat_columns") + " AND " + keeps("gc.obj_columns", name_expr) + "))";
 	};
-	// spec 144: a column some list narrows by a path is listed as the read projects it - the roles' lists folded over
-	// its type (spec 102's acl_listed_type, which the grant projection's rows already pass through); any other keeps
-	// its listed type (a whole-column mask's is spec 026's probe or the source's)
-	auto listed_type = [&](const string &type_expr, const string &name_expr, const string &roles_expr) {
-		if (path_heads.empty()) {
-			return type_expr;
-		}
-		vector<string> heads;
-		for (auto &head : path_heads) {
-			heads.push_back(Lit(head));
-		}
-		return "CASE WHEN " + KeyFoldSql(name_expr) + " IN (" + StringUtil::Join(heads, ", ") +
-		       ") THEN acl_listed_type(" + type_expr + ", " + name_expr + ", " + roles_expr + ") ELSE " + type_expr +
-		       " END";
-	};
-	// spec 026: what a grant's own projection produces - a mask that changes a column's type, or a
-	// computed column the object never had. Probed when the grant is written, so a listing can
-	// describe what the role reads rather than what the physical table holds.
-	// A principal may hold several roles, and two of them may project the same name - at the same
-	// position or at different ones. One row per name is the invariant every consumer depends on:
-	// a duplicate makes `column_count` wrong and the synthesized DDL invalid SQL (spec 035).
-	//
-	// The order has to be the read path's, not merely stable, because a client may project by
-	// position (spec 036). The read path merges roles in role-name order, appending each role's
-	// list in its own order - so a column belongs where the first role that states it put it.
-	// Ranking by `(role, pos)` and taking each name's first occurrence reproduces exactly that,
-	// and the outer row_number closes the gaps a merged name leaves behind.
-	string projected =
-	    "gprojection AS (SELECT vcat, vname, name, type,"
-	    " row_number() OVER (PARTITION BY vcat, vname ORDER BY rk) - 1 AS pos FROM"
-	    " (SELECT vcat, vname, name, min_by(type, rk) AS type, min(rk) AS rk FROM"
-	    " (SELECT vcat, vname, name, type,"
-	    " row_number() OVER (PARTITION BY vcat, vname ORDER BY \"role\", \"pos\") AS rk FROM"
-	    " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
-	    " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
-	    Tbl("grant_columns") +
-	    " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\""
-	    // spec 145: a role's projection is listed only where the role reads the object
-	    " JOIN gcolumns gr ON gr.vcat = pc.\"vcat\" AND gr.vname = pc.\"vname\" AND gr.role = pc.\"role\""
-	    // One role whose chain states no column list lifts the restriction for the
-	    // whole principal (spec 011: `Restricts()` is `any && !unrestricted`), and
-	    // then the object's own columns are what it reads - so another role's
-	    // projection must not be listed either, or the listing would advertise a
-	    // column `SELECT *` never returns.
-	    " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
-	    " AND gc.vname = pc.\"vname\""
-	    " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
-	    " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))"
-	    // review 143: an object grant's list names what that level keeps - the catalog grant's may
-	    // hide it, and then the read has no such column (nor its name, comment or tags a row);
-	    // filtered before the positions are numbered, so they close up as the read's do (spec 036)
-	    " AND " +
-	    column_visible("pc.\"vcat\"", "pc.\"vname\"", "pc.\"name\"") +
-	    "))"
-	    " GROUP BY vcat, vname, name))";
 	auto prelude =
 	    GrantsCte(principal) + ", " +
 	    (platform ? "pobjects AS (" + platform_objects + "), pcolumns AS (" + platform_columns + "), " : string()) +
 	    physcols + ", " + unread + ", " + declared + ", " + objects + ", " + aliases + ", " + schemas + ", " +
-	    grant_columns + ", " + vfunctions + ", " + projected + " ";
+	    grant_columns + ", " + vfunctions + " ";
 	// spec 035: each surface answers in its own standard shape, column for column and type for
 	// type. A value that would describe the physical object rather than the virtual one is not
 	// borrowed - an oid identifies a physical catalog entry, a path is the physical database.
@@ -921,9 +863,6 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		               " AS obj FROM grants g" + alias_object_join + " WHERE g.\"vcat\" = a.vcat" + alias_readers +
 		               ") ag WHERE true";
 	}
-	string alias_roles = "(SELECT list(struct_pack(cat := ag.cat, obj := ag.obj, probed := NULL::VARCHAR) ORDER BY "
-	                     "ag.role) FROM " +
-	                     alias_grants + ")";
 	string alias_visible = !catalog_lists && !alias_object_lists
 	                           ? string()
 	                           : " AND EXISTS (SELECT 1 FROM " + alias_grants + " AND " + keeps_catalog("ag.cat") +
@@ -982,12 +921,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    KeyFoldSql("ip.\"column_name\"") + " = " + KeyFoldSql(read_name("rc")) +
 	    " WHERE o.form <> 'alias'"
 	    " UNION ALL BY NAME"
-	    // a column whose levels' paths leave nothing of it (`addr.city` at one, `addr.secret` at the other) is no
-	    // column of the read - acl_listed_type answers NULL for it
 	    " SELECT * FROM (SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
-	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " +
-	    listed_type("i.\"data_type\"", "i.\"column_name\"", alias_roles) +
-	    " AS data_type)"
+	    KeyQuotePartSql("i.\"table_name\"") +
+	    " AS table_name)"
 	    " FROM aliases a JOIN " +
 	    icolumns +
 	    " i ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
@@ -999,52 +935,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	};
 	string listed_path = "CASE WHEN l.table_schema = 'main' THEN l.table_name"
 	                     " ELSE l.table_schema || '.' || l.table_name END";
-	// A grant's own projection wins over the object's row for the names it defines - it is what the
-	// role actually reads - and adds the ones the object never had (spec 026).
-	// the object's own column rows, read once: the listing itself, and - spec 102 - the source type a
-	// grant's projection is computed over
+	// spec 158: what a role reads of an object is the object's columns its grants' tests admit - a grant names, types
+	// and adds no column of its own (a mask keeps its column's type)
 	prelude += ", lcols AS (" + columns_sql + ") ";
-	string source_path = "CASE WHEN s.table_schema = 'main' THEN s.table_name"
-	                     " ELSE s.table_schema || '.' || s.table_name END";
-	// spec 102: what a principal reads of a column its grants project is what the read path computes -
-	// the roles' column lists folded and united, the tree applied to the source's type - never one
-	// role's probed type: two roles narrowing a struct differently read the union of their fields
-	string roles_of = "(SELECT list(struct_pack(cat := gc.cat_columns, obj := gc.obj_columns,"
-	                  " probed := (SELECT max(pc.\"type\") FROM " +
-	                  Tbl("grant_columns") +
-	                  " pc WHERE pc.\"role\" = gc.\"role\" AND pc.\"vcat\" = gc.vcat AND pc.\"vname\" = gc.vname"
-	                  " AND pc.\"name\" = gp.name)) ORDER BY gc.\"role\") FROM gcolumns gc"
-	                  " WHERE gc.vcat = gp.vcat AND gc.vname = gp.vname)";
-	string relation_roles = "(SELECT list(struct_pack(cat := gc.cat_columns, obj := gc.obj_columns, probed := "
-	                        "NULL::VARCHAR) ORDER BY gc.\"role\") FROM gcolumns gc WHERE gc.vcat = l.table_catalog AND"
-	                        " gc.vname = " +
-	                        listed_path + ")";
 	string effective_columns_body =
-	    (path_heads.empty() ? string("SELECT * FROM lcols l WHERE ")
-	                        : "SELECT * REPLACE (" + listed_type("l.data_type", "l.column_name", relation_roles) +
-	                              " AS data_type) FROM lcols l WHERE ") +
-	    column_visible("l.table_catalog", listed_path, "l.column_name") +
-	    " AND NOT EXISTS (SELECT 1 FROM gprojection gp WHERE gp.vcat = l.table_catalog AND gp.vname = " + listed_path +
-	    " AND gp.name = l.column_name)" +
-	    " UNION ALL BY NAME"
-	    " SELECT gp.vcat AS table_catalog,"
-	    " CASE WHEN " +
-	    KeyNestedSql("gp.vname") + " THEN " + KeyParentSql("gp.vname") + " ELSE 'main' END AS table_schema, " +
-	    KeyLeafSql("gp.vname") +
-	    " AS table_name,"
-	    " gp.name AS column_name, gp.pos + 1 AS ordinal_position,"
-	    // a column the source has is typed by the roles' union over it - NULL (dropped below) when the union leaves
-	    // nothing of it, never one role's own probe, which may name a field another level hides (review 144)
-	    " acl_exposed_type(CASE WHEN s.data_type IS NULL THEN gp.type ELSE acl_listed_type(s.data_type,"
-	    " gp.name, " +
-	    roles_of +
-	    ") END, o.strip_alias, o.enums_to_varchar) AS data_type,"
-	    // spec 143: a column the grant names (masked or not) is the object's column - its comment and tags with it
-	    " s.\"COLUMN_COMMENT\" AS \"COLUMN_COMMENT\", s.acl_tags AS acl_tags"
-	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
-	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
-	    " = gp.vname AND " + KeyFoldSql("s.column_name") + " = " + KeyFoldSql("gp.name") +
-
+	    "SELECT * FROM lcols l WHERE " + column_visible("l.table_catalog", listed_path, "l.column_name") +
 	    // spec 117: the columns of the system catalog's views - the types each view declares
 	    (platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, pc.path AS table_schema, pc.vname AS"
 	                " table_name, pc.name AS column_name, pc.pos AS ordinal_position, pc.type AS data_type,"
@@ -1341,7 +1236,6 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	                      " \"virtual_only\", \"comment\" FROM %s"},
 	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"rls_checked\", \"columns\""
 	                      " FROM %s"},
-	    {"grant_columns", "SELECT \"role\", \"vcat\", \"vname\", \"pos\", \"name\", \"type\" FROM %s"},
 	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
 	    // spec 095: what is stored - a value kept in a secret is NULL here, beside the secret's name;
 	    // nothing in these tables is a key or a credential
@@ -1374,7 +1268,6 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"grants", "role_catalogs"},
 	    {"schema_grants", "role_schemas"},
 	    {"object_grants", "role_object_caps"},
-	    {"grant_columns", "grant_columns"},
 	    {"admins", "admins"},
 	    {"issuers", "issuers"},
 	    {"clients", "clients"},

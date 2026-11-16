@@ -148,7 +148,6 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | `grants` *c* | role, catalog, is_main BOOLEAN, caps, rls, rls_checked BOOLEAN, columns VARCHAR[] |
 | `schema_grants` *c* | role, catalog, schema_path, caps, inherited BOOLEAN, into, virtual_only BOOLEAN, comment |
 | `object_grants` *c* | role, catalog, object, caps, rls, rls_checked BOOLEAN, columns VARCHAR[] |
-| `grant_columns` *c* | role, catalog, object, pos BIGINT, name, type |
 | `admins` | role, scope, catalog (NULL = global) |
 | `platform_grants` | role, object, kind, allowed BOOLEAN |
 | `issuers` | name, url, secret_service, secret (a secret by its **name**, never its content) |

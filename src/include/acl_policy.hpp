@@ -194,10 +194,9 @@ struct TablePolicy {
 	vector<string> write_order;
 	//! What a DML statement's own expressions (SET, WHERE, ON) may read of the target, physical
 	//! names: empty = everything (no column policy). A column outside it is refused there exactly as
-	//! it is absent from a read; `narrowed_reads` are read through their tree (spec 102), a masked
-	//! column (`injections`) as its mask - a write statement is never a way back to what a read hides.
+	//! it is absent from a read; a masked column (`injections`) is read as its mask - a write statement is
+	//! never a way back to what a read hides.
 	case_insensitive_set_t visible_columns;
-	vector<std::pair<string, string>> narrowed_reads;
 	//! spec 158: the columns are narrowed by what is left out, not by what is listed - an object read live (no list of
 	//! its own) under a grant's `* EXCLUDE (…)` or masks: every physical column but `excluded_columns` may be read and
 	//! written (`visible_columns` / `write_columns` are then empty); the masked ones are `injections`
@@ -223,10 +222,6 @@ struct TablePolicy {
 		return !excluded_columns.count(
 		    name); // a masked one is written its mask (`injections`), never the client's value
 	}
-	//! spec 102 part B: columns a grant narrows to some of their fields, still written through -
-	//! physical column -> the COLUMNS items of its tree (rooted at that name). A write keeps the hidden
-	//! fields, assigns the masked ones and refuses a hidden field in the written value.
-	vector<std::pair<string, string>> field_writes;
 	//! spec 099: source columns read as another type - physical column name -> the exposed type's
 	//! spelling (an extension alias as its base type, an ENUM as VARCHAR). Cast where the source is
 	//! read, so a mask, a predicate and the listing all see the exposed type; writes keep `phys`.

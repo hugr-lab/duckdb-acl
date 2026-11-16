@@ -83,7 +83,6 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `role_catalogs` | catalog grants: `is_main`, caps, RLS, `rls_checked`, `versions` (a column list is no longer written, spec 158) |
 | `role_schemas` | schema grants: caps, whether inherited, `into` (the physical home for `create`), `virtual_only` |
 | `role_object_caps` | object grants: caps, RLS, `columns` (the test: names, `*`, `* EXCLUDE (…)`), `masks`, `versions` (spec 158) |
-| `grant_columns` | no longer written since spec 158 (a grant names and retypes no column) |
 | `function_categories` | the function categories (spec 072): name, comment, `builtin` (seeded at creation - never touched by the extension again) |
 | `function_category_members` | a category's keys: `database, schema, name, kind` (`scalar` / `table`) |
 | `function_grants` | per-role or every role's (`role = ''`) grants and denies on a category (key columns `''`) or on a function by name (category `''`); a deny anywhere wins |
@@ -250,7 +249,7 @@ a principal's query - *"table function "acl_issuers" is not allowed"*): `acl_cat
 `acl_schemas()`, `acl_relations()`, `acl_relation_columns()`, `acl_object_columns()`,
 `acl_functions()`, `acl_references()`, `acl_reference_columns()`, `acl_roles()`, `acl_role_claims()`,
 `acl_grants()` (from `role_catalogs`), `acl_schema_grants()` (from `role_schemas`),
-`acl_object_grants()` (from `role_object_caps`), `acl_grant_columns()`, `acl_admins()`,
+`acl_object_grants()` (from `role_object_caps`), `acl_admins()`,
 `acl_issuers()`, `acl_clients()`, `acl_role_mappings()`, `acl_function_categories()`, `acl_function_category_members()`,
 `acl_function_grants()`, and `acl_status()` - plus `acl_function_status([role])`, which joins the
 node's own `duckdb_functions()` with the categories (spec 072): every function with its categories
