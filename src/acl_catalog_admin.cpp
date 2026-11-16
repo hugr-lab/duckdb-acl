@@ -3009,6 +3009,9 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 					marks[name] = nullable.GetValue<bool>() ? 1 : 0;
 				}
 			}
+			if (!catalog->DuplicateName(NamePath::KeyToSql(phys), list).empty()) {
+				continue; // spec 158 stage 2: every read refuses it - the snapshot stays; the check's column_duplicate
+			}
 			vector<std::pair<string, string>> schema;
 			bool derived = acl_detail::StoredListOk(list) && // spec 148
 			               catalog->ProbeSchema(acl_detail::ObjectListSelect(list, " FROM " + NamePath::KeyToSql(phys)),

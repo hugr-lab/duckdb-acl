@@ -3117,11 +3117,19 @@ private:
 		NotePhysical(policy.phys, vname);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr);
+		auto at = original.at_clause ? original.at_clause->Copy() : nullptr;
 		SourceAt(*select_stmt->node, std::move(original.at_clause), vname);
 		if (!policy.distinct_guard.empty()) {
-			// spec 158 stage 2: a list with a star reads no name twice, judged where it binds
+			// spec 158 stage 2: a list with a star reads no name twice, judged where it binds - at the version read (an
+			// older version may hold a column of a name the list makes; re-review)
 			auto guard = store.InstantiateSelect(policy.distinct_guard, template_options);
 			BakeMarkersInNode(*guard->node, nullptr);
+			if (at && guard->node->type == QueryNodeType::SET_OPERATION_NODE) {
+				auto &setop = guard->node->Cast<SetOperationNode>();
+				if (!setop.children.empty()) {
+					SourceAt(*setop.children[0], std::move(at), vname);
+				}
+			}
 			guards.push_back(string(WRITE_GUARD_DISTINCT) + Shown(vname) + "\n" + guard->ToString());
 		}
 		return ReadRef(std::move(select_stmt), vname, original);

@@ -157,6 +157,15 @@ SELECT problem, repair FROM acl_check_catalog('c') WHERE object = 'ex';
 ----
 column_duplicate	ALTER VIRTUAL TABLE c.ex SET COLUMNS (<the list, the name EXCLUDEd from the star or the other column renamed>)
 
+# ANALYZE keeps the snapshot of a list every read refuses (it would list a suffixed name)
+statement ok
+ACL ADMIN ANALYZE VIRTUAL TABLE c.ex;
+
+query T
+SELECT string_agg(name, ',' ORDER BY pos) FROM store.acl.object_columns WHERE vname = 'ex' AND kind = 'relation';
+----
+id,name,tenant,email,ssn_tail
+
 # an ALTER of another field is not refused for it (only a write of the list or its source is judged)
 statement ok
 ACL ADMIN COMMENT ON VIRTUAL TABLE c.ex IS 'people';

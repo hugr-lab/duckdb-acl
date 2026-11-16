@@ -139,3 +139,9 @@ after 65,600 other statements and after a source change; a write carrying an imp
 - **The check skips object grants under a live schema alias.** The guard covers them; the check does not (BACKLOG).
 - **A broken projection's errors name physical columns.** Examples: duckdb's REPLACE-list error, and a `DELETE …
   RETURNING k` headed `id`. These are spec 155's (BACKLOG).
+
+## Known limits
+
+- The guards run in duckdb's pre-optimize hook, which duckdb skips under `SET enable_optimizer = false`. A principal
+  cannot set it (spec 068); an operator who sets it on a gateway's connection turns every guard off there (found by
+  spec 158 stage 2's re-review).

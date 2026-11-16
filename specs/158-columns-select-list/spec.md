@@ -1,6 +1,6 @@
 # Spec 158: columns - the object's shape, the grant's visibility and masks
 
-- **Status**: accepted (stages 1 and 3 built, stage 2 in progress)
+- **Status**: implemented (stages 1, 2 and 3 built)
 - **Date**: 2026-11-16
 - **Author**: duckdb-acl
 - **Supersedes**: spec 011's column lists at the catalog level, spec 038's catalog-wide list, spec 102's field paths
@@ -132,8 +132,8 @@ CREATE VIRTUAL TABLE c.people FROM pg.public.people
   so a duplicate fails closed everywhere (review):
   - where the list or its source is written over a source that binds, the list must bind and read no name twice
     (`DuplicateName`, markers baked as in every probe);
-  - every read binds `<the list's read> UNION ALL BY NAME …` alone first (`DistinctNamesGuard`, a spec 157 / 159 guard;
-    duckdb refuses a duplicate there), refused as "reads a column name twice";
+  - every read binds `<the list's read> UNION ALL BY NAME …` alone first, at the version it reads (`DistinctNamesGuard`,
+    a spec 157 / 159 guard; duckdb refuses a duplicate there), refused as "reads a column name twice";
   - `acl_check_catalog` says `column_duplicate`.
 
   So a source that comes to hold a column named like one of the list's makes the object refuse until the list is
@@ -142,7 +142,8 @@ CREATE VIRTUAL TABLE c.people FROM pg.public.people
   the masks over the object's columns, and a mask of a column the object lost refuses at bind. A mask is read as the
   type the object exposes its column as (spec 099), found by column: a column the star passes by its name, a RENAME's
   source, a named item by stage 1's rule; a computed one (a REPLACE, a named expression) is cast to nothing.
-- **Listings** keep the snapshot every declared list has (`object_columns`, probed at write and at `ANALYZE`). The read
+- **Listings** keep the snapshot every declared list has (`object_columns`, probed at write and at `ANALYZE`; the
+  owner, 2026-11-16: renames and complex shapes are a view's job more than a list's, so the gap is small). The read
   follows the source at once, the listing at the next `ANALYZE`, and `acl_check_catalog`'s `schema_stale` says when
   the two part. A star written over a source that does not bind keeps its named items, marked derived so `ANALYZE`
   re-derives them. Expanding the star in the listing's SQL would be a second reader of duckdb's star rules (`REPLACE`,
@@ -159,6 +160,8 @@ CREATE VIRTUAL TABLE c.people FROM pg.public.people
 
 ## Known limits (stage 2)
 
+- `acl_check_catalog`'s `column_duplicate` judges the current version; an older one a grant admits is judged where it
+  is read. `ANALYZE` keeps the snapshot of a list every read refuses.
 - A star that no longer binds over its source (an `EXCLUDE` of a dropped column) refuses every read and is the check's
   `column_missing`, but the listing's broken-list mark (spec 039) is computed only for named items.
 - A `COLUMNS` selector may read the session (`current_setting('TimeZone')`), which a client sets (spec 068): the
@@ -172,6 +175,8 @@ CREATE VIRTUAL TABLE c.people FROM pg.public.people
   was suffixed (`ssn_1`): the second column read raw past a grant's mask and `EXCLUDE`. It is now refused at write, at
   read and by the check (see "No name twice"). Reading the named items before the star (the first build) only moved
   the suffix onto the next column.
+- An AT read (a client's under `VERSIONS ANY`, a grant's pinned one) bound the guard at the current version (re-review):
+  it now carries the read's AT.
 - A marker in the star made the write's probe fail, which skipped its checks: the probes now bake the markers.
 - A mask over a star object was cast by the output name; it is now cast by the column it reads.
 - The role-union audit (spec 146), lineage's per-role tags (spec 107), the key check (spec 048), the check under the
@@ -201,7 +206,7 @@ CREATE VIRTUAL TABLE c.people FROM pg.public.people
 
 ## Testing
 
-`test/sql/acl_object_list_star.test` (stage 2): each star form, a grant over a star list, the source gaining and losing
+`test/sql/acl_object_list_star.test`, `acl_object_list_star_versions.test` (stage 2): each star form, a grant over a star list, the source gaining and losing
 columns (the read at once, the listing at ANALYZE, `schema_stale` between), a source column named like an item, the
 forms refused where written, read-only, REPAIR keeping the star.
 
