@@ -20,7 +20,11 @@ Four follow-ups spec 158's stage 1 left in the BACKLOG, each small.
     (`GrantsAnAliasTakesOver`): revoke, drop, then grant the alias's object;
   - a principal's own record (`DROP TABLE | VIEW`, spec 151) and its undo (spec 154) take the grants with them, as
     before - the reader's grant on a principal's view never lands on what its author makes next under the name;
-  - a function of the same name keeps the rows, as before (`SameNamedFunction`).
+  - a function of the same name keeps the rows, as before (`SameNamedFunction`);
+  - a principal's view may not take the name of an object its live alias's source holds (`AliasObjectAt`, at the
+    record): its drop or its undo would take the operator's grant on that object with it - the masked role read the
+    column whole (re-review; a `CREATE TABLE` of such a name fails natively). An operator's own `PRAGMA
+    acl_drop_relation(…)` runs as a record and deletes the grants, as before spec 170: the operator's call.
 - **`acl_object_grants()` shows `masks` and `versions`** (specs 158 / 167 store them); `acl_grants()` shows `versions`.
 - **`platform.check_grant` with no caps** (`''`, as the platform form passes an omitted one) answers no `caps` row; it
   answered `caps ok NULL`.

@@ -145,3 +145,33 @@ statement error
 ACL ADMIN GRANT TABLE c.o TO ROLE r COLUMNS (* EXCLUDE (id, ssn, note));
 ----
 the grant's COLUMNS leaves no column of "o"
+
+# --- a principal's view never shadows an object its live alias's source holds (review): its record's drop or undo
+#     would take the operator's grant on that object (COLUMNS, MASK) with it
+
+statement ok
+CREATE TABLE phys.main.pub (id INTEGER);
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.t TO ROLE r COLUMNS (id, ssn) MASK (ssn AS '***');
+
+statement ok
+ACL ROLE "dev" BEGIN;
+
+statement error
+ACL ROLE "dev" CREATE VIEW raw.t AS SELECT id FROM raw.pub;
+----
+is already an object of its live schema alias
+
+statement ok
+ACL ROLE "dev" ROLLBACK;
+
+statement error
+ACL ROLE "dev" CREATE VIEW raw.t AS SELECT id FROM raw.pub;
+----
+is already an object of its live schema alias
+
+query IT
+ACL ROLE "r" SELECT * FROM raw.t;
+----
+1	***

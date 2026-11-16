@@ -583,6 +583,23 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 
 using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 
+//! spec 170: the physical object a live schema alias reaches under `vname` (the longest alias path that holds it, its
+//! physical path and the rest of the name), '' when no alias reaches it or the object does not bind
+string AliasObjectAt(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname) {
+	auto alias = read("SELECT s.\"path\", s.\"phys_path\" FROM " + catalog.Tbl("schemas") +
+	                  " s WHERE s.\"vcat\" = " + Lit(vcat) + " AND s.\"phys_path\" IS NOT NULL AND " +
+	                  KeyPrefixSql(Lit(vname), "s.\"path\"") + " ORDER BY length(s.\"path\") DESC LIMIT 1");
+	if (alias->RowCount() == 0) {
+		return string();
+	}
+	ResultRows row(*alias);
+	auto path = row.GetValue(0, 0).ToString();
+	auto phys = NamePath::JoinKeys(row.GetValue(1, 0).ToString(), vname.substr(path.size() + 1));
+	auto instance = catalog.Db();
+	Connection con(*instance);
+	return con.Query("SELECT * FROM " + NamePath::KeyToSql(phys) + " WHERE false")->HasError() ? string() : phys;
+}
+
 //! Whether a relation's grant rows (keyed by name) are a function's too - the row cannot tell them apart, so they stay
 bool SameNamedFunction(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname) {
 	return read("SELECT 1 FROM " + catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -2036,6 +2053,14 @@ void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, c
 	// fixed shape, like the record of a created table: a body and nothing else to choose
 	auto version = catalog->WriteWithReads(
 	    [&](const ReadFn &read, vector<string> &statements) {
+		    // spec 170: a principal's view never shadows an object its live alias's source holds - its record would
+		    // take that object's grants (COLUMNS, MASK) with it when it goes; a CREATE TABLE of the name fails natively
+		    auto shadowed = AliasObjectAt(*catalog, read, vcat, vname);
+		    if (!shadowed.empty()) {
+			    throw BinderException("acl: \"%s\" is already an object of its live schema alias - a view takes "
+			                          "another name",
+			                          vname); // never the physical name: a principal reads this
+		    }
 		    CaptureBefore(read, *catalog, write, vcat, {vname});
 		    // spec 169: `body` is the author's resolution - the view's shape, what the probes bind; `query` what a
 		    // reader reads, rewritten under the reader's grants
