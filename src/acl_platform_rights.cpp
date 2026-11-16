@@ -301,20 +301,15 @@ Value Nullable(const string &text) {
 	return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
 }
 
-//! The items of a stored column list that compute something (`name = expr`, the grammar's `expr AS name`) - the
-//! expressions a body check reads (AuthorizeSources' own split)
+//! spec 158: the expressions of a grant's stored MASK - what a body check reads (AuthorizeSources' own split)
 vector<string> ColumnExpressions(const string &list) {
 	vector<string> out;
-	for (auto &item : acl_detail::ParseColumnList(list)) {
-		auto piece = item.second.empty() ? item.first : item.second;
-		auto as_at = StringUtil::Lower(piece).rfind(" as ");
-		if (item.second.empty()) {
-			if (as_at == string::npos) {
-				continue; // a column named as is reads no table
-			}
-			piece = piece.substr(0, as_at);
+	try {
+		for (auto &mask : ReadMasks(list)) {
+			out.push_back(mask.second);
 		}
-		out.push_back(piece);
+	} catch (std::exception &) {
+		out.clear(); // a MASK that does not read: the check names it
 	}
 	return out;
 }
@@ -490,14 +485,17 @@ void EffectiveRights(PolicyStore &store, const vector<string> &arguments, Rights
 					columns = TextList(found->second);
 					// the masks the role's grants state, on the columns it reads
 					vector<string> stated;
-					for (auto &list : {decision.row.catalog_columns, decision.row.object_columns}) {
-						for (auto &item : acl_detail::ParseColumnList(list)) {
-							for (auto &name : found->second) {
-								bool is_path = false; // a quoted one-part name is its column (spec 150 4e)
-								auto column = acl_detail::ItemHead(item.first, is_path);
-								if (!item.second.empty() && !is_path && StringUtil::CIEquals(column, name)) {
-									stated.push_back(item.first + " = " + item.second);
-								}
+					acl_detail::GrantMasks mask_items;
+					try {
+						mask_items = ReadMasks(decision.row.object_masks);
+					} catch (std::exception &) {
+						mask_items.clear(); // a MASK that does not read refuses the read: `refusal` says it
+					}
+					for (auto &mask : mask_items) {
+						for (auto &name : found->second) {
+							if (StringUtil::CIEquals(mask.first, name)) {
+								stated.push_back(KeywordHelper::WriteOptionallyQuoted(mask.first, '"', true) + " AS " +
+								                 mask.second);
 							}
 						}
 					}
@@ -715,7 +713,7 @@ void Exposures(PolicyStore &store, const vector<string> &arguments, RightsState 
 	// a grant's own bodies (its RLS, its masks): they read for that role, on the catalog or on one object
 	for (auto object_level : {false, true}) {
 		auto grants = catalog.Query(string("SELECT \"role\", \"vcat\", ") + (object_level ? "\"vname\"" : "NULL") +
-		                            ", \"rls\", \"columns\" FROM " +
+		                            ", \"rls\", " + (object_level ? "\"masks\"" : "NULL") + " FROM " +
 		                            catalog.Tbl(object_level ? "role_object_caps" : "role_catalogs"));
 		ResultRows grant_rows(*grants);
 		for (idx_t i = 0; i < grant_rows.Count(); i++) {
@@ -819,7 +817,7 @@ void RightsScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 }
 
 //===--------------------------------------------------------------------===//
-// spec 122: acl_check_grant(role, vcat, object, rls, columns[, caps]) - what writing the grant would say
+// spec 122: acl_check_grant(role, vcat, object, rls, columns[, caps[, masks]]) - what writing the grant would say
 //===--------------------------------------------------------------------===//
 
 struct CheckGrantInfo : TableFunctionInfo {
@@ -867,7 +865,7 @@ unique_ptr<GlobalTableFunctionState> CheckGrantInit(ClientContext &, TableFuncti
 	auto value = [](const string &text) {
 		return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
 	};
-	for (auto &row : store.CatalogCheckGrant(role, vcat, vname, text(3), text(4), text(5), has_caps)) {
+	for (auto &row : store.CatalogCheckGrant(role, vcat, vname, text(3), text(4), text(5), has_caps, text(6))) {
 		state->rows.push_back(
 		    {Value(row.item), value(row.name), value(row.type), Value(row.status), value(row.message)});
 	}
@@ -1067,7 +1065,7 @@ void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyS
 		loader.RegisterFunction(set);
 	}
 	TableFunctionSet check((Identifier("acl_check_grant")));
-	for (idx_t arity : {5, 6}) {
+	for (idx_t arity : {5, 6, 7}) {
 		TableFunction function(Identifier("acl_check_grant"), vector<LogicalType>(arity, v), RightsScan,
 		                       CheckGrantBindFn, CheckGrantInit);
 		function.function_info = make_shared_ptr<CheckGrantInfo>(store);

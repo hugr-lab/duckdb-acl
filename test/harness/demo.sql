@@ -21,7 +21,7 @@ SET GLOBAL acl_allow_anonymous_admin = true;
 ACL ADMIN CREATE VIRTUAL CATALOG sales COMMENT 'what analysts see';
 --    'orders' -> a read-only projection: only id+amount, ssn masked to NULL, RLS on the tenant claim
 ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders
-    COLUMNS (id, amount, ssn = NULL::VARCHAR) RLS (tenant = acl_claim('tenant'));
+    COLUMNS (id, amount, NULL::VARCHAR AS ssn) RLS (tenant = acl_claim('tenant'));
 --    'raw_orders' -> a writable alias of the physical table (no projection, no predicate)
 ACL ADMIN CREATE VIRTUAL TABLE sales.raw_orders AS phys.main.orders;
 --    a virtual scalar that tags a value with the caller's tenant

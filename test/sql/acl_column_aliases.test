@@ -34,7 +34,7 @@ ACL ADMIN CREATE ROLE analyst;
 
 # a pure rename list keeps the relation writable (form stays 'alias')
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'order_id=id,total=amount';
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id AS order_id,amount AS total';
 
 query I
 SELECT form FROM aclcat.acl.relations WHERE vname = 'orders';
@@ -140,7 +140,7 @@ ACL ROLE "analyst" DELETE FROM raw_orders WHERE id = 7;
 # --- restricting columns still means read-only ----------------------------------------------------
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.masked COLUMNS 'order_id=id,secret=NULL';
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.masked COLUMNS 'id AS order_id,NULL AS secret';
 
 query I
 SELECT form FROM aclcat.acl.relations WHERE vname = 'masked';

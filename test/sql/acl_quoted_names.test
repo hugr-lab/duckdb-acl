@@ -91,7 +91,7 @@ ACL ROLE "m" SELECT id FROM "top items"();
 42
 
 statement ok
-SELECT acl_grant_table('m', 'mart.Masked', 'phys."Raw Data"."Order Items"', 'id,Qty=0', '', 'select');
+SELECT acl_grant_table('m', 'mart.Masked', 'phys."Raw Data"."Order Items"', 'id,0 AS Qty', '', 'select');
 
 query II
 ACL ROLE "m" SELECT id, "Qty" FROM mart."MASKED" ORDER BY id;
@@ -108,7 +108,7 @@ statement ok
 INSERT INTO phys.main.oq VALUES (1, 2, 3);
 
 statement ok
-SELECT acl_grant_table('m', 'oq', 'phys.main.oq', 'id, "odd name", "order" = "order" + 1', '', 'select');
+SELECT acl_grant_table('m', 'oq', 'phys.main.oq', 'id, "odd name", "order" + 1 AS "order"', '', 'select');
 
 query III
 ACL ROLE "m" SELECT * FROM oq;
@@ -385,7 +385,7 @@ statement ok
 ACL ADMIN GRANT CATALOG "Sales Mart" TO ROLE masked MAIN WITH (select) RLS (tenant = 'acme');
 
 statement ok
-ACL ADMIN GRANT TABLE "SALES MART"."order items" TO ROLE masked COLUMNS (id, "Qty" = 0);
+ACL ADMIN GRANT TABLE "SALES MART"."order items" TO ROLE masked COLUMNS (id, "Qty") MASK ("Qty" AS 0);
 
 statement ok
 ACL ADMIN GRANT SCHEMA "Sales Mart"."A.B" TO ROLE masked WITH (select);
@@ -658,7 +658,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE m2 WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c."Ä" TO ROLE m2 COLUMNS (id, "Qty" = 0);
+ACL ADMIN GRANT TABLE c."Ä" TO ROLE m2 COLUMNS (id, "Qty") MASK ("Qty" AS 0);
 
 query II
 ACL ROLE "m2" SELECT (SELECT sum("Qty") FROM "Ä"), (SELECT sum("Qty") FROM "ä");
@@ -854,19 +854,23 @@ ACL ADMIN CREATE VIRTUAL CATALOG "Q Cat";
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE "Q Cat".g AS phys.main.g;
 
+# spec 158: a catalog grant states no columns - the list is the object grant's, and so is its repair
 statement ok
-ACL ADMIN GRANT CATALOG "Q Cat" TO ROLE "Mixed Role" COLUMNS (id, gone);
+ACL ADMIN GRANT CATALOG "Q Cat" TO ROLE "Mixed Role" MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE "Q Cat".g TO ROLE "Mixed Role" COLUMNS (id, gone);
 
 statement ok
 ALTER TABLE phys.main.g DROP COLUMN gone;
 
 query T
-SELECT repair FROM acl_check_catalog('q cat') WHERE problem = 'grant_column_missing';
+SELECT repair LIKE 'SELECT acl_grant_object(''Mixed Role'', ''Q Cat'', ''g'', %, ''id'', %' FROM acl_check_catalog('q cat') WHERE problem = 'grant_column_missing';
 ----
-ALTER GRANT CATALOG "Q Cat" TO ROLE "Mixed Role" SET COLUMNS 'id'
+true
 
 statement ok
-ACL ADMIN ALTER GRANT CATALOG "Q Cat" TO ROLE "Mixed Role" SET COLUMNS 'id';
+ACL ADMIN GRANT TABLE "Q Cat".g TO ROLE "Mixed Role" COLUMNS (id);
 
 query I
 SELECT count(*) FROM acl_check_catalog('q cat') WHERE problem = 'grant_column_missing';
@@ -907,18 +911,17 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.st AS phys.main.st;
 
 statement ok
-ACL ADMIN GRANT TABLE c.st TO ROLE m2 WITH (select, insert) COLUMNS (id, s."äx");
+INSERT INTO phys.main.st VALUES (1, {'äx': 1, 'Äx': 2});
 
-# a written value carrying the hidden field is refused, not folded into the visible one
-statement error
-ACL ROLE "m2" INSERT INTO c.st VALUES (1, {'äx': 1, 'Äx': 2});
-----
-<REGEX>:.*
+# spec 158: a field is hidden by a mask of its struct column (spec 102's field paths and field writes are gone) - the
+# mask's field name is folded as duckdb folds it (ASCII only), so the hidden "Äx" is not the visible "äx"
+statement ok
+ACL ADMIN GRANT TABLE c.st TO ROLE m2 WITH (select) COLUMNS (id, s) MASK (s AS struct_update(s, "Äx" := NULL::INTEGER));
 
-query I
-SELECT count(*) FROM phys.main.st;
+query II
+ACL ROLE "m2" SELECT id, s FROM c.st;
 ----
-0
+1	{'äx': 1, 'Äx': NULL}
 
 # --- verification pass: a subtree is measured in SQL, never by a C++ byte count -------------------------
 
@@ -1166,7 +1169,7 @@ SELECT acl_use_db('old', 'acl', true);
 query T
 SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
 ----
-24
+25
 
 statement ok
 INSERT INTO old.acl.relations(vcat, vname, form, phys) VALUES ('c', 'Orders', 'alias', 'phys.main.u'), ('c', 'orders', 'alias', 'phys.main.u'), ('c', 'S.a', 'alias', 'phys.main.u'), ('c', 's.b', 'alias', 'phys.main.u');
@@ -1212,9 +1215,9 @@ DELETE FROM old.acl.relations WHERE vname IN ('a"b', 'x..y');
 query T
 SELECT acl_migrate_catalog('old', 'acl');
 ----
-"old"."acl" migrated from schema version 19 to 24 (readable from build 24 on)
+"old"."acl" migrated from schema version 19 to 25 (readable from build 25 on)
 
 query T
 SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
 ----
-24
+25

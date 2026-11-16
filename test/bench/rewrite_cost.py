@@ -88,7 +88,7 @@ ACL ADMIN GRANT TABLE c.plain TO ROLE analyst CAPS '{{"select": true}}';
 ACL ADMIN GRANT TABLE c.guarded TO ROLE analyst
     CAPS '{{"select": true}}'
     RLS 'tenant = acl_claim(''tenant'')'
-    COLUMNS 'id,amount,ssn=NULL';
+    COLUMNS (id, amount, ssn) MASK (ssn AS NULL);
 SET GLOBAL acl_allow_anonymous_admin=false;
 """
 

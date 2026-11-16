@@ -76,7 +76,7 @@ statement ok
 ACL ADMIN GRANT SCHEMA c.sales TO ROLE r WITH (select);
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE r CAPS '{"select": true, "insert": true}' COLUMNS (id, amount = 0);
+ACL ADMIN GRANT TABLE c.orders TO ROLE r CAPS '{"select": true, "insert": true}' COLUMNS (id, amount) MASK (amount AS 0);
 
 statement ok
 ACL ADMIN GRANT VIEW c.small TO ROLE r CAPS '{}';
@@ -120,7 +120,7 @@ small	view	object	[]	true
 query TTTTT
 ACL ROLE "pol" SELECT rls, columns, masks, writable, refused FROM platform.effective_rights('r', 'c', 'orders');
 ----
-tenant = acl_claim('tenant')	[id, amount]	['amount = 0']	true	NULL
+tenant = acl_claim('tenant')	[id, amount]	['amount AS CAST(0 AS INTEGER)']	true	NULL
 
 query II
 ACL ROLE "r" SELECT id, amount FROM c.orders;
@@ -300,18 +300,28 @@ ACL ADMIN CREATE VIRTUAL TABLE c.o2 AS phys.main.orders COLUMNS (id, amount);
 statement ok
 ACL ADMIN CREATE ROLE w CLAIMS (tenant = 'acme');
 
+# spec 158: a catalog grant takes no column list - each object's grant says which of its columns the role sees
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE w MAIN CAPS '{"select": true}' RLS (tenant = acl_claim('tenant')) COLUMNS (amount, tenant, id);
+ACL ADMIN GRANT CATALOG c TO ROLE w MAIN CAPS '{"select": true}' RLS (tenant = acl_claim('tenant'));
 
 statement ok
-ACL ADMIN GRANT VIEW c.v TO ROLE w RLS (amount > 1);
+ACL ADMIN GRANT VIEW c.v TO ROLE w RLS (amount > 1) COLUMNS (amount, tenant, id);
 
 query TT
 ACL ROLE "pol" SELECT rls, columns FROM platform.effective_rights('w', 'c', 'v');
 ----
 (tenant = acl_claim('tenant')) AND (amount > 1)	[id, tenant, amount]
 
-# o2 declares (id, amount): tenant of the grant's list grants nothing there - the read and the report agree
+# o2 declares (id, amount): a grant naming a column the object does not have is refused where written (spec 158);
+# the grant's list in the object's order - the read and the report agree
+statement error
+ACL ADMIN GRANT TABLE c.o2 TO ROLE w COLUMNS (amount, tenant, id);
+----
+<REGEX>:.*tenant.*
+
+statement ok
+ACL ADMIN GRANT TABLE c.o2 TO ROLE w COLUMNS (amount, id);
+
 query TT
 ACL ROLE "pol" SELECT columns, writable FROM platform.effective_rights('w', 'c', 'o2');
 ----
@@ -368,7 +378,7 @@ statement ok
 UPDATE store.acl.relations SET phys = 'phys.orders' WHERE vname = 'o4';
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE w COLUMNS (id, amount = (SELECT max(x) FROM phys.main.secret));
+ACL ADMIN GRANT TABLE c.orders TO ROLE w COLUMNS (id, amount) MASK (amount AS (SELECT max(x) FROM phys.main.secret));
 
 query TTTT
 ACL ROLE "pol" SELECT DISTINCT catalog, object, kind, coalesce(role, '') FROM platform.exposures('phys', 'main', 'secret') WHERE kind <> 'grant' OR role = 'w' ORDER BY object, 4;
@@ -432,8 +442,24 @@ ACL ROLE "pol" SELECT object, columns FROM platform.effective_rights('r', 'c') W
 ----
 "T.x"	[sku]
 
-# a role whose grant lists none of the object's columns reads nothing of it: an empty list, never NULL
+# a role whose grant leaves none of the object's columns reads nothing of it: an empty list, never NULL
+# (spec 158: such a grant is refused where written - its test leaves no column -, so the row is stored as a source
+# that lost the column would leave it)
+statement error
+ACL ADMIN GRANT TABLE c."T.x" TO ROLE w COLUMNS (* EXCLUDE (sku));
+----
+<REGEX>:.*the projection of the grant on .*T\.x.* does not bind against it.*
+
+statement ok
+INSERT INTO store.acl.role_object_caps ("role", "vcat", "vname", "caps", "rls", "columns") VALUES ('w', 'c', '"T.x"', NULL, '', '* EXCLUDE (sku)');
+
 query TT
 ACL ROLE "pol" SELECT columns, masks FROM platform.effective_rights('w', 'c', '"T.x"');
 ----
 []	[]
+
+# ... and the read of it is refused (spec 156)
+statement error
+ACL ROLE "w" SELECT * FROM c."T.x";
+----
+<REGEX>:.*acl:.*

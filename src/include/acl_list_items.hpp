@@ -11,6 +11,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "acl_grant_columns.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -41,23 +42,48 @@ struct ListItemText {
 //! it holds a comment (both what a writer refuses)
 vector<ListItemText> SplitListItems(const string &text, bool *open = nullptr, bool *comment = nullptr);
 
-//! One item of an object's declared column list (spec 150 4f): the column's name, its expression ('' = the source's
-//! column as it is) and its nullability mark (spec 048: -1 none, 0 NOT NULL, 1 NULL)
+//! One item of a column list read as a SELECT list (spec 158): `name` (expr ''), `<expression> AS name` or
+//! `name: <expression>` (expr the expression as duckdb prints it), `a.b` a column of its own named as SELECT names it
+//! (`b`, expr `a.b`), or - where admitted - a star (`*`, `* EXCLUDE (…)`, `COLUMNS(…)`: `star`, expr its text). The
+//! name is the identifier itself, never quoted
+struct SelectListItem {
+	string name;
+	string expr;
+	bool star = false;
+};
+
+//! A column list (a grant's, an object's own) read by duckdb's parser as the list of `SELECT <text> FROM t` (spec
+//! 158): refused when the text holds anything more than the list, an expression without a name, a positional
+//! reference (`#2`) or - unless `allow_star` - a star. `what` names the list in the refusal
+vector<SelectListItem> ReadSelectList(const string &text, const char *what, bool allow_star);
+
+//! An object grant's `COLUMNS` (spec 158) read by duckdb's parser: names (`a, b`), `*`, or `* EXCLUDE (a, b)` - and
+//! nothing else (an expression, a qualified or a replacing star, `COLUMNS(…)`, a star beside names refuse). '' is ALL
+acl_detail::ColumnTest ReadColumnTest(const string &text);
+
+//! The test as its rows store it - as duckdb prints a SELECT list ('' for every column)
+string ColumnTestText(const acl_detail::ColumnTest &test);
+
+//! An object grant's `MASK` items (spec 158): `<column> AS <expression>`, each split on duckdb's tokens, the
+//! expression one expression read by duckdb's parser and kept as it prints it; a column named twice refuses
+//! `written`, when given, receives each mask's expression as it stands in `text` (where spec 160 qualifies its tables)
+acl_detail::GrantMasks ReadMasks(const string &text, vector<string> *written = nullptr);
+
+//! The masks as their rows store them (`"ssn" AS <expr>, …`), read back by `ReadMasks`
+string MasksText(const acl_detail::GrantMasks &masks);
+
+//! One item of an object's declared column list: the column's name and its expression ('' = the source's column as it
+//! is). `nullable` / `quoted` are kept for the callers and always unset since spec 158 (no NULL marks)
 struct DeclaredColumnText {
 	string name;
 	string expr;
 	int8_t nullable = -1;
-	//! the name was written as one quoted name (`"odd name"`) - its quotes taken off
 	bool quoted = false;
 };
 
-//! An object's declared column list (CREATE VIRTUAL TABLE ... COLUMNS, SET COLUMNS, REMAP, the function forms) read on
-//! duckdb's tokens: the items as `SplitListItems` splits them (a `$...$` string or a backtick name included - no stored
-//! row of this list is text), `expr AS name` (the last `AS` outside every bracket, read first) or `name = expr`, a
-//! trailing `NOT NULL` / `NULL` after a name and `NOT NULL` after an expression (never `IS NOT NULL`) a mark, one
-//! quoted name the name it quotes. Refused: a comment or a text ending inside a literal or a quoted name, a quoted name
-//! holding `.` or
-//! `[` (the object's list reads it as a path), an item that names nothing. `what` names the list in the refusal
+//! An object's declared column list (CREATE VIRTUAL TABLE ... COLUMNS, SET COLUMNS, REMAP, the function forms) read as
+//! a SELECT list (`ReadSelectList`, no star); a name holding `.` or `[` is refused (a stored declared name is read as
+//! a path). `what` names the list in the refusal
 vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what);
 
 //! Whether a column's name may be stored bare in a list (spec 150 4e): it reads back as one item that is itself - no

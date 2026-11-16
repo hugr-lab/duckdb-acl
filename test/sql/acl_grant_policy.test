@@ -51,7 +51,7 @@ statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true}' MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst CAPS '{"select": true, "insert": true, "update": true, "delete": true, "merge": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,amount,tenant=acl_claim(''tenant'')';
+ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst CAPS '{"select": true, "insert": true, "update": true, "delete": true, "merge": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS (id, amount, tenant) MASK (tenant AS acl_claim('tenant'));
 
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE auditor CAPS '{"select": true}' MAIN;
@@ -68,7 +68,7 @@ ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
 1	100
 3	300
 
-# an injected column reads back as the value it assigns
+# a masked column reads back as the value its mask assigns
 query I
 ACL ROLE "analyst" SELECT DISTINCT tenant FROM orders;
 ----
@@ -239,10 +239,10 @@ ACL ROLE "analyst" SELECT count(*) FROM stats;
 # --- renamed relations compose with a grant --------------------------------------------------------
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.renamed COLUMNS 'order_id=id,total=amount,tenant=tenant';
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.renamed COLUMNS 'id AS order_id,amount AS total,tenant AS tenant';
 
 statement ok
-ACL ADMIN GRANT TABLE sales.renamed TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'order_id,total,tenant=acl_claim(''tenant'')';
+ACL ADMIN GRANT TABLE sales.renamed TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS (order_id, total, tenant) MASK (tenant AS acl_claim('tenant'));
 
 statement ok
 ACL ROLE "analyst" INSERT INTO renamed(order_id, total) VALUES (20, 2000);
@@ -331,7 +331,7 @@ ACL ADMIN GRANT TABLE sales.public_orders TO ROLE auditor CAPS '{"select": true}
 
 # ... but it may mask harder
 statement ok
-ACL ADMIN GRANT TABLE sales.public_orders TO ROLE compliance CAPS '{"select": true}' COLUMNS 'id,amount=0';
+ACL ADMIN GRANT TABLE sales.public_orders TO ROLE compliance CAPS '{"select": true}' COLUMNS (id, amount) MASK (amount AS 0);
 
 query II
 ACL ROLE "compliance" SELECT id, amount FROM public_orders;
@@ -369,7 +369,7 @@ statement ok
 ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.doubled;
 
 statement ok
-ACL ADMIN GRANT TABLE sales.doubled TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'id,amount=amount * 2';
+ACL ADMIN GRANT TABLE sales.doubled TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS (id, amount) MASK (amount AS amount * 2);
 
 statement error
 ACL ROLE "analyst" INSERT INTO doubled(id) VALUES (30);

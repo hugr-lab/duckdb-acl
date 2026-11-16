@@ -253,7 +253,7 @@ is a view or a function
 statement error
 ACL ADMIN GRANT SCHEMA c.raw TO ROLE every VERSIONS CURRENT;
 ----
-RLS, COLUMNS and VERSIONS belong to the catalog or to the object
+RLS, COLUMNS, MASK and VERSIONS belong to the catalog or to the object
 
 # --- several roles: every version wins, different clauses refuse ---------------------------------------------------
 

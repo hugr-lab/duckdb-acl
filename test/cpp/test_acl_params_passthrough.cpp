@@ -96,7 +96,7 @@ void ParamsThroughInjectedInsert() {
 	Exec(con, "ACL ADMIN ADD TABLE phys.main.t AS sales.t");
 	Exec(con, "ACL ADMIN GRANT CATALOG sales TO ROLE writer CAPS '{\"select\": true, \"insert\": true}' MAIN");
 	Exec(con, "ACL ADMIN GRANT TABLE sales.t TO ROLE writer CAPS '{\"select\": true, \"insert\": true}' "
-	          "COLUMNS 'id,amount,tenant=acl_claim(''tenant'')'");
+	          "COLUMNS (id, amount, tenant) MASK (tenant AS acl_claim('tenant'))");
 
 	auto prepared = con.Prepare("ACL ROLE \"writer\" INSERT INTO t(id, amount) VALUES ($1, $2)");
 	if (!CheckOk(*prepared, "injected INSERT prepares")) {

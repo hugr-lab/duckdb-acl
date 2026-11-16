@@ -72,13 +72,14 @@ statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE cat CAPS '{"manage": true}';
 
 statement ok
-ACL ADMIN GRANT CATALOG sales TO ROLE reader MAIN WITH (select, insert) COLUMNS (id);
+ACL ADMIN GRANT CATALOG sales TO ROLE reader MAIN WITH (select, insert);
 
 statement ok
 ACL ADMIN GRANT CATALOG hr TO ROLE reader;
 
+# spec 158: a column list is the object grant's (a catalog grant takes none), and so is a mask
 statement ok
-ACL ADMIN GRANT TABLE sales.orders TO ROLE reader WITH (select);
+ACL ADMIN GRANT TABLE sales.orders TO ROLE reader WITH (select) COLUMNS (id, tenant) MASK (tenant AS 'x');
 
 statement ok
 ACL ADMIN CREATE ISSUER kc URL 'test/idp/two';
@@ -122,7 +123,7 @@ versions	VARCHAR
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name NOT IN ('cluster_items', 'cluster_effective', 'drift');
 ----
-242
+243
 
 foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
@@ -143,12 +144,18 @@ query TT
 ACL ROLE "root" SELECT columns, caps.manage FROM platform.main.grants WHERE role IN ('reader', 'cat') AND catalog = 'sales' ORDER BY role;
 ----
 []	true
-[id]	false
+[]	false
 
 query TTT
 ACL ROLE "root" SELECT object, caps."select", caps.insert FROM platform.object_grants;
 ----
 orders	true	false
+
+# spec 158: an object grant's columns are its test (mode all | only | except, the names) and its masks a list
+query TTTT
+ACL ROLE "root" SELECT columns.mode, columns.names, masks[1]."column", masks[1].mask FROM platform.object_grants;
+----
+only	[id, tenant]	tenant	CAST('x' AS VARCHAR)
 
 query TT
 ACL ROLE "root" SELECT name, columns FROM (SELECT r.name, list(c.name ORDER BY c.pos) AS columns FROM platform.relations r JOIN platform.relation_columns c ON c.catalog = r.catalog AND c.relation = r.name GROUP BY ALL) ORDER BY ALL;
@@ -203,7 +210,7 @@ categorized	true
 query TTTTT
 ACL ROLE "root" SELECT build, build_min_reader, catalog, min_reader, mode FROM platform.catalog_schema;
 ----
-24	24	24	24	current
+25	25	25	25	current
 
 # --- the node views (observe) -------------------------------------------------------------------------
 
@@ -364,7 +371,7 @@ platform	the system catalog of administration (spec 117)
 query TTTTTT
 ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(list_filter(views, lambda v: v NOT IN ('cluster_items', 'cluster_effective', 'drift'))) FROM platform.console_info();
 ----
-3	2	24	[]	[sales]	35
+3	2	25	[]	[sales]	35
 
 query T
 ACL ROLE "cat" SELECT list_contains(my_views, 'grants') AND NOT list_contains(my_views, 'issuers') AND list_contains(my_functions, 'add_relation') AND NOT list_contains(my_functions, 'grant_catalog') FROM platform.console_info();

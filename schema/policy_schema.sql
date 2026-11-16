@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS <role_claims>("role" ACL_KEY_TEXT, "claim" ACL_KEY_TE
 
 CREATE TABLE IF NOT EXISTS <role_catalogs>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "is_main" BOOLEAN, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, "versions" VARCHAR, PRIMARY KEY ("role", "vcat"));
 
-CREATE TABLE IF NOT EXISTS <role_object_caps>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, "versions" VARCHAR, PRIMARY KEY ("role", "vcat", "vname"));
+CREATE TABLE IF NOT EXISTS <role_object_caps>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, "versions" VARCHAR, "masks" VARCHAR, PRIMARY KEY ("role", "vcat", "vname"));
 
 -- spec 072: what a principal may call. A function's key is (database, schema, name, kind) - kind is
 -- 'scalar' or 'table', what the rewriter knows before bind - and a category is a named set of keys.
@@ -142,11 +142,11 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '24' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '25' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
 INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO <meta> SELECT 'min_reader_version', '24' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');
+INSERT INTO <meta> SELECT 'min_reader_version', '25' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');

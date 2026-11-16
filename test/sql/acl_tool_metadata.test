@@ -75,7 +75,7 @@ statement ok
 SELECT acl_add_table_function('other', 'rep', 'SELECT 1 AS id, ''S'' AS ssn, 2 AS amount', '', 'id INTEGER, ssn VARCHAR, amount INTEGER', '');
 
 statement ok
-ACL ADMIN GRANT OBJECT other.rep TO ROLE r CAPS '{"select": true}' COLUMNS 'id,ssn = ''***''';
+ACL ADMIN GRANT OBJECT other.rep TO ROLE r CAPS '{"select": true}' COLUMNS (id, ssn) MASK (ssn AS '***');
 
 # the same name in two held catalogs: bare is MAIN's, qualified is each catalog's own
 statement ok
@@ -217,8 +217,8 @@ ACL ROLE "r" SELECT count(*) FROM acl_function_columns('closed');
 ----
 0
 
-# what the grant hides is not listed: `amount` is gone; the masked `ssn` has the type the mask gives
-# (bound over the declared columns, as the call reads it - spec 026)
+# what the grant hides is not listed: `amount` is gone; the masked `ssn` keeps the column's type (spec 158: a mask is
+# cast to it where the grant is written)
 query IIII
 ACL ROLE "r" SELECT column_kind, position, column_name, data_type FROM acl_function_columns('other', 'main', 'rep') ORDER BY ALL;
 ----

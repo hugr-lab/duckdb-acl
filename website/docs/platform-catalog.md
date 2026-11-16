@@ -363,18 +363,19 @@ The parameters mean what the matching `acl_*` function's do - see the
   against the object's source, then the list in its stored form (`item = 'columns'`) and each column the role would
   read (`item = 'column'`: its name, its exposed type, and its mask or expression as `message`; with no list, every
   column the object exposes - what a grant that lists none lets the role read). The first refusal
-  ends the answer with the write's own message (`status = 'refused'`); a catalog grant's columns are `unchecked`
-  (the write does not probe them either). A body calling a function its author may not call refuses the call itself,
+  ends the answer with the write's own message (`status = 'refused'`); a catalog grant's columns are refused (a
+  catalog grant states none, spec 158). A body calling a function its author may not call refuses the call itself,
   as the write would. Who may grant may check: `policy`, or a point grant on `platform.check_grant`.
 
   ```sql
   SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', 'tenant = acl_claim(''tenant'')',
-      'id, amount, ssn = 42, address.city');
+      'id, amount, ssn', masks := 'ssn AS ''***''');
   -- rls      tenant = acl_claim('tenant')                ok
-  -- columns  id, amount, ssn = 42, address.city          ok
+  -- columns  id, amount, ssn                             ok
+  -- masks    ssn AS CAST(('***') AS VARCHAR)             ok
   -- column   id       INTEGER                            ok
-  -- column   ssn      INTEGER                            ok   42
-  -- column   address  STRUCT(city VARCHAR)               ok
+  -- column   amount   INTEGER                            ok
+  -- column   ssn      VARCHAR                            ok   CAST(('***') AS VARCHAR)
   ```
 - `platform.console_info()` - what a console reads to show only what works: `build`,
   `audit_contract`, `connection_contract`, the catalog schema and window (`schema_build`,

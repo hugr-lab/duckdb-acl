@@ -1,7 +1,7 @@
 # name: test/sql/acl_grant_projection.test
 # description: a grant's own projection is probed where it is written (spec 026), so the metadata
-#   describes what the role reads - the type a mask gives a column, over an expression that may
-#   read what the role cannot (spec 037 leaves naming and computing to the catalog)
+#   describes what the role reads; since spec 158 a mask is cast to its column's type (a column's type never
+#   depends on the role) and reads the object's columns, which may be ones the grant does not show
 # group: [sql]
 
 require acl
@@ -36,35 +36,35 @@ ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
 
-# a projection stated on the grant: one column as-is, one masked into another type, one masked by an
-# expression over a column the role never sees
+# a projection stated on the grant: one column as-is, one masked by NULL, one masked by an expression over a
+# column of the object the role never sees (spec 158: each mask is cast to its column's type)
 statement ok
 ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select)
-    COLUMNS (id, ssn = NULL, amount = coalesce(tenant, 'none'));
+    COLUMNS (id, ssn, amount) MASK (ssn AS NULL, amount AS length(tenant));
 
 # --- the two metadata surfaces agree, and both describe what the role reads -------------------------
 
 query II
 ACL ROLE "r" SELECT column_name, column_type FROM (DESCRIBE t) ORDER BY column_name;
 ----
-amount	VARCHAR
+amount	INTEGER
 id	INTEGER
-ssn	"NULL"
+ssn	VARCHAR
 
 query II
 ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
     WHERE table_name = 't' ORDER BY column_name;
 ----
-amount	VARCHAR
+amount	INTEGER
 id	INTEGER
-ssn	"NULL"
+ssn	VARCHAR
 
 # and that is what a SELECT * gives back - in the object's order, not the order the grant was
 # written in (spec 037)
 query III
 ACL ROLE "r" SELECT * FROM t;
 ----
-1	acme	NULL
+1	4	NULL
 
 # the column the grant does not project is in neither surface
 query I
@@ -73,38 +73,38 @@ ACL ROLE "r" SELECT count(*) FROM information_schema.columns
 ----
 0
 
-# --- the operator sees what was probed ----------------------------------------------------------------
-
-query III
-SELECT vname, name, type FROM acl_grant_columns() ORDER BY pos;
-----
-t	id	INTEGER
-t	amount	VARCHAR
-t	ssn	"NULL"
+# spec 158: a grant keeps no probed columns of its own (acl_grant_columns() lists none) - the listings above read the
+# object's columns its test admits
 
 # --- the two levels fold the way the resolver folds them -------------------------------------------------
 # a bare name in a grant is the object's column, which the object's own projection may have renamed;
-# an expression in a grant is evaluated over the physical row, where the hidden column still is
+# spec 158: a mask reads the object's columns, never the physical row
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (order_id = id, marker = amount);
+ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (id AS order_id, amount AS marker);
 
-# the grant may only name what the object exposes (spec 029), but its *expression* still runs over the
-# physical row - so a column the object's projection dropped is still what the mask reads from
+# the grant may only name what the object exposes (spec 029), and so may its mask: a column the object's projection
+# dropped is not there to read
+statement error
+ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select)
+    COLUMNS (order_id, marker) MASK (marker AS length(tenant));
+----
+<REGEX>:.*projection of the grant on "renamed" does not bind against it.*
+
 statement ok
 ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select)
-    COLUMNS (order_id, marker = coalesce(tenant, 'none'));
+    COLUMNS (order_id, marker) MASK (marker AS order_id + 100);
 
 query II
 ACL ROLE "r" SELECT * FROM renamed;
 ----
-1	acme
+1	101
 
 query II
 ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
     WHERE table_name = 'renamed' ORDER BY column_name;
 ----
-marker	VARCHAR
+marker	INTEGER
 order_id	INTEGER
 
 # --- a mask over a marker keeps its name ----------------------------------------------------------------
@@ -117,13 +117,7 @@ ACL ADMIN CREATE VIRTUAL TABLE c.marked AS phys.main.t;
 
 statement ok
 ACL ADMIN GRANT TABLE c.marked TO ROLE r WITH (select)
-    COLUMNS (id, tenant = acl_claim('tenant'));
-
-query III
-SELECT name, type, pos FROM acl_grant_columns() WHERE vname = 'marked' ORDER BY pos;
-----
-id	INTEGER	0
-tenant	VARCHAR	1
+    COLUMNS (id, tenant) MASK (tenant AS acl_claim('tenant'));
 
 # a claim is a string by construction, so the probe can type it - and every surface agrees
 query III
@@ -151,10 +145,9 @@ INSERT INTO phys.main.odd VALUES (1, 'x');
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.odd AS phys.main.odd;
 
-# through the function form, where the name arrives as itself; the SQL grammar keeps an identifier's
-# quotes in the list it stores, so the same grant written with COLUMNS (...) does not match
+# through the function form: the list is a SELECT list (spec 158), the name quoted as an identifier
 statement ok
-SELECT acl_grant_object('r', 'c', 'odd', '{"select": true}', '', 'id, od''''d');
+SELECT acl_grant_object('r', 'c', 'odd', '{"select": true}', '', 'id, "od''''d"');
 
 query II
 ACL ROLE "r" SELECT * FROM odd;
@@ -166,13 +159,13 @@ ACL ROLE "r" SELECT * FROM odd;
 # something to discover when someone reads
 
 statement error
-ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, ssn = nosuchcolumn);
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, ssn) MASK (ssn AS nosuchcolumn);
 ----
 <REGEX>:.*projection of the grant on "t" does not bind against it.*
 
 # a name the object does not have is refused before its expression is even tried (spec 037)
 statement error
-ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, bad = tenant);
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, bad) MASK (bad AS tenant);
 ----
 <REGEX>:.*lists "bad", which the object does not have.*
 
@@ -181,7 +174,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.later AS notyet.main.x;
 
 statement ok
-ACL ADMIN GRANT TABLE c.later TO ROLE r WITH (select) COLUMNS (id, z = 1);
+ACL ADMIN GRANT TABLE c.later TO ROLE r WITH (select) COLUMNS (id, z) MASK (z AS 1);
 
 query I
 SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 'later';
@@ -232,17 +225,17 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, amount = coalesce(tenant, 'none'));
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, amount) MASK (amount AS length(tenant));
 
 query I
-SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 't';
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vname = 't';
 ----
-2
+1
 
 statement ok
 ACL ADMIN DROP VIRTUAL TABLE c.t;
 
 query I
-SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 't';
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vname = 't';
 ----
 0

@@ -171,110 +171,33 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 	if (policy.wrap_sql.empty() && policy.projection.empty()) {
 		return declared;
 	}
-	if (!db || declared.empty() || policy.granted_items.empty()) {
+	if (!db || declared.empty() || !policy.granted_restricts) {
 		return vector<Column>();
 	}
-	// spec 147: what the read's wrap keeps (ApplyFunctionGrantPolicy), decided from the stored facts - the declared
-	// columns, in their order, whose name the united list names; a mask's type from its text where it says it (a
-	// constant, a cast), else bound once per mask and shape. A mask naming no declared column refuses the read
-	// (REPLACE), and nothing is listed then. The row filter is not judged here, as a relation's listing does not.
-	struct Kept {
-		string spelled; // the item's own name: a masked column is named by it (REPLACE ... AS <item>)
-		string mask;    // '' = as it is
-	};
-	case_insensitive_map_t<Kept> kept;
-	for (auto &item : policy.granted_items) {
-		auto name = item.first;
-		StringUtil::Trim(name);
-		kept[name] = Kept {Unquoted(name), item.second};
-	}
-	string inner;
-	for (auto &column : declared) {
-		if (column.type.empty()) {
-			return vector<Column>();
-		}
-		inner += (inner.empty() ? "" : ", ") + string("NULL::") + column.type + " AS " +
-		         QuoteIdentifier(Unquoted(column.name));
-	}
-	for (auto &item : kept) {
-		if (item.second.mask.empty()) {
-			continue;
-		}
+	// spec 158: what the read's wrap keeps (ApplyFunctionGrantPolicy) - the declared columns, in their order, the
+	// united test admits; a mask keeps its column's type (it is cast to it where the grant is written). A mask naming
+	// no declared column refuses the read (REPLACE), and nothing is listed then. The row filter is not judged here, as
+	// a relation's listing does not.
+	auto &granted = policy.granted_columns;
+	for (auto &mask : granted.masks) {
 		bool returned = false;
 		for (auto &column : declared) {
-			returned = returned || StringUtil::CIEquals(Unquoted(column.name), item.first);
+			returned = returned || StringUtil::CIEquals(Unquoted(column.name), mask.first);
 		}
-		if (!returned) {
+		if (!returned && granted.test.Admits(mask.first)) {
 			return vector<Column>();
 		}
 	}
-	auto mask_type = [&](const string &mask, const string &column, string &type) {
-		// spec 147 review: judged in the read's own shape - the wrap splices the mask's text into `REPLACE (<mask> AS
-		// <column>)`, so a text that does not parse there (an alias, a comment, a `;`, a FROM after it) refuses the
-		// read and lists nothing - then bound from its printed form in that shape (an aggregate, COLUMNS(), refuse
-		// there too); never the text spliced into a statement run here. Only a constant is typed without binding.
-		auto target = QuoteIdentifier(column);
-		unique_ptr<ParsedExpression> expression;
-		try {
-			Parser shape(ParserOptions::Builtin());
-			shape.ParseQuery("SELECT * REPLACE (" + mask + " AS " + target + ") FROM t");
-			if (shape.statements.size() != 1) {
-				return false;
-			}
-			auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask);
-			if (parsed.size() != 1 || parsed[0]->HasAlias()) {
-				return false;
-			}
-			expression = std::move(parsed[0]);
-		} catch (std::exception &) {
-			return false;
-		}
-		if (expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
-			type = LogicalType::NormalizeType(expression->Cast<ConstantExpression>().GetLiteral().ToValue().type())
-			           .ToString();
-			return true;
-		}
-		auto printed = expression->ToString();
-		auto key = printed + "\x1f" + column + "\x1f" + inner;
-		auto entry = mask_types.find(key);
-		if (entry == mask_types.end()) {
-			string bound;
-			try {
-				Connection con(*db);
-				auto described = con.Query("DESCRIBE SELECT * REPLACE (" + printed + " AS " + target +
-				                           ") FROM (SELECT " + inner + " WHERE false)");
-				if (!described->HasError()) {
-					ResultRows rows(*described);
-					for (idx_t row = 0; row < rows.Count(); row++) {
-						if (StringUtil::CIEquals(rows.GetValue(0, row).ToString(), column)) {
-							bound = rows.GetValue(1, row).ToString();
-						}
-					}
-				}
-			} catch (std::exception &) {
-				bound.clear();
-			}
-			entry = mask_types.emplace(key, bound).first;
-		}
-		type = entry->second;
-		return !type.empty();
-	};
 	vector<Column> out;
 	for (auto &candidate : declared) {
-		auto name = Unquoted(candidate.name);
-		auto entry = kept.find(name);
-		if (entry == kept.end()) {
-			continue;
+		if (candidate.type.empty()) {
+			return vector<Column>();
 		}
-		Column column;
-		column.name = entry->second.mask.empty() ? name : entry->second.spelled;
-		column.type = candidate.type;
-		column.comment = candidate.comment;
-		if (!entry->second.mask.empty() && !mask_type(entry->second.mask, name, column.type)) {
-			return vector<Column>(); // a mask that does not bind refuses the read
+		if (granted.test.Admits(Unquoted(candidate.name))) {
+			out.push_back(candidate);
 		}
-		out.push_back(std::move(column));
 	}
+	(void)mask_types;
 	return out;
 }
 

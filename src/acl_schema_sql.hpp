@@ -21,7 +21,7 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <roles>(\"role\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <role_claims>(\"role\" ACL_KEY_TEXT, \"claim\" ACL_KEY_TEXT, \"value\" VARCHAR, PRIMARY KEY (\"role\", \"claim\"))",
     "CREATE TABLE IF NOT EXISTS <role_catalogs>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"is_main\" BOOLEAN, \"caps\" VARCHAR, \"rls\" VARCHAR, \"columns\" VARCHAR, \"rls_checked\" BOOLEAN, \"versions\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\"))",
-    "CREATE TABLE IF NOT EXISTS <role_object_caps>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"caps\" VARCHAR, \"rls\" VARCHAR, \"columns\" VARCHAR, \"rls_checked\" BOOLEAN, \"versions\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\"))",
+    "CREATE TABLE IF NOT EXISTS <role_object_caps>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"caps\" VARCHAR, \"rls\" VARCHAR, \"columns\" VARCHAR, \"rls_checked\" BOOLEAN, \"versions\" VARCHAR, \"masks\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\"))",
     "CREATE TABLE IF NOT EXISTS <function_categories>(\"category\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR, \"builtin\" BOOLEAN)",
     "CREATE TABLE IF NOT EXISTS <function_category_members>(\"category\" ACL_KEY_TEXT, \"database\" ACL_KEY_TEXT, \"schema\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, PRIMARY KEY (\"category\", \"database\", \"schema\", \"name\", \"kind\"))",
     "CREATE TABLE IF NOT EXISTS <function_grants>(\"role\" ACL_KEY_TEXT, \"category\" ACL_KEY_TEXT, \"database\" ACL_KEY_TEXT, \"schema\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"allowed\" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY (\"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\"))",
@@ -56,19 +56,19 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "INSERT INTO <function_category_members> SELECT * FROM (VALUES ('meta', 'system', 'pg_catalog', 'shobj_description', 'scalar'), ('environment', 'system', 'main', 'current_query', 'scalar'), ('environment', 'system', 'main', 'current_setting', 'scalar'), ('environment', 'system', 'main', 'getenv', 'scalar'), ('environment', 'system', 'main', 'getvariable', 'scalar'), ('environment', 'system', 'main', 'in_search_path', 'scalar'), ('environment', 'system', 'main', 'duckdb_secrets', 'table'), ('environment', 'system', 'main', 'duckdb_settings', 'table'), ('environment', 'system', 'main', 'duckdb_variables', 'table'), ('environment', 'system', 'main', 'which_secret', 'table'), ('environment', 'system', 'pg_catalog', 'current_query', 'scalar'), ('node', 'system', 'main', 'currval', 'scalar'), ('node', 'system', 'main', 'nextval', 'scalar'), ('node', 'system', 'main', 'setval', 'scalar'), ('node', 'system', 'main', 'sleep_ms', 'scalar'), ('node', 'system', 'main', 'write_log', 'scalar'), ('node', 'system', 'main', 'checkpoint', 'table'), ('node', 'system', 'main', 'create_external_resource', 'table'), ('node', 'system', 'main', 'dbgen', 'table'), ('node', 'system', 'main', 'delta_set_transaction_version', 'table'), ('node', 'system', 'main', 'deregister_external_resource', 'table'), ('node', 'system', 'main', 'destroy_external_resource', 'table'), ('node', 'system', 'main', 'disable_logging', 'table'), ('node', 'system', 'main', 'disable_profiling', 'table'), ('node', 'system', 'main', 'dsdgen', 'table'), ('node', 'system', 'main', 'enable_logging', 'table'), ('node', 'system', 'main', 'enable_profiling', 'table'), ('node', 'system', 'main', 'force_checkpoint', 'table'), ('node', 'system', 'main', 'iceberg_to_ducklake', 'table'), ('node', 'system', 'main', 'load_aws_credentials', 'table'), ('node', 'system', 'main', 'notify_ui', 'table'), ('node', 'system', 'main', 'register_external_resource', 'table'), ('node', 'system', 'main', 'register_external_resource_type', 'table'), ('node', 'system', 'main', 'start_ui', 'table'), ('node', 'system', 'main', 'start_ui_server', 'table'), ('node', 'system', 'main', 'stop_ui_server', 'table'), ('node', 'system', 'main', 'truncate_duckdb_logs', 'table'), ('node', 'system', 'main', 'unity_catalog_checkpoint_table', 'table'), ('node', 'system', 'pg_catalog', 'pg_sleep', 'scalar'), ('plan', 'system', 'main', 'from_substrait', 'scalar'), ('plan', 'system', 'main', 'get_substrait', 'scalar'), ('plan', 'system', 'main', 'json_serialize_plan', 'scalar')) AS v(\"category\", \"database\", \"schema\", \"name\", \"kind\") WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'function_seed')",
     "INSERT INTO <function_grants> SELECT * FROM (VALUES ('', 'base', '', '', '', '', true), ('', 'generators', '', '', '', '', true), ('', 'node_facts', '', '', '', '', true), ('', 'json', '', '', '', '', true), ('', 'icu', '', '', '', '', true), ('', 'spatial', '', '', '', '', true), ('', 'inet', '', '', '', '', true), ('', 'h3', '', '', '', '', true), ('', 'hashfuncs', '', '', '', '', true), ('', 'a5', '', '', '', '', true), ('', 'geosilo', '', '', '', '', true)) AS v(\"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\") WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'function_seed')",
     "INSERT INTO <meta> SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'function_seed')",
-    "INSERT INTO <meta> SELECT 'schema_version', '24' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
+    "INSERT INTO <meta> SELECT 'schema_version', '25' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
     "INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'policy_version')",
     "INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'config_version')",
-    "INSERT INTO <meta> SELECT 'min_reader_version', '24' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'min_reader_version')",
+    "INSERT INTO <meta> SELECT 'min_reader_version', '25' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'min_reader_version')",
 };
 // clang-format on
 
 //! The version this schema is. A catalog carries its own in `meta`, and a build refuses one
 //! that does not match: the migration contract rests on the two being comparable (spec 034).
-static constexpr int ACL_SCHEMA_VERSION = 24;
+static constexpr int ACL_SCHEMA_VERSION = 25;
 //! spec 094: the oldest build that may read a catalog of this version - it serves from it and
 //! refuses every write. What the latest step in schema/migrations/ declares.
-static constexpr int ACL_SCHEMA_MIN_READER = 24;
+static constexpr int ACL_SCHEMA_MIN_READER = 25;
 
 //! spec 094: the migration steps, embedded, so a node of this build can take an older catalog to
 //! its own version (acl_migrate_catalog). Placeholders as in ACL_SCHEMA_SQL.
@@ -199,6 +199,12 @@ static const char *const ACL_SCHEMA_STEP_24[] = {
     "INSERT INTO <meta> VALUES ('min_reader_version', '24')",
     "UPDATE <meta> SET \"value\" = '24' WHERE \"key\" = 'schema_version'",
 };
+static const char *const ACL_SCHEMA_STEP_25[] = {
+    "ALTER TABLE <role_object_caps> ADD COLUMN IF NOT EXISTS \"masks\" VARCHAR",
+    "DELETE FROM <meta> WHERE \"key\" = 'min_reader_version'",
+    "INSERT INTO <meta> VALUES ('min_reader_version', '25')",
+    "UPDATE <meta> SET \"value\" = '25' WHERE \"key\" = 'schema_version'",
+};
 static const AclSchemaStep ACL_SCHEMA_STEPS[] = {
     {11, 11, ACL_SCHEMA_STEP_11, 4},
     {12, 12, ACL_SCHEMA_STEP_12, 3},
@@ -214,6 +220,7 @@ static const AclSchemaStep ACL_SCHEMA_STEPS[] = {
     {22, 21, ACL_SCHEMA_STEP_22, 9},
     {23, 21, ACL_SCHEMA_STEP_23, 2},
     {24, 24, ACL_SCHEMA_STEP_24, 5},
+    {25, 25, ACL_SCHEMA_STEP_25, 4},
 };
 // clang-format on
 

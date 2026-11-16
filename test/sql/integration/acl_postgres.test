@@ -29,7 +29,7 @@ ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
 
 # masked column over postgres; the dropped column is structurally absent
 statement ok
-SELECT acl_grant_table('analyst', 'employees', 'pg.public.employees', 'id,name,ssn=NULL', '', 'select');
+SELECT acl_grant_table('analyst', 'employees', 'pg.public.employees', 'id,name,NULL AS ssn', '', 'select');
 
 query III
 ACL ROLE "analyst" SELECT id, name, ssn FROM employees ORDER BY id;

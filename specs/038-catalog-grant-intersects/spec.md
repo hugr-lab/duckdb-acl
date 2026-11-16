@@ -1,6 +1,6 @@
 # Spec 038: a catalog-wide column list intersects, and a mask that cannot apply refuses
 
-- **Status**: implemented
+- **Status**: superseded by spec 158 (a catalog grant states no columns)
 - **Date**: 2026-08-21
 - **Author**: hugr-lab
 

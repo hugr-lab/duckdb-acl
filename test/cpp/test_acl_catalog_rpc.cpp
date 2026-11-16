@@ -246,7 +246,9 @@ int main() {
 	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.shipments AS phys.main.shipments");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL REFERENCE c.a_ref FROM shipments TO customers ON (customer_id = id)");
 	Exec(con, "ACL ADMIN CREATE ROLE analyst");
-	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN COLUMNS (id, customer_id, name)");
+	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN");
+	// spec 158: which columns a role sees is its object grants' (orders' secret stays hidden)
+	Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst COLUMNS (id, customer_id)");
 	Exec(con, "ACL ADMIN CREATE ROLE narrow");
 	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE narrow MAIN");
 	Exec(con, "ACL ADMIN GRANT OBJECT c.orders TO ROLE narrow WITH ()");

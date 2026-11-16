@@ -33,7 +33,7 @@ ACL ADMIN CREATE VIRTUAL TABLE c.plain AS phys.main.orders;
 # and an object that does state its shape - naming, computing and ordering, all of it the catalog's
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.shaped AS phys.main.orders
-    COLUMNS (order_id = id, tag = tenant, initial = tenant[1]);
+    COLUMNS (id AS order_id, tenant AS tag, tenant[1] AS initial);
 
 statement ok
 ACL ADMIN CREATE ROLE r;
@@ -44,16 +44,16 @@ ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN;
 # --- what a grant may do: hide, and mask what it keeps ------------------------------------------------
 
 statement ok
-ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, tenant, ssn = NULL);
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, tenant, ssn) MASK (ssn AS NULL);
 
 query IIII
 ACL ROLE "r" SELECT *, 1 FROM plain;
 ----
 1	acme	NULL	1
 
-# a mask's expression still runs over the physical row, so it may read a column the grant hides
+# a mask's expression runs over the object's columns, so it may read a column the grant hides
 statement ok
-ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, tenant = tenant || '/' || ssn);
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, tenant) MASK (tenant AS tenant || '/' || ssn);
 
 query II
 ACL ROLE "r" SELECT * FROM plain;
@@ -69,7 +69,7 @@ ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, nosuch);
 <REGEX>:.*lists "nosuch", which the object does not have.*
 
 statement error
-ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, label = tenant);
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, label) MASK (label AS tenant);
 ----
 <REGEX>:.*naming, computing and ordering belong to the virtual catalog.*
 
@@ -90,7 +90,7 @@ ACL ROLE "r" SELECT * FROM shaped;
 # --- the written order carries no meaning --------------------------------------------------------------
 
 statement ok
-ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (ssn = NULL, amount, id);
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (ssn, amount, id) MASK (ssn AS NULL);
 
 query III
 ACL ROLE "r" SELECT * FROM plain;
@@ -111,13 +111,14 @@ id,amount,ssn
 query I
 ACL ROLE "r" SELECT sql FROM duckdb_tables() WHERE table_name = 'plain';
 ----
-CREATE TABLE "plain"("id" INTEGER, "amount" INTEGER, "ssn" "NULL");
+CREATE TABLE "plain"("id" INTEGER, "amount" INTEGER, "ssn" VARCHAR);
 
-# what the operator sees stored is the normalised list, not the order it was typed in
+# what the operator sees stored is the normalised list, not the order it was typed in (spec 158: in the object's
+# order; the mask is stored apart from the list)
 query I
 SELECT columns FROM acl_object_grants() WHERE vname = 'plain';
 ----
-id, amount, ssn = NULL
+id, amount, ssn
 
 # --- the catalog keeps every power the grant lost -------------------------------------------------------
 # rename, compute and order, all three, on the object
@@ -128,7 +129,7 @@ ACL ROLE "r" SELECT string_agg(column_name, ',') FROM (DESCRIBE shaped);
 order_id,tag
 
 statement ok
-ACL ADMIN ALTER VIRTUAL TABLE c.shaped SET COLUMNS 'initial = tenant[1], order_id = id';
+ACL ADMIN ALTER VIRTUAL TABLE c.shaped SET COLUMNS 'tenant[1] AS initial, id AS order_id';
 
 statement ok
 ACL ADMIN GRANT OBJECT c.shaped TO ROLE r COLUMNS (initial, order_id);

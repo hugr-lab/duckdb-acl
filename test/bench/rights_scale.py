@@ -66,7 +66,7 @@ def generate(args):
         for g in range(args.grants):
             i, t = (r * args.grants + g) % args.sources, (r + g) % args.tables
             sql += (f"ACL ADMIN GRANT TABLE c.v{i:03d}.t{t:03d} TO ROLE r{r:02d} CAPS '{{\"select\": true}}' "
-                    f"COLUMNS (id, amount = 0);\n")
+                    f"COLUMNS (id, amount) MASK (amount AS 0);\n")
     sql += "ACL ADMIN CREATE ROLE pol;\nACL ADMIN GRANT ADMIN policy TO ROLE pol;\n"
     out = run_sql(sql)
     if out.returncode:

@@ -232,8 +232,8 @@ mode of default-deny is a refusal, and the refusal names the function.
   relation, the aggregates and pivot expressions are gated, and the implicit form's column discovery
   (the parser's `CREATE TEMP TYPE ... AS ENUM (SELECT DISTINCT ...)`) runs under the same RLS, so a
   value only a hidden row carries never becomes a column (`test/sql/acl_pivot.test`).
-- A grant's projection is probed where it is written and stored in `grant_columns`, "so
-  `information_schema.columns` describes what the role reads" (spec 026). `duckdb_tables().sql` is
+- A grant's projection is probed where it is written (spec 026); since spec 158 a grant never adds or retypes a
+  column, so `information_schema.columns` lists the object's columns the grant's test admits. `duckdb_tables().sql` is
   never NULL and `is_insertable_into` "follows the grant, not the physical row" (spec 065,
   `test/sql/acl_listing_truth.test`).
 - References (spec 022) are "a hint an agent reads, never enforced and granting nothing; visible
@@ -298,27 +298,24 @@ mode of default-deny is a refusal, and the refusal names the function.
     (`types_incompatible`, e.g. `enum_code(...)`) or that makes a type of its own
     (`types_mismatch`).
 
-### Fields of structured columns (spec 102)
+### Columns and masks (spec 158)
 
-- A grant may narrow a `STRUCT` column to some of its fields, through lists of structs too, and mask
-  single fields. A hidden field is absent from the projection, so nothing that reads the relation
-  reaches it: `SELECT *`, the row as a value, `struct_extract`, `DESCRIBE`, the listings, the DDL a
-  quack client binds, the Arrow schema.
-- A path is parsed, never spliced: every step is a name, emitted quoted inside `struct_extract`.
-  Only the part after `=` is an expression, as with a column mask.
-- **Writes keep what the role cannot see.**
-  - A hidden field is kept (`UPDATE`) or left NULL (`INSERT`).
-  - A masked field is assigned.
-  - A written value that carries a hidden field is refused with an `error()`. The message names no
-    field, so it is no oracle for field names.
-  - `RETURNING` refuses a narrowed column: the stored struct still holds the hidden fields.
-- A grant's predicate reads the physical row, hidden fields included (`address.country =
-  acl_claim('country')`). A hidden column works the same way. A principal's own expressions in a write
-  statement do not: `SET`, `WHERE` and `ON` see the target as the principal reads it. A hidden field
-  or column is refused there, and a masked one reads as its mask. Before spec 102's review an
-  `UPDATE … SET visible = hidden` copied a hidden column out.
-- A `MERGE`'s `UPDATE SET *` / `UPDATE BY NAME` is refused under a column policy (it bypassed the
-  policy before).
+- **One place shapes a column: the object.** Its list is a SELECT list over the source; a grant never adds, renames
+  or retypes a column. An object grant's `COLUMNS` is a test on the object's column names (`a, b` / `*` /
+  `* EXCLUDE (…)`) and its `MASK` what the role reads in place of a column - an expression over the object's
+  columns, stored cast to that column's type. So a listing's types are the object's whatever the role, and the
+  listing filters the object's columns by the same test the read applies.
+- **A catalog grant carries no columns.** One stored by an older build refuses every read under the grant (fail
+  closed) and is the check's `catalog_columns`.
+- **The union of roles is monotone**: a role adds what it sees; a column is unmasked when some role shows it without a
+  mask. Two different masks of one column refuse the read rather than pick one.
+- **Writes keep what the role cannot see.** A masked column is assigned its mask and never takes the client's value;
+  a column `COLUMNS` leaves out is neither written nor read by a write's own conditions (`SET`, `WHERE`, `ON`): there
+  the target reads as the role reads it, a masked column as its mask. `RETURNING` reads only visible unmasked
+  columns. A `MERGE`'s `UPDATE SET *` / `UPDATE BY NAME` is refused under a column policy.
+- A grant's predicate reads the physical row, hidden columns included (`country = acl_claim('country')`).
+- A struct's fields are protected by masking the column with an expression (`struct_update(address, ssn := NULL)`) -
+  spec 102's field paths, with their own write rules, are gone.
 
 ### Statements (`AclRewriter::RewriteStatement`, `src/acl_rewriter.cpp`)
 
@@ -742,9 +739,9 @@ is in force somewhere in the chain:
 | object form | grant | column added to the source | column dropped from the source |
 | --- | --- | --- | --- |
 | plain alias | whole-table (no `COLUMNS`) | **appears, ungranted** | the object adapts (the rest is readable) |
-| plain alias | `COLUMNS (id, tenant, ssn = NULL)` | invisible - not listed | a bare name intersects away (spec 038); a masked name that vanished **refuses** with duckdb's `Column "ssn" in REPLACE list not found` |
-| plain alias | `COLUMNS (ssn = NULL)` (mask only) | invisible - the list is the masked column alone | refuses, as above |
-| declared object (`COLUMNS (id = pk, tenant = internal_tenant, ssn = ssn_raw)`) | any | invisible until declared | **the object refuses, it does not narrow** - with `acl: a column this statement reads does not exist in its source` (spec 065 probe A; duckdb's own text named the source's columns until spec 155); `information_schema.columns` meanwhile lists `id, tenant` |
+| plain alias | `COLUMNS (id, tenant, ssn) MASK (ssn AS NULL)` | invisible - not listed | a bare name intersects away (spec 038); a masked name that vanished **refuses** with duckdb's `Column "ssn" in REPLACE list not found` |
+| plain alias | `COLUMNS (* EXCLUDE (salary))` | **appears** (every column but the excluded) | the object adapts |
+| declared object (`COLUMNS (pk AS id, internal_tenant AS tenant, ssn_raw AS ssn)`) | any | invisible until declared | **the object refuses, it does not narrow** - with `acl: a column this statement reads does not exist in its source` (spec 065 probe A; duckdb's own text named the source's columns until spec 155); `information_schema.columns` meanwhile lists `id, tenant` |
 | alias schema (`AS`) | whole-table | a **whole new table** appears and is listed | the table is gone |
 | expansion schema (`FROM`) | whole-table | invisible (`no access to object "cur.newtab"`) until `ALTER VIRTUAL SCHEMA c.cur REFRESH`, which reported `1` and made it readable | `REFRESH PRUNE` removes the record (spec 014) |
 

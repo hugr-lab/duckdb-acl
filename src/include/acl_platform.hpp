@@ -136,7 +136,7 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
                           PolicyStore &store);
 
 //! The shape a stored definition body is written in
-//! COLUMNS a grant's list (`ParseColumnList`), DECLARED_COLUMNS an object's own (`SplitDeclaredColumns`, spec 150 4f)
+//! COLUMNS a grant's MASK items (`ReadMasks`, spec 158), DECLARED_COLUMNS an object's own list (`SplitDeclaredColumns`)
 enum class BodyShape : uint8_t { SELECT, EXPRESSION, COLUMNS, DECLARED_COLUMNS, FUNCTION_NAME };
 //! Every function a stored body calls, as written (a table function's kind TABLE) - the markers acl_claim /
 //! acl_arg left out. Throws when the body does not parse (a body nobody can judge is refused).

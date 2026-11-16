@@ -30,10 +30,10 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 
 # a declared shape: the resolver knows these columns from the catalog, no probe anywhere
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id = pk, tenant = internal_tenant, "odd name" = "odd name");
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (pk AS id, internal_tenant AS tenant, "odd name" AS "odd name");
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.audit AS phys.main.audit COLUMNS (id = id, note = note);
+ACL ADMIN CREATE VIRTUAL TABLE c.audit AS phys.main.audit COLUMNS (id AS id, note AS note);
 
 statement ok
 ACL ADMIN CREATE ROLE analyst;
@@ -42,29 +42,42 @@ statement ok
 ACL ADMIN CREATE ROLE poor;
 
 # --- a grant's COLUMNS list is judged where it is written (every shape here is declared) ----------
+# spec 158: a catalog grant takes no COLUMNS at all, whatever the list names (both forms)
 statement error
 ACL ADMIN GRANT CATALOG c TO ROLE poor WITH (select) MAIN COLUMNS (ghost);
 ----
-<REGEX>:.*COLUMNS \(ghost\) matches no column.*
+a catalog grant takes no COLUMNS
 
-# the function form is judged by the same rule
 statement error
 SELECT acl_grant_catalog('poor', 'c', '{"select": true}', true, '', 'ghost, phantom');
 ----
-<REGEX>:.*matches no column.*
+a catalog grant takes no column list
 
-# an object grant on a declared object, same rule
+# an object grant's list names columns the object has (the grammar and the function form)
+statement error
+ACL ADMIN GRANT TABLE c.orders TO ROLE poor WITH (select) COLUMNS (ghost);
+----
+<REGEX>:.*grant on "orders" lists "ghost", which the object does not have.*
+
+statement error
+SELECT acl_grant_object('poor', 'c', 'audit', '{"select": true}', '', 'ghost, phantom');
+----
+<REGEX>:.*grant on "audit" lists "ghost", which the object does not have.*
+
 statement error
 SELECT acl_grant_object('poor', 'c', 'orders', '{"select": true}', '', 'ghost');
 ----
-<REGEX>:.*matches no column of.*"orders".*
+<REGEX>:.*grant on "orders" lists "ghost".*
 
 # a list that names one real column is accepted, and the quoted item means the name it quotes
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE poor WITH (select) MAIN COLUMNS ("odd name");
+ACL ADMIN GRANT CATALOG c TO ROLE poor WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE poor WITH (select) COLUMNS ("odd name");
 
 statement ok
 SET allow_parser_override_extension='fallback';
@@ -80,9 +93,13 @@ ACL ROLE "poor" SELECT count(*) FROM information_schema.columns WHERE table_name
 1
 
 # --- the declared-shape refusal names nothing physical --------------------------------------------
-# poor reads only "odd name"; narrow the grant to a name the object declares but audit does not
+# poor reads only "odd name" of orders and note of audit; then orders drops "odd name" (spec 158: a grant that leaves
+# no column is refused where written, so it is the object that changes under the grant)
 statement ok
-ACL ADMIN ALTER GRANT CATALOG c TO ROLE poor SET COLUMNS 'note';
+ACL ADMIN GRANT TABLE c.audit TO ROLE poor WITH (select) COLUMNS (note);
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET COLUMNS (pk AS id, internal_tenant AS tenant);
 
 statement error
 ACL ROLE "poor" SELECT * FROM orders;
@@ -112,6 +129,10 @@ ACL ROLE "poor" SELECT sql LIKE 'CREATE TABLE %note%' FROM duckdb_tables() WHERE
 ----
 true
 
+# (orders declares "odd name" again for the rest)
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET COLUMNS (pk AS id, internal_tenant AS tenant, "odd name" AS "odd name");
+
 # --- is_insertable_into follows the grant, not the physical row ------------------------------------
 # orders answers NO with insert granted: its quoted-identifier mapping makes it the read-only
 # SUBQUERY form on the resolution path, and the listing reports the same authority - the INSERT
@@ -122,20 +143,27 @@ ACL ROLE "analyst" SELECT table_name, is_insertable_into FROM information_schema
 audit	YES
 orders	NO
 
-# poor holds select only: nothing is insertable, whatever the physical table says (the zero-column
-# object stays in information_schema.tables - only the DDL-synthesizing duckdb_tables hides it)
+# poor holds select only: nothing is insertable, whatever the physical table says
 query II
 ACL ROLE "poor" SELECT table_name, is_insertable_into FROM information_schema.tables ORDER BY 1;
 ----
 audit	NO
 orders	NO
 
-# --- a shape-less object in the catalog makes the write-time judgment step aside -------------------
+# --- a shape-less object: spec 158 judges the grant against the columns its source has (the write-time judgment
+# no longer steps aside), and a catalog grant takes no list to alter
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.bare AS phys.main.audit;
 
-statement ok
+statement error
+ACL ADMIN GRANT TABLE c.bare TO ROLE poor WITH (select) COLUMNS (ghost);
+----
+<REGEX>:.*grant on "bare" lists "ghost", which the object does not have.*
+
+statement error
 ACL ADMIN ALTER GRANT CATALOG c TO ROLE poor SET COLUMNS 'ghost'
+----
+a catalog grant takes no column list
 
 # --- review regressions (the self-review's findings, each pinned) ---------------------------------
 
@@ -144,9 +172,9 @@ query I
 ACL ROLE "analyst" SELECT "odd name" FROM orders LIMIT 0;
 ----
 
-# a nullability suffix after a quoted name unquotes too
+# a quoted name in an object's list reads unquoted
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.nn AS phys.main.orders COLUMNS ("odd name" NOT NULL, id = pk);
+ACL ADMIN CREATE VIRTUAL TABLE c.nn AS phys.main.orders COLUMNS ("odd name", pk AS id);
 
 query I
 ACL ROLE "analyst" SELECT "odd name" FROM nn LIMIT 0;
@@ -155,10 +183,10 @@ ACL ROLE "analyst" SELECT "odd name" FROM nn LIMIT 0;
 # a masked relation is the read-only form and answers NO whatever the caps say - and the same under
 # a schema-qualified stored name, which the listing must key by the stored form, not a reconstruction
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (id = pk, who = upper(internal_tenant));
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (pk AS id, upper(internal_tenant) AS who);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.main.mx AS phys.main.orders COLUMNS (id = pk, who = upper(internal_tenant));
+ACL ADMIN CREATE VIRTUAL TABLE c.main.mx AS phys.main.orders COLUMNS (pk AS id, upper(internal_tenant) AS who);
 
 query II
 ACL ROLE "analyst" SELECT table_name, is_insertable_into FROM information_schema.tables WHERE table_name IN ('masked', 'mx') ORDER BY 1;
@@ -169,7 +197,7 @@ mx	NO
 # spec 150 4f: an object's list is read on duckdb's tokens, so a quoted name holding ',' or '=' is the name it quotes
 # (the text reader split it, and refused it for that); one holding '.' is refused - the list reads it as a path
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.audit COLUMNS ("a,b" = id, "x=y" = note);
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.audit COLUMNS (id AS "a,b", note AS "x=y");
 
 query II
 SELECT name, expr FROM store.acl.relation_columns WHERE vcat = 'c' AND vname = 'bad' ORDER BY pos;
@@ -178,14 +206,15 @@ a,b	id
 x=y	note
 
 statement error
-ACL ADMIN CREATE VIRTUAL TABLE c.bad2 AS phys.main.audit COLUMNS ("a.b" = id);
+ACL ADMIN CREATE VIRTUAL TABLE c.bad2 AS phys.main.audit COLUMNS (id AS "a.b");
 ----
 holds no '.' or '['
 
 statement ok
 ACL ADMIN DROP VIRTUAL TABLE c.bad;
 
-# a grant written before any object exists is not judgeable, and passes
+# spec 158: "a grant written before any object exists is not judgeable" is gone - a catalog grant takes no list, and
+# an object grant names an object that exists
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c2;
 
@@ -193,23 +222,32 @@ statement ok
 ACL ADMIN CREATE ROLE writer;
 
 statement ok
-ACL ADMIN GRANT CATALOG c2 TO ROLE writer WITH (select, insert) MAIN COLUMNS (id);
-
-statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c2.t AS phys.main.audit COLUMNS (id = id, note = note);
-
-# a name = expr item is never judged by the write-time list check: a mask of an existing column
-# passes, and a computed column on a declared object is refused by spec 037's own richer message -
-# not preempted by the "matches no column" one
-statement ok
-SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'note = upper(note)');
+ACL ADMIN GRANT CATALOG c2 TO ROLE writer WITH (select, insert) MAIN;
 
 statement error
-SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'initials = substr(note, 1, 1)');
+ACL ADMIN GRANT TABLE c2.t TO ROLE writer WITH (select) COLUMNS (id);
+----
+does not exist
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c2.t AS phys.main.audit COLUMNS (id AS id, note AS note);
+
+# a mask of a column the grant shows passes, and a computed column through a grant is refused - naming, computing
+# and ordering belong to the virtual catalog (spec 037)
+statement ok
+SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'note', '', 'note AS upper(note)');
+
+query T
+SELECT masks FROM store.acl.role_object_caps WHERE vcat = 'c2' AND role = 'writer';
+----
+note AS CAST((upper(note)) AS VARCHAR)
+
+statement error
+SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'initials', '', 'initials AS substr(note, 1, 1)');
 ----
 <REGEX>:.*naming, computing and ordering belong to the virtual catalog.*
 
-# altering an unrelated field never re-judges the stored list
+# altering an unrelated field of the catalog grant passes after its object is gone
 statement ok
 ACL ADMIN DROP RELATION c2.t;
 

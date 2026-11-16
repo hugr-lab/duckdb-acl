@@ -36,7 +36,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.lake.orders COLUMNS (id, amount);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE sales.renamed AS phys.lake.orders COLUMNS (order_id = id, total = amount);
+ACL ADMIN CREATE VIRTUAL TABLE sales.renamed AS phys.lake.orders COLUMNS (id AS order_id, amount AS total);
 
 statement ok
 ACL ADMIN CREATE VIRTUAL VIEW sales.stats (n BIGINT) AS SELECT count(*) AS n FROM phys.lake.orders;
@@ -122,7 +122,7 @@ x	INTEGER	YES
 
 # a computed column and a masked one are in the listing, with the types the write-time probe found
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE sales.computed AS phys.lake.orders COLUMNS (id, total = amount * 2, ssn = NULL);
+ACL ADMIN CREATE VIRTUAL TABLE sales.computed AS phys.lake.orders COLUMNS (id, amount * 2 AS total, NULL AS ssn);
 
 query II
 ACL ROLE "analyst" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'computed' ORDER BY 1;

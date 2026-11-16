@@ -80,10 +80,10 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `schema_dropped` | records dropped on purpose from an expanded schema, so a `REFRESH` does not bring them back |
 | `roles` | the roles and their comments |
 | `role_claims` | a role's default claims (`role, claim, value`) |
-| `role_catalogs` | catalog grants: `is_main`, caps, RLS, column list, `rls_checked` |
+| `role_catalogs` | catalog grants: `is_main`, caps, RLS, `rls_checked`, `versions` (a column list is no longer written, spec 158) |
 | `role_schemas` | schema grants: caps, whether inherited, `into` (the physical home for `create`), `virtual_only` |
-| `role_object_caps` | object grants: caps, RLS, column list |
-| `grant_columns` | the columns a grant's projection produces (a mask that changes a type, a computed column) - spec 026 |
+| `role_object_caps` | object grants: caps, RLS, `columns` (the test: names, `*`, `* EXCLUDE (…)`), `masks`, `versions` (spec 158) |
+| `grant_columns` | no longer written since spec 158 (a grant names and retypes no column) |
 | `function_categories` | the function categories (spec 072): name, comment, `builtin` (seeded at creation - never touched by the extension again) |
 | `function_category_members` | a category's keys: `database, schema, name, kind` (`scalar` / `table`) |
 | `function_grants` | per-role or every role's (`role = ''`) grants and denies on a category (key columns `''`) or on a function by name (category `''`); a deny anywhere wins |

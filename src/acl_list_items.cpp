@@ -4,6 +4,16 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/peg/tokenizer/tokenizer.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -212,178 +222,279 @@ vector<ListItemText> SplitOnTokens(const string &text, const vector<MatcherToken
 	return items;
 }
 
-string Trimmed(string text) {
-	StringUtil::Trim(text);
-	return text;
+} // namespace
+
+namespace {
+
+constexpr const char *LIST_TABLE = "__acl_list";
+
+[[noreturn]] void RefuseList(const char *what, const string &why) {
+	throw BinderException("acl admin: %s %s - a column list is a SELECT list: `name`, `<expression> AS name` or "
+	                      "`name: <expression>`",
+	                      what, why);
 }
 
-//! A token that is the word `word` as written bare (a keyword or an identifier, never a literal or a quoted name)
-bool IsWord(const MatcherToken &token, const char *word) {
-	return token.type != TokenType::STRING_LITERAL && !token.text.empty() && token.text[0] != '"' &&
-	       StringUtil::CIEquals(token.text, word);
+//! Whether a parsed `SELECT <list> FROM __acl_list` holds nothing but the list over the one table: the node with its
+//! list set aside prints as a bare `SELECT 1 FROM __acl_list` (a WHERE, a GROUP BY, a DISTINCT, a second FROM item -
+//! anything written after the list - would not). The list itself is not printed back: a star's EXCLUDE set prints
+//! its names in no fixed order
+bool OnlyTheList(const SelectNode &node) {
+	auto copy = node.Copy();
+	auto &shape = copy->Cast<SelectNode>();
+	shape.select_list.clear();
+	shape.select_list.push_back(ConstantExpression::FromValue(Value::INTEGER(1)));
+	SelectNode bare;
+	bare.select_list.push_back(ConstantExpression::FromValue(Value::INTEGER(1)));
+	bare.from_table = node.from_table->Copy();
+	return shape.ToString() == bare.ToString();
 }
 
-//! The tokens of `text` outside every bracket (a bracket at the top is one of them)
-vector<MatcherToken> TopTokens(const string &text) {
-	vector<MatcherToken> top;
-	string open_brackets;
-	for (auto &token : ListTokens(text, nullptr, nullptr)) {
-		if (token.type == TokenType::END_OF_INPUT || token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
-			break;
-		}
-		auto c = token.type == TokenType::OPERATOR && token.text.size() == 1 ? token.text[0] : '\0';
-		if (open_brackets.empty()) {
-			top.push_back(token);
-		}
-		if (c == '(' || c == '[' || c == '{') {
-			open_brackets += c;
-		} else if ((c == ')' || c == ']' || c == '}') && !open_brackets.empty() &&
-		           open_brackets.back() == (c == ')'   ? '('
-		                                    : c == ']' ? '['
-		                                               : '{')) {
-			open_brackets.pop_back();
-		}
+bool HoldsPositional(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::POSITIONAL_REFERENCE) {
+		return true;
 	}
-	return top;
-}
-
-//! A trailing nullability mark (spec 048) taken off `text`: `NOT NULL` after something (never `IS NOT NULL`), and -
-//! for a column's own name, never after an expression, where a bare `NULL` is the mask's value - `NULL`
-string TakeMark(const string &text, bool expression, int8_t &mark) {
-	auto top = TopTokens(text);
-	auto n = top.size();
-	if (n >= 3 && IsWord(top[n - 2], "not") && IsWord(top[n - 1], "null") && !IsWord(top[n - 3], "is")) {
-		mark = 0;
-		return Trimmed(text.substr(0, top[n - 2].offset));
-	}
-	if (!expression && n >= 2 && IsWord(top[n - 1], "null") && !IsWord(top[n - 2], "not")) {
-		mark = 1;
-		return Trimmed(text.substr(0, top[n - 1].offset));
-	}
-	return text;
-}
-
-//! A declared column's name as written: one quoted name is the name it quotes; anything else as it stands (a word, a
-//! path, the function form's raw text)
-string DeclaredName(const string &text, const char *what, bool *quoted = nullptr) {
-	vector<MatcherToken> tokens;
-	for (auto &token : ListTokens(text, nullptr, nullptr)) {
-		if (token.type != TokenType::END_OF_INPUT && token.type != TokenType::END_OF_INPUT_AUTOCOMPLETE) {
-			tokens.push_back(token);
-		}
-	}
-	string name = text;
-	auto quote = tokens.size() == 1 && !tokens[0].text.empty() ? tokens[0].text[0] : '\0';
-	if (tokens.size() == 1 && tokens[0].type != TokenType::STRING_LITERAL && tokens[0].text.size() >= 2 &&
-	    (quote == '"' || quote == '`') && tokens[0].offset == 0 && tokens[0].length == text.size()) {
-		// a backtick name is a quoted name to duckdb too
-		auto doubled = string(2, quote);
-		name = StringUtil::Replace(text.substr(1, text.size() - 2), doubled, string(1, quote));
-		if (quoted) {
-			*quoted = true;
-		}
-		if (name.empty()) {
-			throw BinderException("acl admin: %s holds an item that names no column", what);
-		}
-		if (name.find_first_of(".[") != string::npos || name[0] == '"') {
-			throw BinderException("acl admin: %s declares the column \"%s\" - a declared column's name holds no '.' "
-			                      "or '[' and starts with no '\"' (the list reads it as a path into a column)",
-			                      what, name);
-		}
-	}
-	// a path written with spaces (`s . x`, `items [ ] . price`) is the path duckdb's tokens read: its tokens joined -
-	// only a path's own shape, a name and then `. name` or `[ ]` steps (`my col.x` stays the text it is)
-	auto is_word = [](const MatcherToken &token) {
-		return (token.type == TokenType::IDENTIFIER || token.type == TokenType::KEYWORD) && !token.text.empty();
-	};
-	auto is_step = [](const MatcherToken &token, const char *step) {
-		// a `.` standing alone is a number token to duckdb's tokenizer
-		return (token.type == TokenType::OPERATOR || token.type == TokenType::NUMBER_LITERAL) && token.text == step;
-	};
-	bool path = tokens.size() > 1 && is_word(tokens[0]);
-	for (idx_t i = 1; path && i < tokens.size();) {
-		if (is_step(tokens[i], "[]")) {
-			i++;
-		} else if (is_step(tokens[i], "[") && i + 1 < tokens.size() && is_step(tokens[i + 1], "]")) {
-			i += 2;
-		} else if (is_step(tokens[i], ".") && i + 1 < tokens.size() && is_word(tokens[i + 1])) {
-			i += 2;
-		} else {
-			path = false;
-		}
-	}
-	if (path) {
-		name.clear();
-		for (auto &token : tokens) {
-			name += token.text;
-		}
-	}
-	if (name.empty() || (!tokens.empty() && tokens[0].type == TokenType::OPERATOR && tokens[0].text[0] == '=')) {
-		throw BinderException("acl admin: %s holds an item that names no column", what);
-	}
-	return name;
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HoldsPositional(child); });
+	return found;
 }
 
 } // namespace
 
-vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what) {
+vector<SelectListItem> ReadSelectList(const string &text_p, const char *what, bool allow_star) {
+	auto text = text_p;
+	StringUtil::Trim(text);
+	vector<SelectListItem> items;
+	if (text.empty()) {
+		return items;
+	}
+	bool open = false, comment = false;
+	ListTokens(text, &open, &comment);
+	if (comment || open) {
+		// spec 148: a list is read as written, item by item - a comment (a stored one: `a--b, c` read `a`) is refused
+		RefuseList(what, "holds a comment or ends inside a literal or a quoted name");
+	}
+	Parser parser(ParserOptions::Builtin());
+	try {
+		parser.ParseQuery("SELECT " + text + "\nFROM " + LIST_TABLE);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		RefuseList(what, "does not read as a SELECT list (" + error.RawMessage() + ")");
+	}
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		RefuseList(what, "holds more than a column list");
+	}
+	auto &select = parser.statements[0]->Cast<SelectStatement>();
+	if (!select.node || select.node->type != QueryNodeType::SELECT_NODE) {
+		RefuseList(what, "holds more than a column list");
+	}
+	auto &node = select.node->Cast<SelectNode>();
+	if (!node.from_table || node.from_table->type != TableReferenceType::BASE_TABLE ||
+	    node.from_table->ToString() != LIST_TABLE || !OnlyTheList(node)) {
+		RefuseList(what, "holds more than a column list");
+	}
+	for (auto &expr : node.select_list) {
+		SelectListItem item;
+		auto alias = expr->GetAlias().GetIdentifierName();
+		if (expr->GetExpressionClass() == ExpressionClass::STAR) {
+			if (!allow_star) {
+				RefuseList(what, "holds a star (" + expr->ToString() + ")");
+			}
+			if (!alias.empty()) {
+				RefuseList(what, "names a star (" + expr->ToString() + ")");
+			}
+			item.star = true;
+			item.expr = expr->ToString();
+			items.push_back(std::move(item));
+			continue;
+		}
+		if (HoldsPositional(*expr)) {
+			RefuseList(what, "reads a column by its position (" + expr->ToString() + ") - name it");
+		}
+		auto copy = expr->Copy();
+		copy->ClearAlias();
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
+			auto &last = names.back().GetIdentifierName();
+			// `x AS x` is written as an expression, as `x = x` was: what the name reads is stated (a renaming list)
+			if (names.size() == 1 && alias.empty()) {
+				item.name = last;
+				items.push_back(std::move(item));
+				continue;
+			}
+			// `address.city` is a column of its own, as in SELECT: named as duckdb names it
+			item.name = alias.empty() ? last : alias;
+			item.expr = copy->ToString();
+			items.push_back(std::move(item));
+			continue;
+		}
+		if (alias.empty()) {
+			RefuseList(what, "holds the expression " + copy->ToString() + " without a name - write `" +
+			                     copy->ToString() + " AS <name>`");
+		}
+		item.name = alias;
+		item.expr = copy->ToString();
+		items.push_back(std::move(item));
+	}
+	return items;
+}
+
+acl_detail::ColumnTest ReadColumnTest(const string &text_p) {
+	const char *what = "the grant's column list";
+	acl_detail::ColumnTest test;
+	auto text = text_p;
+	StringUtil::Trim(text);
+	if (text.empty()) {
+		return test;
+	}
+	bool open = false, comment = false;
+	ListTokens(text, &open, &comment);
+	if (comment || open) {
+		RefuseList(what, "holds a comment or ends inside a literal or a quoted name");
+	}
+	Parser parser(ParserOptions::Builtin());
+	try {
+		parser.ParseQuery("SELECT " + text + "\nFROM " + LIST_TABLE);
+	} catch (std::exception &ex) {
+		RefuseList(what, "does not read as a SELECT list (" + ErrorData(ex).RawMessage() + ")");
+	}
+	auto refuse = [&]() {
+		throw BinderException("acl admin: %s is `name, …`, `*` or `* EXCLUDE (name, …)` - which columns of the object "
+		                      "the role sees (a mask is MASK (<column> AS <expression>))",
+		                      what);
+	};
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		refuse();
+	}
+	auto &select = parser.statements[0]->Cast<SelectStatement>();
+	if (!select.node || select.node->type != QueryNodeType::SELECT_NODE) {
+		refuse();
+	}
+	auto &node = select.node->Cast<SelectNode>();
+	if (!node.from_table || node.from_table->ToString() != LIST_TABLE || !OnlyTheList(node)) {
+		refuse();
+	}
+	for (auto &expr : node.select_list) {
+		if (expr->HasAlias()) {
+			refuse();
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::STAR) {
+			auto &star = expr->Cast<StarExpression>();
+			if (node.select_list.size() != 1 || star.IsColumns() || !star.RelationName().empty() ||
+			    !star.ReplaceList().empty() || !star.RenameList().empty() || star.Expression()) {
+				refuse();
+			}
+			test.kind =
+			    star.ExcludeList().empty() ? acl_detail::ColumnTest::Kind::ALL : acl_detail::ColumnTest::Kind::EXCEPT;
+			for (auto &excluded : star.ExcludeList()) {
+				if (!excluded.catalog.empty() || !excluded.schema.empty() || !excluded.table.empty()) {
+					refuse();
+				}
+				test.names.push_back(excluded.column.GetIdentifierName());
+			}
+			std::sort(test.names.begin(), test.names.end());
+			return test;
+		}
+		if (expr->GetExpressionClass() != ExpressionClass::COLUMN_REF ||
+		    expr->Cast<ColumnRefExpression>().ColumnNames().size() != 1) {
+			refuse();
+		}
+		auto name = expr->Cast<ColumnRefExpression>().ColumnNames()[0].GetIdentifierName();
+		if (test.Names(name)) {
+			throw BinderException("acl admin: %s names \"%s\" twice", what, name);
+		}
+		test.kind = acl_detail::ColumnTest::Kind::ONLY;
+		test.names.push_back(name);
+	}
+	return test;
+}
+
+string ColumnTestText(const acl_detail::ColumnTest &test) {
+	vector<string> names;
+	for (auto &name : test.names) {
+		names.push_back(KeywordHelper::WriteOptionallyQuoted(name, '"', true));
+	}
+	switch (test.kind) {
+	case acl_detail::ColumnTest::Kind::ALL:
+		return string();
+	case acl_detail::ColumnTest::Kind::ONLY:
+		return StringUtil::Join(names, ", ");
+	case acl_detail::ColumnTest::Kind::EXCEPT:
+		return "* EXCLUDE (" + StringUtil::Join(names, ", ") + ")";
+	}
+	return string();
+}
+
+acl_detail::GrantMasks ReadMasks(const string &text, vector<string> *written) {
+	const char *what = "the grant's MASK";
+	acl_detail::GrantMasks masks;
 	bool open = false, comment = false;
 	auto tokens = ListTokens(text, &open, &comment);
-	if (open || comment) {
-		throw BinderException("acl admin: %s holds a comment or ends inside a literal or a quoted name - it does not "
-		                      "stay one expression per item (spec 148); write it without comments",
-		                      what);
+	if (open) {
+		throw BinderException("acl admin: %s ends inside a literal, a quoted name or a comment", what);
 	}
-	vector<DeclaredColumnText> columns;
+	if (comment) {
+		// spec 148: a mask is one expression - a comment in it is refused as an RLS's is
+		throw BinderException("acl admin: %s holds a comment - write each mask as one expression", what);
+	}
 	for (auto &item : SplitOnTokens(text, tokens)) {
+		vector<MatcherToken> words;
+		for (auto &token : ListTokens(item.text, nullptr, nullptr)) {
+			if (token.type != TokenType::END_OF_INPUT && token.type != TokenType::END_OF_INPUT_AUTOCOMPLETE &&
+			    token.type != TokenType::COMMENT) {
+				words.push_back(token);
+			}
+		}
+		if (words.size() < 3 || words[1].type == TokenType::STRING_LITERAL || words[1].text.empty() ||
+		    words[1].text[0] == '"' || !StringUtil::CIEquals(words[1].text, "as")) {
+			throw BinderException("acl admin: %s is items `<column> AS <expression>`", what);
+		}
+		// the column read as duckdb reads an identifier, the expression as one item of a SELECT list naming it
+		auto column_items = ReadSelectList(item.text.substr(0, words[0].offset + words[0].length), what, false);
+		if (column_items.size() != 1 || !column_items[0].expr.empty()) {
+			throw BinderException("acl admin: %s is items `<column> AS <expression>` - \"%s\" is no column name", what,
+			                      words[0].text);
+		}
+		auto &column = column_items[0].name;
+		auto expression = item.text.substr(words[2].offset);
+		auto read = ReadSelectList(expression + " AS __acl_mask", what, false);
+		if (read.size() != 1 || read[0].name != "__acl_mask" || read[0].expr.empty()) {
+			throw BinderException("acl admin: the mask of \"%s\" is one expression", column);
+		}
+		if (acl_detail::MaskOf(masks, column)) {
+			throw BinderException("acl admin: %s masks \"%s\" twice", what, column);
+		}
+		masks.emplace_back(column, read[0].expr);
+		if (written) {
+			written->push_back(expression);
+		}
+	}
+	return masks;
+}
+
+string MasksText(const acl_detail::GrantMasks &masks) {
+	vector<string> items;
+	for (auto &mask : masks) {
+		items.push_back(KeywordHelper::WriteOptionallyQuoted(mask.first, '"', true) + " AS " + mask.second);
+	}
+	return StringUtil::Join(items, ", ");
+}
+
+vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what) {
+	vector<DeclaredColumnText> columns;
+	case_insensitive_set_t named;
+	for (auto &item : ReadSelectList(text, what, false)) {
+		if (!named.insert(item.name).second) {
+			throw BinderException("acl admin: %s declares the column \"%s\" twice", what, item.name);
+		}
+		if (item.name.find_first_of(".[") != string::npos || item.name[0] == '"') {
+			throw BinderException("acl admin: %s declares the column \"%s\" - a declared column's name holds no '.' "
+			                      "or '[' and starts with no '\"'",
+			                      what, item.name);
+		}
 		DeclaredColumnText column;
-		// `expr AS name` (SQL's spelling) is `name = expr`: the last `AS` outside every bracket (a CAST's is inside
-		// it) - read first, as the rule does, so `CASE WHEN a = 1 THEN x END AS u` is u and `k = id AS y` is y = (k =
-		// id)
-		auto top = TopTokens(item.text);
-		optional_idx as;
-		for (idx_t i = 1; i + 1 < top.size(); i++) {
-			if (IsWord(top[i], "as")) {
-				as = i;
-			}
-		}
-		// ... unless a top-level `=` stands after it: `name as text = upper(a)` is the function form's raw name `name
-		// as text`, as the text reader read it (the rule refuses it)
-		for (idx_t i = as.IsValid() ? as.GetIndex() + 1 : top.size(); i < top.size(); i++) {
-			if (top[i].type == TokenType::OPERATOR && top[i].text[0] == '=') {
-				as.SetInvalid();
-				break;
-			}
-		}
-		if (as.IsValid()) {
-			auto &word = top[as.GetIndex()];
-			auto named = Trimmed(item.text.substr(word.offset + word.length));
-			// the alias is one word (the rule's `ColLabel`), a mark after it - `x AS NOT NULL` is the name `NOT` and a
-			// NULL mark, as the rule reads it; else as written (the function form's raw name)
-			auto words = TopTokens(named);
-			int8_t after = -1;
-			if (words.size() >= 2 &&
-			    Trimmed(TakeMark("x " + Trimmed(named.substr(words[1].offset)), false, after)) == "x" && after >= 0) {
-				named = Trimmed(named.substr(0, words[1].offset));
-				column.nullable = after;
-			} else {
-				named = TakeMark(named, false, column.nullable);
-			}
-			column.name = DeclaredName(named, what, &column.quoted);
-			int8_t mark = -1;
-			column.expr = TakeMark(Trimmed(item.text.substr(0, word.offset)), true, mark);
-			if (mark >= 0 && column.nullable >= 0) {
-				throw BinderException("acl admin: %s gives \"%s\" two NULL marks - write one", what, column.name);
-			}
-			if (mark >= 0) {
-				column.nullable = mark; // `expr NOT NULL AS name`, as the text reader read it
-			}
-		} else if (item.has_value) {
-			column.name = DeclaredName(item.name, what, &column.quoted);
-			column.expr = TakeMark(item.value, true, column.nullable);
-		} else {
-			column.name = DeclaredName(TakeMark(item.text, false, column.nullable), what, &column.quoted);
-		}
+		column.name = std::move(item.name);
+		column.expr = std::move(item.expr);
 		columns.push_back(std::move(column));
 	}
 	return columns;

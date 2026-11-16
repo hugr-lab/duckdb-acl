@@ -26,7 +26,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders
-    COLUMNS (id NOT NULL, tenant, amount) PRIMARY KEY (id);
+    COLUMNS (id, tenant, amount) PRIMARY KEY (id);
 
 statement ok
 ACL ADMIN CREATE VIRTUAL VIEW c.stats (day VARCHAR NOT NULL, total INTEGER) PRIMARY KEY (day)
@@ -130,17 +130,18 @@ ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.orders AS phys.main.orders
 ----
 <REGEX>:.*primary key of "orders" names "nope", which is not a column.*
 
+# spec 158: an object's list is a SELECT list - nullability is the source's, a NULL mark is no longer written
 statement error
 ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.orders AS phys.main.orders
     COLUMNS (id NULL, tenant) PRIMARY KEY (id);
 ----
-<REGEX>:.*"id" is declared nullable and named in the primary key.*
+<REGEX>:.*an object's column list is a SELECT list.*
 
 # --- visibility: a grant that hides a key column hides the key -----------------------------------
 
 statement ok
 ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.orders AS phys.main.orders
-    COLUMNS (id NOT NULL, tenant, amount) PRIMARY KEY (id);
+    COLUMNS (id, tenant, amount) PRIMARY KEY (id);
 
 statement ok
 ACL ADMIN CREATE ROLE narrow;
@@ -268,22 +269,13 @@ ACL ADMIN ALTER VIRTUAL SCALAR c.twice DROP PRIMARY KEY;
 a scalar has no PRIMARY KEY
 
 # 3. a masked column cannot carry the key's NOT NULL implication - the mask may answer NULL
-#    whatever the physical rows hold; an explicit NOT NULL is the admin's own promise and passes
+#    whatever the physical rows hold (spec 158: the explicit NOT NULL mark, the admin's own promise, is gone
+#    with the marks - so such a key is refused)
 statement error
 ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders
-    COLUMNS (id = CASE WHEN id > 0 THEN id END, tenant) PRIMARY KEY (id);
+    COLUMNS (CASE WHEN id > 0 THEN id END AS id, tenant) PRIMARY KEY (id);
 ----
 NOT NULL explicitly
-
-statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders
-    COLUMNS (id = CASE WHEN id > 0 THEN id END NOT NULL, tenant) PRIMARY KEY (id);
-
-query I
-ACL ROLE "r" SELECT is_nullable FROM information_schema.columns
-WHERE table_name = 'masked' AND column_name = 'id';
-----
-NO
 
 # 4. a bare alias' key is validated against the probed source - a typo is refused, not stored
 statement error
@@ -307,7 +299,7 @@ id
 # 5. a replace that states no key keeps the declared one (as the comment is kept); it lapses only
 #    when the new shape loses the column, instead of blocking the redeclaration
 statement ok
-ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.bare AS phys.main.orders COLUMNS (id NOT NULL, tenant);
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.bare AS phys.main.orders COLUMNS (id, tenant);
 
 query I
 ACL ROLE "r" SELECT "column" FROM acl_keys('bare');
@@ -343,12 +335,16 @@ id	0
 amount	0
 
 # 7. a grant's columns list narrows a function's result too, so a key over a narrowed-away column
-#    hides with it - while a role that reads the column still sees the key
+#    hides with it - while a role that reads the column still sees the key (spec 158: the list is the object
+#    grant's, a catalog grant takes none)
 statement ok
 ACL ADMIN CREATE ROLE fnarrow;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE fnarrow MAIN COLUMNS (amount, tenant);
+ACL ADMIN GRANT CATALOG c TO ROLE fnarrow MAIN;
+
+statement ok
+ACL ADMIN GRANT OBJECT c.perday TO ROLE fnarrow COLUMNS (amount);
 
 query I
 ACL ROLE "fnarrow" SELECT count(*) FROM acl_keys('perday');

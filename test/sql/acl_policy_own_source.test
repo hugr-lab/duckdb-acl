@@ -53,7 +53,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL VIEW c.v AS 'SELECT id, msg FROM phys.main.logs WHERE region = ''eu''';
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT TABLE c.logs TO ROLE r RLS (region = 'eu'); GRANT TABLE c.sub TO ROLE r RLS (id IN (SELECT k FROM phys.main.allow WHERE region = 'eu')); GRANT TABLE c.pm TO ROLE r COLUMNS (id, secret = note);
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT TABLE c.logs TO ROLE r RLS (region = 'eu'); GRANT TABLE c.sub TO ROLE r RLS (id IN (SELECT k FROM phys.main.allow WHERE region = 'eu')); GRANT TABLE c.pm TO ROLE r COLUMNS (id, secret) MASK (secret AS note);
 
 query III
 ACL ROLE "r" SELECT * FROM logs;

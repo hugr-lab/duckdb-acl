@@ -1795,42 +1795,75 @@ private:
 	//! such role narrows the columns at all
 	TablePolicy VerbReadScope(const string &key, const string &verb, const TablePolicy &verb_policy, bool &restricted) {
 		restricted = false;
-		case_insensitive_set_t allowed;
+		// spec 158: what each role reads plainly, as a test on names - listed (ONLY) or every column but some (EXCEPT)
+		bool except = false;            // the intersection so far leaves out `allowed` rather than listing it
+		case_insensitive_set_t allowed; // ONLY: the names; EXCEPT: the names left out
 		for (auto &role : principal.roles) {
 			auto one = principal;
 			one.roles = {role};
 			TablePolicy own;
 			if (!store.ResolveTable(one, key, own, verb) || !own.caps.count(verb) ||
-			    (own.visible_columns.empty() && !own.exposes_nothing)) {
+			    (!own.ColumnsNarrowed() && !own.exposes_nothing)) {
 				continue; // no grant here, no such verb, or every column as stored
 			}
+			bool mine_except = own.columns_excluded && !own.exposes_nothing;
 			// spec 156: a role whose grants leave no column reads none here - never "every column"
-			case_insensitive_set_t mine = own.exposes_nothing ? case_insensitive_set_t() : own.visible_columns;
-			for (auto &mask : own.injections) {
-				mine.erase(mask.first);
-			}
-			for (auto &tree : own.narrowed_reads) {
-				mine.erase(tree.first);
+			case_insensitive_set_t mine;
+			if (mine_except) {
+				mine = own.excluded_columns;
+				for (auto &mask : own.injections) {
+					mine.insert(mask.first);
+				}
+			} else if (!own.exposes_nothing) {
+				mine = own.visible_columns;
+				for (auto &mask : own.injections) {
+					mine.erase(mask.first);
+				}
+				for (auto &tree : own.narrowed_reads) {
+					mine.erase(tree.first);
+				}
 			}
 			if (!restricted) {
 				allowed = std::move(mine);
+				except = mine_except;
 				restricted = true;
 				continue;
 			}
 			case_insensitive_set_t both;
-			for (auto &name : allowed) {
-				if (mine.count(name)) {
-					both.insert(name);
+			if (except && mine_except) {
+				both = allowed; // both leave out: what either leaves out
+				both.insert(mine.begin(), mine.end());
+			} else if (!except && !mine_except) {
+				for (auto &name : allowed) {
+					if (mine.count(name)) {
+						both.insert(name);
+					}
 				}
+			} else {
+				auto &listed = except ? mine : allowed;
+				auto &left_out = except ? allowed : mine;
+				for (auto &name : listed) {
+					if (!left_out.count(name)) {
+						both.insert(name);
+					}
+				}
+				except = false;
 			}
 			allowed = std::move(both);
 		}
 		auto scope = verb_policy;
 		if (restricted) {
-			// a name no column has: an empty set would read as "every column"
-			scope.visible_columns = allowed.empty() ? case_insensitive_set_t {"\x01"} : allowed;
 			scope.injections.clear();
 			scope.narrowed_reads.clear();
+			if (except) {
+				scope.columns_excluded = true;
+				scope.excluded_columns = allowed;
+				scope.visible_columns.clear();
+			} else {
+				// a name no column has: an empty set would read as "every column"
+				scope.columns_excluded = false;
+				scope.visible_columns = allowed.empty() ? case_insensitive_set_t {"\x01"} : allowed;
+			}
 		}
 		return scope;
 	}
@@ -1864,8 +1897,8 @@ private:
 			                               "already there");
 		}
 		if (node.on_conflict_info->action_type == OnConflictAction::REPLACE &&
-		    (!update.rls.empty() || !update.injections.empty() || !update.write_columns.empty() ||
-		     !update.field_writes.empty() || !update.visible_columns.empty())) {
+		    (!update.rls.empty() || !update.injections.empty() || update.WritesNarrowed() ||
+		     !update.field_writes.empty() || update.ColumnsNarrowed())) {
 			Deny(Reason::WRITE_POLICY, "INSERT OR REPLACE into " + Shown(key) +
 			                               " is not allowed under a row or column policy - write ON CONFLICT (…) DO "
 			                               "UPDATE SET …, which the policy confines");
@@ -1874,8 +1907,8 @@ private:
 		// is: MapReadable, field writes) - under a column policy, the update's or the one it reads under, refused as
 		// ApplyInsertPolicy refuses an insert's (the re-review: hidden columns read, a hidden field written)
 		auto column_policy = [](const TablePolicy &p) {
-			return !p.visible_columns.empty() || !p.injections.empty() || !p.field_writes.empty() ||
-			       !p.write_columns.empty() || !p.narrowed_reads.empty();
+			return p.ColumnsNarrowed() || !p.injections.empty() || !p.field_writes.empty() || p.WritesNarrowed() ||
+			       !p.narrowed_reads.empty();
 		};
 		bool restricted = column_policy(update);
 		if (!restricted && update.caps.count("select") && update.capability_rows_read) {
@@ -2111,7 +2144,7 @@ private:
 	//! A merge's INSERT branch writes a new row, so it carries the grant's column policy exactly as a
 	//! plain INSERT does: only granted columns, and every injected value assigned rather than supplied.
 	void ApplyMergeInsertPolicy(MergeIntoAction &action, const TablePolicy &policy, const string &vname) {
-		if (policy.write_columns.empty() && policy.injections.empty()) {
+		if (!policy.WritesNarrowed() && policy.injections.empty()) {
 			return;
 		}
 		if (action.default_values || action.insert_columns.empty() ||
@@ -2851,7 +2884,8 @@ private:
 		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr.Cast<FunctionExpression>();
 			auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
-			if (name != "acl_arg" && name != "acl_claim" && !SystemCall(function.GetQualifiedName())) {
+			if (name != "acl_arg" && name != "acl_claim" && name != "acl_has_role" &&
+			    !SystemCall(function.GetQualifiedName())) {
 				return true;
 			}
 		}
@@ -2926,7 +2960,8 @@ private:
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
-			if (name != "acl_arg" && name != "acl_claim" && SystemCall(function.GetQualifiedName())) {
+			if (name != "acl_arg" && name != "acl_claim" && name != "acl_has_role" &&
+			    SystemCall(function.GetQualifiedName())) {
 				QualifySystemCall(function);
 			}
 		}
@@ -3643,7 +3678,7 @@ private:
 	//! give it to the target whenever the other relation lacks it.
 	void MapReadable(unique_ptr<ParsedExpression> &expr, const TablePolicy &policy, const string &vname,
 	                 const Identifier &alias, bool single, const case_insensitive_set_t &others = {}) {
-		if (!expr || policy.visible_columns.empty()) {
+		if (!expr || !policy.ColumnsNarrowed()) {
 			return;
 		}
 		ReadScope scope {policy, vname, alias, single, others};
@@ -3711,7 +3746,7 @@ private:
 				break;
 			}
 		}
-		bool plain = policy.visible_columns.count(column) && !mask && !narrowed;
+		bool plain = policy.Readable(column) && !mask && !narrowed;
 		if (!qualified && (scope.in_from_subquery || !scope.single) && !plain) {
 			// another relation may own the name - or, unqualified, the binder may give it to the target
 			Deny(Reason::WRITE_POLICY, "\"" + names[0].GetIdentifierName() + "\" in a write to \"" + vname +
@@ -3719,7 +3754,7 @@ private:
 			                               scope.alias.GetIdentifierName() + "\" for a column of \"" + vname +
 			                               "\" the role may read");
 		}
-		if (!policy.visible_columns.count(column)) {
+		if (!policy.Readable(column)) {
 			Deny(Reason::WRITE_POLICY,
 			     "column \"" + VirtualColumn(policy, column) + "\" of " + Shown(vname) + " is not readable");
 		}
@@ -3891,7 +3926,7 @@ private:
 	//! Refuse a write to a column the grant does not list: silently dropping it would write a row the
 	//! principal did not ask for.
 	void RequireWritableColumn(const TablePolicy &policy, const Identifier &column, const string &vname) {
-		if (policy.write_columns.empty() || policy.write_columns.count(column.GetIdentifierName())) {
+		if (policy.Writable(column.GetIdentifierName())) {
 			return;
 		}
 		Deny(Reason::WRITE_POLICY,
@@ -3917,7 +3952,7 @@ private:
 
 	//! Whether a grant narrows what may be written at all
 	static bool HasWritePolicy(const TablePolicy &policy) {
-		return !policy.injections.empty() || !policy.write_columns.empty() || !policy.rls.empty() ||
+		return !policy.injections.empty() || policy.WritesNarrowed() || !policy.rls.empty() ||
 		       !policy.field_writes.empty();
 	}
 
@@ -4222,7 +4257,7 @@ private:
 	void ApplyInsertPolicy(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
 		// only a column policy has something to check an INSERT against: a predicate alone does not
 		// confine what is written (that is what a value column is for), so it does not restrict here
-		if (policy.write_columns.empty()) {
+		if (!policy.WritesNarrowed()) {
 			return;
 		}
 		if (node.columns.empty() && !node.default_values && node.column_order != InsertColumnOrder::INSERT_BY_NAME &&
@@ -4307,7 +4342,7 @@ private:
 		if (!returning.empty() && !policy.returning_refused.empty()) {
 			Deny(Reason::CAPABILITY, "RETURNING: " + policy.returning_refused); // spec 145: RETURNING is a read
 		}
-		if (policy.write_columns.empty()) {
+		if (!policy.WritesNarrowed() && policy.injections.empty()) {
 			return; // no column policy: the relation is the table, and RETURNING reads the table
 		}
 		for (auto &item : returning) {
@@ -4324,22 +4359,34 @@ private:
 			if (names.empty()) {
 				return;
 			}
-			auto name = names.back().GetIdentifierName();
-			bool masked = false;
-			for (auto &injection : policy.injections) {
-				if (StringUtil::CIEquals(injection.first, name)) {
-					masked = true; // the grant computes this column, so the stored value is not readable
-					break;
-				}
+			// spec 158 review: the column is the first part, or the second after a qualifier (`t.s.f`) - never a field
+			// (`s.f` names column s); both are judged, so a qualifier named like a hidden column refuses (fail closed)
+			vector<string> candidates {names[0].GetIdentifierName()};
+			if (names.size() >= 2) {
+				candidates.push_back(names[1].GetIdentifierName());
 			}
-			for (auto &narrowed : policy.field_writes) {
-				if (StringUtil::CIEquals(narrowed.first, name)) {
-					masked = true; // the stored struct carries the fields the role does not see
-					break;
+			auto masked = [&](const string &name) {
+				for (auto &injection : policy.injections) {
+					if (StringUtil::CIEquals(injection.first, name)) {
+						return true; // the grant computes this column, so the stored value is not readable
+					}
 				}
+				for (auto &narrowed : policy.field_writes) {
+					if (StringUtil::CIEquals(narrowed.first, name)) {
+						return true; // the stored struct carries the fields the role does not see
+					}
+				}
+				return policy.columns_excluded && policy.excluded_columns.count(name) > 0;
+			};
+			bool listed = policy.columns_excluded;
+			for (auto &name : candidates) {
+				if (masked(name)) {
+					Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of " + Shown(vname) + " is not readable");
+				}
+				listed = listed || policy.write_columns.count(name) > 0;
 			}
-			if (masked || !policy.write_columns.count(name)) {
-				Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of " + Shown(vname) + " is not readable");
+			if (!listed) {
+				Deny(Reason::WRITE_POLICY, "column \"" + candidates[0] + "\" of " + Shown(vname) + " is not readable");
 			}
 			return;
 		}
@@ -5042,15 +5089,17 @@ private:
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
-			if (marker == "acl_claim" && keep_claim_markers) {
+			// spec 158: a marker is the reader's - in a principal's stored body it is resolved by whoever reads it
+			if ((marker == "acl_claim" || marker == "acl_has_role") && keep_claim_markers) {
 				return; // stored body: this claim is resolved by whoever reads it, not by its author
 			}
-			if (marker == "acl_claim" || marker == "acl_arg") {
+			if (marker == "acl_claim" || marker == "acl_arg" || marker == "acl_has_role") {
 				// the marker may be the whole select item (`acl_claim('tenant') AS tenant`), so its
 				// alias has to survive the replacement - otherwise the column loses its name
 				auto alias = expr->GetAlias();
-				expr = marker == "acl_claim" ? ConstantExpression::FromValue(ClaimValue(function))
-				                             : ArgExpression(function, args);
+				expr = marker == "acl_claim"      ? ConstantExpression::FromValue(ClaimValue(function))
+				       : marker == "acl_has_role" ? ConstantExpression::FromValue(HasRoleValue(function))
+				                                  : ArgExpression(function, args);
 				if (!alias.GetIdentifierName().empty()) {
 					expr->SetAlias(alias);
 				}
@@ -5077,6 +5126,16 @@ private:
 			Deny(Reason::POLICY_ERROR, "acl_arg(" + std::to_string(position) + ") has no matching call argument");
 		}
 		return (*args)[position - 1]->Copy();
+	}
+
+	//! spec 158: acl_has_role('r') - whether the principal holds role r (as roles compare, exactly)
+	Value HasRoleValue(FunctionExpression &function) {
+		auto &args = function.GetArguments();
+		if (args.size() != 1 || args[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
+			Deny(Reason::POLICY_ERROR, "acl_has_role() expects a single constant role name");
+		}
+		auto role = args[0].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
+		return Value::BOOLEAN(std::find(principal.roles.begin(), principal.roles.end(), role) != principal.roles.end());
 	}
 
 	Value ClaimValue(FunctionExpression &function) {
@@ -5205,12 +5264,15 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
 		auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
-		if (marker == "acl_claim" || marker == "acl_arg") {
+		if (marker == "acl_claim" || marker == "acl_arg" || marker == "acl_has_role") {
 			string type;
 			// a claim is a string by construction (the principal carries them as such), so a mask over
 			// one is VARCHAR and the probe can say so; only an argument's type has to be declared
 			if (marker == "acl_claim") {
 				type = "VARCHAR";
+			}
+			if (marker == "acl_has_role") {
+				type = "BOOLEAN"; // spec 158
 			}
 			if (marker == "acl_arg") {
 				auto &args = function.GetArguments();

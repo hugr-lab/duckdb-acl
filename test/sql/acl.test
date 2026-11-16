@@ -30,11 +30,11 @@ SELECT acl_grant_table('analyst', 'orders', 'phys.main.orders_physical', 'id,amo
 
 # 'employees': SUBQUERY - projects id+name, masks ssn to NULL, drops salary entirely, no RLS
 statement ok
-SELECT acl_grant_table('analyst', 'employees', 'phys.main.employees_physical', 'id,name,ssn=NULL', '', 'select');
+SELECT acl_grant_table('analyst', 'employees', 'phys.main.employees_physical', 'id,name,NULL AS ssn', '', 'select');
 
 # 'orders_calc': SUBQUERY with a computed column (amount*2) and RLS
 statement ok
-SELECT acl_grant_table('analyst', 'orders_calc', 'phys.main.orders_physical', 'id,double_amount=amount*2', 'tenant = acl_claim(''tenant'')', 'select');
+SELECT acl_grant_table('analyst', 'orders_calc', 'phys.main.orders_physical', 'id,amount*2 AS double_amount', 'tenant = acl_claim(''tenant'')', 'select');
 
 # 'writable_orders': RENAME - no projection/RLS, exposes the physical table as-is, writable
 statement ok

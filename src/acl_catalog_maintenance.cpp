@@ -29,9 +29,12 @@ namespace duckdb {
 namespace acl {
 
 using acl_detail::CatalogBackend;
+using acl_detail::ColumnTest;
+using acl_detail::GrantMasks;
 using acl_detail::Ident;
 using acl_detail::Lit;
 using acl_detail::ParseColumnList;
+using acl_detail::RoleColumns;
 
 namespace {
 
@@ -90,7 +93,14 @@ bool ItemBinds(CatalogBackend &catalog, const string &source, const string &item
 		error = "the expression is " + problem + " (spec 148: one expression)";
 		return false;
 	}
-	return Binds(catalog, "SELECT " + item + " AS __acl_probe FROM " + source + " WHERE false", error);
+	// the markers a read bakes (acl_claim, acl_has_role, acl_arg) are NULLs here, as every probe has them
+	string baked;
+	try {
+		baked = BakeTemplateForProbe(item, ParserOptions::Builtin(), true, {});
+	} catch (std::exception &) {
+		baked = item;
+	}
+	return Binds(catalog, "SELECT " + baked + " AS __acl_probe FROM " + source + " WHERE false", error);
 }
 
 //! What the object's stored schema says (spec 010), and whether it was derived by a probe or declared
@@ -259,9 +269,8 @@ private:
 					    "declared column \"" + entry.first + "\" reads " +
 					        (entry.second.empty() ? "a source column of that name" : "\"" + entry.second + "\"") +
 					        ", which \"" + relation.phys + "\" no longer has: " + error,
-					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" +
-					        KeywordHelper::WriteOptionallyQuoted(entry.first) +
-					        " = <column>)  -- or DROP MISSING COLUMNS");
+					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (<column> AS " +
+					        KeywordHelper::WriteOptionallyQuoted(entry.first) + ")  -- or DROP MISSING COLUMNS");
 				}
 				if (!any_missing && stored_derived) {
 					Columns probed;
@@ -487,27 +496,30 @@ private:
 					Add(kind, relation.vname, "", "types_mismatch",
 					    "declared column \"" + entry.first + "\" is described as " + said + " and reads as " +
 					        probed[0].second + " - an expression that makes a type of its own is not cast",
-					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" +
-					        KeywordHelper::WriteOptionallyQuoted(entry.first) + " = CAST(" + item + " AS " + said +
-					        "))");
+					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (CAST(" + item + " AS " + said +
+					        ") AS " + KeywordHelper::WriteOptionallyQuoted(entry.first) + ")");
 				}
 			}
 		}
 		// the masks of the grants that reach this object read the exposed values like the projection
-		auto grants = Read("SELECT \"role\", \"columns\" FROM " + catalog.Tbl("role_object_caps") +
-		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(relation.vname) +
-		                   " UNION ALL SELECT \"role\", \"columns\" FROM " + catalog.Tbl("role_catalogs") +
-		                   " WHERE \"vcat\" = " + Lit(vcat));
+		auto grants = Read("SELECT \"role\", \"masks\" FROM " + catalog.Tbl("role_object_caps") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(relation.vname));
 		ResultRows grant_rows(*grants);
 		for (idx_t row = 0; row < grant_rows.Count(); row++) {
 			auto role = grant_rows.GetValue(0, row).ToString();
-			for (auto &item : ParseColumnList(Text(grant_rows.GetValue(1, row)))) {
-				if (item.second.empty() || !ItemBinds(catalog, relation.Source(), item.second, error)) {
+			GrantMasks masks;
+			try {
+				masks = ReadMasks(Text(grant_rows.GetValue(1, row)));
+			} catch (std::exception &) {
+				continue; // columns_unreadable says it
+			}
+			for (auto &mask : masks) {
+				if (!ItemBinds(catalog, relation.Source(), mask.second, error)) {
 					continue;
 				}
-				if (!ItemBinds(catalog, typed, item.second, error)) {
+				if (!ItemBinds(catalog, typed, mask.second, error)) {
 					Add("grant", relation.vname, role, "types_incompatible",
-					    "the mask \"" + item.first + " = " + item.second +
+					    "the mask of \"" + mask.first +
 					        "\" does not bind once the source's types are exposed: " + error,
 					    repair_types);
 				}
@@ -616,18 +628,17 @@ private:
 				          kind == "table" ? BodyShape::SELECT : BodyShape::EXPRESSION);
 			}
 		}
-		auto grants = Read("SELECT \"role\", '' AS vname, \"rls\", \"columns\" FROM " + catalog.Tbl("role_catalogs") +
-		                   " WHERE \"vcat\" = " + Lit(vcat) +
-		                   " UNION ALL SELECT \"role\", \"vname\", \"rls\", \"columns\" FROM " +
-		                   catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY 1, 2");
+		auto grants =
+		    Read("SELECT \"role\", '' AS vname, \"rls\", NULL AS masks FROM " + catalog.Tbl("role_catalogs") +
+		         " WHERE \"vcat\" = " + Lit(vcat) + " UNION ALL SELECT \"role\", \"vname\", \"rls\", \"masks\" FROM " +
+		         catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY 1, 2");
 		ResultRows grant_rows(*grants);
 		for (idx_t row = 0; row < grant_rows.Count(); row++) {
 			auto role = grant_rows.GetValue(0, row).ToString();
 			auto object = grant_rows.GetValue(1, row).ToString();
 			CheckBody("grant", object, role, "the grant's RLS", Text(grant_rows.GetValue(2, row)),
 			          BodyShape::EXPRESSION);
-			CheckBody("grant", object, role, "the grant's column list", Text(grant_rows.GetValue(3, row)),
-			          BodyShape::COLUMNS);
+			CheckBody("grant", object, role, "the grant's MASK", Text(grant_rows.GetValue(3, row)), BodyShape::COLUMNS);
 		}
 	}
 
@@ -697,112 +708,70 @@ private:
 		return true;
 	}
 
-	//! A grant's list against one object (spec 038's semantics, read back): a bare item that matches
-	//! nothing intersects away - the role reads less than the grant says; a mask on a column the
-	//! object does not expose, or whose expression does not bind, refuses every read of the object.
-	//! `matched` collects the bare items that did match (a catalog grant's are judged across objects).
-	void JudgeColumns(const Relation &relation, const string &role, const Columns &items, bool object_grant,
-	                  const string &repair, case_insensitive_set_t *matched) {
+	//! spec 158: an object grant's COLUMNS and MASK against the object: a listed name the object no longer has (the
+	//! role reads less than the grant says, or - EXCEPT - the exclusion names nothing), a mask of a column the object
+	//! does not expose or whose expression does not bind (every read of it by this role refuses). `repair` builds the
+	//! re-grant without one column's item.
+	void JudgeObjectGrant(const Relation &relation, const string &role, const ColumnTest &test, const GrantMasks &masks,
+	                      const std::function<string(const string &)> &repair) {
 		case_insensitive_set_t exposed;
 		if (!Exposed(relation, exposed)) {
 			return;
 		}
-		for (auto &item : items) {
-			// spec 102: a path is judged by its column, then by the column's type - a field it no longer
-			// has fails a bare path's reads (at either level: a path never intersects away), and a masked
-			// one is appended by struct_update instead of replacing anything. A name the object has as
-			// written (`odd.col`) is a column, not a path.
-			acl_detail::FieldPath path;
-			string path_error;
-			if (!exposed.count(item.first) && acl_detail::ParseFieldPath(item.first, path, path_error) &&
-			    !path.IsColumn() && exposed.count(path.head)) {
-				string missing;
-				auto own = relation.own.find(path.head);
-				auto value = own != relation.own.end() && !own->second.empty() ? own->second : Ident(path.head);
-				vector<std::pair<string, LogicalType>> types;
-				if (acl_detail::StoredExpressionsOk({value}) && // spec 148
-				    catalog.ProbeTypes("SELECT " + value + " AS c FROM " + relation.Source(), types) &&
-				    !types.empty()) {
-					string steps;
-					for (auto &step : path.steps) {
-						steps += step.empty() ? string("[]") : "." + acl_detail::FieldName(step);
-					}
-					LogicalType at;
-					if (!acl_detail::TypeAtPath(types[0].second, steps, at)) {
-						missing =
-						    "\"" + item.first + "\" names a field " + types[0].second.ToString() + " does not have";
-					}
-				}
-				if (missing.empty()) {
-					if (matched) {
-						matched->insert(item.first);
-					}
-				} else if (item.second.empty()) {
-					Add("grant", relation.vname, role, "grant_column_missing",
-					    "the COLUMNS path " + missing + " - every read of \"" + Named(relation.vname) +
-					        "\" by this role refuses",
-					    repair);
-				} else {
-					Add("grant", relation.vname, role, "mask_broken",
-					    "the mask \"" + item.first + " = " + item.second + "\": " + missing +
-					        " - the read adds the field rather than masking one",
-					    repair);
-				}
-				continue;
+		for (auto &name : test.names) {
+			if (!exposed.count(name)) {
+				Add("grant", relation.vname, role, "grant_column_missing",
+				    "the COLUMNS item \"" + name + "\" matches no column of \"" + Named(relation.vname) +
+				        "\" - the role reads less than the grant says",
+				    repair(name));
 			}
-			// spec 150 4e: the column a one-part item names - a quoted name (`"a,b"`) without its quotes
-			auto column = MatchKey(item.first);
-			if (item.second.empty()) {
-				if (exposed.count(column)) {
-					if (matched) {
-						matched->insert(column);
-					}
-				} else if (object_grant) {
-					Add("grant", relation.vname, role, "grant_column_missing",
-					    "the COLUMNS item \"" + item.first + "\" matches no column of \"" + Named(relation.vname) +
-					        "\" - it intersects away, and the role reads less than the grant says",
-					    repair);
-				}
-				continue;
+		}
+		vector<string> own_order;
+		for (auto &column : relation.declared) {
+			own_order.push_back(column.first);
+		}
+		if (!masks.empty()) {
+			// a mask is judged over the object's read: when that read does not bind, the object's own finding
+			// (column_missing, definition_broken) says it, and no mask is to blame
+			vector<string> items;
+			for (auto &column : relation.declared) {
+				items.push_back((column.second.empty() ? Ident(column.first) : column.second) + " AS " +
+				                Ident(column.first));
 			}
-			if (!exposed.count(column)) {
+			auto instance = catalog.Db();
+			Connection con(*instance);
+			auto object = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " +
+			              relation.Source() + " WHERE false";
+			if (con.Query(object)->HasError()) {
+				return;
+			}
+		}
+		for (auto &mask : masks) {
+			if (!exposed.count(mask.first)) {
 				Add("grant", relation.vname, role, "mask_broken",
-				    "the mask \"" + item.first + " = " + item.second + "\" names a column \"" + Named(relation.vname) +
+				    "the mask of \"" + mask.first + "\" names a column \"" + Named(relation.vname) +
 				        "\" does not expose - every read of it by this role refuses (spec 038)",
-				    repair);
+				    repair(mask.first));
 				continue;
 			}
+			RoleColumns one;
+			one.masks.push_back(mask);
 			Columns derived;
 			bool probed = false;
-			auto error = catalog.ProjectionSchema(relation.Source(), item.first + " = " + item.second, relation.own,
-			                                      derived, &probed);
+			auto error = catalog.ProjectionSchema(relation.Source(), one, own_order, relation.own, derived, &probed);
 			if (!error.empty()) {
 				Add("grant", relation.vname, role, "mask_broken",
-				    "the mask \"" + item.first + " = " + item.second + "\" does not bind over \"" +
-				        Named(relation.vname) + "\": " + FirstLine(error),
-				    repair);
+				    "the mask of \"" + mask.first + "\" does not bind over \"" + Named(relation.vname) +
+				        "\": " + FirstLine(error),
+				    repair(mask.first));
 			}
 		}
-	}
-
-	//! A list without one item, as the csv the writers take
-	//! The list without every item of the column `name`'s item names (spec 150 4e: by the column, so a repair of a
-	//! broken `"ssn" = …` beside a bare `ssn` takes both - the column leaves the list, never stays unmasked)
-	static string Without(const Columns &items, const string &name) {
-		vector<string> kept;
-		auto column = MatchKey(name);
-		for (auto &item : items) {
-			if (StringUtil::CIEquals(MatchKey(item.first), column)) {
-				continue;
-			}
-			kept.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
-		}
-		return StringUtil::Join(kept, ", ");
 	}
 
 	void CheckGrants() {
 		auto objects =
-		    Read("SELECT \"role\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\" FROM " +
+		    Read("SELECT \"role\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\", \"masks\", "
+		         "\"versions\" FROM " +
 		         catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"role\", \"vname\"");
 		ResultRows objects_rows(*objects);
 		for (idx_t row = 0; row < objects->RowCount(); row++) {
@@ -811,36 +780,66 @@ private:
 			auto caps = Text(objects_rows.GetValue(2, row));
 			auto rls = Text(objects_rows.GetValue(3, row));
 			auto columns = Text(objects_rows.GetValue(4, row));
+			auto masks = Text(objects_rows.GetValue(6, row));
+			auto versions = Text(objects_rows.GetValue(7, row));
 			auto found = relations.find(vname);
 			if (found == relations.end() || found->second.dead) {
 				continue; // a function's grant, or an object whose own finding says it all
 			}
 			auto &relation = found->second;
-			// the re-grant that keeps everything but the item: an object grant has no ALTER form, and
-			// GRANT OBJECT with fewer clauses would reset what it does not state
-			auto regrant = [&](const string &columns_text) {
-				if (columns_text.empty() && !columns.empty()) {
-					// spec 156: an empty list is a row-only grant - every column - and a revoke drops the grant's RLS
-					// too (the catalog grant then decides): the operator names the columns, the placeholder never runs
-					return "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
-					       Lit(caps) + ", " + Lit(rls) +
-					       ", '<columns>')  -- name what the role reads; an empty list reads every column";
-				}
+			// the re-grant that keeps everything but the item: an object grant has no ALTER form for it
+			auto regrant = [&](const string &columns_text, const string &masks_text) {
 				return "SELECT acl_grant_object(" + Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " +
-				       Lit(caps) + ", " + Lit(rls) + ", " + Lit(columns_text) + ")";
+				       Lit(caps) + ", " + Lit(rls) + ", " + Lit(columns_text) + ", " + Lit(versions) + ", " +
+				       Lit(masks_text) + ")";
 			};
 			if (!rls.empty()) {
 				JudgePredicate("grant", relation, role, rls, objects_rows.GetValue(5, row),
-				               regrant(columns) + "  -- with a predicate that binds");
+				               regrant(columns, masks) + "  -- with a predicate that binds");
 			}
-			if (!columns.empty()) {
-				auto items = ParseColumnList(columns);
-				for (auto &item : items) {
-					// judged one item at a time so the repair can name the list without it
-					JudgeColumns(relation, role, {item}, true, regrant(Without(items, item.first)), nullptr);
+			if (columns.empty() && masks.empty()) {
+				continue;
+			}
+			ColumnTest test;
+			GrantMasks mask_items;
+			try {
+				test = ReadColumnTest(columns);
+				mask_items = ReadMasks(masks);
+			} catch (std::exception &ex) {
+				Add("grant", vname, role, "columns_unreadable",
+				    "the stored COLUMNS or MASK does not read (spec 158) - every read of the object by this role "
+				    "refuses: " +
+				        FirstLine(ErrorData(ex).RawMessage()),
+				    regrant("<columns>", "<masks>"));
+				continue;
+			}
+			JudgeObjectGrant(relation, role, test, mask_items, [&](const string &name) {
+				auto rest = test;
+				rest.names.clear();
+				for (auto &kept : test.names) {
+					if (!StringUtil::CIEquals(kept, name)) {
+						rest.names.push_back(kept);
+					}
 				}
-			}
+				if (rest.kind == ColumnTest::Kind::EXCEPT && rest.names.empty()) {
+					rest.kind = ColumnTest::Kind::ALL;
+				}
+				GrantMasks other;
+				for (auto &mask : mask_items) {
+					if (!StringUtil::CIEquals(mask.first, name)) {
+						other.push_back(mask);
+					}
+				}
+				auto rest_text = ColumnTestText(rest);
+				if (rest.kind == ColumnTest::Kind::ONLY && rest.names.empty()) {
+					rest_text = "<columns>"; // spec 156: no item left is every column - the operator names them
+				}
+				return regrant(rest_text, MasksText(other)) +
+				       (rest_text == "<columns>" ? "  -- name what the role reads; an empty list reads every column"
+				                                 : string());
+			});
 		}
+		// spec 158: a catalog grant states no columns - one stored (an older build's) refuses every read under it
 		auto catalogs = Read("SELECT \"role\", \"rls\", \"columns\", \"rls_checked\" FROM " +
 		                     catalog.Tbl("role_catalogs") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"role\"");
 		ResultRows catalogs_rows(*catalogs);
@@ -849,44 +848,27 @@ private:
 			auto rls = Text(catalogs_rows.GetValue(1, row));
 			auto columns = Text(catalogs_rows.GetValue(2, row));
 			auto rls_checked = catalogs_rows.GetValue(3, row);
-			auto items = ParseColumnList(columns);
-			// spec 156: the list without its last item is no list - every column - so that repair names a placeholder
-			auto set_columns = [&](const string &rest) {
-				auto grantee = NamePath(vector<string> {role}).ToGrammar();
-				if (rest.empty()) {
-					return "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee +
-					       " SET COLUMNS '<columns>'  -- name what the role reads; an empty list reads every column";
-				}
-				return "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee + " SET COLUMNS " +
-				       Lit(rest);
-			};
-			case_insensitive_set_t matched;
+			auto grantee = NamePath(vector<string> {role}).ToGrammar();
+			if (!columns.empty()) {
+				Add("grant", "*", role, "catalog_columns",
+				    "the catalog grant states COLUMNS (\"" + columns +
+				        "\"), which only an object grant states since spec 158 - every read under this grant refuses",
+				    "SELECT acl_alter_grant(" + Lit(role) + ", " + Lit(vcat) +
+				        ", 'columns', '')  -- then GRANT TABLE <object> TO ROLE " + grantee + " COLUMNS (…)");
+			}
+			if (rls.empty()) {
+				continue;
+			}
 			for (auto &entry : relations) {
 				auto &relation = entry.second;
 				if (relation.dead) {
 					continue;
 				}
-				// the catalog level has no single object to bind against, so it is judged against
-				// every one (spec 027): a predicate or a mask that fails on an object fails that
-				// object's reads
-				if (!rls.empty()) {
-					JudgePredicate("grant", relation, role, rls, rls_checked,
-					               "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
-					                   NamePath(vector<string> {role}).ToGrammar() + " SET RLS '<predicate>'");
-				}
-				for (auto &item : items) {
-					JudgeColumns(relation, role, {item}, false, set_columns(Without(items, item.first)), &matched);
-				}
-			}
-			// a catalog-wide bare name applies where an object has it and is absent elsewhere by
-			// design (spec 038) - it is a finding only when no object of the catalog has it any more
-			for (auto &item : items) {
-				if (item.second.empty() && !matched.count(MatchKey(item.first)) && !relations.empty()) {
-					Add("grant", "*", role, "grant_column_missing",
-					    "the catalog-wide COLUMNS item \"" + item.first + "\" matches no column of any object of \"" +
-					        vcat + "\" - the role reads less than the grant says",
-					    set_columns(Without(items, item.first)));
-				}
+				// the catalog level has no single object to bind against, so it is judged against every one (spec
+				// 027): a predicate that fails on an object fails that object's reads
+				JudgePredicate("grant", relation, role, rls, rls_checked,
+				               "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + grantee +
+				                   " SET RLS '<predicate>'");
 			}
 		}
 	}
@@ -1462,25 +1444,30 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		// The masks that would be orphaned: the object grants on this object. A catalog grant's mask
 		// is not touched either way - it protects the column on every other object, and spec 038
 		// refuses this object's reads for it, which the check reports as mask_broken.
-		auto grants =
-		    catalog->Query("SELECT \"role\", \"caps\", \"rls\", \"columns\" FROM " + catalog->Tbl("role_object_caps") +
-		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"role\"");
+		auto grants = catalog->Query("SELECT \"role\", \"caps\", \"rls\", \"columns\", \"masks\" FROM " +
+		                             catalog->Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                             " AND \"vname\" = " + Lit(vname) + " ORDER BY \"role\"");
 		ResultRows grants_rows(*grants);
 		struct Affected {
 			string role, caps, rls;
-			Columns items;
+			ColumnTest test;
+			GrantMasks masks;
 		};
 		vector<Affected> affected;
 		vector<string> orphaned;
 		for (idx_t row = 0; row < grants->RowCount(); row++) {
 			Affected grant {grants_rows.GetValue(0, row).ToString(), Text(grants_rows.GetValue(1, row)),
-			                Text(grants_rows.GetValue(2, row)), ParseColumnList(Text(grants_rows.GetValue(3, row)))};
+			                Text(grants_rows.GetValue(2, row)), ReadColumnTest(Text(grants_rows.GetValue(3, row))),
+			                ReadMasks(Text(grants_rows.GetValue(4, row)))};
 			bool touched = false;
-			for (auto &item : grant.items) {
-				if (!item.second.empty() && missing.count(MatchKey(item.first))) {
-					orphaned.push_back("\"" + item.first + "\" (role \"" + grant.role + "\")");
+			for (auto &mask : grant.masks) {
+				if (missing.count(MatchKey(mask.first))) {
+					orphaned.push_back("\"" + mask.first + "\" (role \"" + grant.role + "\")");
 					touched = true;
 				}
+			}
+			for (auto &name : grant.test.names) {
+				touched = touched || missing.count(MatchKey(name)) > 0; // its COLUMNS lose the name too (re-review)
 			}
 			if (touched) {
 				affected.push_back(std::move(grant));
@@ -1492,14 +1479,9 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 			    "REMAP the column, alter those grants, or DROP MISSING COLUMNS AND MASKS",
 			    vcat, vname, StringUtil::Join(orphaned, ", "));
 		}
-		// Not one transaction (each writer is its own, spec 034's version bump included), so the
-		// order is what keeps a failure midway harmless: the grants lose their mask items FIRST -
-		// a grant with fewer items reads less, never more - and the object's list is cut after.
-		// A grant rewrite that fails leaves the object whole and the dead entry unreadable as
-		// before; a cut that fails leaves masks gone from grants that could not read the column
-		// anyway. Nothing on either path widens.
-		// spec 156: an emptied list is no list - every column - so neither the object's nor a grant's may be emptied
-		// here (both read wider than before: the source's every column, a row-only grant)
+		// Not one transaction (each writer is its own, spec 034's version bump included), so the order is what keeps a
+		// failure midway harmless (below). spec 156: an emptied list is no list - every column - so the object's may
+		// not be emptied here
 		Columns kept;
 		for (auto &column : columns) {
 			if (!missing.count(column.first)) {
@@ -1511,31 +1493,51 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 			                      "list reads every column of its source; SET COLUMNS to what it exposes, or drop it",
 			                      vcat, vname);
 		}
-		vector<string> rewritten;
+		// the grants without the vanished columns, judged before anything is written
+		vector<std::pair<string, string>> rewrites; // the COLUMNS and MASK of each affected grant
 		for (auto &grant : affected) {
-			vector<string> items;
-			for (auto &item : grant.items) {
-				if (!item.second.empty() && missing.count(MatchKey(item.first))) {
-					changed++;
+			GrantMasks other;
+			int64_t dropped = 0;
+			for (auto &mask : grant.masks) {
+				if (missing.count(MatchKey(mask.first))) {
+					dropped++;
 					continue;
 				}
-				items.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
+				other.push_back(mask);
 			}
-			if (items.empty() && !grant.items.empty()) {
-				throw BinderException("acl admin: \"%s.%s\": dropping the masks would leave the grant of role \"%s\" "
-				                      "with no column - an empty list reads every column; alter or revoke that grant "
-				                      "first",
-				                      vcat, vname, grant.role);
+			auto test = grant.test;
+			vector<string> names;
+			for (auto &name : test.names) {
+				if (!missing.count(MatchKey(name))) {
+					names.push_back(name);
+				}
 			}
-			rewritten.push_back(StringUtil::Join(items, ", "));
+			if (test.kind == ColumnTest::Kind::ONLY && names.empty()) {
+				// an empty list reads every column: the grant is left as it is - it names only vanished columns and
+				// reads nothing (spec 156 refuses its reads; the check says grant_exposes_nothing) - alter or revoke it
+				rewrites.emplace_back(string("\x01"), string());
+				continue;
+			}
+			changed += dropped;
+			test.names = names;
+			if (test.kind == ColumnTest::Kind::EXCEPT && names.empty()) {
+				test.kind = ColumnTest::Kind::ALL; // nothing left to leave out
+			}
+			rewrites.emplace_back(ColumnTestText(test), MasksText(other));
 		}
-		for (idx_t i = 0; i < affected.size(); i++) {
-			auto &grant = affected[i];
-			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, rewritten[i], false, false, false);
-		}
+		// the object's list is cut first: a grant still masking a vanished column refuses its reads meanwhile (a mask
+		// that cannot be applied), so nothing widens; the grants are then written over the mended object
 		columns = std::move(kept);
 		changed += NumericCast<int64_t>(missing.size());
 		CatalogAlterRelation(vcat, vname, "columns", "", columns, marks);
+		for (idx_t i = 0; i < affected.size(); i++) {
+			auto &grant = affected[i];
+			if (rewrites[i].first == "\x01") {
+				continue; // left as it is (above)
+			}
+			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, rewrites[i].first, false, false, false,
+			                     nullptr, &rewrites[i].second);
+		}
 		CatalogRefreshSchema(vcat, vname);
 		return changed;
 	} else {

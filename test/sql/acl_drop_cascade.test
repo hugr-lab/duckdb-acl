@@ -104,7 +104,9 @@ SELECT count(*) FROM acl_references();
 ----
 0
 
-# --- a grant's probed projection goes with what it describes -------------------------------------------
+# --- a grant's projection goes with what it describes -------------------------------------------------
+# (spec 158: a grant's COLUMNS and MASK live on its role_object_caps row - nothing is probed into grant_columns any
+# more, so the row itself is what must go; acl_grant_columns() stays checked empty)
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
@@ -116,12 +118,12 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) COLUMNS (id, dest = upper(dest));
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) COLUMNS (id, dest) MASK (dest AS upper(dest));
 
-query I
-SELECT count(*) FROM acl_grant_columns();
+query T
+SELECT columns FROM acl_object_grants() WHERE role = 'r' AND vname = 'orders';
 ----
-2
+id, dest
 
 # dropping the role takes them, not only the grant they belong to
 statement ok
@@ -195,12 +197,12 @@ statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE c.crosses FROM c.vs.inner TO orders ON (id = id);
 
 statement ok
-ACL ADMIN GRANT TABLE c.vs.inner TO ROLE g WITH (select) COLUMNS (id, kind = upper(kind));
+ACL ADMIN GRANT TABLE c.vs.inner TO ROLE g WITH (select) COLUMNS (id, kind) MASK (kind AS upper(kind));
 
-query I
-SELECT count(*) FROM acl_grant_columns() WHERE vname = 'vs.inner';
+query T
+SELECT columns FROM acl_object_grants() WHERE vname = 'vs.inner';
 ----
-2
+id, kind
 
 # a function under the path is an object too, so it also needs CASCADE
 statement error
@@ -216,10 +218,11 @@ SELECT count(*) FROM acl_references() WHERE name = 'crosses';
 ----
 0
 
-query I
-SELECT count(*) FROM acl_grant_columns() WHERE vname = 'vs.inner';
+query II
+SELECT (SELECT count(*) FROM acl_grant_columns() WHERE vname = 'vs.inner'),
+       (SELECT count(*) FROM acl_object_grants() WHERE vname = 'vs.inner');
 ----
-0
+0	0
 
 query I
 SELECT count(*) FROM acl_functions() WHERE vname = 'vs.fn';
@@ -243,7 +246,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE c.last FROM customers TO orders ON (id = cust);
 
 statement ok
-ACL ADMIN GRANT TABLE c.customers TO ROLE g WITH (select) COLUMNS (id, city = upper(city));
+ACL ADMIN GRANT TABLE c.customers TO ROLE g WITH (select) COLUMNS (id, city) MASK (city AS upper(city));
 
 statement ok
 ACL ADMIN DROP VIRTUAL CATALOG c CASCADE;

@@ -55,7 +55,8 @@ ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
 ACL ADMIN CREATE VIRTUAL TABLE c.typed AS memory.main.typed;
 ACL ADMIN CREATE VIRTUAL TABLE c.typed_v AS memory.main.typed;
 ACL ADMIN ALTER VIRTUAL TABLE c.typed_v SET TYPES (enums = varchar);
-ACL ADMIN CREATE VIRTUAL TABLE c.nested AS memory.main.nested;
+-- spec 158: a struct narrowed to its fields is the object's own column (an expression over the source's)
+ACL ADMIN CREATE VIRTUAL TABLE c.nested AS memory.main.nested COLUMNS (id, struct_pack(city := address.city) AS address);
 ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."Order Items" AS memory."Raw Data"."Order Items" PRIMARY KEY (id);
 ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."Line Items" AS memory."Raw Data"."Line Items";
 ACL ADMIN CREATE VIRTUAL REFERENCE c."Line To Order" FROM "Raw Data"."Line Items" TO "Raw Data"."Order Items"
@@ -73,7 +74,7 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     CAPS '{"select": true, "insert": true}'
     RLS 'tenant = acl_claim(''tenant'')';
 ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select) COLUMNS (id, name);
-ACL ADMIN GRANT TABLE c.nested TO ROLE analyst WITH (select) COLUMNS (id, address.city);
+ACL ADMIN GRANT TABLE c.nested TO ROLE analyst WITH (select) COLUMNS (id, address);
 -- spec 051: create prices CREATE, drop prices REPLACE and DROP - a live-alias schema as the home
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
 ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);

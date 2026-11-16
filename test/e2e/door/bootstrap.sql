@@ -39,7 +39,7 @@ ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT 'test/idp/s' TO ROLE analyst;
 ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     CAPS '{"select": true, "insert": true}'
     RLS 'tenant = acl_claim(''tenant'')'
-    COLUMNS 'id,tenant=acl_claim(''tenant''),amount';
+    COLUMNS (id, tenant, amount) MASK (tenant AS acl_claim('tenant'));
 
 -- spec 114: a second catalog the role holds (not MAIN), for a client's USE through the door
 ACL ADMIN CREATE VIRTUAL CATALOG m;

@@ -10,15 +10,15 @@ require acl
 
 # the memory store judges the same text (it pastes it at read too)
 statement error
-SELECT acl_grant_table('m', 't', 'phys.main.t', 'id, note = 1 FROM range(1)', '', 'select');
+SELECT acl_grant_table('m', 't', 'phys.main.t', 'id, 1 FROM range(1) AS note', '', 'select');
 ----
-spec 148
+a column list is a SELECT list
 
 # ... and a name it pastes as written
 statement error
 SELECT acl_grant_table('m', 't', 'phys.main.t', 'id FROM range(1)', '', 'select');
 ----
-not a column name
+a column list is a SELECT list
 
 statement ok
 ATTACH ':memory:' AS store;
@@ -50,43 +50,53 @@ ACL ADMIN CREATE VIRTUAL TABLE c.u AS phys.main.t;
 statement ok
 ACL ADMIN CREATE ROLE r;
 
-# a catalog grant's mask: a FROM after it, a comment, a second statement, an alias, an unbalanced parenthesis
+# spec 158: a catalog grant takes no column list, so none is judged - it is refused as such
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1 FROM range(3)');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, 1 FROM range(3) AS note');
 ----
-spec 148
+a catalog grant takes no column list
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN;
+
+# an object grant's mask: a FROM after it, a comment, a second statement, an alias, an unbalanced parenthesis
+statement error
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS 1 FROM range(3)');
+----
+a column list is a SELECT list
+
+# a comment in a mask is refused (spec 148: one expression, read as written)
+statement error
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS upper(note) -- hidden');
+----
+holds a comment
+
+# an open comment is refused as written all the same
+statement error
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS upper(note) /* hidden');
+----
+ends inside a literal, a quoted name or a comment
+
+# a closed comment too
+statement error
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS upper(note) /* kept */');
+----
+holds a comment
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) -- hidden');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS 1; SELECT 2');
 ----
-does not stay one expression
-
-# spec 150 4e: the list is read on duckdb's tokens, where an open comment is nothing - refused as written all the same
-statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* hidden');
-----
-spec 148
-
-# spec 150 4e: no comment at all - a stored list with one is read the way builds before 4e read it, so none is written
-statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* kept */');
-----
-spec 148
+a column list is a SELECT list
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1; SELECT 2');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS 1 AS x');
 ----
-spec 148
+a column list is a SELECT list
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1 AS x');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS 1) UNION SELECT 1 (');
 ----
-an alias
-
-statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1) UNION SELECT 1 (');
-----
-spec 148
+a column list is a SELECT list
 
 # ... and its row filter
 statement error
@@ -107,7 +117,7 @@ id > 0
 
 # what is one expression stays allowed: a string holding the comment marks, a subquery, CASE, a lambda, a cast
 statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'note <> ''x--y''', 'id, note = CASE WHEN id > 1 THEN ''--'' ELSE upper(note) END');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', 'note <> ''x--y''', 'id, note', '', 'note AS CASE WHEN id > 1 THEN ''--'' ELSE upper(note) END');
 
 query II
 ACL ROLE "r" SELECT * FROM t ORDER BY id;
@@ -116,7 +126,7 @@ ACL ROLE "r" SELECT * FROM t ORDER BY id;
 2	--
 
 statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM phys.main.t)', 'id, note = list_transform([note], lambda x: x || ''/*'')[1]::VARCHAR');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', 'id IN (SELECT id FROM phys.main.t)', 'id, note', '', 'note AS list_transform([note], lambda x: x || ''/*'')[1]::VARCHAR');
 
 query II
 ACL ROLE "r" SELECT * FROM t ORDER BY id;
@@ -132,7 +142,7 @@ statement ok
 INSERT INTO phys.main.w VALUES (1, 'a', 0, 0, 0), (2, 'b', 0, 0, 0);
 
 statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM (SELECT * EXCLUDE (s, l, j) FROM phys.main.w)) AND id IN (SELECT i FROM (SELECT * RENAME (id AS i, note AS n, s AS ss) FROM phys.main.w))', 'id, note');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', 'id IN (SELECT id FROM (SELECT * EXCLUDE (s, l, j) FROM phys.main.w)) AND id IN (SELECT i FROM (SELECT * RENAME (id AS i, note AS n, s AS ss) FROM phys.main.w))', 'id, note', '', '');
 
 query I
 ACL ROLE "r" SELECT count(*) FROM t;
@@ -146,7 +156,7 @@ SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id = ?', '');
 parameter
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = $1');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS $1');
 ----
 parameter
 
@@ -156,15 +166,15 @@ SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id F
 parameter
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = (SELECT max(note) FROM phys.main.t WHERE id = $1)');
+SELECT acl_grant_object('r', 'c', 't', '{"select": true}', '', 'id, note', '', 'note AS (SELECT max(note) FROM phys.main.t WHERE id = $1)');
 ----
 parameter
 
 # an object grant's mask and row filter
 statement error
-SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', '', 'id, note = j AS m FROM range(3) j');
+SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', '', 'id, note', '', 'note AS j AS m FROM range(3) j');
 ----
-spec 148
+a column list is a SELECT list
 
 statement error
 SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', 'id > 0 WHERE true', '');
@@ -173,9 +183,9 @@ spec 148
 
 # a relation's computed column and row filter
 statement error
-SELECT acl_add_relation('c', 'v', 'phys.main.t', 'id, n = note FROM range(1)', '');
+SELECT acl_add_relation('c', 'v', 'phys.main.t', 'id, note FROM range(1) AS n', '');
 ----
-spec 148
+a column list is a SELECT list
 
 statement error
 SELECT acl_add_relation('c', 'v', 'phys.main.t', '', 'id > 0 -- x');
@@ -184,12 +194,12 @@ spec 148
 
 # a REMAP item
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.d AS phys.main.t COLUMNS (id, n = note);
+ACL ADMIN CREATE VIRTUAL TABLE c.d AS phys.main.t COLUMNS (id, note AS n);
 
 statement error
-SELECT acl_repair_relation('c', 'd', 'remap', 'n = note FROM range(1)');
+SELECT acl_repair_relation('c', 'd', 'remap', 'note FROM range(1) AS n');
 ----
-spec 148
+a column list is a SELECT list
 
 # a scalar function's template
 statement error
@@ -202,7 +212,7 @@ ACL ADMIN ADD SCALAR c.s2 MACRO 'upper(acl_arg(1))';
 
 # a row stored past the check (the operator's own SQL into the policy tables) is reported, never run by the probes
 statement ok
-UPDATE store.acl.role_catalogs SET "columns" = 'id, note = j AS m FROM range(3) j' WHERE "role" = 'r';
+UPDATE store.acl.role_object_caps SET "rls" = 'id > 0 FROM range(3) j' WHERE "role" = 'r' AND "vname" = 't';
 
 query I
 SELECT count(*) > 0 FROM acl_check_catalog('c') WHERE detail LIKE '%spec 148%';
@@ -214,6 +224,20 @@ statement error
 ACL ROLE "r" SELECT * FROM t;
 ----
 spec 148
+
+# spec 158: a stored MASK is re-read by duckdb's parser at every read - one that does not read is reported and refuses
+statement ok
+UPDATE store.acl.role_object_caps SET "rls" = '', "masks" = 'note AS j AS m FROM range(3) j' WHERE "role" = 'r' AND "vname" = 't';
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'columns_unreadable' AND object = 't';
+----
+1
+
+statement error
+ACL ROLE "r" SELECT * FROM t;
+----
+a column list is a SELECT list
 
 # review: a column's name is read as a name, quoted - a declared column named with a space reads under a grant
 statement ok

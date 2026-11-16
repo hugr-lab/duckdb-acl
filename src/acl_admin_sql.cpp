@@ -28,37 +28,6 @@
 namespace duckdb {
 namespace acl {
 
-namespace {
-
-//! spec 065 / 150 4e: a grant's legacy quoted list (`COLUMNS '"id", ssn = upper(ssn)'`) is SQL's spelling - a quoted
-//! name means the name it quotes: stored bare when the stored list reads it back as itself, else kept quoted (`"a,b"`,
-//! `"a.b"` - the path reader takes the quotes off). Split as the stored list is read (`SplitListItems`); a mask as
-//! written
-string UnquoteGrantColumns(const string &raw) {
-	vector<string> items;
-	for (auto &item : SplitListItems(raw)) {
-		auto name = item.has_value ? item.name : item.text;
-		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-			string bare;
-			bool one = true; // one quoted name: every quote inside doubled
-			for (idx_t i = 1; one && i + 1 < name.size(); i++) {
-				if (name[i] == '"') {
-					one = i + 2 < name.size() && name[i + 1] == '"';
-					i++;
-				}
-				bare += name[i];
-			}
-			if (one && StoresBare(bare)) {
-				name = bare;
-			}
-		}
-		items.push_back(item.has_value ? name + " = " + item.value : name);
-	}
-	return StringUtil::Join(items, ", ");
-}
-
-} // namespace
-
 unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Value> &args) {
 	vector<unique_ptr<ParsedExpression>> children;
 	for (auto &arg : args) {
@@ -311,7 +280,7 @@ struct HeadWords {
 		RefuseMovedForm("write CHECK VIRTUAL CATALOG <catalog>");
 	}
 	if (verb == "repair") {
-		RefuseMovedForm("write REPAIR VIRTUAL TABLE <catalog>.<name> REMAP (<column> = <expression>, ...) | DROP "
+		RefuseMovedForm("write REPAIR VIRTUAL TABLE <catalog>.<name> REMAP (<expression> AS <column>, ...) | DROP "
 		                "MISSING COLUMNS [AND MASKS]");
 	}
 	RefuseMovedForm("write ANALYZE VIRTUAL CATALOG <catalog>, or ANALYZE VIRTUAL [TABLE | VIEW | SCALAR | TABLE "
@@ -685,9 +654,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		for (auto &list : entry.texts) {
 			string read;
 			switch (list.kind) {
-			case MgmtParsed::TextKind::GRANT_COLUMNS:
-				read = UnquoteGrantColumns(list.text);
-				break;
+			case MgmtParsed::TextKind::GRANT_COLUMNS: // spec 158: the writer reads the list (`ReadSelectList`)
 			case MgmtParsed::TextKind::TEXT:
 				read = list.text;
 				break;

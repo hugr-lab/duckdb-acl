@@ -85,6 +85,26 @@ buffer pool holding what was read (2 GiB of `BASE_TABLE` after 8,000 tables) - u
 The first functions listing of a role set still resolves functions x roles pairs (1 million with 100 roles). Writes are
 PR 2's.
 
+**After spec 158 stage 1** (2026-11-16; the catalog grants carry no column list any more - only the RLS - so every
+table shows its 11 columns and `information_schema.columns` lists 220,000 rows, not 80,000: the shapes differ, the
+numbers are not a before/after of the same reads):
+
+| what | 1 role | 10 roles | 100 roles |
+|---|---|---|---|
+| a warm statement (gateway) | 0 ms | 1 ms | 3 ms |
+| a table, first | 57 ms | 72 ms | 159 ms |
+| 2,000 distinct tables, each | 28 ms | 43 ms | 47 ms |
+| `information_schema.tables` | 0.07 s, 0.46 GiB | 0.08 s, 0.47 GiB | 0.22 s, 0.68 GiB |
+| columns of one table | 0.44 s, 0.59 GiB | 0.53 s, 0.62 GiB | 1.3 s, 1.1 GiB |
+| `information_schema.columns` (220,000) | 0.59 s, 1.7 GiB | 0.59 s, 1.7 GiB | 1.3 s, 2.1 GiB |
+| `duckdb_tables()` | 0.64 s, 1.2 GiB | 0.65 s, 1.1 GiB | 1.4 s, 1.6 GiB |
+| `SHOW ALL TABLES` | 0.43 s, 1.0 GiB | 0.43 s, 1.0 GiB | 1.2 s, 1.4 GiB |
+| `duckdb_functions()` first / again | 0.44 / 0.04 s | 0.68 / 0.04 s | 2.6 / 0.04 s |
+
+Writes are unchanged (a table 52 → 66 ms, an object grant 48 ms, a catalog grant with RLS at full size 8.3 s); the
+policy file 18 MiB. The listings no longer fold the roles' lists (`keeps` filters the object's columns by each
+role's test), so with 100 roles they cost a third less than PR 1's at almost three times the rows.
+
 ## Findings
 
 1. **`duckdb_functions()` / `acl_function_columns()` resolve every visible function on its own**

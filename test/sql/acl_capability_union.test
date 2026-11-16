@@ -2,7 +2,8 @@
 # description: spec 145 - a capability's policy is the union of the grant rows that hold it: a role that may not read
 #   (insert only, CAPS '{}') lifts no read role's row filter or columns, a role that may only insert lifts no update
 #   role's confinement, RETURNING reads under the read policy, and the listings narrow as the read does. The token
-#   names two roles: analyst and auditor (test/idp/rs).
+#   names two roles: analyst and auditor (test/idp/rs). Spec 158: a role's columns are its object grants' (a catalog
+#   grant takes no COLUMNS), so each object a section reads carries its own; REVOKE CATALOG takes them with it.
 # group: [sql]
 
 require acl
@@ -48,7 +49,13 @@ ACL ADMIN CREATE ROLE auditor;
 
 # --- a read role with a row filter and a column list, beside a role that may only insert -------------------------
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2) COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE analyst COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE analyst COLUMNS (id, amount);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
@@ -161,7 +168,10 @@ statement ok
 ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2) COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE analyst COLUMNS (id, amount);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
@@ -262,7 +272,10 @@ statement ok
 ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert, update) MAIN RLS (id = 2) COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert, update) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE auditor COLUMNS (id, amount);
 
 query T
 ACL ROLE 'auditor' SELECT column_name FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position;
@@ -322,7 +335,13 @@ statement ok
 ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, delete, merge) MAIN RLS (id = 2) COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, delete, merge) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT TABLE c.v TO ROLE analyst COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT TABLE c.d TO ROLE analyst COLUMNS (id, amount);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
@@ -344,6 +363,8 @@ SELECT * FROM phys.main.d ORDER BY id;
 1	10
 
 # --- review 145: a table a grant narrows by columns is a table - DROP drops it, RENAME renames it -------------------
+# (spec 158: the narrowing is an object grant on the table, a grant by name, so RENAME refuses it while the grant is
+# there - spec 113 - and renames it once revoked)
 statement ok
 CREATE SCHEMA phys.lake;
 
@@ -354,7 +375,7 @@ statement ok
 ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN COLUMNS (id);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
 
 statement ok
 ACL ADMIN GRANT SCHEMA c.vs TO ROLE analyst WITH (select, insert, create, drop);
@@ -363,7 +384,26 @@ statement ok
 ACL ROLE 'analyst' CREATE TABLE vs.k(id INTEGER, y INTEGER);
 
 statement ok
+ACL ADMIN GRANT TABLE c.vs.k TO ROLE analyst COLUMNS (id);
+
+query I
+ACL ROLE 'analyst' SELECT column_name FROM (DESCRIBE vs.k);
+----
+id
+
+statement error
 ACL ROLE 'analyst' ALTER TABLE vs.k RENAME TO k2;
+----
+carries the operator's declarations
+
+statement ok
+ACL ADMIN REVOKE TABLE c.vs.k FROM ROLE analyst;
+
+statement ok
+ACL ROLE 'analyst' ALTER TABLE vs.k RENAME TO k2;
+
+statement ok
+ACL ADMIN GRANT TABLE c.vs.k2 TO ROLE analyst COLUMNS (id);
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = 'lake' AND table_name = 'k2';
@@ -390,7 +430,10 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2);
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE auditor COLUMNS (id, amount);
 
 statement error
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = amount WHERE secret = 'S1';
@@ -398,7 +441,8 @@ ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiO
 secret
 
 # an upsert's SET and WHERE are never mapped column by column: under a column policy - the update's, or the one it
-# reads under - refused, as an insert's is (a hidden column read, a hidden field written)
+# reads under - refused, as an insert's is (a hidden column read, a masked field written; spec 158: the hidden field
+# of spec 102 is a struct_update mask)
 statement ok
 CREATE TABLE phys.main.p(id INTEGER PRIMARY KEY, amount INTEGER, addr STRUCT(city VARCHAR, ssn VARCHAR));
 
@@ -415,7 +459,10 @@ statement ok
 ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN COLUMNS (id, amount, addr.city);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.p TO ROLE analyst COLUMNS (id, amount, addr) MASK (addr AS struct_update(addr, ssn := NULL::VARCHAR));
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
@@ -444,7 +491,10 @@ statement ok
 ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2) COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE analyst COLUMNS (id, amount);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN RLS (id = 1);
@@ -464,7 +514,10 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update, delete) MAIN RLS (id = 2);
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update, delete) MAIN RLS (id = 1) COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update, delete) MAIN RLS (id = 1);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE auditor COLUMNS (id, amount);
 
 statement error
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = amount WHERE id = 1 AND secret = 'S1';
@@ -484,7 +537,10 @@ statement ok
 ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, update) MAIN COLUMNS (id, amount);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, update) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.p TO ROLE analyst COLUMNS (id, amount);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert, update) MAIN RLS (amount = -1);

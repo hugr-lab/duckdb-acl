@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "acl_grant_columns.hpp"
+
 #include "acl_list_items.hpp"
 #include "acl_name_path.hpp"
 #include "acl_door_certificate.hpp"
@@ -148,9 +150,10 @@ struct TablePolicy {
 	//! names in an outer `COLUMNS(lambda …)` (which keeps what matches and ignores what does not).
 	//! Wraps the call, which appears in it as the placeholder `"__acl_inner"`. Empty = no projection.
 	string wrap_sql;
-	//! spec 147: a table function grant's united column list (name, mask), the one wrap_sql is written from - what a
-	//! listing narrows the function's declared columns by, without binding wrap_sql
-	vector<std::pair<string, string>> granted_items;
+	//! spec 147, 158: a table function grant's united columns (the test and the masks), the ones wrap_sql is written
+	//! from - what a listing narrows the function's declared columns by, without binding wrap_sql
+	acl_detail::RoleColumns granted_columns;
+	bool granted_restricts = false;
 	case_insensitive_set_t caps; // {"select","insert","update","delete","merge"}
 	//! Column renames of a writable (alias-form) relation: virtual name -> physical name. Renaming is
 	//! not a restriction, so it does not force the read-only subquery form: reads go through
@@ -189,6 +192,31 @@ struct TablePolicy {
 	//! column (`injections`) as its mask - a write statement is never a way back to what a read hides.
 	case_insensitive_set_t visible_columns;
 	vector<std::pair<string, string>> narrowed_reads;
+	//! spec 158: the columns are narrowed by what is left out, not by what is listed - an object read live (no list of
+	//! its own) under a grant's `* EXCLUDE (…)` or masks: every physical column but `excluded_columns` may be read and
+	//! written (`visible_columns` / `write_columns` are then empty); the masked ones are `injections`
+	bool columns_excluded = false;
+	case_insensitive_set_t excluded_columns;
+
+	//! Whether a column policy narrows what a DML statement reads or writes
+	bool ColumnsNarrowed() const {
+		return columns_excluded || !visible_columns.empty();
+	}
+	bool WritesNarrowed() const {
+		return columns_excluded || !write_columns.empty();
+	}
+	//! Whether a DML statement may read physical column `name` (as stored or masked - a mask is `injections`)
+	bool Readable(const string &name) const {
+		return columns_excluded ? !excluded_columns.count(name) : visible_columns.count(name) > 0;
+	}
+	//! Whether a write may name physical column `name` (a masked one is assigned its mask, never the client's value)
+	bool Writable(const string &name) const {
+		if (!columns_excluded) {
+			return write_columns.empty() || write_columns.count(name) > 0;
+		}
+		return !excluded_columns.count(
+		    name); // a masked one is written its mask (`injections`), never the client's value
+	}
 	//! spec 102 part B: columns a grant narrows to some of their fields, still written through -
 	//! physical column -> the COLUMNS items of its tree (rooted at that name). A write keeps the hidden
 	//! fields, assigns the masked ones and refuses a hidden field in the written value.
@@ -1026,11 +1054,12 @@ struct PolicyStore {
 	//! transaction, and the difference is written as rows
 	void CatalogEditIdentity(const std::function<void(IdentityModel &)> &apply);
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
-	//! `versions` (spec 167): as CatalogGrant's
+	//! `versions` (spec 167): as CatalogGrant's; `masks` (spec 158): the grant's MASK, nullptr = keep the stored ones
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
 	                          const string &rls = "", const string &columns = "", bool judge_caps = true,
 	                          bool ensure_grant = false, bool written_list = true,
-	                          optional_ptr<const string> versions = nullptr);
+	                          optional_ptr<const string> versions = nullptr,
+	                          optional_ptr<const string> masks = nullptr);
 	//! spec 167: a grant's VERSIONS as written -> as stored (acl_versions.hpp), its values evaluated on the store
 	string NormalizeGrantVersions(const string &written);
 	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function);
@@ -1049,7 +1078,7 @@ struct PolicyStore {
 	//! grant)
 	vector<GrantCheckRow> CatalogCheckGrant(const string &role, const string &vcat, const string &vname,
 	                                        const string &rls, const string &columns, const string &caps_json,
-	                                        bool has_caps);
+	                                        bool has_caps, const string &masks = string());
 	//! Whether an object of that kind already exists - what CREATE / CREATE OR REPLACE /
 	//! CREATE IF NOT EXISTS decide on (spec 013). kind: catalog|role|issuer|schema|relation|table|scalar
 	bool CatalogObjectExists(const string &vcat, const string &vname, const string &kind);

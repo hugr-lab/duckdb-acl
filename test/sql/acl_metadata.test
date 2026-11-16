@@ -81,7 +81,7 @@ SELECT count(*) FROM aclcat.acl.object_columns WHERE vname = 'rng';
 # --- a projection's names are stored; types come from the physical catalog on read ----------------
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id,amount,ssn=NULL';
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id,amount,NULL AS ssn';
 
 # a projection is bound at write time like a view's SQL, so its columns carry types - including the
 # ones no physical column has (`ssn = NULL` here) - and are re-derived by ANALYZE when the source moves

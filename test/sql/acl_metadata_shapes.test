@@ -37,7 +37,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COMMENT 'orders a role may read';
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (id, ssn = NULL);
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (id, NULL AS ssn);
 
 statement ok
 ACL ADMIN CREATE VIRTUAL VIEW c.recent AS 'SELECT 1 AS n';
@@ -481,8 +481,8 @@ id	1	true	false
 tenant	2	true	false
 
 # --- a grant's own projection: three answers, one object ----------------------------------------------
-# a computed column the object never had (spec 026) has to appear in the columns listing, in the
-# synthesized DDL and in DESCRIBE - the whole point of building all three from one listing
+# a grant's projection (spec 158: its COLUMNS and a MASK, typed as the column) has to appear in the columns listing,
+# in the synthesized DDL and in DESCRIBE - the whole point of building all three from one listing
 
 statement ok
 ACL ADMIN CREATE ROLE auditor;
@@ -491,7 +491,13 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT OBJECT c.orders TO ROLE auditor COLUMNS (id, tenant = tenant[1]);
+ACL ADMIN GRANT OBJECT c.orders TO ROLE auditor COLUMNS (id, tenant) MASK (tenant AS tenant[1]);
+
+query IT
+ACL ROLE "auditor" SELECT * FROM orders ORDER BY id;
+----
+1	a
+2	g
 
 query II
 ACL ROLE "auditor" SELECT column_name, data_type FROM duckdb_columns()
@@ -608,7 +614,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG m;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE m.orders AS phys.main.orders COLUMNS (id, tag = tenant, ssn);
+ACL ADMIN CREATE VIRTUAL TABLE m.orders AS phys.main.orders COLUMNS (id, tenant AS tag, ssn);
 
 statement ok
 ACL ADMIN CREATE ROLE r1;
@@ -624,10 +630,10 @@ ACL ADMIN GRANT CATALOG m TO ROLE r2 WITH (select) MAIN;
 
 # overlapping plain lists (`id` in both) and the same projection at two different positions
 statement ok
-ACL ADMIN GRANT OBJECT m.orders TO ROLE r1 COLUMNS (id, tag = lower(tenant));
+ACL ADMIN GRANT OBJECT m.orders TO ROLE r1 COLUMNS (id, tag) MASK (tag AS lower(tag));
 
 statement ok
-ACL ADMIN GRANT OBJECT m.orders TO ROLE r2 COLUMNS (id, ssn, tag = lower(tenant));
+ACL ADMIN GRANT OBJECT m.orders TO ROLE r2 COLUMNS (id, ssn, tag) MASK (tag AS lower(tag));
 
 # roles ["r1","r2"]
 query II
@@ -655,7 +661,7 @@ statement ok
 ACL ADMIN GRANT CATALOG m TO ROLE r3 WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT OBJECT m.orders TO ROLE r3 COLUMNS (id, tag = upper(tenant));
+ACL ADMIN GRANT OBJECT m.orders TO ROLE r3 COLUMNS (id, tag) MASK (tag AS upper(tag));
 
 # roles ["r1","r3"]
 query II
@@ -669,4 +675,4 @@ statement error
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zaGFwZXMiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIxIiwicjMiXX0.Vbmzj47hpahFLMN5BTXD4DB2hJj9-52ahZ7BMVbLLKMlBwKzIUaLsH7T-OUb4uTZuVItsnjdFbHbwJX_JqgDCfiRTAOEnKAYUrzC2EM7dWDzzvdNISTdQ8Wr2WOGJ0diy7HRrF3ZgKNbQ_MkJVk_o8g9ucfd_3WVDfqB0PL4X4fvYJqha0TFQ99UHXd8jBNuK2GRS-uQHYu0u8vGL-AjrPdUx3ZVU1SIliRdJ-RJMICGXx661INT35tXv787zoVvaU4imW6p0EbUS1-h1QesDjFKjJ-cJf64Dh7oEDZKXOkDw3m87Xk6QCuiSHJ8CGFd81xHHnLwye9ytulxSc6THw'
 SELECT * FROM orders;
 ----
-<REGEX>:.*mask column "tag" differently.*
+<REGEX>:.*mask column "tag" of "orders" differently.*

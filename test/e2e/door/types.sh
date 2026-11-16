@@ -81,12 +81,13 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.typed AS phys.main.typed;
 ACL ADMIN CREATE VIRTUAL TABLE c.kept AS phys.main.typed;
 ACL ADMIN ALTER VIRTUAL TABLE c.kept SET TYPES (enums = keep);
-ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.main.typed COLUMNS (id, s.b, l);
+ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.main.typed COLUMNS (id, struct_pack(b := s.b) AS s, l);
 $MS_SQL
 ACL ADMIN CREATE ROLE analyst;
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
-ACL ADMIN CREATE VIRTUAL TABLE c.nested AS phys.main.nested;
-ACL ADMIN GRANT TABLE c.nested TO ROLE analyst COLUMNS (id, items[].price);
+ACL ADMIN CREATE VIRTUAL TABLE c.nested AS phys.main.nested
+    COLUMNS (id, list_transform(items, lambda e: struct_pack(price := e.price)) AS items);
+ACL ADMIN GRANT TABLE c.nested TO ROLE analyst COLUMNS (id, items);
 SET GLOBAL acl_allow_anonymous_admin=false;
 SELECT acl_quack_serve('quack:localhost:$PORT', '$SERVER_TOKEN');
 EOF
@@ -127,7 +128,7 @@ expect "ENUMs as VARCHAR at every depth, the data as described" \
 expect "a filter on the cast columns" "filtered,1"
 expect "a table that keeps its ENUMs" "kept,\"ENUM('gold', 'silver')\",gold,silver"
 expect "a struct narrowed to its fields" "narrow,STRUCT(b INTEGER),2"
-expect "a grant narrowing a list of structs" "nested,STRUCT(price INTEGER)[],10"
+expect "an object narrowing a list of structs" "nested,STRUCT(price INTEGER)[],10"
 expect "the listing says what the read returns" "columns,VARCHAR"
 [ -z "$MS_LOAD" ] || expect "mssql alias types as their base type" "ms,VARCHAR,VARCHAR,n42,u42"
 

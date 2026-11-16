@@ -59,9 +59,9 @@ POLICIES = {
     "none": ("", True),                                       # a plain rename: the floor
     "cols": ("    COLUMNS 'id,tenant,amount'", True),         # a column list, nothing computed
     "rls": ("    RLS 'tenant = acl_claim(''tenant'')'", False),  # a predicate alone: reads only
-    "inject": ("    COLUMNS 'id,tenant=acl_claim(''tenant''),amount'", True),  # an assigned column
+    "inject": ("    COLUMNS (id, tenant, amount) MASK (tenant AS acl_claim('tenant'))", True),  # an assigned column
     "full": ("    RLS 'tenant = acl_claim(''tenant'')'\n"
-             "    COLUMNS 'id,tenant=acl_claim(''tenant''),amount'", True),
+             "    COLUMNS (id, tenant, amount) MASK (tenant AS acl_claim('tenant'))", True),
 }
 
 

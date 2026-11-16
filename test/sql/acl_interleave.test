@@ -47,11 +47,11 @@ ACL ADMIN GRANT CATALOG c TO ROLE globex WITH (select, insert, delete) MAIN;
 
 statement ok
 ACL ADMIN GRANT TABLE c.orders TO ROLE acme WITH (select, insert, delete)
-    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant) MASK (tenant AS acl_claim('tenant'));
 
 statement ok
 ACL ADMIN GRANT TABLE c.orders TO ROLE globex WITH (select, insert, delete)
-    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant) MASK (tenant AS acl_claim('tenant'));
 
 # --- interleaved: each principal on its own connection, statements alternating -----------------------
 

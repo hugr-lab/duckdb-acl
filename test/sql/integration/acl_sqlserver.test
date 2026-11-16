@@ -30,7 +30,7 @@ ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
 
 # masked column over SQL Server; the dropped column is structurally absent
 statement ok
-SELECT acl_grant_table('analyst', 'employees', 'ms.dbo.employees', 'id,name,ssn=NULL', '', 'select');
+SELECT acl_grant_table('analyst', 'employees', 'ms.dbo.employees', 'id,name,NULL AS ssn', '', 'select');
 
 query III
 ACL ROLE "analyst" SELECT id, name, ssn FROM employees ORDER BY id;

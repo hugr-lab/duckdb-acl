@@ -80,16 +80,6 @@ struct MgmtParseData : ParserExtensionParseData {
 		bool expression = false;
 		//! a quoted list a reader of ours splits: judged as the compiler's text is (no comment, no `$$`, ...)
 		bool judge = false;
-		//! a grant's column list read by its rule (spec 150 4e): each item's name as stored and, for a mask, where
-		//! its expression's tokens stand - the csv is composed once the batch's tokens are known
-		struct ColumnItem {
-			string name;
-			bool masked = false;
-			idx_t start = 0;
-			idx_t end = 0;
-		};
-		bool column_items = false;
-		vector<ColumnItem> columns;
 	};
 	vector<Span> spans;
 
@@ -629,21 +619,16 @@ void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg
 	data.spans.push_back(std::move(span));
 }
 
-//! `AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue` into argument `arg` (spec 150 4f): an object's
-//! own column list (COLUMNS of CREATE VIRTUAL TABLE / ADD TABLE / SET COLUMNS, REMAP). `AclDeclaredItems <- '('
-//! AclDeclaredEntry AclDeclaredMore* ')'`, each `AclDeclaredColumn <- AclDeclaredAs / AclDeclaredNamed` - `Expression
-//! 'AS' ColLabel AclColumnMark?` (SQL's spelling, the alias duckdb's) or `AclFieldPath (AclDeclaredValue /
-//! AclColumnMark)?`, a name or a path each part duckdb's identifier, a value `'=' Expression` - duckdb's expression
-//! rule. The list goes as written (each comment a space) to the one reader of an object's list, `SplitDeclaredColumns`,
-//! which the function forms read it with too; the legacy quoted string goes to it as it stands
+//! `AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue` into argument `arg` (spec 158): an object's
+//! own column list (COLUMNS of CREATE VIRTUAL TABLE / ADD TABLE / SET COLUMNS, REMAP) is a SELECT list,
+//! `AclDeclaredItems <- '(' TargetList ')'` - duckdb's own rule. The list goes as written to the one reader of an
+//! object's list, `SplitDeclaredColumns` (duckdb's parser), which the function forms read it with too; the legacy
+//! quoted string goes to it as it stands
 void DeclaredColumnsInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg, MgmtParseData &data) {
 	auto &node = Strip(result);
 	if (node.Name() == "AclParenList") {
-		throw BinderException(
-		    "acl admin: an object's column list is items `name`, `name = <expression>` or "
-		    "`<expression> AS name`, each optionally NOT NULL / NULL - a name a column or a path into "
-		    "one (address.city), each part an identifier as duckdb reads one (quote a keyword or a "
-		    "name holding other characters), an expression one expression");
+		throw BinderException("acl admin: an object's column list is a SELECT list - `name`, `<expression> AS name` or "
+		                      "`name: <expression>`, each name an identifier as duckdb reads one");
 	}
 	if (node.Name() != "AclDeclaredItems") {
 		ListInto(transformer, result, arg, MgmtParsed::TextKind::TEXT, true, "a column list", data);
@@ -1569,11 +1554,13 @@ struct GrantClauses {
 	optional_idx rls;
 	optional_idx columns;
 	optional_idx versions;
+	optional_idx masks;
 	bool main = false;
 	//! a clause that is present and not empty (a schema grant carries capabilities only)
 	bool rls_written = false;
 	bool columns_written = false;
 	bool versions_written = false;
+	bool masks_written = false;
 };
 
 //! spec 167: `AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord` as the clause the grant functions
@@ -1717,112 +1704,30 @@ string CapsListJson(ParseResult &result) {
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
-//! A field path's name as a grant's csv stores it (spec 102, 150 4e): one part as it is (`odd name`) when the stored
-//! list reads it back so (`StoresBare`), else quoted; a path its parts as `FieldName` writes them, `[]` an element -
-//! what `ParseFieldPath` reads back
-string StoredFieldPath(const vector<string> &parts) {
-	if (parts.size() == 1) {
-		// bare when the stored list reads it back as itself, as `NormaliseGrantColumns` writes it (`RootName`)
-		return StoresBare(parts[0]) ? parts[0] : acl_detail::QuotedName(parts[0]);
-	}
-	string path = acl_detail::FieldName(parts[0]);
-	for (idx_t i = 1; i < parts.size(); i++) {
-		path += parts[i].empty() ? "[]" : "." + acl_detail::FieldName(parts[i]);
-	}
-	return path;
-}
-
-//! `AclGrantColumnList <- AclGrantColumnItems / AclParenList / AclQuotedValue` into argument `arg` (spec 150 4e): a
-//! grant's column list. `AclGrantColumnItems <- '(' AclGrantColumnEntry AclGrantColumnMore* ')'`, each
-//! `AclGrantColumn <- AclFieldPath AclGrantColumnMask?` - a column or a path (`AclFieldPath <- AclNameToken
-//! AclFieldStep*`, a step `.` and a name or `[]`), each name read as duckdb reads an identifier, and a mask `'='
-//! Expression` - duckdb's own expression rule, so `[ ]`, `{ }`, `MAP`, lambdas read as duckdb reads them; the mask is
-//! stored as written (each comment a space) once the tokens are known. The legacy quoted csv goes to the compiler's
-//! reader as before
+//! `AclGrantColumnList <- AclGrantColumnItems / AclParenList / AclQuotedValue` into argument `arg` (spec 158): a
+//! grant's column list is a SELECT list, `AclGrantColumnItems <- '(' TargetList ')'` - duckdb's own rule; it goes as
+//! written to the writer, which reads it with duckdb's parser (`ReadSelectList`) and stores it as duckdb prints it. The
+//! legacy quoted string goes there too
 void GrantColumnsInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg, MgmtParseData &data) {
 	auto &node = Strip(result);
-	if (node.Name() == "AclParenList") {
-		throw BinderException("acl admin: a grant's column list is items `name` or `name = <mask>` - a name a column "
-		                      "or a path into one (address.city, items[].price), each part an identifier as duckdb "
-		                      "reads one (quote a keyword or a name holding other characters), a mask one expression");
+	if (node.Name() == "AclParenList" && !ListIsEmpty(transformer, result)) {
+		throw BinderException("acl admin: a grant's COLUMNS is `name, …`, `*` or `* EXCLUDE (name, …)` - each name an "
+		                      "identifier as duckdb reads one (a mask is MASK (<column> AS <expression>))");
 	}
-	if (node.Name() != "AclGrantColumnItems") {
-		ListInto(transformer, result, arg, MgmtParsed::TextKind::GRANT_COLUMNS, false, "a column list", data);
+	if (node.Name() == "AclParenList" || node.Name() == "AclGrantColumnItems") {
+		ParensInto(node, arg, MgmtParsed::TextKind::TEXT, true, data);
 		return;
 	}
-	auto &list = node.Cast<ListParseResult>();
-	// each entry with where it ends: the next separator, or the closing parenthesis
-	vector<std::pair<reference<ParseResult>, idx_t>> entries;
-	vector<reference<ParseResult>> more;
-	grammar::Collect(list.GetChild(2), more);
-	auto &close = list.GetChild(3);
-	auto entry_end = [&](idx_t index) {
-		auto &next = index < more.size() ? more[index].get().Cast<ListParseResult>().GetChild(0) : close;
-		if (!next.offset.IsValid()) {
-			throw ParserException("acl admin: a list has no position");
-		}
-		return next.offset.GetIndex();
-	};
-	entries.emplace_back(list.GetChild(1), entry_end(0));
-	for (idx_t i = 0; i < more.size(); i++) {
-		entries.emplace_back(more[i].get().Cast<ListParseResult>().GetChild(1), entry_end(i + 1));
-	}
-	MgmtParseData::Span span;
-	span.column_items = true;
-	span.kind = MgmtParsed::TextKind::TEXT;
-	for (auto &entry : entries) {
-		auto &part = Strip(entry.first.get());
-		if (part.type == ParseResultType::OPTIONAL) {
-			continue; // an empty item: none, as the reader drops it
-		}
-		auto &column = part.Cast<ListParseResult>();
-		auto &path = Strip(column.GetChild(0)).Cast<ListParseResult>();
-		vector<string> parts {NameOf(path.GetChild(0), "a column name")};
-		vector<reference<ParseResult>> steps;
-		grammar::Collect(path.GetChild(1), steps);
-		for (auto &step : steps) {
-			auto &taken = Strip(step.get()).Cast<ListParseResult>();
-			parts.push_back(taken.Name() == "AclFieldDot" ? NameOf(taken.GetChild(1), "a field name") : string());
-		}
-		MgmtParseData::Span::ColumnItem item;
-		item.name = StoredFieldPath(parts);
-		auto &mask = column.Child<OptionalParseResult>(1);
-		if (mask.HasResult()) {
-			auto &equals = Strip(mask.GetResult()).Cast<ListParseResult>().GetChild(0);
-			if (!equals.offset.IsValid()) {
-				throw ParserException("acl admin: a mask has no position");
-			}
-			item.masked = true;
-			item.start = equals.offset.GetIndex() + 1;
-			item.end = entry.second;
-		}
-		span.columns.push_back(std::move(item));
-	}
-	if (!arg.IsValid()) {
-		return;
-	}
-	span.arg = arg.GetIndex();
-	data.spans.push_back(std::move(span));
+	ListInto(transformer, result, arg, MgmtParsed::TextKind::TEXT, false, "a column list", data);
 }
 
 //! Whether a grant's column list (`AclGrantColumnList`) is empty as written - `()`, separators only or `''`
 bool GrantColumnsAreEmpty(PEGTransformer &transformer, ParseResult &result) {
 	auto &node = Strip(result);
-	if (node.Name() != "AclGrantColumnItems") {
-		return ListIsEmpty(transformer, result);
-	}
-	auto &list = node.Cast<ListParseResult>();
-	if (Strip(list.GetChild(1)).type != ParseResultType::OPTIONAL) {
+	if (node.Name() == "AclGrantColumnItems") {
 		return false;
 	}
-	vector<reference<ParseResult>> more;
-	grammar::Collect(list.GetChild(2), more);
-	for (auto &next : more) {
-		if (Strip(next.get().Cast<ListParseResult>().GetChild(1)).type != ParseResultType::OPTIONAL) {
-			return false;
-		}
-	}
-	return true;
+	return ListIsEmpty(transformer, result);
 }
 
 //! The clauses of a repetition at part `index` into the call's arguments `clauses` names
@@ -1842,6 +1747,12 @@ void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t 
 			if (clauses.versions.IsValid()) {
 				data.args[clauses.versions.GetIndex()] = Value(VersionsText(transformer, parts.GetChild(1)));
 			}
+			continue;
+		}
+		if (keyword == "mask") {
+			// spec 158: `MASK (<column> AS <expression>, …)` - read by the writer (`ReadMasks`)
+			clauses.masks_written = !ListIsEmpty(transformer, parts.GetChild(1));
+			ParensInto(parts.GetChild(1), clauses.masks, MgmtParsed::TextKind::TEXT, true, data);
 			continue;
 		}
 		if (keyword == "with") {
@@ -1902,7 +1813,7 @@ unique_ptr<MgmtParseData> PlatformViewGrant(ListParseResult &list, const string 
 	auto data = PlatformGrantCall("view", PathOf(list.GetChild(2)), verb, RoleTargetOf(list.GetChild(4)));
 	if (data && clauses.IsValid() && list.Child<OptionalParseResult>(clauses.GetIndex()).HasResult()) {
 		throw BinderException("acl admin: a grant on a view of the platform catalog takes no WITH, CAPS, RLS, "
-		                      "COLUMNS or VERSIONS - it is the view, granted or denied");
+		                      "COLUMNS, MASK or VERSIONS - it is the view, granted or denied");
 	}
 	return data;
 }
@@ -1920,6 +1831,11 @@ arena_ptr<TransformResultValue> FinalizeGrantCatalog(PEGTransformer &transformer
 	clauses.columns = AddArg(*data);
 	clauses.versions = AddArg(*data);
 	GrantClausesInto(transformer, list, 6, clauses, *data);
+	if (clauses.columns_written || clauses.masks_written) {
+		throw BinderException("acl admin: a catalog grant takes no COLUMNS or MASK - which columns a role sees, and "
+		                      "masked how, is said on the object's grant (GRANT TABLE <catalog>.<name> TO ROLE <role> "
+		                      "COLUMNS (…) MASK (…), spec 158)");
+	}
 	data->args[main] = Value::BOOLEAN(clauses.main);
 	return MgmtResult(transformer, std::move(data));
 }
@@ -1939,9 +1855,9 @@ arena_ptr<TransformResultValue> FinalizeGrantSchema(PEGTransformer &transformer,
 	auto into = AddArg(*data);
 	auto virtual_only = AddArg(*data, Value::BOOLEAN(false));
 	GrantClausesInto(transformer, list, 6, clauses, *data);
-	if (clauses.rls_written || clauses.columns_written || clauses.versions_written) {
-		throw BinderException("acl admin: a schema grant carries capabilities only - RLS, COLUMNS and VERSIONS belong "
-		                      "to the catalog or to the object (spec 015)");
+	if (clauses.rls_written || clauses.columns_written || clauses.versions_written || clauses.masks_written) {
+		throw BinderException("acl admin: a schema grant carries capabilities only - RLS, COLUMNS, MASK and VERSIONS "
+		                      "belong to the catalog or to the object (spec 015)");
 	}
 	auto &home = list.Child<OptionalParseResult>(7);
 	if (home.HasResult()) {
@@ -1982,6 +1898,7 @@ arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer,
 	clauses.rls = AddArg(*data);
 	clauses.columns = AddArg(*data);
 	clauses.versions = AddArg(*data);
+	clauses.masks = AddArg(*data);
 	GrantClausesInto(transformer, list, 5, clauses, *data);
 	return MgmtResult(transformer, std::move(data));
 }
@@ -3060,35 +2977,12 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclWithCaps <- 'WITH' AclCapsList"));
 		changes.push_back(GrammarChange::AddRule("AclCapsClause <- 'CAPS' AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclMainClause <- 'MAIN'"));
-		// a grant's column list (spec 150 4e): a column or a path, each part duckdb's identifier, a mask duckdb's
-		// expression
-		changes.push_back(GrammarChange::AddRule("AclFieldDot <- '.' AclNameToken"));
-		changes.push_back(GrammarChange::AddRule("AclFieldElement <- '[' ']'"));
-		changes.push_back(GrammarChange::AddRule("AclFieldStep <- AclFieldDot / AclFieldElement"));
-		changes.push_back(GrammarChange::AddRule("AclFieldPath <- AclNameToken AclFieldStep*"));
-		changes.push_back(GrammarChange::AddRule("AclGrantColumnMask <- '=' Expression"));
-		changes.push_back(GrammarChange::AddRule("AclGrantColumn <- AclFieldPath AclGrantColumnMask?"));
-		changes.push_back(GrammarChange::AddRule("AclGrantColumnEntry <- AclGrantColumn?"));
-		changes.push_back(GrammarChange::AddRule("AclGrantColumnMore <- ',' AclGrantColumnEntry"));
-		changes.push_back(
-		    GrammarChange::AddRule("AclGrantColumnItems <- '(' AclGrantColumnEntry AclGrantColumnMore* ')'"));
+		// spec 158: a column list - a grant's and an object's own - is duckdb's SELECT list
+		changes.push_back(GrammarChange::AddRule("AclGrantColumnItems <- '(' TargetList ')'"));
 		changes.push_back(
 		    GrammarChange::AddRule("AclGrantColumnList <- AclGrantColumnItems / AclParenList / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclGrantColumnsClause <- 'COLUMNS' AclGrantColumnList"));
-		// an object's own column list (spec 150 4f): `expr AS name` first - a name alone reads as an expression too,
-		// and only the AS form reads past it; a NULL mark after the name (after an expression it is the expression's
-		// `x NOT NULL`, which the reader takes off as spec 048's mark)
-		changes.push_back(GrammarChange::AddRule("AclColumnMark <- 'NOT'? 'NULL'"));
-		// the name after AS is duckdb's alias (`ColLabel`: any keyword - `AS order`, as `SELECT … AS order` reads)
-		changes.push_back(GrammarChange::AddRule("AclDeclaredAs <- Expression 'AS' ColLabel AclColumnMark?"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredValue <- '=' Expression"));
-		// a value's own `NOT NULL` is the expression's; a bare `NULL` after it is no mark (`u = ssn NULL`)
-		changes.push_back(GrammarChange::AddRule("AclDeclaredRest <- AclDeclaredValue / AclColumnMark"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredNamed <- AclFieldPath AclDeclaredRest?"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredColumn <- AclDeclaredAs / AclDeclaredNamed"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredEntry <- AclDeclaredColumn?"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredMore <- ',' AclDeclaredEntry"));
-		changes.push_back(GrammarChange::AddRule("AclDeclaredItems <- '(' AclDeclaredEntry AclDeclaredMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclDeclaredItems <- '(' TargetList ')'"));
 		changes.push_back(
 		    GrammarChange::AddRule("AclDeclaredList <- AclDeclaredItems / AclParenList / AclQuotedValue"));
 		// spec 167: the versions of a time-travel table - duckdb's AT clause, its BETWEEN operands
@@ -3097,8 +2991,9 @@ public:
 		    "AclVersionsBetween <- 'BETWEEN' OtherOperatorExpression 'AND' OtherOperatorExpression"));
 		changes.push_back(GrammarChange::AddRule("AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord"));
 		changes.push_back(GrammarChange::AddRule("AclVersionsClause <- 'VERSIONS' AclVersionsSpec"));
+		changes.push_back(GrammarChange::AddRule("AclMaskClause <- 'MASK' AclParenList"));
 		changes.push_back(GrammarChange::AddRule("AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / "
-		                                         "AclGrantColumnsClause / AclVersionsClause"));
+		                                         "AclGrantColumnsClause / AclVersionsClause / AclMaskClause"));
 		changes.push_back(GrammarChange::AddRule("AclGrantClause <- AclObjectClause / AclMainClause"));
 		changes.push_back(
 		    GrammarChange::AddRule("AclGrantCatalog <- 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName AclGrantClause*",
@@ -3422,25 +3317,6 @@ string TokensText(const string &text, const TokenIterator &tokens, idx_t start, 
 		previous = &token;
 	}
 	return inside;
-}
-
-//! A grant's column list read by its rule as the csv its rows store (spec 150 4e): `name` or `name = <mask>`, the mask
-//! its tokens as written with each comment a space - and refused unless the csv reads back as these items
-//! (`ParseColumnList` splits on duckdb's tokens: a name holding `,` or `=`, or a quote that opens a literal before
-//! the next item, would read as other items)
-string GrantColumnsText(const string &text, const TokenIterator &tokens, const MgmtParseData::Span &span) {
-	vector<std::pair<string, string>> items;
-	for (auto &column : span.columns) {
-		string mask;
-		if (column.masked) {
-			mask = TokensText(text, tokens, column.start, column.end, true, true, TILING_REFUSAL,
-			                  [](const MatcherToken &) {});
-		}
-		items.emplace_back(column.name, mask);
-	}
-	auto csv = acl_detail::ItemsCsv(items);
-	acl_detail::RequireColumnsReadBack(items, csv);
-	return csv;
 }
 
 //! Whether [start, end) is a list's inside: a parenthesis right before it and after it (one placed at another token's
@@ -4123,9 +3999,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			parsed.secrets = data.secrets;
 			for (auto &span : data.spans) {
 				string value;
-				if (span.column_items) {
-					value = GrantColumnsText(text, tokens, span);
-				} else if (span.resolved) {
+				if (span.resolved) {
 					value = span.text;
 					if (span.judge) {
 						// a quoted list is split by a reader of ours, which knows no comment

@@ -274,8 +274,9 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, delete) MAIN");
 		// the writable slice: the predicate confines reads and writes, the assigned column makes every
 		// insert land inside it (specs 011/024)
-		Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst WITH (select, insert, delete) "
-		          "RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'))");
+		Exec(con,
+		     "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst WITH (select, insert, delete) "
+		     "RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant) MASK (tenant AS acl_claim('tenant'))");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN");
 		Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE auditor WITH (select) COLUMNS (id, tenant)");
 

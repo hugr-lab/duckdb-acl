@@ -8,6 +8,7 @@
 #include "acl_field_paths.hpp"
 #include "acl_policy.hpp"
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -44,50 +45,42 @@ inline string LitList(const vector<string> &values) {
 	return StringUtil::Join(quoted, ", ");
 }
 
-//! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use - split on duckdb's
-//! tokens (`SplitListItems`, spec 150 4e), so an expression may hold commas of its own (`coalesce(a, b)`,
-//! `['a', 'b']`) and the name is the text before the item's first top-level `=`
+//! A column name as a grant's (name, expr) items carry it: bare when the stored list reads it back as itself
+//! (`StoresBare`), else quoted - the form the field-path reader (`ItemHead`, `ColumnTrees`) takes the quotes off
+inline string ItemName(const string &name) {
+	return StoresBare(name) ? name : "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+}
+
+//! A grant's column list (spec 158): a SELECT list read by duckdb's parser (`ReadSelectList`), as (name, expr) items -
+//! expr '' a column as it is, else what the role reads in its place. A stored list that does not read so (one an older
+//! build stored, `ssn = 'x'`) refuses
 inline vector<std::pair<string, string>> ParseColumnList(const string &csv) {
 	vector<std::pair<string, string>> columns;
-	for (auto &item : SplitListItems(csv)) {
-		if (item.has_value) {
-			columns.emplace_back(item.name, item.value);
-		} else {
-			columns.emplace_back(item.text, string());
-		}
+	for (auto &item : ReadSelectList(csv, "the grant's column list", false)) {
+		columns.emplace_back(ItemName(item.name), item.expr);
 	}
 	return columns;
 }
 
-//! A grant's column list as a writer gives it (spec 150 4e): read as `ParseColumnList` reads it, and refused when the
-//! text holds a comment or ends inside a literal or a quoted name - the read leaves a comment out (a stored one is read
-//! the old way, `SplitListItems`), and a stored text with one would keep it (spec 148: `note = upper(note) -- hidden`)
+//! A grant's column list as a writer gives it: read as `ParseColumnList` reads it, and refused when it names a column
+//! twice (`ssn, '***' AS ssn`)
 inline vector<std::pair<string, string>> ParseWrittenColumnList(const string &csv) {
-	bool open = false, comment = false;
-	SplitListItems(csv, &open, &comment);
-	if (open || comment) {
-		throw BinderException("acl admin: the grant's column list holds a comment or ends inside a literal or a quoted "
-		                      "name - it does not stay one expression per item (spec 148); write it without comments");
-	}
 	auto items = ParseColumnList(csv);
-	// a column named twice (`ssn, ssn = 'm'`, `ssn, "SSN" = 'm'`): a catalog grant's list is stored as written, and its
-	// read lets the bare item win over the mask - refused where written (spec 150 4e's review)
 	case_insensitive_set_t named;
 	for (auto &item : items) {
 		bool is_path = false;
 		auto head = ItemHead(item.first, is_path);
-		if (!named.insert(is_path ? item.first : head).second) {
+		if (!named.insert(head).second) {
 			throw BinderException("acl admin: the grant's column list names \"%s\" twice - name a column once, bare "
 			                      "or masked",
-			                      is_path ? item.first : head);
+			                      head);
 		}
 	}
 	return items;
 }
 
-//! A writer's column list must read back as the items it wrote (spec 150 4e): the csv split by `ParseColumnList`
-//! gives the same names and masks in the same order, or the write is refused - the read would grant other columns
-//! than written (a name holding `,` or `=`, a quote in a name that opens a literal across the next item)
+//! A writer's column list must read back as the items it wrote: the stored text read by `ParseColumnList` gives the
+//! same names and masks in the same order, or the write is refused
 inline void RequireColumnsReadBack(const vector<std::pair<string, string>> &items, const string &csv) {
 	auto read = ParseColumnList(csv);
 	for (idx_t i = 0; i < MaxValue(items.size(), read.size()); i++) {
@@ -96,56 +89,53 @@ inline void RequireColumnsReadBack(const vector<std::pair<string, string>> &item
 		}
 		auto &named = i < items.size() ? items[i].first : read[i].first;
 		throw BinderException("acl admin: column \"%s\" cannot be carried by a COLUMNS list - its stored form would "
-		                      "read back as other items than written (a name holding ',' or '=', or a quote that opens "
-		                      "a literal before the next item)",
+		                      "read back as other items than written",
 		                      named);
 	}
 }
 
-//! The policy one role's grant chain imposes on one object (spec 011). Levels compose by narrowing:
-//! predicates are AND-ed and column lists intersected on the way down (catalog -> object), so a more
-//! specific grant can hide or mask more but never re-expose.
+//! A grant's column list as its rows store it (spec 158): the items as duckdb prints a SELECT list, read back alike
+inline string NormalizedColumnList(const string &csv) {
+	auto items = ParseWrittenColumnList(csv);
+	auto stored = ItemsCsv(items);
+	RequireColumnsReadBack(items, stored);
+	return stored;
+}
+
+//! The policy one role's grant chain imposes on one object (spec 011): the levels' predicates AND-ed, and - spec 158 -
+//! the object grant's columns (a test on names) and masks. A catalog grant states no columns: a stored list there (an
+//! older build's) refuses the read
 struct GrantPolicy {
-	bool restricts = false;                    // a column list was given somewhere in the chain
-	bool unchecked = false;                    // some level's predicate was never bound (spec 027)
-	vector<std::pair<string, string>> columns; // visible columns, name -> expr ("" = as-is)
-	vector<string> predicates;                 // AND-ed together
+	bool unchecked = false;    // some level's predicate was never bound (spec 027)
+	vector<string> predicates; // AND-ed together
+	RoleColumns columns;       // the object grant's COLUMNS and MASK
+	//! a catalog grant's stored COLUMNS (spec 158: none is written) - the read refuses on it
+	string catalog_columns;
+	//! a stored list or mask that does not read (spec 158) - the read refuses on it
+	string unreadable;
+
+	bool Restricts() const {
+		return !columns.test.All() || !columns.masks.empty();
+	}
 
 	//! Fold one level of the chain in; empty strings mean "this level says nothing". `rls_checked`
 	//! records whether that level's predicate was actually bound when it was written (spec 027).
-	void Narrow(const string &rls, const string &column_csv, bool rls_checked = true) {
+	void Narrow(const string &rls, bool rls_checked = true) {
 		if (!rls.empty()) {
 			predicates.push_back(rls);
 			if (!rls_checked) {
 				unchecked = true;
 			}
 		}
-		auto level = ParseColumnList(column_csv);
-		if (level.empty()) {
-			return;
+	}
+	//! The object grant's COLUMNS and MASK as stored
+	void ReadColumns(const string &column_text, const string &mask_text) {
+		try {
+			columns.test = ReadColumnTest(column_text);
+			columns.masks = ReadMasks(mask_text);
+		} catch (std::exception &ex) {
+			unreadable = ErrorData(ex).RawMessage();
 		}
-		if (!restricts) {
-			restricts = true;
-			columns = std::move(level);
-			return;
-		}
-		if (HasFieldPaths(columns) || HasFieldPaths(level)) {
-			// spec 102: fields narrow like columns - the levels' trees intersect
-			columns = IntersectColumnItems(columns, level);
-			return;
-		}
-		vector<std::pair<string, string>> intersected;
-		for (auto &column : columns) {
-			for (auto &narrower : level) {
-				if (!StringUtil::CIEquals(column.first, narrower.first)) {
-					continue;
-				}
-				// the narrower level may mask harder, never un-mask what the wider one computed
-				intersected.emplace_back(column.first, narrower.second.empty() ? column.second : narrower.second);
-				break;
-			}
-		}
-		columns = std::move(intersected);
 	}
 
 	string Predicate() const {
@@ -164,15 +154,16 @@ struct GrantPolicy {
 };
 
 //! The union of what the principal's roles are granted on one object: a principal may do what any of
-//! its roles may, so predicates are OR-ed (a role without one lifts the restriction entirely) and
-//! column lists unioned (a plain column beats a masked one).
+//! its roles may, so predicates are OR-ed (a role without one lifts the restriction entirely) and - spec 158 - the
+//! columns united by `UniteRoleColumns`
 struct GrantUnion {
-	bool any = false;                  // at least one role's grant was seen
-	bool unrestricted_rls = false;     // some role has no predicate -> no predicate at all
-	bool unrestricted_columns = false; // some role has no column list -> the object's own
-	bool unchecked = false;            // some contributing predicate was never bound (spec 027)
+	bool any = false;              // at least one role's grant was seen
+	bool unrestricted_rls = false; // some role has no predicate -> no predicate at all
+	bool unchecked = false;        // some contributing predicate was never bound (spec 027)
 	vector<string> predicates;
-	vector<std::pair<string, string>> columns;
+	vector<RoleColumns> roles;
+	//! why the read refuses, when a role's grant does not read (spec 158)
+	string refusal;
 
 	void Add(const GrantPolicy &policy) {
 		any = true;
@@ -183,38 +174,19 @@ struct GrantUnion {
 			predicates.push_back(predicate);
 			unchecked = unchecked || policy.unchecked;
 		}
-		if (!policy.restricts) {
-			unrestricted_columns = true;
-			return;
+		if (!policy.catalog_columns.empty() && refusal.empty()) {
+			refusal = "a catalog grant states COLUMNS (\"" + policy.catalog_columns +
+			          "\"), which only an object grant states since spec 158";
 		}
-		if (HasFieldPaths(columns) || HasFieldPaths(policy.columns)) {
-			// spec 102: the roles' trees unite - a visible field beats a masked one, conflicts refuse
-			columns = UniteColumnItems(columns, policy.columns);
-			return;
+		if (!policy.unreadable.empty() && refusal.empty()) {
+			refusal = policy.unreadable;
 		}
-		for (auto &column : policy.columns) {
-			bool merged = false;
-			for (auto &existing : columns) {
-				if (!StringUtil::CIEquals(existing.first, column.first)) {
-					continue;
-				}
-				if (column.second.empty() || existing.second.empty()) {
-					existing.second.clear(); // one role sees it unmasked, so the principal does
-				} else if (existing.second != column.second) {
-					// two roles mask the same column differently and neither is wider: there is no
-					// order on expressions, so picking one would depend on the row order the join
-					// happens to return. Refuse instead of masking non-deterministically.
-					throw BinderException("acl: the principal's roles mask column \"%s\" differently (\"%s\" vs "
-					                      "\"%s\") - grant the same expression, or drop one of the grants",
-					                      column.first, existing.second, column.second);
-				}
-				merged = true;
-				break;
-			}
-			if (!merged) {
-				columns.push_back(column);
-			}
-		}
+		roles.push_back(policy.columns);
+	}
+
+	//! The roles' columns united (refuses two different masks of one column)
+	RoleColumns Columns(const string &object) const {
+		return UniteRoleColumns(roles, object);
 	}
 
 	//! Only meaningful together with a non-empty Predicate(): a role without one lifts the restriction
@@ -236,112 +208,49 @@ struct GrantUnion {
 		}
 		return StringUtil::Join(wrapped, " OR ");
 	}
-	bool Restricts() const {
-		return any && !unrestricted_columns;
-	}
 };
 
-//! spec 146: the union is per object - rows OR-ed, column lists united independently (spec 011) - so two roles that
+//! spec 158 review: whether a mask over an object with its own column list reads those columns by plain name only -
+//! no subquery, star or field path (they would read the physical row the projection is built over); `why` otherwise
+bool MaskReadsColumnsPlainly(const string &mask, string &why);
+
+//! spec 158: `SELECT <the test as a COLUMNS selector> FROM (SELECT * REPLACE (<masks>) FROM (<inner>))` - a grant
+//! over a read whose columns are the object's
+string GrantOverSql(const RoleColumns &columns, const string &inner);
+
+//! spec 146: the union is per object - rows OR-ed, columns united independently (spec 011, 158) - so two roles that
 //! narrow one object differently unite into cells neither reads: B's columns on A's rows. Every such pair, with the
-//! items it adds - names as the policy lists them, never a value or a predicate. A's rows are read whole by A and by
-//! every role whose filter is A's or none; an item of B is theirs when one lists it or a column / path above it
-//! (spec 102) plainly with nothing masked at or under it, or masks that very item too (two masks of one item are
-//! refused). B without a filter, or with A's, adds nothing B does not read itself. `known` = the object's columns
-//! (empty: unknown) - an item naming none of them is no cell. Predicates compare as given: the caller normalizes.
-//! One pair per set of rows (a filter, named by its first role) and B; at most `max_pairs` + 1 (more = there are more).
+//! columns it adds. A's rows are read whole by A and by every role whose filter is A's or none; a column of B is
+//! theirs when one shows it as B does (unmasked, or masked where B masks it). B without a filter, or with A's, adds
+//! nothing B does not read itself. `known` = the object's columns (empty: unknown - B's every column is `*`).
+//! Predicates compare as given: the caller normalizes. One pair per set of rows (a filter, named by its first role)
+//! and B; at most `max_pairs` + 1 (more = there are more).
 inline vector<UnionWidening> RoleUnionWidens(const vector<std::pair<string, GrantPolicy>> &roles,
                                              const vector<string> &known, idx_t max_pairs) {
-	struct Seen {
-		bool all = false;                      // no list: every column
-		vector<std::pair<string, bool>> items; // the list, trimmed: name, masked
-		case_insensitive_set_t plain;          // listed as they are
-		case_insensitive_set_t masked;         // listed masked
-		case_insensitive_set_t above_masked;   // a strict prefix of a masked item
-	};
-	auto trimmed = [](const string &text) {
-		auto name = text;
-		StringUtil::Trim(name);
-		return name;
-	};
-	auto prefixes = [](const string &name) {
-		vector<string> out;
-		for (idx_t i = 1; i < name.size(); i++) {
-			if (name[i] == '.' || name[i] == '[') {
-				out.push_back(name.substr(0, i));
-			}
-		}
-		return out;
-	};
-	case_insensitive_set_t known_set(known.begin(), known.end());
-	auto head_known = [&](const string &name) {
-		auto cut = name.find_first_of(".[");
-		return known_set.empty() || known_set.count(cut == string::npos ? name : name.substr(0, cut)) > 0;
-	};
-	vector<Seen> seen(roles.size());
 	vector<string> predicates;
-	for (idx_t i = 0; i < roles.size(); i++) {
-		auto &policy = roles[i].second;
-		predicates.push_back(policy.Predicate());
-		seen[i].all = !policy.restricts;
-		for (auto &item : policy.columns) {
-			auto name = trimmed(item.first);
-			seen[i].items.emplace_back(name, !item.second.empty());
-			if (item.second.empty()) {
-				seen[i].plain.insert(name);
-				continue;
-			}
-			seen[i].masked.insert(name);
-			for (auto &prefix : prefixes(name)) {
-				seen[i].above_masked.insert(prefix);
-			}
-		}
+	for (auto &role : roles) {
+		predicates.push_back(role.second.Predicate());
 	}
-	auto covers = [&](const Seen &c, const string &name, bool masked_item) {
-		if (c.all) {
-			return true;
-		}
-		bool plain = false;
-		for (auto &prefix : prefixes(name)) {
-			if (c.masked.count(prefix)) {
-				return false; // masked above: what the union shows of it is not what c reads
-			}
-			plain = plain || c.plain.count(prefix) > 0;
-		}
-		if (c.masked.count(name)) {
-			return masked_item;
-		}
-		return (plain || c.plain.count(name) > 0) && !c.above_masked.count(name);
+	auto everything = [&](idx_t c) {
+		return !roles[c].second.Restricts();
 	};
-	// A's rows are read whole by the roles without a filter (the same for every A: their answer per item is kept) and
-	// by those with A's filter
+	// what the union reads of B's column, read by role c as well: c shows it, and unmasked unless B masks it
+	auto covers = [&](idx_t c, const string &name, bool masked_item) {
+		auto &columns = roles[c].second.columns;
+		if (!columns.test.Admits(name)) {
+			return false;
+		}
+		return !MaskOf(columns.masks, name) || masked_item;
+	};
 	vector<idx_t> open_readers;
 	for (idx_t c = 0; c < roles.size(); c++) {
 		if (predicates[c].empty()) {
-			if (seen[c].all) {
+			if (everything(c)) {
 				return {}; // one role reads every cell of the object
 			}
 			open_readers.push_back(c);
 		}
 	}
-	case_insensitive_map_t<bool> open_covered[2]; // item -> some open reader covers it, by mask kind
-	auto covered_open = [&](const string &name, bool masked_item) {
-		auto &memo = open_covered[masked_item ? 1 : 0];
-		auto entry = memo.find(name);
-		if (entry != memo.end()) {
-			return entry->second;
-		}
-		bool answer = false;
-		for (auto c : open_readers) {
-			if (covers(seen[c], name, masked_item)) {
-				answer = true;
-				break;
-			}
-		}
-		memo[name] = answer;
-		return answer;
-	};
-	// a set of rows per filter: the first role holding it (by the caller's order) names it, the open readers' rows
-	// are every row
 	vector<UnionWidening> out;
 	vector<string> classes;
 	for (idx_t a = 0; a < roles.size(); a++) {
@@ -349,23 +258,20 @@ inline vector<UnionWidening> RoleUnionWidens(const vector<std::pair<string, Gran
 			continue;
 		}
 		classes.push_back(predicates[a]);
-		vector<idx_t> readers; // the roles with A's filter (with none: the open readers again)
+		vector<idx_t> readers = open_readers; // A's rows: the roles with A's filter, and those with none
 		bool all = false;
 		for (idx_t c = 0; c < roles.size(); c++) {
 			if (predicates[c] == predicates[a]) {
 				readers.push_back(c);
-				all = all || seen[c].all;
+				all = all || everything(c);
 			}
 		}
 		if (all) {
 			continue; // every column of A's rows is read
 		}
 		auto covered = [&](const string &name, bool masked_item) {
-			if (covered_open(name, masked_item)) {
-				return true;
-			}
 			for (auto c : readers) {
-				if (covers(seen[c], name, masked_item)) {
+				if (covers(c, name, masked_item)) {
 					return true;
 				}
 			}
@@ -375,22 +281,25 @@ inline vector<UnionWidening> RoleUnionWidens(const vector<std::pair<string, Gran
 			if (predicates[b].empty() || predicates[b] == predicates[a]) {
 				continue;
 			}
-			vector<string> extra;
-			if (seen[b].all) {
-				for (auto &name : known) {
-					if (!covered(name, false)) {
-						extra.push_back(name);
-					}
-				}
-				if (known.empty()) {
-					extra.push_back("*");
-				}
+			auto &columns = roles[b].second.columns;
+			vector<string> shown;
+			if (columns.test.kind == ColumnTest::Kind::ONLY) {
+				shown = columns.test.names;
 			} else {
-				for (auto &item : seen[b].items) {
-					if (head_known(item.first) && !covered(item.first, item.second)) {
-						extra.push_back(item.first);
+				for (auto &name : known) {
+					if (columns.test.Admits(name)) {
+						shown.push_back(name);
 					}
 				}
+			}
+			vector<string> extra;
+			for (auto &name : shown) {
+				if (!covered(name, MaskOf(columns.masks, name) != nullptr)) {
+					extra.push_back(name);
+				}
+			}
+			if (known.empty() && columns.test.kind != ColumnTest::Kind::ONLY) {
+				extra.push_back("*");
 			}
 			if (!extra.empty()) {
 				out.push_back(UnionWidening {roles[a].first, roles[b].first, std::move(extra)});
@@ -718,6 +627,7 @@ struct CatalogBackend {
 		bool main = false;           // MAIN and the role's only MAIN catalog (bare names resolve)
 		string catalog_rls, object_rls;
 		string catalog_columns, object_columns; // the grants' column lists as stated
+		string object_masks;                    // spec 158: the object grant's MASK as stored
 	};
 	//! one per name of `vnames`, in that order - one query for all of them
 	vector<GrantDecisionRow> GrantDecisions(const string &role, const string &vcat, const vector<string> &vnames);
@@ -942,8 +852,11 @@ struct CatalogBackend {
 	//! Returns the binder's message when the projection is at fault, and an empty string when it binds -
 	//! or when the object itself does not bind, since then there is nothing to judge it against. The
 	//! same two steps as a predicate's check (spec 021), for the same reason.
-	string ProjectionSchema(const string &source, const string &column_csv, const case_insensitive_map_t<string> &own,
-	                        vector<std::pair<string, string>> &out, bool *checked = nullptr);
+	//! spec 158: the grant's `columns` (test and masks) over the object's read - its own columns (`own_order` in its
+	//! order, `own` their expressions; none = every column of the source)
+	string ProjectionSchema(const string &source, const RoleColumns &columns, const vector<string> &own_order,
+	                        const case_insensitive_map_t<string> &own, vector<std::pair<string, string>> &out,
+	                        bool *checked = nullptr);
 
 	//! Whether a relation has a column of that name. False only when the relation itself binds and the
 	//! column does not: a source that cannot be reached at all answers true, since it cannot answer.

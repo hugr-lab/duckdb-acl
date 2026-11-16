@@ -35,7 +35,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id, tag = tenant, amount, note);
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id, tenant AS tag, amount, note);
 
 statement ok
 ACL ADMIN CREATE ROLE ra;
