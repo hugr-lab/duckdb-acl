@@ -333,7 +333,6 @@ void RegisterAclIntrospection(ExtensionLoader &loader, const shared_ptr<PolicySt
 	                                 "grants",
 	                                 "schema_grants",
 	                                 "object_grants",
-	                                 "grant_columns",
 	                                 "admins",
 	                                 "issuers",
 	                                 "clients",

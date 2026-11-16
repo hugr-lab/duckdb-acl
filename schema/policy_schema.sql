@@ -112,10 +112,6 @@ CREATE TABLE IF NOT EXISTS <reference_columns>("vcat" ACL_KEY_TEXT, "name" ACL_K
 -- enforced; visible only when the object and every named column are.
 CREATE TABLE IF NOT EXISTS <keys>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "pos" INTEGER, "column" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
 
--- add a computed one the object never had - and a listing that cannot see those describes
--- something the role does not read.
-CREATE TABLE IF NOT EXISTS <grant_columns>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
-
 -- spec 085 (schema v15): resource groups - named limits bound to roles, resolved once when a session
 -- opens. A NULL limit is unset: the node's setting applies. Across a principal's groups each limit
 -- takes the most generous value; `max_sessions` is charged to the group that allows the most.
@@ -142,11 +138,11 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '26' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '27' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
 INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO <meta> SELECT 'min_reader_version', '26' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');
+INSERT INTO <meta> SELECT 'min_reader_version', '27' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');

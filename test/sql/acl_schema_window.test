@@ -43,15 +43,15 @@ ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 26, 'build_min_reader': 26, 'catalog': 26, 'min_reader': 26, 'mode': current}
+{'build': 27, 'build_min_reader': 27, 'catalog': 27, 'min_reader': 27, 'mode': current}
 
 # --- a newer catalog inside its window, migrated under the running node: served, never written ---
 
 statement ok
-UPDATE store.acl.meta SET "value" = '27' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '28' WHERE "key" = 'schema_version';
 
 statement ok
-UPDATE store.acl.meta SET "value" = '26' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '27' WHERE "key" = 'min_reader_version';
 
 query I
 ACL ROLE "r" SELECT count(*) FROM orders;
@@ -66,7 +66,7 @@ read_only
 statement error
 ACL ADMIN CREATE ROLE other;
 ----
-<REGEX>:.*schema version 27 and this node's build writes 26 - policy is written from a node of the catalog's build.*
+<REGEX>:.*schema version 28 and this node's build writes 27 - policy is written from a node of the catalog's build.*
 
 # the refused write wrote nothing
 query I
@@ -77,12 +77,12 @@ SELECT count(*) FROM store.acl.roles WHERE "role" = 'other';
 # --- outside the window: the running node stops serving (fail closed) -----------------------------
 
 statement ok
-UPDATE store.acl.meta SET "value" = '27' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '28' WHERE "key" = 'min_reader_version';
 
 statement error
 ACL ROLE "r" SELECT count(*) FROM orders;
 ----
-<REGEX>:.*schema version 27, readable from build 27 on, and this build is 26 - upgrade the node.*
+<REGEX>:.*schema version 28, readable from build 28 on, and this build is 27 - upgrade the node.*
 
 statement error
 SELECT acl_use_db('store', 'acl', false);
@@ -98,10 +98,10 @@ SELECT acl_migrate_catalog('store', 'acl');
 # --- an older catalog: refused with what to do, then migrated by the embedded steps ------------------
 
 statement ok
-UPDATE store.acl.meta SET "value" = '26' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '27' WHERE "key" = 'schema_version';
 
 statement ok
-UPDATE store.acl.meta SET "value" = '26' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '27' WHERE "key" = 'min_reader_version';
 
 statement ok
 SELECT acl_use_db('store', 'acl', false);
@@ -140,6 +140,10 @@ ALTER TABLE store.acl.role_object_caps DROP COLUMN masks;
 statement ok
 ALTER TABLE store.acl.relations DROP COLUMN query;
 
+# (v27 dropped grant_columns: an older catalog still has it)
+statement ok
+CREATE TABLE store.acl.grant_columns("role" VARCHAR, "vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
+
 statement ok
 DROP TABLE store.acl.clients;
 
@@ -174,7 +178,7 @@ UPDATE store.acl.meta SET "value" = '15' WHERE "key" = 'min_reader_version';
 statement error
 SELECT acl_use_db('store', 'acl', false);
 ----
-<REGEX>:.*schema version 16 and this build reads 26 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
+<REGEX>:.*schema version 16 and this build reads 27 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
 
 statement error
 SELECT acl_use_db('store', 'acl', true);
@@ -184,12 +188,12 @@ SELECT acl_use_db('store', 'acl', true);
 query T
 SELECT acl_migrate_catalog('store', 'acl');
 ----
-"store"."acl" migrated from schema version 16 to 26 (readable from build 26 on)
+"store"."acl" migrated from schema version 16 to 27 (readable from build 27 on)
 
 query T
 SELECT acl_migrate_catalog('store');
 ----
-"store"."acl" is already schema version 26
+"store"."acl" is already schema version 27
 
 statement ok
 SELECT acl_use_db('store', 'acl', false);
@@ -197,7 +201,7 @@ SELECT acl_use_db('store', 'acl', false);
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 26, 'build_min_reader': 26, 'catalog': 26, 'min_reader': 26, 'mode': current}
+{'build': 27, 'build_min_reader': 27, 'catalog': 27, 'min_reader': 27, 'mode': current}
 
 # spec 095: the issuer became the short form - its keys, algorithms and client secret are gone, the
 # rest is its implicit client, and its mapping is scoped to that client (its only one)

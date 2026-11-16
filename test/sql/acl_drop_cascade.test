@@ -105,8 +105,7 @@ SELECT count(*) FROM acl_references();
 0
 
 # --- a grant's projection goes with what it describes -------------------------------------------------
-# (spec 158: a grant's COLUMNS and MASK live on its role_object_caps row - nothing is probed into grant_columns any
-# more, so the row itself is what must go; acl_grant_columns() stays checked empty)
+# (spec 158: a grant's COLUMNS and MASK live on its role_object_caps row, so the row itself is what must go)
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
@@ -130,7 +129,7 @@ statement ok
 ACL ADMIN DROP ROLE r;
 
 query I
-SELECT count(*) FROM acl_grant_columns();
+SELECT count(*) FROM acl_object_grants();
 ----
 0
 
@@ -218,11 +217,10 @@ SELECT count(*) FROM acl_references() WHERE name = 'crosses';
 ----
 0
 
-query II
-SELECT (SELECT count(*) FROM acl_grant_columns() WHERE vname = 'vs.inner'),
-       (SELECT count(*) FROM acl_object_grants() WHERE vname = 'vs.inner');
+query I
+SELECT count(*) FROM acl_object_grants() WHERE vname = 'vs.inner';
 ----
-0	0
+0
 
 query I
 SELECT count(*) FROM acl_functions() WHERE vname = 'vs.fn';
@@ -251,12 +249,12 @@ ACL ADMIN GRANT TABLE c.customers TO ROLE g WITH (select) COLUMNS (id, city) MAS
 statement ok
 ACL ADMIN DROP VIRTUAL CATALOG c CASCADE;
 
-query IIIIII
+query IIIII
 SELECT (SELECT count(*) FROM acl_catalogs()), (SELECT count(*) FROM acl_relations()),
        (SELECT count(*) FROM acl_functions()), (SELECT count(*) FROM acl_references()),
-       (SELECT count(*) FROM acl_reference_columns()), (SELECT count(*) FROM acl_grant_columns());
+       (SELECT count(*) FROM acl_reference_columns());
 ----
-0	0	0	0	0	0
+0	0	0	0	0
 
 query III
 SELECT (SELECT count(*) FROM acl_schemas()), (SELECT count(*) FROM acl_schema_grants()),

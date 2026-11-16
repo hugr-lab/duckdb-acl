@@ -163,8 +163,8 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   expressions and `IN (SELECT ...)` are walked like any FROM and expression; the implicit form arrives
   as a `MultiStatement` (the parser's `CREATE TEMP TYPE __pivot_enum_* AS ENUM (SELECT DISTINCT ...)`
   per column, then the SELECT) and only that shape is admitted, each enum query rewritten as a read.
-- **A grant's projection is probed where it is written** (spec 026): a mask that changes a column's
-  type and a computed column the object never had are stored in `grant_columns`, so
+- **A grant's projection is probed where it is written** (spec 026; since spec 158 a grant only tests names and masks
+  a column cast to its type, so nothing is stored per grant - `grant_columns` dropped in schema v27):
   `information_schema.columns` and `DESCRIBE` describe the same thing — what the role reads.
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
@@ -614,19 +614,9 @@ table functions, the memory store. `acl_check_catalog` adds `types_stale`, `enum
 that does not bind over the exposed type) and `types_mismatch` (an entry that makes a type of its own).
 e2e: `test/e2e/door/types.sh` (a quack client without mssql reads an mssql table), Flight run.sh.
 
-**Spec 102 — fields of structured types per role** (superseded by spec 158: the paths are gone; what follows is
-history until stage 3 removes the code): a COLUMNS item (grant or object list) may be a
-path - `address.city`, `address.geo.lat`, `items[].price`, `address.ssn = <mask>`; a column's items
-form a tree (`acl_field_paths.hpp`: parse, `IntersectNodes` for levels, `UniteNodes` for roles - a
-visible field beats a masked one, different masks refuse - `CompileNode` read via struct_pack /
-struct_update / list_transform, NULL-preserving, fields by struct_extract). Paths are checked against
-the column's type where written (`OrderAndCheckFields`; MAP/UNION refused) and stored in the source's
-field order. Writes (owner decision): a grant-narrowed column stays writable - `field_writes` +
-`CompileWrite`: hidden fields keep the stored value (UPDATE `struct_update`, INSERT `struct_pack`, NULL
-filled by name), masks are assigned, a hidden field in the written value is refused via
-`struct_keys`/`error()`; a `[]` narrowing and an object-declared one are read-only; RETURNING refuses a
-narrowed column. Listings describe `acl_listed_type` (the read's own fold of the roles' lists over the
-source type). e2e: a narrowed struct through quack in `test/e2e/door/types.sh`.
+**Spec 102 — fields of structured types per role** (superseded by spec 158, its code removed in 158's stage 3:
+field trees, field writes, `acl_listed_type`, `grant_columns` - schema v27, min_reader 27; `acl_field_paths.hpp` keeps
+only the reading of a stored list item's column, `ItemHead`).
 
 **Spec 107 — lineage for OpenLineage**: the node emits a `lineage` event kind (ext-common spec 014,
 `acl_audit` v3: `AuditLineage`, delivered only to sinks with `WantsLineage()` and to its own ring
@@ -905,8 +895,9 @@ catalog grant states no columns (a stored list refuses every read under it - `Gr
 `catalog_columns`). An object grant's `COLUMNS` is a test on names (`acl_grant_columns.hpp`: `ColumnTest` ALL | ONLY |
 EXCEPT from `a, b` / `*` / `* EXCLUDE (…)`, `ReadColumnTest`) and `MASK (<column> AS <expr>, …)` its masks
 (`role_object_caps.masks`, schema v25 / min_reader 25; `ReadMasks`), each written over the object's columns and stored
-cast to the column's type (`NormaliseObjectGrant`) - a grant never adds, renames or retypes a column, so `grant_columns`
-is no longer written and a listing filters the object's columns by the test (`keeps`). Roles unite in
+cast to the column's type (`NormaliseObjectGrant`) - a grant never adds, renames or retypes a column, so nothing is
+kept per grant (stage 3: `grant_columns` dropped, schema v27) and a listing filters the object's columns by the test
+(`keeps`). Roles unite in
 `UniteRoleColumns`: visible = some role's test admits it, unmasked = some role shows it without a mask, else one
 common mask, two different masks refuse. `ApplyGrantPolicy`: a declared list keeps the admitted columns in its order,
 a mask substituted onto the object's expressions (`OverObject`); an object read live gets `GrantOver` - `SELECT
@@ -1158,10 +1149,8 @@ object + capability + roles in `union_floor`, stamped only when recorded - spec 
 grant's list, the role's object grant on `alias.table` as a joined `aoc` column - `alias_visible`, only when the
 principal holds such lists, read in C++: `catalog_lists` / `alias_object_lists`; spec 145: of the roles whose caps
 chain admits `select`, else - write-only - of every role), and an object a relation names under
-the alias path is the relation's; a column some list narrows by a path or masks (`path_heads`) is listed through
-`acl_listed_type` - a mask nothing probed typed from its text (a constant's type, a cast's target, else a scalar
-source type or NULL, never a nested one) - and drops when the levels leave nothing of it (no fallback to one role's
-probe); positions close up per object where a list narrowed; a separators-only list narrows nothing; `KeepItemNames`
+the alias path is the relation's (since spec 158 a mask keeps its column's type - spec 144's path typing is gone);
+positions close up per object where a list narrowed; a separators-only list narrows nothing; `KeepItemNames`
 leaves an item with an expanding star (`* LIKE`, `COLUMNS()` inside an expression; not `count(t.*)`) to duckdb.
 Test `acl_listing_read_parity.test`.
 

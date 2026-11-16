@@ -1,6 +1,6 @@
 # Spec 158: columns - the object's shape, the grant's visibility and masks
 
-- **Status**: accepted (stage 1 built)
+- **Status**: accepted (stages 1 and 3 built)
 - **Date**: 2026-11-16
 - **Author**: duckdb-acl
 - **Supersedes**: spec 011's column lists at the catalog level, spec 038's catalog-wide list, spec 102's field paths
@@ -120,7 +120,10 @@ stand in an object's expression, an RLS or a mask.
 1. The grant model: COLUMNS forms, MASK, the union, `acl_has_role`, the listing's filter, schema v25; the object's
    list as a SELECT list without stars.
 2. Live stars in the object's list.
-3. Spec 102's machinery removed (field trees, field writes, `acl_listed_type`, `grant_columns`).
+3. Spec 102's machinery removed (field trees, field writes, `acl_listed_type`, `grant_columns`) - built: none of it
+   was reached since stage 1 (nothing filled `field_writes` / `narrowed_reads`, nothing wrote `grant_columns`). Schema
+   v27, `min_reader` 27 (`grant_columns` dropped - a v26 build's listings still read it); `platform.grant_columns` and
+   `acl_grant_columns()` go with it; `acl_field_paths.hpp` keeps only `ItemHead` (a stored item's column).
 
 ## Testing
 

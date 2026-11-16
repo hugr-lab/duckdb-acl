@@ -73,8 +73,7 @@ ACL ROLE "r" SELECT count(*) FROM information_schema.columns
 ----
 0
 
-# spec 158: a grant keeps no probed columns of its own (acl_grant_columns() lists none) - the listings above read the
-# object's columns its test admits
+# spec 158: a grant keeps no probed columns of its own - the listings above read the object's columns its test admits
 
 # --- the two levels fold the way the resolver folds them -------------------------------------------------
 # a bare name in a grant is the object's column, which the object's own projection may have renamed;
@@ -176,11 +175,6 @@ ACL ADMIN CREATE VIRTUAL TABLE c.later AS notyet.main.x;
 statement ok
 ACL ADMIN GRANT TABLE c.later TO ROLE r WITH (select) COLUMNS (id, z) MASK (z AS 1);
 
-query I
-SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 'later';
-----
-0
-
 # --- a grant with no projection of its own is unaffected ------------------------------------------------
 
 statement ok
@@ -193,11 +187,6 @@ query I
 ACL ROLE "plain" SELECT count(*) FROM information_schema.columns WHERE table_name = 't';
 ----
 4
-
-query I
-SELECT count(*) FROM aclcat.acl.grant_columns WHERE role = 'plain';
-----
-0
 
 # --- rewriting the grant rewrites what was probed -------------------------------------------------------
 
@@ -214,11 +203,6 @@ amount,id
 
 statement ok
 SELECT acl_revoke_catalog('r', 'c');
-
-query I
-SELECT count(*) FROM aclcat.acl.grant_columns WHERE role = 'r';
-----
-0
 
 # dropping the object clears them too, whoever they belonged to
 statement ok

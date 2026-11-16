@@ -1169,10 +1169,14 @@ SELECT acl_use_db('old', 'acl', true);
 query T
 SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
 ----
-26
+27
 
 statement ok
 INSERT INTO old.acl.relations(vcat, vname, form, phys) VALUES ('c', 'Orders', 'alias', 'phys.main.u'), ('c', 'orders', 'alias', 'phys.main.u'), ('c', 'S.a', 'alias', 'phys.main.u'), ('c', 's.b', 'alias', 'phys.main.u');
+
+# (v27 dropped grant_columns: a v19 catalog has it)
+statement ok
+CREATE TABLE old.acl.grant_columns("role" VARCHAR, "vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
 
 statement ok
 UPDATE old.acl.meta SET "value" = '19' WHERE "key" = 'schema_version';
@@ -1215,9 +1219,9 @@ DELETE FROM old.acl.relations WHERE vname IN ('a"b', 'x..y');
 query T
 SELECT acl_migrate_catalog('old', 'acl');
 ----
-"old"."acl" migrated from schema version 19 to 26 (readable from build 26 on)
+"old"."acl" migrated from schema version 19 to 27 (readable from build 27 on)
 
 query T
 SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
 ----
-26
+27
