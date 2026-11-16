@@ -1683,6 +1683,11 @@ private:
 			if (rcte.right) {
 				RewriteQueryNode(*rcte.right);
 			}
+			// USING KEY's targets are expressions duckdb binds (duckdb's own iterator does not walk them): gated like
+			// any other
+			for (auto &target : rcte.key_targets) {
+				RewriteExpr(target);
+			}
 			break;
 		}
 		case QueryNodeType::INSERT_QUERY_NODE:

@@ -83,3 +83,9 @@ statement error
 ACL ROLE "r" CREATE VIEW home.leak AS WITH b AS (SELECT * FROM b) SELECT * FROM b;
 ----
 no access to object "b"
+
+# USING KEY's targets are walked like any expression: a plain key still reads
+query I
+ACL ROLE "r" WITH RECURSIVE n(k, v) USING KEY (k) AS (SELECT 1, 1 UNION SELECT k, v + 1 FROM n WHERE v < 3) SELECT max(v) FROM n;
+----
+3

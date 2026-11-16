@@ -104,6 +104,8 @@ read the view.
   CTE's right side excepted). A self or forward reference was skipped as a CTE and bound by duckdb to the default
   database's table or a file - past the gate, and through a principal's view for its readers. The scope now follows
   the binder's; a name a view's query names that no policy answers is refused at create.
+- **A recursive CTE's `USING KEY` targets** (older than this spec): expressions duckdb binds, walked by neither
+  duckdb's iterator nor the rewriter - now gated like any expression.
 - The shape is replaced only where it occurs once (a mask holding its text is refused); a refusal inside a nested view
   names the outermost view; the rewriter's state is restored on a refusal.
 
