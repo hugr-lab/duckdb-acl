@@ -15,6 +15,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_list_items.hpp"
 #include "acl_versions.hpp"
 #include "acl_platform.hpp"
 #include "acl_types.hpp"
@@ -641,7 +642,12 @@ void RequireStoredExpressions(const string &object, const string &own_rls,
                               const vector<std::pair<string, GrantPolicy>> &united) {
 	vector<string> texts = {own_rls};
 	for (auto &column : own_columns) {
-		texts.push_back(column.second);
+		if (!IsStarItem(column)) {
+			texts.push_back(column.second);
+		}
+	}
+	if (HoldsStar(own_columns) && !StoredListOk(own_columns)) {
+		texts.push_back(";"); // spec 158 stage 2: a stored star that does not read back as one star refuses as well
 	}
 	for (auto &role : united) {
 		for (auto &predicate : role.second.predicates) {
@@ -781,7 +787,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	if (!cols.IsNull() && form != "view") {
 		for (auto &item : ListValue::GetChildren(cols)) {
 			auto &fields = StructValue::GetChildren(item);
-			auto name = fields[0].ToString();
+			auto name = fields[0].IsNull() ? string() : fields[0].ToString(); // spec 158 stage 2: the star has none
 			auto expr = fields[1].IsNull() ? string() : fields[1].ToString();
 			if (form == "alias" && !expr.empty()) {
 				// the list maps virtual -> physical, and a write maps the name back (spec 010)
@@ -827,6 +833,9 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	vector<string> known;
 	for (auto &column : object_columns) {
 		known.push_back(column.first);
+	}
+	if (HoldsStar(object_columns)) {
+		known.clear(); // spec 158 stage 2: a star's columns are not known here - RoleUnionWidens judges every one
 	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
 	NoteUnionWidens(out.canonical.empty() ? vname : out.canonical, capability, united, known);
@@ -1044,6 +1053,37 @@ string ExposedMask(const string &mask, const string &column, const vector<std::p
 	return mask;
 }
 
+//! spec 158 stage 2: the source column an object's column `name` reads as it is, under a list holding a star - a
+//! named item's by stage 1's rule (a plain reference names it), a RENAME's source, a column the star passes by its own
+//! name; '' for one computed (a named expression, a REPLACE)
+string StarCastKey(const DeclaredList &list, const string &name) {
+	string star;
+	for (auto &item : list) {
+		if (IsStarItem(item)) {
+			star = item.second;
+			continue;
+		}
+		if (StringUtil::CIEquals(item.first, name)) {
+			if (item.second.empty()) {
+				return item.first;
+			}
+			return PlainColumnName(item.second) ? item.second : string();
+		}
+	}
+	auto parts = ReadStarParts(star);
+	for (auto &replaced : parts.replaced) {
+		if (StringUtil::CIEquals(replaced.first, name)) {
+			return string();
+		}
+	}
+	for (auto &renamed : parts.renamed) {
+		if (StringUtil::CIEquals(renamed.first, name)) {
+			return renamed.second;
+		}
+	}
+	return name;
+}
+
 string ColumnsSelector(const ColumnTest &test) {
 	if (test.All()) {
 		return "*";
@@ -1092,6 +1132,40 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		                (predicate.empty() ? "" : " WHERE " + predicate);
 		out.casts.clear();
 		out.query = restricts ? GrantOver(columns, filtered) : filtered;
+		return;
+	}
+	if (!out.is_view && HoldsStar(object_columns)) {
+		// spec 158 stage 2: the object's list holds a star - read live, as duckdb expands it; the grant goes over that
+		// read as over an object with no list (the test and the masks by duckdb, over the object's columns), the
+		// predicate inside it, so RLS reads the source's values. Read-only: what it writes is known only at bind
+		if (!predicate.empty()) {
+			out.rls = out.rls.empty() ? predicate : "(" + out.rls + ") AND (" + predicate + ")";
+		}
+		auto read = ObjectListSelect(object_columns, out.ReadFrom());
+		out.distinct_guard = DistinctNamesGuard(object_columns, out.ReadFrom());
+		if (restricts) {
+			auto exposed = columns;
+			for (auto &mask : exposed.masks) {
+				// a mask is read as the type the object exposes its column as (spec 099): the source column it reads
+				// as it is - by its name, or the one a RENAME or a plain item names; a computed one is no source's
+				auto key = StarCastKey(object_columns, mask.first);
+				if (!key.empty()) {
+					mask.second = ExposedMask(mask.second, key, out.casts);
+				}
+			}
+			read = GrantOver(exposed, read);
+			// what the grants keep, for the screens that list a role's columns (lineage's tags, spec 107): read-only,
+			// so nothing is written by it
+			if (columns.test.kind == ColumnTest::Kind::ONLY) {
+				out.visible_columns.insert(columns.test.names.begin(), columns.test.names.end());
+			} else {
+				out.columns_excluded = true;
+				out.excluded_columns.insert(columns.test.names.begin(), columns.test.names.end());
+			}
+		}
+		out.query = read;
+		out.subquery_form = true;
+		out.writable = false; // whatever form is stored: which source columns it writes is known only at bind
 		return;
 	}
 	if (predicate.empty() && !restricts) {

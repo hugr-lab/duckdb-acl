@@ -501,9 +501,11 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	for (auto &column : columns) {
 		auto mark = nullable_marks.find(column.first);
 		string nullable = mark == nullable_marks.end() ? "NULL" : (mark->second ? "true" : "false");
+		// spec 158 stage 2: the star item has no name
 		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") +
 		                     "(\"vcat\", \"vname\", \"pos\", \"name\", \"expr\", \"nullable\") VALUES (" + Lit(vcat) +
-		                     ", " + Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
+		                     ", " + Lit(vname) + ", " + std::to_string(pos++) + ", " +
+		                     (acl_detail::IsStarItem(column) ? string("NULL") : Lit(column.first)) + ", " +
 		                     Lit(column.second) + ", " + nullable + ")");
 	}
 	// the object's column schema (spec 010): a view has no physical row and no declared projection,
@@ -519,22 +521,20 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		// `ssn = NULL`) has no physical column to read a type from - so bind the projection once, here
 		// on the write path, exactly as a view's SQL is bound (spec 010). Without this the column is
 		// readable but typeless, and metadata cannot describe it (spec 010 part 3).
-		vector<string> items;
-		vector<string> expressions;
-		for (auto &column : columns) {
-			items.push_back(column.second.empty() ? acl_detail::Ident(column.first)
-			                                      : column.second + " AS " + acl_detail::Ident(column.first));
-			expressions.push_back(column.second);
-		}
 		// spec 148: a stored list (re-read by an ALTER of another field) is pasted only when each is one expression
-		derived = StoredExpressionsOk(expressions) &&
-		          catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + NamePath::KeyToSql(phys),
-		                              false, {}, schema);
+		auto source = NamePath::KeyToSql(phys);
+		derived = acl_detail::StoredListOk(columns) &&
+		          catalog.ProbeSchema(acl_detail::ObjectListSelect(columns, " FROM " + source), false, {}, schema);
 		if (!derived) {
 			schema.clear();
 			for (auto &column : columns) {
-				schema.emplace_back(column.first, string()); // the probe could not bind: names only
+				if (!acl_detail::IsStarItem(column)) {
+					schema.emplace_back(column.first, string()); // the probe could not bind: names only
+				}
 			}
+			// spec 158 stage 2: a star's columns are known only from a probe - the names kept are re-derived at the
+			// next ANALYZE and compared by the check, as a probed schema is
+			derived = acl_detail::HoldsStar(columns);
 		}
 	} else {
 		for (auto &column : columns) {
@@ -550,7 +550,9 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	// is then accepted the way an uncheckable predicate is.
 	vector<string> known;
 	for (auto &column : columns) {
-		known.push_back(StringUtil::Lower(column.first));
+		if (!acl_detail::IsStarItem(column)) {
+			known.push_back(StringUtil::Lower(column.first));
+		}
 	}
 	for (auto &entry : schema) {
 		known.push_back(StringUtil::Lower(entry.first));
@@ -563,8 +565,17 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 			}
 		}
 	}
+	// spec 158 stage 2: a column a star's REPLACE computes is a computed column to a key, as a named expression is
+	auto key_columns = columns;
+	for (auto &column : columns) {
+		if (acl_detail::IsStarItem(column)) {
+			for (auto &replaced : ReadStarParts(column.second).replaced) {
+				key_columns.push_back(replaced);
+			}
+		}
+	}
 	for (auto &statement :
-	     catalog.KeyStatements(vcat, vname, "relation", pk, known, nullable_marks, &columns, pk_carried)) {
+	     catalog.KeyStatements(vcat, vname, "relation", pk, known, nullable_marks, &key_columns, pk_carried)) {
 		statements.push_back(statement);
 	}
 	return statements;
@@ -572,31 +583,42 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 
 using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 
+//! spec 158 stage 2: where a list holding a star is written over a source that binds here, it must bind over it and
+//! read no name twice (the read refuses both: a duplicate is suffixed in a subquery, `ssn_1`, where a grant's test and
+//! masks name only the first)
+void RequireStarListReads(CatalogBackend &catalog, const string &vname, const string &phys,
+                          const vector<std::pair<string, string>> &columns) {
+	if (!acl_detail::HoldsStar(columns) || phys.empty()) {
+		return;
+	}
+	string error;
+	auto twice = catalog.DuplicateName(NamePath::KeyToSql(phys), columns, &error);
+	if (!twice.empty()) {
+		throw InvalidInputException("acl: the column list of \"%s\" reads \"%s\" twice - EXCLUDE it from the star or "
+		                            "name the other column otherwise",
+		                            vname, twice);
+	}
+	if (!error.empty()) {
+		throw InvalidInputException("acl: the column list of \"%s\" does not bind over \"%s\": %s", vname, phys, error);
+	}
+}
+
+//! An object's own list as stored, in its order (read by `DeclaredListFrom`)
+string DeclaredListSql(CatalogBackend &catalog, const string &vcat, const string &vname) {
+	return "SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	       " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"";
+}
+
 //! The types of the columns an object exposes (what a grant's mask is cast to, spec 158): its declared projection,
 //! or the source's own columns. Empty when it does not bind here - the read path decides then.
 vector<std::pair<string, LogicalType>> ExposedTypes(CatalogBackend &catalog, const ReadFn &read, const string &vcat,
                                                     const string &vname, const string &source) {
-	auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
-	                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
-	ResultRows rows_rows(*rows);
-	vector<string> items;
-	for (idx_t i = 0; i < rows->RowCount(); i++) {
-		auto name = rows_rows.GetValue(0, i).ToString();
-		auto expr = rows_rows.GetValue(1, i);
-		items.push_back(expr.IsNull() || expr.ToString().empty() ? acl_detail::Ident(name)
-		                                                         : expr.ToString() + " AS " + acl_detail::Ident(name));
-	}
+	auto declared = acl_detail::DeclaredListFrom(*read(DeclaredListSql(catalog, vcat, vname)));
 	vector<std::pair<string, LogicalType>> types;
-	vector<string> expressions;
-	for (idx_t i = 0; i < rows->RowCount(); i++) {
-		auto expr = rows_rows.GetValue(1, i);
-		expressions.push_back(expr.IsNull() ? string() : expr.ToString());
-	}
-	if (!StoredExpressionsOk(expressions)) {
+	if (!acl_detail::StoredListOk(declared)) {
 		return types; // spec 148: not pasted - unknown here, the read refuses it
 	}
-	catalog.ProbeTypes("SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + source,
-	                   types);
+	catalog.ProbeTypes(acl_detail::ObjectListSelect(declared, " FROM " + source), types);
 	return types;
 }
 
@@ -643,13 +665,7 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 		if (source.empty()) {
 			return stored();
 		}
-		vector<string> declared;
-		auto rows = read("SELECT \"name\" FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                 " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
-		ResultRows rows_rows(*rows);
-		for (idx_t i = 0; i < rows->RowCount(); i++) {
-			declared.push_back(rows_rows.GetValue(0, i).ToString());
-		}
+		auto declared = acl_detail::DeclaredListFrom(*read(DeclaredListSql(catalog, vcat, vname)));
 		if (!declared.empty() && form != "view") {
 			// spec 158 review: over an object's own list a mask reads those columns by name (it is substituted onto
 			// the object's expressions; a subquery, a star or a field path would read the physical row)
@@ -795,17 +811,9 @@ void CheckGrantProjection(CatalogBackend &catalog, const ReadFn &read, const str
 	// a grant's *expression* is evaluated over the physical row, while a bare name in it refers to the
 	// object's own column - which a rename may have moved.
 	string source = form == "view" ? "(" + text(2) + ")" : NamePath::KeyToSql(text(1));
-	case_insensitive_map_t<string> own;
-	vector<string> own_order;
+	acl_detail::DeclaredList own;
 	if (form != "view") {
-		auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
-		                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
-		ResultRows rows_rows(*rows);
-		for (idx_t i = 0; i < rows->RowCount(); i++) {
-			own_order.push_back(rows_rows.GetValue(0, i).ToString());
-			own[rows_rows.GetValue(0, i).ToString()] =
-			    rows_rows.GetValue(1, i).IsNull() ? string() : rows_rows.GetValue(1, i).ToString();
-		}
+		own = acl_detail::DeclaredListFrom(*read(DeclaredListSql(catalog, vcat, vname)));
 	}
 	vector<std::pair<string, string>> derived;
 	if (source.empty()) {
@@ -815,7 +823,7 @@ void CheckGrantProjection(CatalogBackend &catalog, const ReadFn &read, const str
 	acl_detail::RoleColumns granted;
 	granted.test = ReadColumnTest(columns);
 	granted.masks = ReadMasks(masks);
-	auto error = catalog.ProjectionSchema(source, granted, own_order, own, derived, &probed);
+	auto error = catalog.ProjectionSchema(source, granted, own, derived, &probed);
 	if (!error.empty() || !probed) {
 		if (!strict) {
 			return; // the object still cannot judge it; leave what an earlier probe found in place
@@ -1112,6 +1120,7 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 			kept_pk = StringUtil::Join(parts, ", ");
 			pk_carried = !kept_pk.empty();
 		}
+		RequireStarListReads(*catalog, vname, phys, columns);
 		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns,
 		                                string(), kept_pk, nullable_marks, pk_carried, alias_types, enum_types);
 	});
@@ -1286,7 +1295,7 @@ bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname
 		return false;
 	}
 	string form, phys, view_sql, rls;
-	vector<string> items;
+	acl_detail::DeclaredList declared;
 	vector<string> stored_expressions; // spec 148: planned only when each is one expression
 	case_insensitive_set_t masks;      // `c = expr` over a column the source has: a mask, not a computed column
 	case_insensitive_set_t source_columns;
@@ -1318,13 +1327,20 @@ bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname
 				}
 			}
 		}
-		for (idx_t i = 0; i < columns->RowCount(); i++) {
-			auto name = column_rows.GetValue(0, i).ToString();
-			auto expr = column_rows.GetValue(1, i).IsNull() ? string() : column_rows.GetValue(1, i).ToString();
-			items.push_back(expr.empty() ? acl_detail::Ident(name) : expr + " AS " + acl_detail::Ident(name));
-			stored_expressions.push_back(expr);
-			if (!expr.empty() && source_columns.count(name)) {
-				masks.insert(name);
+		declared = acl_detail::DeclaredListFrom(*columns);
+		for (auto &item : declared) {
+			if (acl_detail::IsStarItem(item)) {
+				// spec 158 stage 2: judged with the list (StoredListOk below); a REPLACE of a source column masks it
+				for (auto &replaced : ReadStarParts(item.second).replaced) {
+					if (source_columns.count(replaced.first)) {
+						masks.insert(replaced.first);
+					}
+				}
+				continue;
+			}
+			stored_expressions.push_back(item.second);
+			if (!item.second.empty() && source_columns.count(item.first)) {
+				masks.insert(item.first);
 			}
 		}
 	} catch (std::exception &) {
@@ -1335,13 +1351,13 @@ bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname
 	}
 	string sql;
 	stored_expressions.push_back(rls);
-	if (!StoredExpressionsOk(stored_expressions)) {
+	if (!StoredExpressionsOk(stored_expressions) || !acl_detail::StoredListOk(declared)) {
 		// spec 148: a stored text that is not one expression is never planned - the dataset without its edges
 	} else if (form == "view") {
 		sql = view_sql;
 	} else if (!phys.empty()) {
-		sql = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " +
-		      NamePath::KeyToSql(phys) + (rls.empty() ? string() : " WHERE " + rls);
+		sql = acl_detail::ObjectListSelect(declared, " FROM " + NamePath::KeyToSql(phys) +
+		                                                 (rls.empty() ? string() : " WHERE " + rls));
 	}
 	if (!sql.empty()) {
 		try {
@@ -1708,10 +1724,12 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 				}
 				continue;
 			}
-			auto declared = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
-			                     catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-			                     " AND \"vname\" = " + Lit(end));
-			if (declared->Collection().GetValue(1, 0).GetValue<int64_t>() > 0) {
+			// spec 158 stage 2: a list with a star names its columns in the stored schema (below), not in the list
+			auto declared =
+			    read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
+			         catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+			         " AND \"vname\" = " + Lit(end) + " HAVING count(*) FILTER (WHERE \"name\" IS NULL) = 0");
+			if (declared->RowCount() > 0 && declared->Collection().GetValue(1, 0).GetValue<int64_t>() > 0) {
 				if (declared->Collection().GetValue(0, 0).GetValue<int64_t>() == 0) {
 					missing();
 				}
@@ -2367,6 +2385,14 @@ void PolicyStore::CatalogSetKey(const string &vcat, const string &vname, const s
 		ResultRows declared_rows(*declared);
 		vector<string> projected;
 		for (idx_t row = 0; row < declared->RowCount(); row++) {
+			if (declared_rows.GetValue(0, row).IsNull()) {
+				// spec 158 stage 2: the star - its columns are the stored schema's (known), its REPLACEs computed
+				auto star = declared_rows.GetValue(1, row);
+				for (auto &replaced : ReadStarParts(star.IsNull() ? string() : star.ToString()).replaced) {
+					masked.push_back(replaced);
+				}
+				continue;
+			}
 			auto name = declared_rows.GetValue(0, row).ToString();
 			auto expr = declared_rows.GetValue(1, row);
 			masked.emplace_back(name, expr.IsNull() ? string() : expr.ToString());
@@ -2969,31 +2995,27 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			    read("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 			         " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object) + " ORDER BY \"pos\"");
 			ResultRows columns_rows(*columns);
-			vector<string> items;
+			auto list = acl_detail::DeclaredListFrom(*columns);
 			vector<std::pair<string, string>> names_only;
 			case_insensitive_map_t<int8_t> marks;
 			for (idx_t i = 0; i < columns->RowCount(); i++) {
+				if (columns_rows.GetValue(0, i).IsNull()) {
+					continue; // spec 158 stage 2: the star - its columns are known only from the probe
+				}
 				auto name = columns_rows.GetValue(0, i).ToString();
-				auto expr = columns_rows.GetValue(1, i);
-				items.push_back(expr.IsNull() || expr.ToString().empty()
-				                    ? acl_detail::Ident(name)
-				                    : expr.ToString() + " AS " + acl_detail::Ident(name));
 				names_only.emplace_back(name, string());
 				auto nullable = columns_rows.GetValue(2, i);
 				if (!nullable.IsNull()) {
 					marks[name] = nullable.GetValue<bool>() ? 1 : 0;
 				}
 			}
-			vector<std::pair<string, string>> schema;
-			vector<string> expressions;
-			for (idx_t i = 0; i < columns->RowCount(); i++) {
-				auto expr = columns_rows.GetValue(1, i);
-				expressions.push_back(expr.IsNull() ? string() : expr.ToString());
+			if (!catalog->DuplicateName(NamePath::KeyToSql(phys), list).empty()) {
+				continue; // spec 158 stage 2: every read refuses it - the snapshot stays; the check's column_duplicate
 			}
-			bool derived =
-			    StoredExpressionsOk(expressions) && // spec 148
-			    catalog->ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + NamePath::KeyToSql(phys),
-			                         false, {}, schema);
+			vector<std::pair<string, string>> schema;
+			bool derived = acl_detail::StoredListOk(list) && // spec 148
+			               catalog->ProbeSchema(acl_detail::ObjectListSelect(list, " FROM " + NamePath::KeyToSql(phys)),
+			                                    false, {}, schema);
 			rederive(object, "relation", derived ? schema : names_only, derived, marks);
 		}
 		auto macros = read("SELECT \"vname\", \"kind\", \"template\", \"params\" FROM " + catalog->Tbl("functions") +
@@ -3519,7 +3541,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			ResultRows rows_rows(*rows);
 			for (idx_t row = 0; row < rows->RowCount(); row++) {
 				auto expr = rows_rows.GetValue(1, row);
-				auto name = rows_rows.GetValue(0, row).ToString();
+				auto name = rows_rows.GetValue(0, row).IsNull() ? string() : rows_rows.GetValue(0, row).ToString();
 				new_columns.emplace_back(name, expr.IsNull() ? string() : expr.ToString());
 				auto nullable = rows_rows.GetValue(2, row);
 				if (!nullable.IsNull()) {
@@ -3605,6 +3627,10 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 				parts.push_back(key_rows_rows.GetValue(0, key_row).ToString());
 			}
 			kept_pk = StringUtil::Join(parts, ", ");
+		}
+		if (field == "columns" || field == "phys") {
+			RequireStarListReads(*catalog, vname, new_phys,
+			                     new_columns); // only where the list or its source is written
 		}
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
 		                                comment, string(), origin, kept_pk, kept_marks, true, alias_types, enum_types);
@@ -4122,13 +4148,7 @@ string ExposedColumnList(CatalogBackend &catalog, const ReadFn &read, const stri
 	if (source.empty()) {
 		return string();
 	}
-	vector<string> declared;
-	auto rows = read("SELECT \"name\" FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                 " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
-	ResultRows rows_rows(*rows);
-	for (idx_t i = 0; i < rows->RowCount(); i++) {
-		declared.push_back(rows_rows.GetValue(0, i).ToString());
-	}
+	auto declared = acl_detail::DeclaredListFrom(*read(DeclaredListSql(catalog, vcat, vname)));
 	vector<string> exposed;
 	if (!catalog.ExposedColumns(source, declared, exposed)) {
 		return string();

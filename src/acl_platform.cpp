@@ -1619,7 +1619,7 @@ void WalkBodyCalls(const string &text, BodyShape shape,
 		}
 		return;
 	case BodyShape::DECLARED_COLUMNS:
-		for (auto &column : SplitDeclaredColumns(trimmed, "the object's column list")) {
+		for (auto &column : SplitDeclaredColumns(trimmed, "the object's column list", true)) {
 			if (!column.expr.empty()) {
 				for (auto &expr : Parser(options).ParseExpressionList(column.expr)) {
 					WalkBodyExpr(*expr, none, callback);
@@ -1834,9 +1834,10 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 			// a column list (a grant's, a relation's, a REMAP) is checked item by item, each expression as one
 			vector<std::pair<string, bool>> pieces;
 			if (body.shape == BodyShape::DECLARED_COLUMNS) {
-				for (auto &column : SplitDeclaredColumns(text, "the object's column list")) {
-					if (!column.expr.empty()) {
-						pieces.emplace_back(column.expr, true); // a column named as is reads no table
+				for (auto &column : SplitDeclaredColumns(text, "the object's column list", true)) {
+					// a column named as is reads no table, nor does a star (no subquery inside it, spec 158 stage 2)
+					if (!column.expr.empty() && !column.name.empty()) {
+						pieces.emplace_back(column.expr, true);
 					}
 				}
 			} else if (body.shape == BodyShape::COLUMNS) {
@@ -1885,7 +1886,7 @@ vector<string> BodyItemExpressions(const string &text, BodyShape shape) {
 		if (shape == BodyShape::COLUMNS) {
 			ReadMasks(text, &out); // spec 158: a grant's MASK items, as they stand in the text
 		} else if (shape == BodyShape::DECLARED_COLUMNS) {
-			for (auto &column : SplitDeclaredColumns(text, "the object's column list")) {
+			for (auto &column : SplitDeclaredColumns(text, "the object's column list", true)) {
 				if (!column.expr.empty()) {
 					out.push_back(column.expr);
 				}

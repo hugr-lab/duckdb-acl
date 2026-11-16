@@ -1,0 +1,74 @@
+# name: test/sql/acl_object_list_star_versions.test
+# description: spec 158 stage 2 - the distinct-names guard binds at the version a read names (a client's AT under
+#   VERSIONS ANY, a grant's pinned AT): an older version holding a column of a name the list makes refuses (re-review)
+# group: [sql]
+
+require acl
+
+require parquet
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/star_versions_lake.ducklake' AS lk (DATA_PATH '{TEST_DIR}/star_versions_lake');
+
+# version 2: (id, ssn, doc) where doc holds the ssn too; then doc is dropped
+statement ok
+CREATE TABLE lk.p (id INTEGER, ssn VARCHAR, doc VARCHAR);
+
+statement ok
+INSERT INTO lk.p VALUES (1, '123-45-6789', '123-45-6789');
+
+statement ok
+ALTER TABLE lk.p DROP COLUMN doc;
+
+query I
+SELECT max(snapshot_id) FROM ducklake_snapshots('lk');
+----
+3
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE m;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE m MAIN VERSIONS ANY;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ex AS lk.main.p COLUMNS (* RENAME (ssn AS doc));
+
+statement ok
+ACL ADMIN GRANT TABLE c.ex TO ROLE m MASK (doc AS '***');
+
+query IT
+ACL ROLE "m" SELECT * FROM ex;
+----
+1	***
+
+# gate coverage: the distinct-names guard must bind at the version the read names
+statement error
+ACL ROLE "m" SELECT * FROM ex AT (VERSION => 2);
+----
+reads a column name twice
+
+statement ok
+ACL ADMIN CREATE ROLE pin; GRANT CATALOG c TO ROLE pin MAIN; GRANT TABLE c.ex TO ROLE pin VERSIONS AT (VERSION => 2) MASK (doc AS '***');
+
+statement error
+ACL ROLE "pin" SELECT * FROM ex;
+----
+reads a column name twice
+
+# the current version reads as it is
+query IT
+ACL ROLE "m" SELECT * FROM ex AT (VERSION => 3);
+----
+1	***

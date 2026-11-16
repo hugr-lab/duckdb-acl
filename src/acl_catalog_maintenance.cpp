@@ -103,6 +103,23 @@ bool ItemBinds(CatalogBackend &catalog, const string &source, const string &item
 	return Binds(catalog, "SELECT " + baked + " AS __acl_probe FROM " + source + " WHERE false", error);
 }
 
+//! spec 158 stage 2: an entry of an object's list binds over `source` - the star as one item of its own
+bool EntryBinds(CatalogBackend &catalog, const string &source, const std::pair<string, string> &entry, string &error) {
+	if (!acl_detail::IsStarItem(entry)) {
+		return ItemBinds(catalog, source, EntryItem(entry), error);
+	}
+	if (!acl_detail::StoredListOk({entry})) {
+		error = "the star does not read back as stored (spec 148)";
+		return false;
+	}
+	auto sql = "SELECT " + entry.second + " FROM " + source + " WHERE false";
+	try {
+		sql = BakeTemplateForProbe(sql, ParserOptions::Builtin(), false, {}); // markers NULL, as in every probe
+	} catch (std::exception &) {
+	}
+	return Binds(catalog, sql, error);
+}
+
 //! What the object's stored schema says (spec 010), and whether it was derived by a probe or declared
 //! by the admin - a declared schema is the admin's word and is never compared against the source.
 Columns StoredSchema(CatalogBackend &catalog, const string &vcat, const string &vname, const string &kind,
@@ -218,11 +235,16 @@ private:
 			                     " ORDER BY \"pos\"");
 			ResultRows declared_rows(*declared);
 			for (idx_t i = 0; i < declared->RowCount(); i++) {
-				auto name = declared_rows.GetValue(0, i).ToString();
+				auto name = Text(declared_rows.GetValue(0, i)); // spec 158 stage 2: the star has no name
 				auto expr = Text(declared_rows.GetValue(1, i));
 				relation.declared.emplace_back(name, expr);
-				relation.own[name] = expr;
-				relation.known.push_back(name);
+				if (!name.empty()) {
+					relation.own[name] = expr;
+					relation.known.push_back(name);
+				}
+			}
+			if (acl_detail::HoldsStar(relation.declared)) {
+				relation.known.clear(); // the star's columns are the stored schema's (below)
 			}
 			bool is_view = relation.form == "view";
 			auto kind = is_view ? "view" : "table";
@@ -268,14 +290,17 @@ private:
 				relation.dead = true;
 			} else if (!relation.declared.empty()) {
 				bool any_missing = false;
-				vector<string> items;
 				for (auto &entry : relation.declared) {
-					auto item = EntryItem(entry);
-					items.push_back(item + " AS " + Ident(entry.first));
-					if (ItemBinds(catalog, relation.phys, item, error)) {
+					if (EntryBinds(catalog, relation.phys, entry, error)) {
 						continue;
 					}
 					any_missing = true;
+					if (acl_detail::IsStarItem(entry)) {
+						Add(kind, relation.vname, "", "column_missing",
+						    "the star " + entry.second + " no longer binds over \"" + relation.phys + "\": " + error,
+						    "ALTER VIRTUAL TABLE " + Named(relation.vname) + " SET COLUMNS (<list>)");
+						continue;
+					}
 					Add(kind, relation.vname, "", "column_missing",
 					    "declared column \"" + entry.first + "\" reads " +
 					        (entry.second.empty() ? "a source column of that name" : "\"" + entry.second + "\"") +
@@ -283,10 +308,22 @@ private:
 					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (<column> AS " +
 					        KeywordHelper::WriteOptionallyQuoted(entry.first) + ")  -- or DROP MISSING COLUMNS");
 				}
+				auto twice = any_missing ? string()
+				                         : catalog.DuplicateName(NamePath::KeyToSql(relation.phys), relation.declared);
+				if (!twice.empty()) {
+					// spec 158 stage 2: every read refuses it (a subquery would suffix the second, `x_1`)
+					any_missing = true;
+					Add(kind, relation.vname, "", "column_duplicate",
+					    "the column list reads \"" + twice +
+					        "\" twice - its star and another column share the name, "
+					        "and every read refuses",
+					    "ALTER VIRTUAL TABLE " + Named(relation.vname) +
+					        " SET COLUMNS (<the list, the name EXCLUDEd from the star or the other column renamed>)");
+				}
 				if (!any_missing && stored_derived) {
 					Columns probed;
-					if (catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " +
-					                            NamePath::KeyToSql(relation.phys),
+					if (catalog.ProbeSchema(acl_detail::ObjectListSelect(relation.declared,
+					                                                     " FROM " + NamePath::KeyToSql(relation.phys)),
 					                        false, {}, probed)) {
 						auto diff = SchemaDiff(stored, probed);
 						if (!diff.empty()) {
@@ -408,8 +445,35 @@ private:
 		bool strip_alias = alias_types.IsNull() ? NodeStripsAliases(*instance) : Text(alias_types) == "base";
 		bool enums_to_varchar = enum_types.IsNull() ? NodeEnumsToVarchar(*instance) : Text(enum_types) == "varchar";
 		// the columns the object exposes: a declared list shows only what its entries read by name
+		// spec 158 stage 2: a star passes the source columns it names as it is (not those it leaves out or computes)
+		case_insensitive_set_t star_passes;
+		for (auto &entry : relation.declared) {
+			if (!acl_detail::IsStarItem(entry)) {
+				continue;
+			}
+			auto parts = ReadStarParts(entry.second);
+			vector<std::pair<string, string>> probed;
+			string star_read;
+			try {
+				star_read = BakeTemplateForProbe("SELECT " + entry.second + " FROM " + relation.Source(),
+				                                 ParserOptions::Builtin(), false, {});
+			} catch (std::exception &) {
+			}
+			if (!star_read.empty() && catalog.ProbeSchema(star_read, false, {}, probed)) {
+				for (auto &column : probed) {
+					star_passes.insert(column.first);
+				}
+			}
+			for (auto &replaced : parts.replaced) {
+				star_passes.erase(replaced.first);
+			}
+			for (auto &renamed : parts.renamed) {
+				star_passes.erase(renamed.first);
+				star_passes.insert(renamed.second);
+			}
+		}
 		auto exposed = [&](const string &column) {
-			if (relation.declared.empty()) {
+			if (relation.declared.empty() || star_passes.count(column)) {
 				return true;
 			}
 			for (auto &entry : relation.declared) {
@@ -477,6 +541,15 @@ private:
 		bool stored_derived = false;
 		auto stored = StoredSchema(catalog, vcat, relation.vname, "relation", stored_derived);
 		for (auto &entry : relation.declared) {
+			if (acl_detail::IsStarItem(entry)) {
+				// its REPLACE expressions read the exposed types too (spec 099)
+				if (EntryBinds(catalog, relation.Source(), entry, error) && !EntryBinds(catalog, typed, entry, error)) {
+					Add(kind, relation.vname, "", "types_incompatible",
+					    "the star " + entry.second + " does not bind once the source's types are exposed: " + error,
+					    repair_types);
+				}
+				continue;
+			}
 			auto item = EntryItem(entry);
 			if (!ItemBinds(catalog, relation.Source(), item, error)) {
 				continue; // column_missing says it
@@ -705,12 +778,8 @@ private:
 	//! The columns a relation exposes right now: its declared names (the contract), else what its
 	//! source binds to NOW - not the stored schema, which is exactly what may be stale
 	bool Exposed(const Relation &relation, case_insensitive_set_t &out) {
-		vector<string> declared;
-		for (auto &entry : relation.declared) {
-			declared.push_back(entry.first);
-		}
 		vector<string> names;
-		if (!catalog.ExposedColumns(relation.Source(), declared, names)) {
+		if (!catalog.ExposedColumns(relation.Source(), relation.declared, names)) {
 			return false;
 		}
 		for (auto &name : names) {
@@ -737,22 +806,16 @@ private:
 				    repair(name));
 			}
 		}
-		vector<string> own_order;
-		for (auto &column : relation.declared) {
-			own_order.push_back(column.first);
-		}
 		if (!masks.empty()) {
 			// a mask is judged over the object's read: when that read does not bind, the object's own finding
 			// (column_missing, definition_broken) says it, and no mask is to blame
-			vector<string> items;
-			for (auto &column : relation.declared) {
-				items.push_back((column.second.empty() ? Ident(column.first) : column.second) + " AS " +
-				                Ident(column.first));
+			if (!acl_detail::StoredListOk(relation.declared)) {
+				return;
 			}
 			auto instance = catalog.Db();
 			Connection con(*instance);
-			auto object = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " +
-			              relation.Source() + " WHERE false";
+			auto object =
+			    acl_detail::ObjectListSelect(relation.declared, " FROM " + relation.Source()) + " WHERE false";
 			if (con.Query(object)->HasError()) {
 				return;
 			}
@@ -769,7 +832,7 @@ private:
 			one.masks.push_back(mask);
 			Columns derived;
 			bool probed = false;
-			auto error = catalog.ProjectionSchema(relation.Source(), one, own_order, relation.own, derived, &probed);
+			auto error = catalog.ProjectionSchema(relation.Source(), one, relation.declared, derived, &probed);
 			if (!error.empty()) {
 				Add("grant", relation.vname, role, "mask_broken",
 				    "the mask of \"" + mask.first + "\" does not bind over \"" + Named(relation.vname) +
@@ -1237,8 +1300,9 @@ void PolicyStore::SourcesNotGranted(const string &vcat, vector<CatalogFinding> &
 	                   "\"created_by\", \"rls\", (SELECT list(c.\"expr\") FROM " +
 	                   catalog->Tbl("relation_columns") +
 	                   " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\" AND c.\"expr\" IS NOT NULL"
-	                   " AND trim(c.\"expr\") <> '') FROM " +
-	                   catalog->Tbl("relations") + " r" + where + " ORDER BY 1");
+	                   " AND trim(c.\"expr\") <> '' AND c.\"name\" IS NOT NULL) FROM " + // a star reads no table
+	                   catalog->Tbl("relations") +
+	                   " r" + where + " ORDER BY 1");
 	ResultRows relation_rows(*relations);
 	for (idx_t i = 0; i < relation_rows.Count(); i++) {
 		Defined entry {Text(relation_rows.GetValue(1, i)) == "view" ? "view" : "table",
@@ -1401,7 +1465,7 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 	Columns columns;
 	case_insensitive_map_t<int8_t> marks;
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		auto name = rows_rows.GetValue(0, row).ToString();
+		auto name = Text(rows_rows.GetValue(0, row)); // spec 158 stage 2: the star has no name, and is kept as it is
 		columns.emplace_back(name, Text(rows_rows.GetValue(1, row)));
 		auto nullable = rows_rows.GetValue(2, row);
 		if (!nullable.IsNull()) {
@@ -1445,7 +1509,7 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		bool and_masks = action == "drop_missing_and_masks";
 		case_insensitive_set_t missing;
 		for (auto &column : columns) {
-			if (!ItemBinds(*catalog, phys, EntryItem(column), error)) {
+			if (!acl_detail::IsStarItem(column) && !ItemBinds(*catalog, phys, EntryItem(column), error)) {
 				missing.insert(column.first);
 			}
 		}

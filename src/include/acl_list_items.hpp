@@ -82,9 +82,18 @@ struct DeclaredColumnText {
 };
 
 //! An object's declared column list (CREATE VIRTUAL TABLE ... COLUMNS, SET COLUMNS, REMAP, the function forms) read as
-//! a SELECT list (`ReadSelectList`, no star); a name holding `.` or `[` is refused (a stored declared name is read as
-//! a path). `what` names the list in the refusal
-vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what);
+//! a SELECT list (`ReadSelectList`); a name holding `.` or `[` is refused (a stored declared name is read as a path).
+//! `allow_star` (an object's own list, spec 158 stage 2): one star item, with no name and the star as duckdb prints
+//! it. `what` names the list in the refusal
+vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what, bool allow_star = false);
+
+//! spec 158 stage 2: what a stored star makes of the source's columns by name - each REPLACE (column, expression) and
+//! each RENAME (new name, the source's name); empty when the text is no star
+struct StarParts {
+	vector<std::pair<string, string>> replaced;
+	vector<std::pair<string, string>> renamed;
+};
+StarParts ReadStarParts(const string &star_text);
 
 //! Whether a column's name may be stored bare in a list (spec 150 4e): it reads back as one item that is itself - no
 //! `,` / `=` / bracket or quote that the split reads otherwise, no comment, no space at an end - and not as a path (no

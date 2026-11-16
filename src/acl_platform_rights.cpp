@@ -646,7 +646,8 @@ void Exposures(PolicyStore &store, const vector<string> &arguments, RightsState 
 		add_bodies(body_reads(text(relation_rows.GetValue(5, i)), true), base); // the relation's own RLS
 	}
 	auto columns = catalog.Query("SELECT \"vcat\", \"vname\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
-	                             " WHERE \"expr\" IS NOT NULL AND trim(\"expr\") <> ''");
+	                             // spec 158 stage 2: a star (no name) reads no table of its own
+	                             " WHERE \"expr\" IS NOT NULL AND trim(\"expr\") <> '' AND \"name\" IS NOT NULL");
 	ResultRows column_rows(*columns);
 	for (idx_t i = 0; i < column_rows.Count(); i++) {
 		Reader base;

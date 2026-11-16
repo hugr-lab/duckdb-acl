@@ -159,12 +159,32 @@ duckdb's parser (spec 158):
 | `<expression> AS name`       | a computed column (`amount * 2 AS total`), evaluated over the physical row           |
 | `name: <expression>`         | the same, in duckdb's prefix spelling                                                |
 | `a.b`                        | a column of its own named `b` (`struct_extract`), as in SELECT                       |
+| `*`, `* EXCLUDE (…)`, `* REPLACE (…)`, `* RENAME (…)`, `COLUMNS('<regex>')`, `COLUMNS(lambda c: …)` | the source's columns, read live (one star per list) |
 
 Each name is an identifier as duckdb reads one (quote a keyword or a name holding other characters); an expression is
 any duckdb expression - `['a', 'b']`, `{'k': 1}`, a lambda. An expression without a name, a positional reference
-(`#2`), a star (until stage 2) and anything after the list (`FROM`, `WHERE`) are refused. A column's nullability is its
+(`#2`) and anything after the list (`FROM`, `WHERE`) are refused. A column's nullability is its
 source's: the list carries no `NULL` / `NOT NULL` marks. The legacy quoted form `COLUMNS '<list>'`, `SET COLUMNS`,
 `REMAP` and the function forms (`acl_add_relation`, `acl_alter_relation`) read their text the same way.
+
+**A star** (spec 158 stage 2) is read by duckdb as written, so a column the source gains appears at once, and one it
+loses goes at once.
+- A list holds one star, unqualified and standing alone. Not allowed: `t.*`, a star inside an expression, or
+  `* LIKE` (write `COLUMNS('<regex>')`).
+- Its expressions (`REPLACE`, the selector of `COLUMNS`) read the source by its columns' names: no subquery, no
+  qualified name, no marker in the selector.
+- **No name may be read twice.** A star's column and a named item, or two of the star's own, never share a name.
+  This is refused where the list is written. If the source later gains a column named like an item, every read
+  refuses ("reads a column name twice") and `acl_check_catalog` says `column_duplicate`; `EXCLUDE` the name from the
+  star.
+- Listings describe the columns as of the write or the last `ANALYZE VIRTUAL TABLE`. `acl_check_catalog` says
+  `schema_stale` when the source has moved on.
+- An object whose list holds a star is read-only.
+
+```sql
+ACL ADMIN CREATE VIRTUAL TABLE c.people AS pg.public.people
+    COLUMNS (* EXCLUDE (ssn), '***-**-' || right(ssn, 4) AS ssn_tail);
+```
 
 A computed column and an `RLS` predicate are each **one SQL expression**: text with a comment left open, a parameter
 or a clause after it is refused where it is written (spec 148); a stored one refuses the reads it would have shaped,

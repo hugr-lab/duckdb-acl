@@ -202,6 +202,9 @@ struct TablePolicy {
 	//! written (`visible_columns` / `write_columns` are then empty); the masked ones are `injections`
 	bool columns_excluded = false;
 	case_insensitive_set_t excluded_columns;
+	//! spec 158 stage 2: a read of an object whose list holds a star that does not bind when two of its columns share
+	//! a name - the rewriter binds it alone before the statement runs (spec 157 / 159's guards)
+	string distinct_guard;
 
 	//! Whether a column policy narrows what a DML statement reads or writes
 	bool ColumnsNarrowed() const {

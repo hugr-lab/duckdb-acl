@@ -927,6 +927,11 @@ void WriteGuardPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		// spec 164: a call's probe (its caller's arguments NULL) refuses only a name it cannot resolve - an untyped
 		// NULL may leave an overload or an UNNEST without a type, which says nothing about scope
 		bool names_only = StringUtil::StartsWith(read, WRITE_GUARD_NAMES_ONLY);
+		string distinct; // spec 158 stage 2: the object whose list must read no name twice
+		if (StringUtil::StartsWith(read, WRITE_GUARD_DISTINCT)) {
+			auto end = read.find('\n');
+			distinct = read.substr(strlen(WRITE_GUARD_DISTINCT), end - strlen(WRITE_GUARD_DISTINCT));
+		}
 		// a statement of its own: no name of the write is in scope to bind a name the source lost to
 		Parser parser(ParserOptions::Builtin());
 		parser.ParseQuery(read);
@@ -937,6 +942,11 @@ void WriteGuardPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 			ErrorData error(ex);
 			if (names_only && !NameNotFound(error)) {
 				continue;
+			}
+			if (!distinct.empty() && StringUtil::Contains(error.RawMessage(), "duplicate names")) {
+				throw BinderException("acl: the object %s reads a column name twice - its list's star and another "
+				                      "column share it (acl_check_catalog names it)",
+				                      distinct);
 			}
 			auto info = error.ExtraInfo();
 			info.erase("position"); // an offset into the read, not into the client's text

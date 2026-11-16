@@ -8,6 +8,8 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -249,6 +251,71 @@ bool OnlyTheList(const SelectNode &node) {
 	return shape.ToString() == bare.ToString();
 }
 
+bool HoldsClass(const ParsedExpression &expr, ExpressionClass kind) {
+	if (expr.GetExpressionClass() == kind) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HoldsClass(child, kind); });
+	return found;
+}
+
+//! A star inside a star's expressions other than duckdb's own `*` of `COLUMNS(lambda …)` (`list_filter(*, …)`): a
+//! qualified one or a `COLUMNS(…)` of its own
+bool HoldsOtherStar(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::STAR) {
+		auto &star = expr.Cast<StarExpression>();
+		if (star.IsColumns() || !star.RelationName().empty() || star.Expression() || !star.ReplaceList().empty() ||
+		    !star.RenameList().empty() || !star.ExcludeList().empty()) {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HoldsOtherStar(child); });
+	return found;
+}
+
+//! A column reference of more than one part that is not a lambda parameter's field: a qualified name or a field path
+bool HoldsQualifiedColumn(const ParsedExpression &expr, const case_insensitive_set_t &params) {
+	if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
+		auto &lambda = expr.Cast<LambdaExpression>();
+		auto inner = params;
+		if (lambda.Left().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			inner.insert(lambda.Left().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+		}
+		ParsedExpressionIterator::EnumerateChildren(lambda.Left(), [&](const ParsedExpression &child) {
+			if (child.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				inner.insert(child.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+			}
+		});
+		return HoldsQualifiedColumn(lambda.Right(), inner);
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+		return names.size() > 1 && !params.count(names[0].GetIdentifierName());
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HoldsQualifiedColumn(child, params); });
+	return found;
+}
+
+//! A call of a marker the rewriter bakes per reader (acl_claim, acl_has_role, acl_arg)
+bool HoldsMarker(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto name = StringUtil::Lower(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+		if (name == "acl_claim" || name == "acl_has_role" || name == "acl_arg") {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HoldsMarker(child); });
+	return found;
+}
+
 bool HoldsPositional(const ParsedExpression &expr) {
 	if (expr.GetExpressionClass() == ExpressionClass::POSITIONAL_REFERENCE) {
 		return true;
@@ -293,6 +360,7 @@ vector<SelectListItem> ReadSelectList(const string &text_p, const char *what, bo
 	    node.from_table->ToString() != LIST_TABLE || !OnlyTheList(node)) {
 		RefuseList(what, "holds more than a column list");
 	}
+	bool starred = false;
 	for (auto &expr : node.select_list) {
 		SelectListItem item;
 		auto alias = expr->GetAlias().GetIdentifierName();
@@ -300,13 +368,75 @@ vector<SelectListItem> ReadSelectList(const string &text_p, const char *what, bo
 			if (!allow_star) {
 				RefuseList(what, "holds a star (" + expr->ToString() + ")");
 			}
+			// spec 158 stage 2: one star over the object's one source - unqualified, unnamed, standing alone, reading
+			// no table of its own
+			auto &star = expr->Cast<StarExpression>();
 			if (!alias.empty()) {
 				RefuseList(what, "names a star (" + expr->ToString() + ")");
 			}
+			if (starred) {
+				RefuseList(what,
+				           "holds a second star (" + expr->ToString() + ") - one star reads the source's columns");
+			}
+			bool qualified = !star.RelationName().empty();
+			for (auto &excluded : star.ExcludeList()) {
+				qualified =
+				    qualified || !excluded.catalog.empty() || !excluded.schema.empty() || !excluded.table.empty();
+			}
+			for (auto &renamed : star.RenameList()) {
+				qualified = qualified || !renamed.first.catalog.empty() || !renamed.first.schema.empty() ||
+				            !renamed.first.table.empty();
+			}
+			ParsedExpressionIterator::EnumerateChildren(*expr, [&](const ParsedExpression &child) {
+				qualified = qualified || HoldsQualifiedColumn(child, case_insensitive_set_t());
+			});
+			if (qualified) {
+				RefuseList(what, "holds the star " + expr->ToString() +
+				                     " - a star of the list reads the object's one source by its columns' names: no "
+				                     "qualified name or field path in it (write struct_extract(<column>, '<field>'))");
+			}
+			if (star.Expression() && HoldsMarker(*star.Expression())) {
+				// which columns the object has is the object's, never the reader's: a marker in REPLACE is fine
+				RefuseList(what, "holds the star " + expr->ToString() +
+				                     " - its COLUMNS selector reads a marker (acl_claim, acl_has_role), so the object "
+				                     "would have other columns for each reader");
+			}
+			bool reads_table = false;
+			ParsedExpressionIterator::EnumerateChildren(*expr, [&](const ParsedExpression &child) {
+				reads_table = reads_table || HoldsClass(child, ExpressionClass::SUBQUERY) || HoldsOtherStar(child) ||
+				              HoldsPositional(child);
+			});
+			if (reads_table) {
+				RefuseList(what, "holds the star " + expr->ToString() +
+				                     " - its expressions read the object's source by name: no subquery, star or "
+				                     "position inside it");
+			}
+			starred = true;
 			item.star = true;
 			item.expr = expr->ToString();
 			items.push_back(std::move(item));
 			continue;
+		}
+		if (HoldsClass(*expr, ExpressionClass::STAR)) {
+			// duckdb's `* LIKE | ILIKE | GLOB | SIMILAR TO '…'` (TryTransformStarLike): a matching operator over `*`
+			bool like = false;
+			if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
+				auto name = expr->Cast<FunctionExpression>().FunctionName().GetIdentifierName();
+				static const case_insensitive_set_t matchers {
+				    "~~", "!~~", "~~*", "!~~*", "~~~", "!~~~", "regexp_full_match"};
+				if (matchers.count(name)) {
+					ParsedExpressionIterator::EnumerateChildren(*expr, [&](const ParsedExpression &child) {
+						like = like || (child.GetExpressionClass() == ExpressionClass::STAR &&
+						                !child.Cast<StarExpression>().IsColumns());
+					});
+				}
+			}
+			if (like && allow_star) {
+				RefuseList(what, "holds " + expr->ToString() +
+				                     " - a star matched by LIKE / GLOB / SIMILAR TO is written COLUMNS('<regex>') or "
+				                     "COLUMNS(lambda c: c LIKE '…') here");
+			}
+			RefuseList(what, "holds a star inside " + expr->ToString() + " - a star stands alone in the list");
 		}
 		if (HoldsPositional(*expr)) {
 			RefuseList(what, "reads a column by its position (" + expr->ToString() + ") - name it");
@@ -480,10 +610,16 @@ string MasksText(const acl_detail::GrantMasks &masks) {
 	return StringUtil::Join(items, ", ");
 }
 
-vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what) {
+vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what, bool allow_star) {
 	vector<DeclaredColumnText> columns;
 	case_insensitive_set_t named;
-	for (auto &item : ReadSelectList(text, what, false)) {
+	for (auto &item : ReadSelectList(text, what, allow_star)) {
+		if (item.star) {
+			DeclaredColumnText column; // spec 158 stage 2: no name, the star as duckdb prints it
+			column.expr = std::move(item.expr);
+			columns.push_back(std::move(column));
+			continue;
+		}
 		if (!named.insert(item.name).second) {
 			throw BinderException("acl admin: %s declares the column \"%s\" twice", what, item.name);
 		}
@@ -498,6 +634,27 @@ vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *
 		columns.push_back(std::move(column));
 	}
 	return columns;
+}
+
+StarParts ReadStarParts(const string &star_text) {
+	StarParts parts;
+	vector<unique_ptr<ParsedExpression>> parsed;
+	try {
+		parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(star_text);
+	} catch (std::exception &) {
+		return parts;
+	}
+	if (parsed.size() != 1 || parsed[0]->GetExpressionClass() != ExpressionClass::STAR) {
+		return parts;
+	}
+	auto &star = parsed[0]->Cast<StarExpression>();
+	for (auto &replaced : star.ReplaceList()) {
+		parts.replaced.emplace_back(replaced.first.GetIdentifierName(), replaced.second->ToString());
+	}
+	for (auto &renamed : star.RenameList()) {
+		parts.renamed.emplace_back(renamed.second.GetIdentifierName(), renamed.first.column.GetIdentifierName());
+	}
+	return parts;
 }
 
 bool StoresBare(const string &name) {

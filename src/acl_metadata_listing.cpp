@@ -915,10 +915,16 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " LEFT JOIN " +
 	    Tbl("relation_columns") +
 	    " rc ON o.form = 'subquery' AND rc.\"vcat\" = o.vcat AND rc.\"vname\" = " + alias_vname +
-	    " AND rc.\"name\" = oc.\"name\" AND " + reads_by_name("rc") + " LEFT JOIN " + icolumns +
-	    " ip ON rc.\"name\" IS NOT NULL AND len(o.parts) = 3 AND ip.\"table_catalog\" = o.parts[1]"
-	    " AND ip.\"table_schema\" = o.parts[2] AND ip.\"table_name\" = o.parts[3] AND " +
-	    KeyFoldSql("ip.\"column_name\"") + " = " + KeyFoldSql(read_name("rc")) +
+	    " AND rc.\"name\" = oc.\"name\" AND " + reads_by_name("rc") +
+	    // spec 158 stage 2: a column a star passes (no named item of its name) carries its source column's by name
+	    " LEFT JOIN " + Tbl("relation_columns") +
+	    " rs ON o.form = 'subquery' AND rc.\"name\" IS NULL AND rs.\"vcat\" = " + "o.vcat AND rs.\"vname\" = " +
+	    alias_vname + " AND rs.\"name\" IS NULL AND NOT EXISTS (SELECT 1 FROM " + Tbl("relation_columns") +
+	    " rn WHERE rn.\"vcat\" = o.vcat AND rn.\"vname\" = " + alias_vname + " AND " + KeyFoldSql("rn.\"name\"") +
+	    " = " + KeyFoldSql("oc.\"name\"") + ") LEFT JOIN " + icolumns +
+	    " ip ON (rc.\"name\" IS NOT NULL OR rs.\"expr\" IS NOT NULL) AND len(o.parts) = 3 AND ip.\"table_catalog\" = "
+	    "o.parts[1] AND ip.\"table_schema\" = o.parts[2] AND ip.\"table_name\" = o.parts[3] AND " +
+	    KeyFoldSql("ip.\"column_name\"") + " = " + KeyFoldSql("coalesce(" + read_name("rc") + ", oc.\"name\")") +
 	    " WHERE o.form <> 'alias'"
 	    " UNION ALL BY NAME"
 	    " SELECT * FROM (SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +

@@ -4,6 +4,9 @@
 // acl_policy_catalog.cpp (plan 4.2).
 
 #include "acl_result_rows.hpp"
+#include "acl_grant_columns.hpp"
+#include "acl_list_items.hpp"
+#include "acl_name_path.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_types.hpp"
@@ -301,14 +304,118 @@ bool CatalogBackend::CatalogPredicateChecked(const std::function<unique_ptr<Quer
 	return any;
 }
 
-bool CatalogBackend::ExposedColumns(const string &source, const vector<string> &declared, vector<string> &out) {
-	if (!declared.empty()) {
-		out = declared;
+DeclaredList DeclaredListFrom(QueryResult &rows) {
+	DeclaredList list;
+	ResultRows read(rows);
+	for (idx_t row = 0; row < read.Count(); row++) {
+		auto name = read.GetValue(0, row);
+		auto expr = read.GetValue(1, row);
+		list.emplace_back(name.IsNull() ? string() : name.ToString(), expr.IsNull() ? string() : expr.ToString());
+	}
+	return list;
+}
+
+namespace {
+
+string ListItem(const std::pair<string, string> &item) {
+	if (IsStarItem(item)) {
+		return item.second;
+	}
+	return item.second.empty() ? Ident(item.first) : item.second + " AS " + Ident(item.first);
+}
+
+} // namespace
+
+string ObjectListSelect(const DeclaredList &list, const string &from) {
+	vector<string> written;
+	for (auto &item : list) {
+		written.push_back(ListItem(item));
+	}
+	return "SELECT " + (written.empty() ? string("*") : StringUtil::Join(written, ", ")) + from;
+}
+
+string DistinctNamesGuard(const DeclaredList &list, const string &from) {
+	// duckdb refuses a duplicate name in a UNION BY NAME's select list (a subquery would suffix it: `ssn_1`)
+	return ObjectListSelect(list, from) + " UNION ALL BY NAME SELECT NULL AS \"__acl_distinct\" WHERE false";
+}
+
+bool StoredListOk(const DeclaredList &list) {
+	vector<string> expressions;
+	for (auto &item : list) {
+		if (!IsStarItem(item)) {
+			expressions.push_back(item.second);
+			continue;
+		}
+		try {
+			// one star and nothing after it (an EXCLUDE set prints its names in no fixed order: not compared as text)
+			auto read = ReadSelectList(item.second, "the object's column list", true);
+			if (read.size() != 1 || !read[0].star) {
+				return false;
+			}
+		} catch (std::exception &) {
+			return false;
+		}
+	}
+	return StoredExpressionsOk(expressions);
+}
+
+string CatalogBackend::DuplicateName(const string &source, const DeclaredList &list, string *error) {
+	if (!HoldsStar(list) || !StoredListOk(list)) {
+		return string();
+	}
+	auto instance = Db();
+	Connection con(*instance);
+	if (con.Query("SELECT * FROM " + source + " WHERE false")->HasError()) {
+		return string(); // the source does not bind here: judged where it does
+	}
+	string baked;
+	try {
+		// the markers a read bakes (acl_claim, acl_has_role) are NULLs here, as every probe has them
+		baked = BakeTemplateForProbe(ObjectListSelect(list, " FROM " + source + " WHERE false"),
+		                             ParserOptions::Builtin(), false, {});
+	} catch (std::exception &ex) {
+		if (error) {
+			*error = ErrorData(ex).RawMessage();
+		}
+		return string();
+	}
+	auto probe = con.Query(baked);
+	if (probe->HasError()) {
+		if (error) {
+			*error = probe->GetError();
+		}
+		return string();
+	}
+	case_insensitive_set_t seen;
+	for (auto &name : probe->GetNames()) {
+		if (!seen.insert(name.GetIdentifierName()).second) {
+			return name.GetIdentifierName();
+		}
+	}
+	return string();
+}
+
+bool CatalogBackend::ExposedColumns(const string &source, const DeclaredList &declared, vector<string> &out) {
+	if (!declared.empty() && !HoldsStar(declared)) {
+		for (auto &item : declared) {
+			out.push_back(item.first);
+		}
 		return true;
 	}
 	auto instance = Db();
 	Connection con(*instance);
-	auto probe = con.Query("SELECT * FROM " + source + " WHERE false");
+	auto read = declared.empty() ? "SELECT * FROM " + source : ObjectListSelect(declared, " FROM " + source);
+	if (!declared.empty()) {
+		if (!StoredListOk(declared)) {
+			return false;
+		}
+		try {
+			read = BakeTemplateForProbe(read, ParserOptions::Builtin(), false, {}); // markers NULL, as in every probe
+		} catch (std::exception &) {
+			return false;
+		}
+	}
+	auto probe = con.Query("SELECT * FROM (" + read + ") WHERE false");
 	if (probe->HasError()) {
 		return false;
 	}
@@ -318,8 +425,7 @@ bool CatalogBackend::ExposedColumns(const string &source, const vector<string> &
 	return true;
 }
 
-string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns &columns,
-                                        const vector<string> &own_order, const case_insensitive_map_t<string> &own,
+string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns &columns, const DeclaredList &own,
                                         vector<std::pair<string, string>> &out, bool *checked) {
 	if (checked) {
 		*checked = false;
@@ -336,12 +442,18 @@ string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns 
 		}
 	}
 	for (auto &item : own) {
-		if (!item.second.empty() && !OneExpression(item.second, problem)) {
+		if (!IsStarItem(item) && !item.second.empty() && !OneExpression(item.second, problem)) {
 			if (checked) {
 				*checked = true;
 			}
 			return "the object's \"" + item.first + "\" is " + problem + " (spec 148: one expression)";
 		}
+	}
+	if (!StoredListOk(own)) {
+		if (checked) {
+			*checked = true;
+		}
+		return "the object's column list does not read back as stored (spec 148)";
 	}
 	if (columns.test.All() && columns.masks.empty()) {
 		return string();
@@ -355,13 +467,7 @@ string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns 
 		*checked = true; // whatever the answer, the projection was probed rather than waved through
 	}
 	// the object's read: its own columns over the source (a computed one by its expression), else the source's
-	vector<string> items;
-	for (auto &name : own_order) {
-		auto entry = own.find(name);
-		auto expr = entry == own.end() || entry->second.empty() ? Ident(name) : entry->second;
-		items.push_back(expr + " AS " + Ident(name));
-	}
-	auto object = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + source;
+	auto object = ObjectListSelect(own, " FROM " + source);
 	auto sql = GrantOverSql(columns, object);
 	if (ProbeSchema(sql, false, {}, out)) {
 		return string();
