@@ -616,7 +616,7 @@ e2e: `test/e2e/door/types.sh` (a quack client without mssql reads an mssql table
 
 **Spec 102 — fields of structured types per role** (superseded by spec 158, its code removed in 158's stage 3:
 field trees, field writes, `acl_listed_type`, `grant_columns` - schema v27, min_reader 27; `acl_field_paths.hpp` keeps
-only the reading of a stored list item's column, `ItemHead`).
+only the reading of a stored list's names: `ParseFieldPath`, `ItemHead`, `ItemsCsv`, `QuotedName`).
 
 **Spec 107 — lineage for OpenLineage**: the node emits a `lineage` event kind (ext-common spec 014,
 `acl_audit` v3: `AuditLineage`, delivered only to sinks with `WantsLineage()` and to its own ring

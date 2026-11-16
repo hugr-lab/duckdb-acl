@@ -626,7 +626,7 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 	}
 	// the object's columns and their types: a relation's (its list, else its source's), a table function's declared or
 	// probed result, or - a table under a live schema alias - its physical table's; `probe` is the object's read, a
-	// grant over which must bind (a relation's is probed with its projection below, GrantProjectionStatements)
+	// grant over which must bind (a relation's is probed with its projection below, CheckGrantProjection)
 	vector<string> exposed;
 	vector<std::pair<string, LogicalType>> types;
 	vector<string> type_texts; // a table function's declared result types, as written (`types` then names only)
@@ -775,10 +775,9 @@ NormalisedGrant NormaliseObjectGrant(CatalogBackend &catalog, const ReadFn &read
 
 //! Whether a grant's projection binds over its object (spec 026, 158): refused on the write path (`strict`), only a
 //! fact not true yet for `acl_refresh_schema` (spec 027); nothing is stored per grant
-void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, const string &role, const string &vcat,
-                               const string &vname, const string &columns, const string &masks,
-                               vector<string> &statements, bool strict,
-                               vector<std::pair<string, string>> *probed_out = nullptr) {
+void CheckGrantProjection(CatalogBackend &catalog, const ReadFn &read, const string &role, const string &vcat,
+                          const string &vname, const string &columns, const string &masks, vector<string> &statements,
+                          bool strict, vector<std::pair<string, string>> *probed_out = nullptr) {
 	if (columns.empty() && masks.empty()) {
 		return;
 	}
@@ -2450,8 +2449,6 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 	}
 }
 
-namespace {} // namespace
-
 string PolicyStore::NormalizeGrantVersions(const string &written) {
 	RequireCatalog(catalog, "acl grant");
 	return NormalizeVersions(written, [&](const string &sql) {
@@ -3077,7 +3074,7 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			auto masks = text(4);
 			if (!columns.empty() || !masks.empty()) {
 				try {
-					GrantProjectionStatements(*catalog, read, role, vcat, object, columns, masks, statements, false);
+					CheckGrantProjection(*catalog, read, role, vcat, object, columns, masks, statements, false);
 					// spec 158: a mask written while its object could not be judged is cast to its column's type now
 					auto normalised = NormaliseObjectGrant(*catalog, read, vcat, object, columns, masks);
 					if (normalised.masks != masks) {
@@ -4096,15 +4093,12 @@ ObjectGrantPlan PlanObjectGrant(CatalogBackend &catalog, const ReadFn &read, con
 			}
 		}
 	}
-	// what this projection actually produces: names a mask renames the type of, and columns the
-	// object never had. Probed here, where it is written, so a listing can describe what the role
-	// reads rather than what the physical table holds (spec 026).
-	// spec 037: what the grant may say at all, and in whose order it is kept
+	// spec 037 / 158: what the grant may say at all, and in whose order it is kept; its projection must bind over the
+	// object (CheckGrantProjection below) - nothing of it is stored
 	auto normalised = NormaliseObjectGrant(catalog, read, vcat, vname, columns, masks);
 	plan.listed = normalised.columns;
 	plan.masks = normalised.masks;
-	GrantProjectionStatements(catalog, read, role, vcat, vname, plan.listed, plan.masks, statements, true,
-	                          &plan.probed);
+	CheckGrantProjection(catalog, read, role, vcat, vname, plan.listed, plan.masks, statements, true, &plan.probed);
 	return plan;
 }
 

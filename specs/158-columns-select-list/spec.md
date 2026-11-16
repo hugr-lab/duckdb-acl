@@ -123,7 +123,11 @@ stand in an object's expression, an RLS or a mask.
 3. Spec 102's machinery removed (field trees, field writes, `acl_listed_type`, `grant_columns`) - built: none of it
    was reached since stage 1 (nothing filled `field_writes` / `narrowed_reads`, nothing wrote `grant_columns`). Schema
    v27, `min_reader` 27 (`grant_columns` dropped - a v26 build's listings still read it); `platform.grant_columns` and
-   `acl_grant_columns()` go with it; `acl_field_paths.hpp` keeps only `ItemHead` (a stored item's column).
+   `acl_grant_columns()` go with it; `acl_field_paths.hpp` keeps only the reading of a stored list's names
+   (`ParseFieldPath`, `ItemHead`, `ItemsCsv`, `QuotedName`). Two effects a client can see (review): a catalog migrated
+   from v24 or older kept spec 026's projection rows, which the listings still read - a column the read no longer
+   returns - and now no longer list; a principal's `information_schema.columns.ordinal_position` is INTEGER, as
+   duckdb's own (the removed projection branch widened it to BIGINT; Flight's Arrow type int64 -> int32).
 
 ## Testing
 

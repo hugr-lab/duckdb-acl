@@ -46,7 +46,7 @@ inline string LitList(const vector<string> &values) {
 }
 
 //! A column name as a grant's (name, expr) items carry it: bare when the stored list reads it back as itself
-//! (`StoresBare`), else quoted - the form the field-path reader (`ItemHead`, `ColumnTrees`) takes the quotes off
+//! (`StoresBare`), else quoted - the form `ItemHead` takes the quotes off
 inline string ItemName(const string &name) {
 	return StoresBare(name) ? name : "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
 }
