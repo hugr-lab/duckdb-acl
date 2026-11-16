@@ -1,7 +1,7 @@
 # name: test/sql/acl_view_call_probes.test
-# description: spec 165 - a virtual table function called with the body's columns inside a principal's view (spec 113)
-#   keeps its probe (spec 164) at the stored body's root; the view's reader binds it alone, so a name the call's
-#   template or grant lost refuses rather than binding to a relation of the body
+# description: spec 165 / 169 - a virtual table function called with the body's columns inside a principal's view
+#   (spec 113) is probed (spec 164) in its reader's statement (spec 169: the view is read under the reader's grants),
+#   so a name the call's template or grant lost refuses rather than binding to a relation of the body
 # group: [sql]
 
 require acl
@@ -52,33 +52,21 @@ statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE w MAIN; GRANT SCHEMA sales.vs TO ROLE w WITH (select, create, drop); GRANT OBJECT sales.tfa TO ROLE w RLS (region = 'eu'); GRANT OBJECT sales.mac TO ROLE w RLS (region = 'eu');
 
 statement ok
-ACL ROLE "w" CREATE VIEW vs.viat AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, tfa(s.key) f;
+ACL ROLE "w" CREATE VIEW vs.viat AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, sales.tfa(s.key) f;
 
 statement ok
-ACL ROLE "w" CREATE VIEW vs.viam AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, mac(s.key) f;
+ACL ROLE "w" CREATE VIEW vs.viam AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, sales.mac(s.key) f;
 
 # a view over that view carries its probe to its own root
 statement ok
 ACL ROLE "w" CREATE VIEW vs.outer AS SELECT v.id FROM (SELECT 1 AS one) x, vs.viat v;
 
 statement ok
-ACL ROLE "w" CREATE VIEW vs.days AS SELECT f.id FROM vs.ev e, byday(e.ts) f;
+ACL ROLE "w" CREATE VIEW vs.days AS SELECT f.id FROM vs.ev e, sales.byday(e.ts) f;
 
-query I
-SELECT view_sql LIKE 'WITH __acl_probe_1 AS NOT MATERIALIZED (%' FROM aclcat.acl.relations WHERE vname = 'vs.viat';
-----
-true
-
-query I
-SELECT view_sql LIKE '%__acl_probe_%' FROM aclcat.acl.relations WHERE vname = 'vs.outer';
-----
-true
-
-# a probe is never the view's own name
-statement error
+# a name spec 165's probes took is a name like any other
+statement ok
 ACL ROLE "w" CREATE VIEW vs.named AS WITH __acl_probe_1 AS (SELECT 1 AS x) SELECT x FROM __acl_probe_1;
-----
-reserved
 
 query I
 ACL ROLE "w" SELECT * FROM vs.viat;
@@ -130,10 +118,10 @@ statement ok
 ALTER TABLE phys.lake.logs ADD COLUMN region VARCHAR DEFAULT 'eu';
 
 statement ok
-ACL ROLE "w" CREATE VIEW vs.vg AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, tfa(s.key) f;
+ACL ROLE "w" CREATE VIEW vs.vg AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, sales.tfa(s.key) f;
 
 statement ok
-ACL ROLE "w" CREATE VIEW vs.vc AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, tfa(s.key) f;
+ACL ROLE "w" CREATE VIEW vs.vc AS SELECT f.id FROM (SELECT 'k' AS key, 'eu' AS region) s, sales.tfa(s.key) f;
 
 statement ok
 ACL ADMIN GRANT OBJECT sales.vs.vg TO ROLE w RLS (id > 0); GRANT OBJECT sales.vs.vc TO ROLE w COLUMNS (id);
@@ -182,16 +170,6 @@ ACL ROLE "r2" SELECT count(*) FROM vs.viat;
 ----
 does not exist in its source
 
-# an operator's view body names no probe
-statement error
-ACL ADMIN CREATE VIRTUAL VIEW sales.vs.ov AS WITH __acl_probe_1 AS (SELECT 1 AS id) SELECT id FROM __acl_probe_1;
-----
-reserved
-
+# an operator's view body may name one too
 statement ok
-ACL ADMIN CREATE VIRTUAL VIEW sales.vs.ov AS SELECT 1 AS id;
-
-statement error
-ACL ADMIN ALTER VIRTUAL VIEW sales.vs.ov SET AS WITH __acl_probe_1 AS (SELECT 1 AS id) SELECT id FROM __acl_probe_1;
-----
-reserved
+ACL ADMIN CREATE VIRTUAL VIEW sales.vs.ov AS WITH __acl_probe_1 AS (SELECT 1 AS id) SELECT id FROM __acl_probe_1;

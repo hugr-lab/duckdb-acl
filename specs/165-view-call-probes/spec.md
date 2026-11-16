@@ -1,6 +1,6 @@
 # Spec 165: a call in a principal's view keeps its probe
 
-- **Status**: implemented
+- **Status**: superseded by 169
 - **Date**: 2026-11-15
 - **Author**: hugr lab (spec 164's BACKLOG item)
 

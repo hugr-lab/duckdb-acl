@@ -234,6 +234,17 @@ private:
 				}
 			}
 			string error;
+			if (is_view && LegacyPrincipalView(relation.view_sql) &&
+			    Read("SELECT 1 FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+			         " AND \"vname\" = " + Lit(relation.vname) + " AND \"query\" IS NULL")
+			            ->RowCount() > 0) {
+				// spec 169: a principal's view stored by an earlier build (spec 162 / 165's CTEs in its body) holds
+				// its author's policy - refused where read; its author creates it again
+				Add(kind, relation.vname, "", "view_recreate",
+				    "a principal's view of an earlier build: its body holds its author's policy and is refused where "
+				    "read",
+				    "its author: CREATE OR REPLACE VIEW " + Named(relation.vname) + " AS <its query>");
+			}
 			if (is_view) {
 				Columns probed;
 				if (!catalog.ProbeSchema(relation.view_sql, false, {}, probed)) {

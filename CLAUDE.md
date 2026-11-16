@@ -858,12 +858,8 @@ SQL, template - `BodiesOf`) to its entry's `<db>.<schema>.<table>` (`ResolvedRef
 location, the rest as written - so a principal's CTE or temp table never stands in for it. Stored rows are the check's
 `body_table_unqualified`. Test `acl_policy_tables_qualified.test`.
 
-**Spec 162 — a principal's view reads its policies at its root**: in a principal's `CREATE VIEW` (spec 113) `ReadRef`
-(`view_reads` set) turns each policy read - a relation's, a table function's called with constants - into a `NOT
-MATERIALIZED` CTE `__acl_read_<n>` that `AttachViewReads` puts at the body's root, ahead of its own CTEs: the stored body is
-read later as one read (spec 159 binds it alone), and a CTE at its root sees none of the body's FROM. The root's first FROM
-item's read stays in place (`view_leftmost`: nothing can reach it, and a CTE would stop a reader's filters at it); a body
-CTE with the `__acl_read_` prefix is refused at any level. Test `acl_principal_view_reads.test`.
+**Spec 162 — a principal's view reads its policies at its root** (superseded by spec 169: the reads are the reader's
+statement's now, and the `__acl_read_` prefix is no longer reserved).
 
 **Spec 163 — a call's arguments are the caller's**: only `Spliceable` arguments (constants, casts, operators, CASE, the
 system's plain scalars - `SystemScalarFunction` - and parameters) are spliced into a template; others are evaluated beside
@@ -883,12 +879,24 @@ statement's guards (spec 159), so a name its template or policy lost refuses ins
 the probe refuses only a name not found (`WRITE_GUARD_NAMES_ONLY` - an untyped NULL may fail an overload), and a system
 table function is not probed. Test `acl_call_bound_alone.test`.
 
-**Spec 165 — a call in a principal's view keeps its probe**: in a principal's view body spec 164's probe of a call with
-the body's columns is kept at the body's root as an unreferenced `NOT MATERIALIZED` CTE `__acl_probe_<n>` (duckdb binds a
-CTE only when referenced); the resolver splits it off the body before a grant wraps it (`SplitViewProbes` -> `TablePolicy::probes`), and
-`BuildTableSubquery` adds it to the guards - or, reading inside a principal's view, to that body's root. The prefix is
-reserved in a principal's view body and refused at the root of an operator's. Test
-`acl_view_call_probes.test`.
+**Spec 165 — a call in a principal's view keeps its probe** (superseded by spec 169: the probe is the reader's
+statement's, and the `__acl_probe_` prefix is no longer reserved).
+
+**Spec 169 — a principal's view reads under its reader's grants** (owner, 2026-11-16: a mask is the reader's): a
+principal's `CREATE VIEW` stores `relations.query` (schema v26, min_reader 26) - the view as written, each relation
+qualified to its canonical virtual key by the author's reading (`QualifyWrittenNames` with `ViewNameReading`; a
+session temp refused, a virtual function call must name its catalog) - beside `view_sql`, the author's resolution,
+now the view's SHAPE only (the write-time probes, types, a grant's RLS / MASK over it, the check, lineage). At read
+the resolver gives `TablePolicy::invoker_query` / `invoker_shape`, and the rewriter's `InvokerRead` rewrites the
+query under the reader's grants (canonical names checked, USE and CTE scope cleared, a cycle or nesting past 16
+refused) and puts it in place of the shape inside the reader's grant wrapping on the view. A refusal inside names
+the outermost view (`reads what this principal may not read`). Reading needs `select` on the view AND the reader's
+rights on what it reads; an operator's `CREATE VIRTUAL VIEW` still reads its own SQL. A view only reads (a
+data-modifying CTE, a parameter refused), its author's reads are bound alone at create (the record carries the
+guards, markers NULL), the composed read is bounded (4 MiB), a pre-v26 body with spec 162/165's CTEs is refused
+(`LegacyPrincipalView`, check `view_recreate`). Found by its review: `RewriteQueryNode` scopes a CTE as duckdb's binder
+does (in scope after its own definition; a recursive CTE's right side sees itself) - a self or forward reference read
+a physical table or a file past the gate. Tests `acl_principal_view_invoker.test`, `acl_cte_scope.test`.
 
 **Spec 158 — columns: the object's shape, the grant's test and masks** (owner, 2026-11-16; stage 1 built): every
 column list is read by duckdb's parser. An object's list is a SELECT list (`ReadSelectList`, acl_list_items.cpp: `name`,

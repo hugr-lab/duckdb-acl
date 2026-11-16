@@ -107,11 +107,13 @@ vector<string> TempCatalogNames(ClientContext &context);
 //! (the 2026-09-03 review).
 string MintRandomHex(idx_t bytes);
 
-//! spec 165: the root CTEs a principal's view body keeps its calls' probes in (spec 164), never referenced
-constexpr const char *VIEW_PROBE_PREFIX = "__acl_probe_";
-//! spec 165: a view body's root CTEs named with the prefix, taken off `body` (rewritten without them) into `probes`
-//! as SELECTs; false (the body untouched) when it holds none
-bool SplitViewProbes(string &body, vector<string> &probes);
+//! spec 169: a view body a principal's CREATE VIEW stored before v26 - its policy reads hoisted to root CTEs (spec
+//! 162, `__acl_read_<n>`) or its calls' probes kept there (spec 165, `__acl_probe_<n>`): its author's policy, read
+//! with its reader's markers, and no longer probed. Refused where read, named by acl_check_catalog.
+inline bool LegacyPrincipalView(const string &view_sql) {
+	auto lower = StringUtil::Lower(view_sql);
+	return StringUtil::Contains(lower, "__acl_read_") || StringUtil::Contains(lower, "__acl_probe_");
+}
 
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement
 //! form: RENAME (subquery_form=false) swaps the name in place for a physical object - it stays a real
@@ -133,8 +135,12 @@ struct TablePolicy {
 	//! subquery whose free names could resolve against the source instead of the target (spec 020).
 	bool rls_unchecked = false;
 	string query; // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
-	//! spec 165: a principal's view body's call probes, split off `query` before a grant wraps it - each bound alone
-	vector<string> probes;
+	//! spec 169: a principal's view as written, its relations qualified to canonical virtual keys - rewritten under
+	//! the reader's grants where it is read, the rewrite then standing in `query`; empty = an operator's view
+	string invoker_query;
+	//! spec 169: the view's shape (its author's resolution) as `query` holds it, inside whatever the grants wrapped it
+	//! in - where the reader's rewrite of `invoker_query` takes its place
+	string invoker_shape;
 	//! spec 167: the versions of a time-travel table the roles' grants admit - the stored clause (`ANY` every version,
 	//! `CURRENT`, `AT (…)`, `BETWEEN … AND …`, acl_versions.hpp; '' - nothing stated, a driver, the memory store - is
 	//! `CURRENT`, spec 168); `versions_differ` when the roles' clauses differ, which refuses the read (never one role's
@@ -749,9 +755,10 @@ struct PolicyStore {
 		int64_t version = 0;
 		vector<std::pair<string, RelationChange>> names;
 	};
-	//! Record a view a role created (spec 018): its body was resolved with the author's rights, with
-	//! claims left as markers, so reading it is decided by the grant on the view itself
-	void CatalogRegisterView(const string &vcat, const string &vname, const string &body,
+	//! Record a view a role created (spec 018 / 169): `body` its author's resolution - the view's shape, what the
+	//! write-time probes bind - and `query` the view as written, its relations qualified: what a reader reads,
+	//! rewritten under the reader's grants (empty = the view reads `body`)
+	void CatalogRegisterView(const string &vcat, const string &vname, const string &body, const string &query,
 	                         optional_ptr<RecordWrite> write = nullptr);
 	//! Record an object a principal's own DDL just created (spec 016): alias form, the schema's
 	//! origin, nothing else to choose

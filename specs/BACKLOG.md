@@ -39,12 +39,6 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
   - mirror / pull-through / publish, everything re-signed with our key;
   - public vs private extensions (a token through an http secret, tresor-issued);
   - air-gapped bundles.
-- **A principal's view mixes the author's policy with the reader's markers** (spec 158 review, the owner 2026-11-16:
-  a mask is the reader's): a view a principal creates (spec 113) stores its author's policy reads (spec 162) - RLS,
-  masks - while `acl_claim` / `acl_has_role` in them are resolved by the reader. A reader whose own grant hides a
-  column reads it through a view whose author's mask keys on the reader's role (`CASE WHEN acl_has_role('hr') THEN
-  ssn …`) - access neither grant gives. Next spec (169): a principal's view reads its tables under the READER's grants
-  (invoker rights), its body stored without the author's policy.
 - **Columns after spec 158 stage 1** (found by its test migration):
   - `DROP RELATION` of a relation that shadows a live alias's object (same name) also deletes that object's grants -
     their COLUMNS and MASK go with it, and the role then reads the alias object whole (grants are keyed by name);

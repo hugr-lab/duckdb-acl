@@ -1006,6 +1006,43 @@ string ApplyReplacements(const string &text, vector<std::tuple<idx_t, idx_t, str
 
 } // namespace
 
+string QualifyWrittenNames(const string &text, const std::function<vector<string>(const vector<string> &)> &resolve,
+                           vector<string> &unwritable) {
+	vector<vector<string>> references;
+	vector<QueryLocation> locations;
+	Parser parser(ParserOptions::Builtin());
+	parser.ParseQuery(text);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw BinderException("acl: a view is one SELECT");
+	}
+	ScopedReferences walk {references, &locations};
+	walk.Node(*parser.statements[0]->Cast<SelectStatement>().node, case_insensitive_set_t());
+	vector<std::tuple<idx_t, idx_t, string>> replacements;
+	for (idx_t i = 0; i < references.size() && i < locations.size(); i++) {
+		auto entry = resolve(references[i]);
+		if (entry.empty() || entry == references[i]) {
+			continue;
+		}
+		auto &location = locations[i];
+		auto end = string::npos;
+		idx_t offset = 0;
+		if (location.offset != QueryLocation::INVALID_OFFSET) {
+			offset = idx_t(location.offset);
+			end = WrittenNameEnd(text, offset, references[i].size());
+		}
+		if (end == string::npos) {
+			unwritable.push_back(StringUtil::Join(references[i], "."));
+			continue;
+		}
+		vector<string> quoted;
+		for (auto &part : entry) {
+			quoted.push_back(KeywordHelper::WriteOptionallyQuoted(part));
+		}
+		replacements.emplace_back(offset, end - offset, StringUtil::Join(quoted, "."));
+	}
+	return ApplyReplacements(text, std::move(replacements));
+}
+
 string QualifiedBodyTables(DatabaseInstance &db, const string &text, bool select,
                            const vector<string> &item_expressions, vector<string> *unwritable) {
 	static constexpr const char *PREFIX = "SELECT ";

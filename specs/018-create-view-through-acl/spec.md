@@ -1,6 +1,6 @@
 # Spec 018: a role may create a view — `CREATE VIEW` through the ACL
 
-- **Status**: implemented
+- **Status**: implemented (its read model superseded by 169: a principal's view reads under its reader's grants)
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 

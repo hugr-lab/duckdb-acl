@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS acl."meta"("key" VARCHAR PRIMARY KEY, "value" VARCHAR
 
 CREATE TABLE IF NOT EXISTS acl."catalogs"("vcat" VARCHAR PRIMARY KEY, "comment" VARCHAR);
 
-CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "vname"));
+CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, "query" VARCHAR, PRIMARY KEY ("vcat", "vname"));
 
 CREATE TABLE IF NOT EXISTS acl."relation_columns"("vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
 
@@ -151,7 +151,7 @@ INSERT INTO acl."function_grants" SELECT * FROM (VALUES ('', 'base', '', '', '',
 
 INSERT INTO acl."meta" SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'function_seed');
 
-INSERT INTO acl."meta" SELECT 'schema_version', '25' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '26' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
 
@@ -159,4 +159,4 @@ INSERT INTO acl."meta" SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 F
 
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO acl."meta" SELECT 'min_reader_version', '25' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');
+INSERT INTO acl."meta" SELECT 'min_reader_version', '26' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');

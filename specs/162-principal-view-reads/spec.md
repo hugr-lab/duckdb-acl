@@ -1,6 +1,6 @@
 # Spec 162: a principal's view reads its policies at its root
 
-- **Status**: implemented
+- **Status**: superseded by 169
 - **Date**: 2026-11-13
 - **Author**: hugr lab (found by spec 159's review)
 
