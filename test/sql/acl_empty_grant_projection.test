@@ -297,7 +297,7 @@ SELECT * FROM phys.main.k;
 1	secret
 
 # REPAIR ... DROP MISSING COLUMNS never empties a list: the object's (it would read every source column) nor a grant's
-# (its COLUMNS lose the vanished name with its mask - a grant left naming no column is refused: alter or revoke it)
+# (a grant naming only the vanished column is left as it is - it reads nothing, never every column)
 statement ok
 CREATE TABLE phys.main.m (id INTEGER, old INTEGER, ssn VARCHAR, b INTEGER);
 
@@ -315,20 +315,20 @@ ACL ADMIN REPAIR VIRTUAL TABLE c.only DROP MISSING COLUMNS;
 ----
 every declared column is missing
 
-statement error
+query I
 ACL ADMIN REPAIR VIRTUAL TABLE c.mk DROP MISSING COLUMNS AND MASKS;
 ----
-would leave the grant of role "mr" with no column
+1
 
 query II
 SELECT columns, coalesce(masks, '') FROM store.acl.role_object_caps WHERE role = 'mr' AND vname = 'mk';
 ----
 "old"	"old" AS CAST((0) AS INTEGER)
 
-# the grant's mask reads no source column (a constant): the role reads it in place of the vanished one, nothing else
-query I
+statement error
 ACL ROLE "mr" SELECT * FROM mk;
 ----
+which the object does not have
 
 # a row-only object grant's predicate repair keeps it row-only (no placeholder: nothing was taken out of a list)
 statement ok

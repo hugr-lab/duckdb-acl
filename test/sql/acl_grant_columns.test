@@ -137,3 +137,34 @@ statement error
 ACL ROLE "h" SELECT acl_has_role('h');
 ----
 acl_has_role
+
+# --- REPAIR ... DROP MISSING COLUMNS AND MASKS takes a vanished name out of every grant's COLUMNS (re-review) -------
+
+statement ok
+CREATE TABLE phys.main.r (id INTEGER, pub INTEGER, gone INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.r AS phys.main.r COLUMNS (id, pub, gone); CREATE ROLE e; CREATE ROLE o; CREATE ROLE p;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE e MAIN; GRANT TABLE c.r TO ROLE e COLUMNS (* EXCLUDE (gone)); GRANT CATALOG c TO ROLE o MAIN; GRANT TABLE c.r TO ROLE o COLUMNS (gone); GRANT CATALOG c TO ROLE p MAIN; GRANT TABLE c.r TO ROLE p COLUMNS (id, gone) MASK (gone AS 0);
+
+statement ok
+ALTER TABLE phys.main.r DROP COLUMN gone;
+
+statement ok
+ACL ADMIN REPAIR VIRTUAL TABLE c.r DROP MISSING COLUMNS AND MASKS;
+
+# e's EXCLUDE is every column again; o's list would be empty - every column - so o's grant is left as it is and reads
+# nothing; p loses the name and its mask
+query TTT
+SELECT role, coalesce(columns, ''), coalesce(masks, '') FROM store.acl.role_object_caps WHERE vname = 'r' ORDER BY role;
+----
+e	(empty)	(empty)
+o	gone	(empty)
+p	id	(empty)
+
+statement error
+ACL ROLE "o" SELECT * FROM r;
+----
+exposes no readable columns

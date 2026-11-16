@@ -235,11 +235,10 @@ SELECT count(*) FROM store.acl.relation_columns WHERE vname = 'customers';
 ----
 3
 
-# the mask is gone with the column; poor's bare item now matches nothing, and the check says so
+# the mask is gone with the column, and so is poor's item naming it (spec 158): no finding is left
 query IIII
 SELECT object, role, problem, repair FROM acl_check_catalog('c') WHERE kind = 'grant' ORDER BY role;
 ----
-customers	poor	grant_column_missing	SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id', '', '')
 
 statement ok
 SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id', '', '');

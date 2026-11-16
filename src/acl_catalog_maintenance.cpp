@@ -1466,6 +1466,9 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 					touched = true;
 				}
 			}
+			for (auto &name : grant.test.names) {
+				touched = touched || missing.count(MatchKey(name)) > 0; // its COLUMNS lose the name too (re-review)
+			}
 			if (touched) {
 				affected.push_back(std::move(grant));
 			}
@@ -1494,9 +1497,10 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		vector<std::pair<string, string>> rewrites; // the COLUMNS and MASK of each affected grant
 		for (auto &grant : affected) {
 			GrantMasks other;
+			int64_t dropped = 0;
 			for (auto &mask : grant.masks) {
 				if (missing.count(MatchKey(mask.first))) {
-					changed++;
+					dropped++;
 					continue;
 				}
 				other.push_back(mask);
@@ -1509,12 +1513,12 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 				}
 			}
 			if (test.kind == ColumnTest::Kind::ONLY && names.empty()) {
-				throw BinderException(
-				    "acl admin: \"%s.%s\": dropping the missing columns would leave the grant of role "
-				    "\"%s\" with no column - an empty list reads every column; alter or revoke that "
-				    "grant first",
-				    vcat, vname, grant.role);
+				// an empty list reads every column: the grant is left as it is - it names only vanished columns and
+				// reads nothing (spec 156 refuses its reads; the check says grant_exposes_nothing) - alter or revoke it
+				rewrites.emplace_back(string("\x01"), string());
+				continue;
 			}
+			changed += dropped;
 			test.names = names;
 			if (test.kind == ColumnTest::Kind::EXCEPT && names.empty()) {
 				test.kind = ColumnTest::Kind::ALL; // nothing left to leave out
@@ -1528,6 +1532,9 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		CatalogAlterRelation(vcat, vname, "columns", "", columns, marks);
 		for (idx_t i = 0; i < affected.size(); i++) {
 			auto &grant = affected[i];
+			if (rewrites[i].first == "\x01") {
+				continue; // left as it is (above)
+			}
 			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, rewrites[i].first, false, false, false,
 			                     nullptr, &rewrites[i].second);
 		}
