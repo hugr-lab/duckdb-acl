@@ -393,7 +393,7 @@ ACL ROLE "pol" CREATE VIRTUAL SCHEMA sales.raw AS store.acl;
 <REGEX>:.*the schema alias reads the policy store itself.*
 
 statement error
-ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders COLUMNS (id, tenant = (SELECT max(secret) FROM store.acl.issuers));
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders COLUMNS (id, (SELECT max(secret) FROM store.acl.issuers) AS tenant);
 ----
 <REGEX>:.*the relation's RLS or column list reads the policy store itself.*
 

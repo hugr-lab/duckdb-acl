@@ -86,7 +86,7 @@ ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.r AS phys.main.orders RLS (acl_grant_
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 
 statement error
-ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.m AS phys.main.orders COLUMNS (id, tenant = acl_grant_admin('cadm', 'observe')::VARCHAR);
+ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.m AS phys.main.orders COLUMNS (id, acl_grant_admin('cadm', 'observe')::VARCHAR AS tenant);
 ----
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 
@@ -119,7 +119,7 @@ ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET RLS 'acl_grant_admin
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 
 statement error
-ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET COLUMNS 'id, tenant = acl_grant_admin(''pol'', ''observe'')::VARCHAR';
+ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET COLUMNS 'id, acl_grant_admin(''pol'', ''observe'')::VARCHAR AS tenant';
 ----
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 

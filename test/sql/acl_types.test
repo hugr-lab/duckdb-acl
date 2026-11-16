@@ -216,7 +216,7 @@ statement ok
 ACL ADMIN ADD TABLE phys.main.typed AS c.typed;
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.typed AS c.typed_rn COLUMNS (ident = id, level = tier);
+ACL ADMIN ADD TABLE phys.main.typed AS c.typed_rn COLUMNS (id AS ident, tier AS level);
 
 statement ok
 ACL ADMIN ADD TABLE phys.main.typed AS c.typed_rls RLS 'typed.region = ''eu''';
@@ -299,7 +299,7 @@ typed_view	VARCHAR
 
 # a mask over the ENUM column reads the cast value, and is described as what it reads
 statement ok
-ACL ADMIN GRANT TABLE c.typed_rn TO ROLE r COLUMNS (ident, level = CASE WHEN id = 1 THEN tier END);
+ACL ADMIN GRANT TABLE c.typed_rn TO ROLE r COLUMNS (ident, level) MASK (level AS CASE WHEN id = 1 THEN tier END);
 
 query II
 ACL ROLE "r" SELECT typeof(level), level FROM typed_rn ORDER BY ident;
@@ -492,16 +492,16 @@ statement ok
 CREATE TABLE phys.main.inc(id INTEGER, sev phys.main.lv, name VARCHAR);
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.inc AS c.inc_code COLUMNS (id, code = enum_code(sev));
+ACL ADMIN ADD TABLE phys.main.inc AS c.inc_code COLUMNS (id, enum_code(sev) AS code);
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.inc AS c.inc_made COLUMNS (id, sev, n2 = CAST(name AS ENUM('a', 'b')));
+ACL ADMIN ADD TABLE phys.main.inc AS c.inc_made COLUMNS (id, sev, CAST(name AS ENUM('a', 'b')) AS n2);
 
 query III
 SELECT object, problem, repair FROM acl_check_catalog('c') WHERE problem IN ('types_incompatible', 'types_mismatch') ORDER BY 1;
 ----
 inc_code	types_incompatible	ALTER VIRTUAL TABLE c.inc_code SET TYPES (enums = keep)  -- or rewrite the expression for the exposed type
-inc_made	types_mismatch	REPAIR VIRTUAL TABLE c.inc_made REMAP (n2 = CAST(CAST(name AS ENUM('a', 'b')) AS VARCHAR))
+inc_made	types_mismatch	REPAIR VIRTUAL TABLE c.inc_made REMAP (CAST(CAST(name AS ENUM('a', 'b')) AS VARCHAR) AS n2)
 
 statement ok
 SET GLOBAL acl_enum_types = 'keep';

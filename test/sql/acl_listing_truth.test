@@ -30,10 +30,10 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 
 # a declared shape: the resolver knows these columns from the catalog, no probe anywhere
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id = pk, tenant = internal_tenant, "odd name" = "odd name");
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (pk AS id, internal_tenant AS tenant, "odd name" AS "odd name");
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.audit AS phys.main.audit COLUMNS (id = id, note = note);
+ACL ADMIN CREATE VIRTUAL TABLE c.audit AS phys.main.audit COLUMNS (id AS id, note AS note);
 
 statement ok
 ACL ADMIN CREATE ROLE analyst;
@@ -146,7 +146,7 @@ ACL ROLE "analyst" SELECT "odd name" FROM orders LIMIT 0;
 
 # a nullability suffix after a quoted name unquotes too
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.nn AS phys.main.orders COLUMNS ("odd name" NOT NULL, id = pk);
+ACL ADMIN CREATE VIRTUAL TABLE c.nn AS phys.main.orders COLUMNS ("odd name", pk AS id);
 
 query I
 ACL ROLE "analyst" SELECT "odd name" FROM nn LIMIT 0;
@@ -155,10 +155,10 @@ ACL ROLE "analyst" SELECT "odd name" FROM nn LIMIT 0;
 # a masked relation is the read-only form and answers NO whatever the caps say - and the same under
 # a schema-qualified stored name, which the listing must key by the stored form, not a reconstruction
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (id = pk, who = upper(internal_tenant));
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (pk AS id, upper(internal_tenant) AS who);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.main.mx AS phys.main.orders COLUMNS (id = pk, who = upper(internal_tenant));
+ACL ADMIN CREATE VIRTUAL TABLE c.main.mx AS phys.main.orders COLUMNS (pk AS id, upper(internal_tenant) AS who);
 
 query II
 ACL ROLE "analyst" SELECT table_name, is_insertable_into FROM information_schema.tables WHERE table_name IN ('masked', 'mx') ORDER BY 1;
@@ -169,7 +169,7 @@ mx	NO
 # spec 150 4f: an object's list is read on duckdb's tokens, so a quoted name holding ',' or '=' is the name it quotes
 # (the text reader split it, and refused it for that); one holding '.' is refused - the list reads it as a path
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.audit COLUMNS ("a,b" = id, "x=y" = note);
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.audit COLUMNS (id AS "a,b", note AS "x=y");
 
 query II
 SELECT name, expr FROM store.acl.relation_columns WHERE vcat = 'c' AND vname = 'bad' ORDER BY pos;
@@ -178,7 +178,7 @@ a,b	id
 x=y	note
 
 statement error
-ACL ADMIN CREATE VIRTUAL TABLE c.bad2 AS phys.main.audit COLUMNS ("a.b" = id);
+ACL ADMIN CREATE VIRTUAL TABLE c.bad2 AS phys.main.audit COLUMNS (id AS "a.b");
 ----
 holds no '.' or '['
 
@@ -196,16 +196,16 @@ statement ok
 ACL ADMIN GRANT CATALOG c2 TO ROLE writer WITH (select, insert) MAIN COLUMNS (id);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c2.t AS phys.main.audit COLUMNS (id = id, note = note);
+ACL ADMIN CREATE VIRTUAL TABLE c2.t AS phys.main.audit COLUMNS (id AS id, note AS note);
 
 # a name = expr item is never judged by the write-time list check: a mask of an existing column
 # passes, and a computed column on a declared object is refused by spec 037's own richer message -
 # not preempted by the "matches no column" one
 statement ok
-SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'note = upper(note)');
+SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'note', NULL, 'note AS upper(note)');
 
 statement error
-SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'initials = substr(note, 1, 1)');
+SELECT acl_grant_object('writer', 'c2', 't', '{"select": true}', '', 'initials', NULL, 'initials AS substr(note, 1, 1)');
 ----
 <REGEX>:.*naming, computing and ordering belong to the virtual catalog.*
 

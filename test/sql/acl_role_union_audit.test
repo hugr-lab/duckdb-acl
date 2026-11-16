@@ -144,10 +144,10 @@ ACL ADMIN CREATE VIRTUAL TABLE d.q AS phys.main.people;
 # covers itself - no event (with a row filter of its own, the analyst's `address.city` on the auditor's rows would
 # widen the other way)
 statement ok
-ACL ADMIN GRANT CATALOG d TO ROLE analyst WITH (select) COLUMNS (id, address, secret = 'x');
+ACL ADMIN GRANT CATALOG d TO ROLE analyst WITH (select) COLUMNS (id, address, 'x' AS secret);
 
 statement ok
-ACL ADMIN GRANT CATALOG d TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, address.zip, secret = 'x');
+ACL ADMIN GRANT CATALOG d TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, address.zip, 'x' AS secret);
 
 statement ok
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM d.p;
@@ -162,7 +162,7 @@ SELECT count(*) FROM acl_audit_events() WHERE detail = 'role_union_widens' AND o
 
 # a field the analyst does not list, and a column the analyst only reads masked
 statement ok
-ACL ADMIN GRANT CATALOG d TO ROLE analyst WITH (select) RLS (id = 2) COLUMNS (id, address.city, secret = 'x');
+ACL ADMIN GRANT CATALOG d TO ROLE analyst WITH (select) RLS (id = 2) COLUMNS (id, address.city, 'x' AS secret);
 
 statement ok
 ACL ADMIN GRANT CATALOG d TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, address.zip, secret);

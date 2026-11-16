@@ -24,6 +24,9 @@
 #include "acl_token.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -511,9 +514,10 @@ vector<CatalogBackend::GrantDecisionRow> CatalogBackend::GrantDecisions(const st
 	auto sql = GrantsCte(principal) + "SELECT q.\"i\", " + CapsExpr(name, cat) + ", " + object_term + ", " +
 	           (schema_term.empty() ? string("NULL") : schema_term) + ", " + schema_row +
 	           ", g.\"is_main\" AND (SELECT unique_main FROM main_ok), " +
-	           (function_mode ? string("NULL, NULL, NULL, NULL")
+	           (function_mode ? string("NULL, NULL, NULL, NULL, NULL")
 	                          : string("g.\"rls\", ") + (HasObjectCaps() ? "oc.\"rls\"" : "NULL") +
-	                                ", g.\"columns\", " + (HasObjectCaps() ? "oc.\"columns\"" : "NULL")) +
+	                                ", g.\"columns\", " + (HasObjectCaps() ? "oc.\"columns\"" : "NULL") + ", " +
+	                                (HasObjectCaps() ? "oc.\"masks\"" : "NULL")) +
 	           " FROM (VALUES " + values + ") q(\"i\", \"vname\") JOIN grants g ON " + KeyEqSql("g.\"vcat\"", cat) +
 	           oc_join;
 	auto result = Query(sql);
@@ -543,6 +547,7 @@ vector<CatalogBackend::GrantDecisionRow> CatalogBackend::GrantDecisions(const st
 		row.object_rls = text(7);
 		row.catalog_columns = text(8);
 		row.object_columns = text(9);
+		row.object_masks = text(10);
 	}
 	return out;
 }
@@ -553,10 +558,12 @@ string CatalogBackend::FunctionVisibleExpr(bool object_level, bool schema_level)
 }
 
 string CatalogBackend::GrantPolicyExprs() {
+	// spec 158: an object grant's COLUMNS and MASK travel as one struct, so no index of the readers moves
 	return function_mode ? "NULL AS crls, NULL AS ccols, false AS cchk, NULL AS orls, NULL AS ocols,"
 	                       " false AS ochk"
 	                     : "g.\"rls\" AS crls, g.\"columns\" AS ccols, g.\"rls_checked\" AS cchk,"
-	                       " oc.\"rls\" AS orls, oc.\"columns\" AS ocols, oc.\"rls_checked\" AS ochk";
+	                       " oc.\"rls\" AS orls, struct_pack(c := oc.\"columns\", m := oc.\"masks\") AS ocols,"
+	                       " oc.\"rls_checked\" AS ochk";
 }
 
 GrantPolicy CatalogBackend::RowPolicy(const ResultRows &result_rows, idx_t row, idx_t first_column) {
@@ -569,8 +576,16 @@ GrantPolicy CatalogBackend::RowPolicy(const ResultRows &result_rows, idx_t row, 
 		return !value.IsNull() && value.GetValue<bool>();
 	};
 	GrantPolicy policy;
-	policy.Narrow(text(first_column), text(first_column + 1), flag(first_column + 2));     // catalog level
-	policy.Narrow(text(first_column + 3), text(first_column + 4), flag(first_column + 5)); // object level
+	policy.Narrow(text(first_column), flag(first_column + 2));     // catalog level
+	policy.Narrow(text(first_column + 3), flag(first_column + 5)); // object level
+	policy.catalog_columns = text(first_column + 1);
+	StringUtil::Trim(policy.catalog_columns);
+	auto object = result_rows.GetValue(first_column + 4, row);
+	if (!object.IsNull() && object.type().id() == LogicalTypeId::STRUCT) {
+		auto &fields = StructValue::GetChildren(object);
+		policy.ReadColumns(fields[0].IsNull() ? string() : fields[0].ToString(),
+		                   fields[1].IsNull() ? string() : fields[1].ToString());
+	}
 	return policy;
 }
 
@@ -632,8 +647,8 @@ void RequireStoredExpressions(const string &object, const string &own_rls,
 		for (auto &predicate : role.second.predicates) {
 			texts.push_back(predicate);
 		}
-		for (auto &column : role.second.columns) {
-			texts.push_back(column.second);
+		for (auto &mask : role.second.columns.masks) {
+			texts.push_back(mask.second);
 		}
 	}
 	if (!StoredExpressionsOk(texts)) {
@@ -849,7 +864,8 @@ void CatalogBackend::ApplyGrantVersions(const vector<std::pair<string, GrantPoli
 		return StringUtil::CIEquals(text, "ANY");
 	};
 	auto same = [](const GrantPolicy &a, const GrantPolicy &b) {
-		return a.restricts == b.restricts && a.Predicate() == b.Predicate() && a.columns == b.columns;
+		return a.Predicate() == b.Predicate() && a.columns.test == b.columns.test &&
+		       a.columns.masks == b.columns.masks;
 	};
 	vector<UnionWidening> pairs;
 	for (auto &limited : united) {
@@ -857,7 +873,7 @@ void CatalogBackend::ApplyGrantVersions(const vector<std::pair<string, GrantPoli
 			continue;
 		}
 		for (auto &wide : united) {
-			if (every(wide.first) && (wide.second.restricts || !wide.second.Predicate().empty()) &&
+			if (every(wide.first) && (wide.second.Restricts() || !wide.second.Predicate().empty()) &&
 			    !same(wide.second, limited.second) && pairs.size() <= UnionWidening::REPORTED) {
 				pairs.push_back({limited.first, wide.first, {UnionWidening::EVERY_VERSION}});
 			}
@@ -892,65 +908,98 @@ void CatalogBackend::ApplyTypeFacts(ResultRows &row, TablePolicy &out) {
 
 namespace {
 
-//! One column a grant lists (spec 102): shown as it is, masked whole, or narrowed to some of its fields
-struct ListedColumn {
-	string name;
-	string mask;                // masked whole
-	unique_ptr<FieldNode> tree; // narrowed: the fields the role reads (and masks within them)
-
-	//! A narrowed column is written through unless its tree steps into list elements (spec 102)
-	bool Writable() const {
-		return !tree || !HasElementStep(*tree);
+//! spec 158: a mask reads the object's columns - in physical terms, each reference to one of them (unqualified, not a
+//! lambda's parameter) replaced by what the object reads it from (`object_columns`: name -> its expression, '' the
+//! source's column of that name)
+string OverObject(const string &mask, const vector<std::pair<string, string>> &object_columns) {
+	auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask);
+	if (parsed.size() != 1) {
+		throw BinderException("acl: a mask is one expression (\"%s\")", mask);
 	}
-	//! The tree as COLUMNS items rooted at `root` - what a write rebuilds it from
-	string TreeItems(const string &root) const {
-		vector<std::pair<string, string>> items;
-		auto copy = tree->Clone();
-		copy->name = root;
-		SerializeNode(*copy, ColumnTrees::RootName(*copy), items);
-		return ItemsCsv(items);
-	}
-
-	//! What the role reads of the column, over `source` (its value in physical terms)
-	string Read(const string &source) const {
-		if (tree) {
-			return CompileNode(*tree, "(" + source + ")");
+	std::function<void(unique_ptr<ParsedExpression> &, const case_insensitive_set_t &)> walk;
+	walk = [&](unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &params) {
+		if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
+			auto &lambda = expr->Cast<LambdaExpression>();
+			vector<string> names;
+			ParsedExpressionIterator::EnumerateChildren(lambda.Left(), [&](const ParsedExpression &child) {
+				if (child.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+					names.push_back(child.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+				}
+			});
+			if (lambda.Left().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				names.push_back(lambda.Left().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+			}
+			auto inner = params;
+			inner.insert(names.begin(), names.end());
+			walk(lambda.RightMutable(), inner);
+			return;
 		}
-		return mask.empty() ? source : mask;
-	}
-};
-
-vector<ListedColumn> ListColumns(const vector<std::pair<string, string>> &items) {
-	vector<ListedColumn> listed;
-	for (auto &column : ColumnTrees::From(items).columns) {
-		ListedColumn entry;
-		entry.name = column->name;
-		if (column->masked) {
-			entry.mask = column->mask;
-		} else if (!column->Plain()) {
-			entry.tree = column->Clone();
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() != 1 || params.count(names[0].GetIdentifierName())) {
+				return;
+			}
+			for (auto &column : object_columns) {
+				if (!StringUtil::CIEquals(column.first, names[0].GetIdentifierName())) {
+					continue;
+				}
+				auto source = column.second.empty() ? Ident(column.first) : column.second;
+				auto replaced = Parser(ParserOptions::Builtin()).ParseExpressionList(source);
+				if (replaced.size() == 1) {
+					expr = std::move(replaced[0]);
+				}
+				return;
+			}
+			return;
 		}
-		listed.push_back(std::move(entry));
-	}
-	return listed;
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { walk(child, params); });
+	};
+	walk(parsed[0], case_insensitive_set_t());
+	return parsed[0]->ToString();
 }
 
-//! The grant's items over a view's output, where every column is its own source
-vector<string> ViewItems(const vector<std::pair<string, string>> &items) {
-	vector<string> out;
-	for (auto &column : ListColumns(items)) {
-		auto read = column.Read(Ident(column.name));
-		out.push_back(read == Ident(column.name) ? read : read + " AS " + Ident(column.name));
+//! spec 158: the roles' test as a COLUMNS selector over a read's own columns ("*" for every column)
+string ColumnsSelector(const ColumnTest &test) {
+	if (test.All()) {
+		return "*";
 	}
-	return out;
+	vector<string> names;
+	for (auto &name : test.names) {
+		names.push_back(Lit(FoldColumn(name)));
+	}
+	return "COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") +
+	       (test.kind == ColumnTest::Kind::EXCEPT ? " NOT IN (" : " IN (") + StringUtil::Join(names, ", ") + "))";
+}
+
+string GrantOver(const RoleColumns &columns, const string &inner) {
+	string masked = inner;
+	if (!columns.masks.empty()) {
+		vector<string> replaces;
+		for (auto &mask : columns.masks) {
+			replaces.push_back(mask.second + " AS " + Ident(mask.first));
+		}
+		masked = "SELECT * REPLACE (" + StringUtil::Join(replaces, ", ") + ") FROM (" + inner + ") AS __acl_object";
+	}
+	return "SELECT " + ColumnsSelector(columns.test) + " FROM (" + masked + ") AS __acl_granted";
 }
 
 } // namespace
 
+string GrantOverSql(const RoleColumns &columns, const string &inner) {
+	return GrantOver(columns, inner);
+}
+
 void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &grants,
                                       vector<std::pair<string, string>> &object_columns, TablePolicy &out) {
+	if (!grants.refusal.empty()) {
+		NoteDenyReason(Reason::POLICY_ERROR);
+		throw BinderException("acl: the grant on \"%s\" cannot be read: %s - acl_check_catalog names it", vname,
+		                      grants.refusal);
+	}
 	auto predicate = grants.Predicate();
-	bool restricts = grants.Restricts();
+	auto columns = grants.Columns(vname);
+	bool restricts = !columns.test.All() || !columns.masks.empty();
 	out.rls_unchecked = out.rls_unchecked || grants.Unchecked();
 	if (!out.query.empty() && !out.casts.empty()) {
 		// spec 099: a view's output is cast right above the grant's row filter - the predicate reads
@@ -958,10 +1007,7 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		auto filtered = "SELECT " + TablePolicy::CastItems(out.casts) + " FROM (" + out.query + ") AS __acl_typed" +
 		                (predicate.empty() ? "" : " WHERE " + predicate);
 		out.casts.clear();
-		auto items = ViewItems(grants.columns);
-		out.exposes_nothing = restricts && items.empty(); // spec 156: the lists intersect to nothing
-		out.query = restricts ? "SELECT " + StringUtil::Join(items, ", ") + " FROM (" + filtered + ") AS __acl_granted"
-		                      : filtered;
+		out.query = restricts ? GrantOver(columns, filtered) : filtered;
 		return;
 	}
 	if (predicate.empty() && !restricts) {
@@ -973,12 +1019,10 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		return;
 	}
 	if (!out.query.empty()) {
-		// a view has no column list of its own to intersect: wrap its SQL, so the grant's columns
-		// and predicate apply to the view's output
-		auto items = ViewItems(grants.columns);
-		out.exposes_nothing = restricts && items.empty(); // spec 156: the lists intersect to nothing
-		out.query = "SELECT " + (restricts ? StringUtil::Join(items, ", ") : string("*")) + " FROM (" + out.query +
-		            ") AS __acl_granted" + (predicate.empty() ? "" : " WHERE " + predicate);
+		// a view has no column list of its own: the grant's columns and predicate apply to the view's output
+		auto filtered = "SELECT * FROM (" + out.query + ") AS __acl_viewed" +
+		                (predicate.empty() ? "" : " WHERE " + predicate);
+		out.query = restricts ? GrantOver(columns, filtered) : filtered;
 		return;
 	}
 	if (!predicate.empty()) {
@@ -992,133 +1036,86 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		out.subquery_form = out.subquery_form || !out.rls.empty();
 		return;
 	}
-	// the visible columns of the relation as the object defines it: its own projection, or - when it
-	// declares none - every physical column under its own name. The grant's list is a subset of the
-	// object's (checked below), so it replaces what the object allowed rather than adding to it.
 	out.write_columns.clear();
 	out.write_order.clear();
 	out.visible_columns.clear();
 	out.narrowed_reads.clear();
-	// spec 038: where the object states its own columns, the grant is folded into them - in the
-	// object's order, so a column's position belongs to the object rather than to whoever asks. A
-	// listed name the object does not have is a *bare name* that grants nothing (it intersects
-	// away) or a *mask* that cannot be applied (it refuses): protection that is silently skipped
-	// is the one failure mode worth refusing over.
-	// spec 102: a column may be listed through paths into its fields; the tree compiles to what the
-	// role reads, over the column's physical value, and a write folds into the stored value
-	// (field_writes) - unless the tree steps into list elements.
-	auto listed = ListColumns(grants.columns);
-	if (!object_columns.empty()) {
-		for (auto &column : listed) {
-			bool known = false;
-			for (auto &defined : object_columns) {
-				if (StringUtil::CIEquals(defined.first, column.name)) {
-					known = true;
-					break;
-				}
-			}
-			if (!known && (!column.mask.empty() || column.tree)) {
-				throw BinderException("acl: the grant on \"%s\" masks column \"%s\", which the object does not "
-				                      "have - a mask that cannot be applied would leave it unprotected",
-				                      vname, column.name);
-			}
+	for (auto &mask : columns.masks) {
+		if (!columns.test.Admits(mask.first)) {
+			continue; // masks a column no role shows: nothing to read
 		}
-		vector<ListedColumn> ordered;
+		bool known = object_columns.empty();
 		for (auto &defined : object_columns) {
-			for (auto &column : listed) {
-				if (StringUtil::CIEquals(defined.first, column.name)) {
-					ordered.push_back(std::move(column));
-					column.name.clear();
-					break;
-				}
-			}
+			known = known || StringUtil::CIEquals(defined.first, mask.first);
 		}
-		listed = std::move(ordered);
+		if (!known) {
+			throw BinderException("acl: the grant on \"%s\" masks column \"%s\", which the object does not have - a "
+			                      "mask that cannot be applied would leave it unprotected",
+			                      vname, mask.first);
+		}
 	}
 	if (object_columns.empty()) {
-		// spec 038: the object's own columns are not known here and we do not probe for them - the
-		// engine answers while it binds the statement we generate. A mask goes into an inner
-		// REPLACE, which errors when the column is not there (a mask that cannot be applied must
-		// never be silently skipped); the listed names go into an outer COLUMNS(lambda ...), which
-		// keeps what matches and ignores what does not. Both keep the source's own order, which is
-		// the object's. The predicate stays inside, so RLS reads physical values, not masked ones.
-		vector<string> replaces;
-		vector<string> names;
-		for (auto &column : listed) {
-			names.push_back(Lit(StringUtil::Lower(column.name)));
-			if (!column.mask.empty() || column.tree) {
-				replaces.push_back(column.Read(Ident(column.name)) + " AS " + Ident(column.name));
+		// the object's columns are its source's, read live (no list of its own): the test and the masks go to duckdb
+		// over the read (a mask of a column the source lost refuses at bind); the predicate stays inside, so RLS
+		// reads the source's values
+		out.query = GrantOver(columns, "SELECT *" + out.ReadFrom());
+		if (columns.test.kind != ColumnTest::Kind::ONLY) {
+			// the columns are every one but those left out: a write and its conditions are judged by exclusion
+			out.columns_excluded = true;
+			out.excluded_columns.insert(columns.test.names.begin(), columns.test.names.end());
+			for (auto &mask : columns.masks) {
+				if (out.writable && columns.test.Admits(mask.first)) {
+					out.injections.emplace_back(mask.first, mask.second);
+				}
 			}
+			out.subquery_form = true;
+			return;
 		}
-		string inner = "SELECT *";
-		if (!replaces.empty()) {
-			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
-		}
-		inner += out.ReadFrom();
-		// spec 156: the grants' lists intersect to nothing (a catalog grant's and an object grant's) - no column
-		out.exposes_nothing = listed.empty();
-		out.query = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
-		            StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
-		for (auto &column : listed) {
-			out.visible_columns.insert(column.name);
-			if (column.tree) {
-				out.narrowed_reads.emplace_back(column.name, column.TreeItems(column.name));
-			}
-			if (!out.writable || !column.Writable()) {
+		for (auto &name : columns.test.names) {
+			out.visible_columns.insert(name);
+			if (!out.writable) {
 				continue;
 			}
-			out.write_columns.insert(column.name);
-			out.write_order.push_back(column.name);
-			if (!column.mask.empty()) {
-				out.injections.emplace_back(column.name, column.mask);
+			auto mask = MaskOf(columns.masks, name);
+			if (mask) {
+				out.injections.emplace_back(name, *mask);
+				continue;
 			}
-			if (column.tree) {
-				out.field_writes.emplace_back(column.name, column.TreeItems(column.name));
-			}
+			out.write_columns.insert(name);
+			out.write_order.push_back(name);
 		}
 		out.subquery_form = true;
 		return;
 	}
-	for (auto &column : listed) {
-		string source = column.name; // what to read the value from, in physical terms
-		bool source_is_name = true;  // spec 148 review: a name is emitted quoted, never as text
-		for (auto &defined : object_columns) {
-			if (StringUtil::CIEquals(defined.first, column.name)) {
-				source = defined.second.empty() ? defined.first : defined.second;
-				source_is_name = defined.second.empty();
-				break;
-			}
+	// spec 038: the object states its own columns - the grant keeps those its test admits, in the object's order
+	for (auto &defined : object_columns) {
+		if (!columns.test.Admits(defined.first)) {
+			continue;
 		}
+		string source = defined.second.empty() ? defined.first : defined.second; // in physical terms
+		bool source_is_name = defined.second.empty(); // spec 148 review: a name is emitted quoted, never as text
 		for (auto &rename : out.renames) {
-			if (StringUtil::CIEquals(rename.first, column.name)) {
+			if (StringUtil::CIEquals(rename.first, defined.first)) {
 				source = rename.second;
 				source_is_name = false;
 				break;
 			}
-			if (StringUtil::CIEquals(rename.second, column.name)) {
-				throw BinderException("acl: grant on \"%s\" lists column \"%s\", which the object renamed away", vname,
-				                      column.name);
-			}
 		}
-		auto expr = column.Read(source_is_name ? Ident(source) : source);
-		out.projection.push_back(expr == Ident(column.name) ? expr : expr + " AS " + Ident(column.name));
+		auto mask = MaskOf(columns.masks, defined.first);
+		auto expr = mask ? OverObject(*mask, object_columns) : source_is_name ? Ident(source) : source;
+		out.projection.push_back(expr == Ident(defined.first) ? expr : expr + " AS " + Ident(defined.first));
 		out.visible_columns.insert(source);
-		if (column.tree) {
-			out.narrowed_reads.emplace_back(source, column.TreeItems(source));
+		if (!out.writable) {
+			continue;
 		}
-		if (!out.writable || !column.Writable()) {
+		if (mask) {
+			out.injections.emplace_back(source, expr);
 			continue;
 		}
 		out.write_columns.insert(source);
-		out.write_order.push_back(column.name);
-		if (!column.mask.empty()) {
-			out.injections.emplace_back(source, column.mask);
-		}
-		if (column.tree) {
-			out.field_writes.emplace_back(source, column.TreeItems(source));
-		}
+		out.write_order.push_back(defined.first);
 	}
-	// spec 156: nothing the grants list is a column of the object - the role reads no column, whatever the RLS
+	// spec 156: nothing the grants show is a column of the object - the role reads no column, whatever the RLS
 	out.exposes_nothing = out.projection.empty();
 	out.subquery_form = true; // a narrowed read is a projection, so it needs the subquery shape
 }
@@ -1468,8 +1465,14 @@ void CatalogBackend::ResolveFunctions(const Principal &principal, const vector<V
 
 void CatalogBackend::ApplyFunctionGrantPolicy(const string &vname, bool table_kind, const GrantUnion &grants,
                                               TablePolicy &out) {
+	if (!grants.refusal.empty()) {
+		NoteDenyReason(Reason::POLICY_ERROR);
+		throw BinderException("acl: the grant on \"%s\" cannot be read: %s - acl_check_catalog names it", vname,
+		                      grants.refusal);
+	}
 	auto predicate = grants.Predicate();
-	bool restricts = grants.Restricts();
+	auto columns = grants.Columns(vname);
+	bool restricts = !columns.test.All() || !columns.masks.empty();
 	out.rls_unchecked = grants.Unchecked();
 	if (predicate.empty() && !restricts) {
 		return;
@@ -1483,29 +1486,17 @@ void CatalogBackend::ApplyFunctionGrantPolicy(const string &vname, bool table_ki
 	if (!restricts) {
 		return;
 	}
-	// spec 038: a function's returns cannot be known without calling it, so the grant is not folded
-	// in here but expressed as SQL the engine resolves while binding - the same shape a plain alias
-	// gets. A bare name the function does not return intersects away; a mask it cannot apply
-	// refuses. Naming and shaping a function's output stays with its declaration in the catalog.
-	vector<string> replaces;
-	vector<string> names;
-	for (auto &column : grants.columns) {
-		names.push_back(Lit(StringUtil::Lower(column.first)));
-		if (!column.second.empty()) {
-			replaces.push_back(column.second + " AS " + Ident(column.first));
-		}
-	}
-	string inner = "SELECT *";
-	if (!replaces.empty()) {
-		inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
-	}
-	inner += " FROM \"__acl_inner\"";
+	// spec 038, 158: a function's returns cannot be known without calling it, so the grant is not folded in here but
+	// expressed as SQL the engine resolves while binding: its test as a COLUMNS selector over the result (a name the
+	// function does not return keeps nothing), its masks a REPLACE (one it cannot apply refuses). Naming and shaping a
+	// function's output stays with its declaration in the catalog.
+	string inner = "SELECT * FROM \"__acl_inner\"";
 	if (!out.rls.empty()) {
 		inner += " WHERE " + out.rls;
 	}
-	out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
-	               StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
-	out.granted_items = grants.columns;
+	out.wrap_sql = GrantOver(columns, inner);
+	out.granted_columns = columns;
+	out.granted_restricts = true;
 }
 
 bool CatalogBackend::PrincipalMainCap(const Principal &principal, const string &capability) {

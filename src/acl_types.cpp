@@ -107,12 +107,11 @@ optional_ptr<const acl_detail::FieldNode> NodeAt(const acl_detail::FieldNode &tr
 	return node;
 }
 
-//! acl_listed_type(source_type, column, roles) - spec 102: the type a principal reads of one column,
-//! computed as the read path computes it. `roles` is one STRUCT(cat, obj, probed) per role, in the
-//! order the resolver unites them (role name): the role's catalog and object column lists, and the
-//! type its own projection was probed to (spec 026) - where a mask's type comes from.
+//! acl_listed_type(source_type, column, roles) - spec 158: the type a principal reads of one column, as the read path
+//! computes it: the source's type when the roles' united COLUMNS admit the column (a mask keeps its column's type,
+//! cast to it where the grant is written), NULL when it does not or the grant does not read. `roles` is one
+//! STRUCT(cat, obj, probed) per role: the role's catalog and object column lists (`probed` is no longer read)
 void ListedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto source_text = args.data[0].GetValue(row);
 		auto column = args.data[1].GetValue(row);
@@ -121,83 +120,25 @@ void ListedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 			result.SetValue(row, source_text);
 			continue;
 		}
-		try {
-			auto source = TransformStringToLogicalType(source_text.ToString(), context);
-			auto name = column.ToString();
-			acl_detail::GrantUnion grants;
-			vector<std::pair<unique_ptr<acl_detail::FieldNode>, string>> own; // each role's tree, its probe
-			for (auto &role : ListValue::GetChildren(roles)) {
-				auto &fields = StructValue::GetChildren(role);
-				auto text = [&](idx_t i) {
-					return fields[i].IsNull() ? string() : fields[i].ToString();
-				};
-				acl_detail::GrantPolicy policy;
-				policy.Narrow(string(), text(0));
-				policy.Narrow(string(), text(1));
-				grants.Add(policy);
-				auto trees = acl_detail::ColumnTrees::From(policy.columns);
-				auto node = trees.Find(name);
-				own.emplace_back(node ? node->Clone() : nullptr, text(2));
-			}
-			if (!grants.Restricts()) {
-				result.SetValue(row, source_text);
-				continue;
-			}
-			auto united = acl_detail::ColumnTrees::From(grants.columns);
-			auto node = united.Find(name);
-			if (!node) {
-				result.SetValue(row, Value());
-				continue;
-			}
-			auto mask_type = [&](const string &path) -> LogicalType {
-				for (auto &entry : own) {
-					auto at = entry.first ? NodeAt(*entry.first, path) : nullptr;
-					if (at && at->masked && !entry.second.empty()) {
-						LogicalType probed;
-						if (acl_detail::TypeAtPath(TransformStringToLogicalType(entry.second, context), path, probed)) {
-							return probed;
-						}
-					}
-				}
-				// spec 144: no probe (a catalog grant's mask, an object grant's on a live alias's object - nothing is
-				// probed for either) - the type the mask's own text says: a constant's, a cast's target. A mask that
-				// reads columns cannot be typed without binding it: the source's type where that names no field (a
-				// scalar), else NULL - never a nested source type, whose field names the grant may hide
-				for (auto &entry : own) {
-					auto at = entry.first ? NodeAt(*entry.first, path) : nullptr;
-					if (!at || !at->masked) {
-						continue;
-					}
-					auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(at->mask);
-					if (parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CONSTANT) {
-						return LogicalType::NormalizeType(
-						    parsed[0]->Cast<ConstantExpression>().GetLiteral().ToValue().type());
-					}
-					if (parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CAST) {
-						return TransformStringToLogicalType(parsed[0]->Cast<CastExpression>().TargetType().ToString(),
-						                                    context);
-					}
-					LogicalType own_type;
-					if (acl_detail::TypeAtPath(source, path, own_type) && !own_type.IsNested()) {
-						return own_type;
-					}
-					break;
-				}
-				return LogicalType::SQLNULL;
-			};
-			auto type = acl_detail::ProjectedType(*node, source, string(), mask_type);
-			result.SetValue(row, Value(type.ToString()));
-		} catch (std::exception &ex) {
-			ErrorData error(ex);
-			if (error.Type() == ExceptionType::INTERRUPT || error.Type() == ExceptionType::FATAL ||
-			    error.Type() == ExceptionType::INTERNAL) {
-				throw;
-			}
-			// fail closed: the read refuses this principal (two roles masking one field differently, a
-			// list that does not parse) - the listing must not answer the source's full type instead
-			result.SetValue(row, Value(LogicalType(LogicalTypeId::SQLNULL).ToString()));
+		acl_detail::GrantUnion grants;
+		for (auto &role : ListValue::GetChildren(roles)) {
+			auto &fields = StructValue::GetChildren(role);
+			acl_detail::GrantPolicy policy;
+			policy.catalog_columns = fields[0].IsNull() ? string() : fields[0].ToString();
+			StringUtil::Trim(policy.catalog_columns);
+			policy.ReadColumns(fields[1].IsNull() ? string() : fields[1].ToString(), string());
+			grants.Add(policy);
 		}
+		if (!grants.refusal.empty()) {
+			result.SetValue(row, Value(LogicalType(LogicalTypeId::SQLNULL).ToString()));
+			continue;
+		}
+		auto united = acl_detail::UniteRoleColumns(grants.roles, string());
+		result.SetValue(row, united.test.Admits(column.ToString())
+		                         ? source_text
+		                         : Value(LogicalType(LogicalTypeId::SQLNULL).ToString()));
 	}
+	(void)state;
 }
 
 } // namespace

@@ -39,10 +39,10 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.bare AS phys.main.t COLUMNS (id, amount);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (order_id = id, total = amount);
+ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (id AS order_id, amount AS total);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.mixed AS phys.main.t COLUMNS (order_id = id, ssn = NULL);
+ACL ADMIN CREATE VIRTUAL TABLE c.mixed AS phys.main.t COLUMNS (id AS order_id, NULL AS ssn);
 
 query I
 ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESCRIBE bare);
@@ -225,7 +225,7 @@ ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select) COLUMNS (order_id, tenan
 # dropped - it just has to be a mask of a column the object does expose
 statement ok
 ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select, insert, update)
-    COLUMNS (order_id = coalesce(tenant, 'none'));
+    COLUMNS (order_id) MASK (order_id AS coalesce(tenant, 'none'));
 
 query I
 ACL ROLE "r" SELECT * FROM renamed;
@@ -237,7 +237,7 @@ acme
 # through that the grant had taken away
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.two AS phys.main.t COLUMNS (order_id = id, total = amount);
+ACL ADMIN CREATE VIRTUAL TABLE c.two AS phys.main.t COLUMNS (id AS order_id, amount AS total);
 
 statement ok
 ACL ADMIN GRANT TABLE c.two TO ROLE r WITH (select, insert) COLUMNS (order_id);
@@ -260,7 +260,7 @@ SELECT id, amount FROM phys.main.t WHERE id = 5;
 # list two ways used to give a writable relation one way and a read-only one the other
 
 statement ok
-ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (order_id = id, total = amount);
+ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (id AS order_id, amount AS total);
 
 query I
 SELECT form FROM acl_relations() WHERE vname = 'two';
@@ -272,7 +272,7 @@ ACL ROLE "r" INSERT INTO two (order_id) VALUES (6);
 
 # ... and a list that masks still costs writability, whichever way it is written
 statement ok
-ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (order_id = id, total = NULL);
+ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (id AS order_id, NULL AS total);
 
 query I
 SELECT form FROM acl_relations() WHERE vname = 'two';

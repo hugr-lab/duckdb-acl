@@ -28,7 +28,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE r; CREATE ROLE o;
 
 # `narrow` declares k and b, `wide` declares id: a catalog grant listing id reads `wide`'s id and nothing of `narrow`
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.main.t COLUMNS (k = id, b) RLS (id > 0);
+ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.main.t COLUMNS (id AS k, b) RLS (id > 0);
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.wide AS phys.main.t COLUMNS (id);
@@ -54,7 +54,7 @@ exposes no readable columns
 
 # the grant's own RLS, and a rename-only object (read as `* RENAME (...)` before)
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.ren AS phys.main.t COLUMNS (i = id, k = b);
+ACL ADMIN CREATE VIRTUAL TABLE c.ren AS phys.main.t COLUMNS (id AS i, b AS k);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r MAIN COLUMNS (id) RLS 'id > 0';
@@ -88,7 +88,7 @@ ACL ROLE "o" SELECT * FROM g;
 1
 
 statement ok
-ACL ADMIN ALTER VIRTUAL TABLE c.g SET COLUMNS (k = id, b);
+ACL ADMIN ALTER VIRTUAL TABLE c.g SET COLUMNS (id AS k, b);
 
 statement error
 ACL ROLE "o" SELECT * FROM g;
@@ -107,7 +107,7 @@ ACL ROLE "o" SELECT * FROM g;
 # a writable object (a rename-only list, no RLS) whose grants leave no column: every column set of a write was empty,
 # which read as "no column policy" - the whole physical row written, read in WHERE and returned. No write at all now
 statement ok
-ACL ADMIN CREATE ROLE wr; CREATE VIRTUAL TABLE c.w AS phys.main.t COLUMNS (k = b);
+ACL ADMIN CREATE ROLE wr; CREATE VIRTUAL TABLE c.w AS phys.main.t COLUMNS (b AS k);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE wr MAIN COLUMNS (id);
@@ -188,7 +188,7 @@ statement ok
 CREATE TABLE phys.main.d (id INTEGER, old INTEGER);
 
 statement ok
-ACL ADMIN CREATE ROLE dr; CREATE VIRTUAL TABLE c.dt AS phys.main.d COLUMNS (i = id, old);
+ACL ADMIN CREATE ROLE dr; CREATE VIRTUAL TABLE c.dt AS phys.main.d COLUMNS (id AS i, old);
 
 statement ok
 ACL ADMIN GRANT TABLE c.dt TO ROLE dr COLUMNS (old);
@@ -257,10 +257,10 @@ statement ok
 CREATE TABLE phys.main.m (id INTEGER, old INTEGER, ssn VARCHAR, b INTEGER);
 
 statement ok
-ACL ADMIN CREATE ROLE mr; CREATE VIRTUAL TABLE c.only AS phys.main.m COLUMNS (old); CREATE VIRTUAL TABLE c.mk AS phys.main.m COLUMNS (i = id, old, b);
+ACL ADMIN CREATE ROLE mr; CREATE VIRTUAL TABLE c.only AS phys.main.m COLUMNS (old); CREATE VIRTUAL TABLE c.mk AS phys.main.m COLUMNS (id AS i, old, b);
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE mr MAIN; GRANT TABLE c.mk TO ROLE mr COLUMNS (old = 0) RLS (id > 0);
+ACL ADMIN GRANT CATALOG c TO ROLE mr MAIN; GRANT TABLE c.mk TO ROLE mr COLUMNS (old) MASK (old AS 0) RLS (id > 0);
 
 statement ok
 ALTER TABLE phys.main.m DROP COLUMN old;

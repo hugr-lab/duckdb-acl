@@ -160,7 +160,7 @@ ACL ROLE "cadm" CREATE VIRTUAL VIEW c.n1 AS 'SELECT x.id FROM src.main.t x INNER
 # --- a computed column's body ----------------------------------------------------------------------------------------
 
 statement error
-ACL ROLE "cadm" CREATE VIRTUAL TABLE c.m1 AS src.main.t COLUMNS (id, k = (SELECT x FROM sec.main.vconst));
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.m1 AS src.main.t COLUMNS (id, (SELECT x FROM sec.main.vconst) AS k);
 ----
 <REGEX>:.*names "sec\.main\.vconst", outside the sources granted.*
 

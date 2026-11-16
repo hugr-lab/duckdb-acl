@@ -79,7 +79,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE narrowed WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE narrowed WITH (select) COLUMNS (id, amount = 0, note);
+ACL ADMIN GRANT TABLE c.orders TO ROLE narrowed WITH (select) COLUMNS (id, amount, note) MASK (amount AS 0);
 
 query II
 ACL ROLE 'narrowed' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
@@ -100,7 +100,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE both_levels WITH (select) MAIN COLUMNS (id, amount);
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE both_levels WITH (select) COLUMNS (id, note = '***');
+ACL ADMIN GRANT TABLE c.orders TO ROLE both_levels WITH (select) COLUMNS (id, note) MASK (note AS '***');
 
 query I
 ACL ROLE 'both_levels' SELECT * FROM orders;
@@ -122,7 +122,7 @@ statement ok
 ACL ADMIN CREATE ROLE comma_mask;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE comma_mask WITH (select) MAIN COLUMNS (id, note = concat(id, amount, 'x'));
+ACL ADMIN GRANT CATALOG c TO ROLE comma_mask WITH (select) MAIN COLUMNS (id, concat(id, amount, 'x') AS note);
 
 query T
 ACL ROLE 'comma_mask' SELECT column_name FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
@@ -138,7 +138,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE two_levels WITH (select) MAIN COLUMNS (amount, note);
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE two_levels WITH (select) COLUMNS (id, amount = 0, note);
+ACL ADMIN GRANT TABLE c.orders TO ROLE two_levels WITH (select) COLUMNS (id, amount, note) MASK (amount AS 0);
 
 query TI
 ACL ROLE 'two_levels' SELECT column_name, ordinal_position FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
@@ -152,7 +152,7 @@ ACL ADMIN REVOKE TABLE c.orders FROM ROLE two_levels;
 # a renaming list keeps its columns' comments under their virtual names - shown over the source's; a column named
 # in another case is the same column
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.orders COLUMNS (id = id, paid = amount, note = note);
+ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.orders COLUMNS (id AS id, amount AS paid, note AS note);
 
 statement ok
 ACL ADMIN COMMENT ON VIRTUAL TABLE c.renamed COLUMN PAID IS 'virtual paid';

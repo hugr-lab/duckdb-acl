@@ -152,7 +152,7 @@ statement ok
 CREATE TABLE phys.lake.decl_src(id INT, ssn_raw VARCHAR, internal_note VARCHAR);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE sales.decl AS phys.lake.decl_src COLUMNS (id, ssn = ssn_raw);
+ACL ADMIN CREATE VIRTUAL TABLE sales.decl AS phys.lake.decl_src COLUMNS (id, ssn_raw AS ssn);
 
 statement ok
 ACL ADMIN GRANT TABLE sales.decl TO ROLE wide WITH (select);

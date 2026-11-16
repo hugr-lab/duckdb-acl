@@ -10,15 +10,15 @@ require acl
 
 # the memory store judges the same text (it pastes it at read too)
 statement error
-SELECT acl_grant_table('m', 't', 'phys.main.t', 'id, note = 1 FROM range(1)', '', 'select');
+SELECT acl_grant_table('m', 't', 'phys.main.t', 'id, 1 FROM range(1) AS note', '', 'select');
 ----
-spec 148
+a column list is a SELECT list
 
 # ... and a name it pastes as written
 statement error
 SELECT acl_grant_table('m', 't', 'phys.main.t', 'id FROM range(1)', '', 'select');
 ----
-not a column name
+a column list is a SELECT list
 
 statement ok
 ATTACH ':memory:' AS store;
@@ -52,41 +52,44 @@ ACL ADMIN CREATE ROLE r;
 
 # a catalog grant's mask: a FROM after it, a comment, a second statement, an alias, an unbalanced parenthesis
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1 FROM range(3)');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, 1 FROM range(3) AS note');
 ----
-spec 148
+a column list is a SELECT list
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) -- hidden');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, upper(note) -- hidden AS note');
 ----
-does not stay one expression
+a column list is a SELECT list
 
 # spec 150 4e: the list is read on duckdb's tokens, where an open comment is nothing - refused as written all the same
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* hidden');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, upper(note) /* hidden AS note');
 ----
-spec 148
+a column list is a SELECT list
 
-# spec 150 4e: no comment at all - a stored list with one is read the way builds before 4e read it, so none is written
-statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* kept */');
-----
-spec 148
+# spec 158: a closed comment is read by duckdb's parser as nothing - the list is stored as duckdb prints it, without it
+statement ok
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, upper(note) /* kept */ AS note');
 
-statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1; SELECT 2');
+query T
+SELECT columns FROM store.acl.role_catalogs WHERE role = 'r';
 ----
-spec 148
+id, upper(note) AS note
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1 AS x');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, 1; SELECT 2 AS note');
 ----
-an alias
+a column list is a SELECT list
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1) UNION SELECT 1 (');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, 1 AS x AS note');
 ----
-spec 148
+a column list is a SELECT list
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, 1) UNION SELECT 1 ( AS note');
+----
+a column list is a SELECT list
 
 # ... and its row filter
 statement error
@@ -107,7 +110,7 @@ id > 0
 
 # what is one expression stays allowed: a string holding the comment marks, a subquery, CASE, a lambda, a cast
 statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'note <> ''x--y''', 'id, note = CASE WHEN id > 1 THEN ''--'' ELSE upper(note) END');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'note <> ''x--y''', 'id, CASE WHEN id > 1 THEN ''--'' ELSE upper(note) END AS note');
 
 query II
 ACL ROLE "r" SELECT * FROM t ORDER BY id;
@@ -116,7 +119,7 @@ ACL ROLE "r" SELECT * FROM t ORDER BY id;
 2	--
 
 statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM phys.main.t)', 'id, note = list_transform([note], lambda x: x || ''/*'')[1]::VARCHAR');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM phys.main.t)', 'id, list_transform([note], lambda x: x || ''/*'')[1]::VARCHAR AS note');
 
 query II
 ACL ROLE "r" SELECT * FROM t ORDER BY id;
@@ -146,7 +149,7 @@ SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id = ?', '');
 parameter
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = $1');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, $1 AS note');
 ----
 parameter
 
@@ -156,15 +159,15 @@ SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id F
 parameter
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = (SELECT max(note) FROM phys.main.t WHERE id = $1)');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, (SELECT max(note) FROM phys.main.t WHERE id = $1) AS note');
 ----
 parameter
 
 # an object grant's mask and row filter
 statement error
-SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', '', 'id, note = j AS m FROM range(3) j');
+SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', '', 'id, note', NULL, 'note AS j AS m FROM range(3) j');
 ----
-spec 148
+a column list is a SELECT list
 
 statement error
 SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', 'id > 0 WHERE true', '');
@@ -173,9 +176,9 @@ spec 148
 
 # a relation's computed column and row filter
 statement error
-SELECT acl_add_relation('c', 'v', 'phys.main.t', 'id, n = note FROM range(1)', '');
+SELECT acl_add_relation('c', 'v', 'phys.main.t', 'id, note FROM range(1) AS n', '');
 ----
-spec 148
+a column list is a SELECT list
 
 statement error
 SELECT acl_add_relation('c', 'v', 'phys.main.t', '', 'id > 0 -- x');
@@ -184,12 +187,12 @@ spec 148
 
 # a REMAP item
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.d AS phys.main.t COLUMNS (id, n = note);
+ACL ADMIN CREATE VIRTUAL TABLE c.d AS phys.main.t COLUMNS (id, note AS n);
 
 statement error
-SELECT acl_repair_relation('c', 'd', 'remap', 'n = note FROM range(1)');
+SELECT acl_repair_relation('c', 'd', 'remap', 'note FROM range(1) AS n');
 ----
-spec 148
+a column list is a SELECT list
 
 # a scalar function's template
 statement error

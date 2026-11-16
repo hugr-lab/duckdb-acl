@@ -91,7 +91,7 @@ ACL ROLE "m" SELECT id FROM "top items"();
 42
 
 statement ok
-SELECT acl_grant_table('m', 'mart.Masked', 'phys."Raw Data"."Order Items"', 'id,Qty=0', '', 'select');
+SELECT acl_grant_table('m', 'mart.Masked', 'phys."Raw Data"."Order Items"', 'id,0 AS Qty', '', 'select');
 
 query II
 ACL ROLE "m" SELECT id, "Qty" FROM mart."MASKED" ORDER BY id;
@@ -108,7 +108,7 @@ statement ok
 INSERT INTO phys.main.oq VALUES (1, 2, 3);
 
 statement ok
-SELECT acl_grant_table('m', 'oq', 'phys.main.oq', 'id, "odd name", "order" = "order" + 1', '', 'select');
+SELECT acl_grant_table('m', 'oq', 'phys.main.oq', 'id, "odd name", "order" + 1 AS "order"', '', 'select');
 
 query III
 ACL ROLE "m" SELECT * FROM oq;
@@ -385,7 +385,7 @@ statement ok
 ACL ADMIN GRANT CATALOG "Sales Mart" TO ROLE masked MAIN WITH (select) RLS (tenant = 'acme');
 
 statement ok
-ACL ADMIN GRANT TABLE "SALES MART"."order items" TO ROLE masked COLUMNS (id, "Qty" = 0);
+ACL ADMIN GRANT TABLE "SALES MART"."order items" TO ROLE masked COLUMNS (id, "Qty") MASK ("Qty" AS 0);
 
 statement ok
 ACL ADMIN GRANT SCHEMA "Sales Mart"."A.B" TO ROLE masked WITH (select);
@@ -658,7 +658,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE m2 WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c."Ä" TO ROLE m2 COLUMNS (id, "Qty" = 0);
+ACL ADMIN GRANT TABLE c."Ä" TO ROLE m2 COLUMNS (id, "Qty") MASK ("Qty" AS 0);
 
 query II
 ACL ROLE "m2" SELECT (SELECT sum("Qty") FROM "Ä"), (SELECT sum("Qty") FROM "ä");

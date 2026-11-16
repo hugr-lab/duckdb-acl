@@ -44,7 +44,7 @@ statement ok
 ACL ADMIN CREATE ROLE r_cat;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_cat WITH (select) MAIN COLUMNS (id, amount = 0);
+ACL ADMIN GRANT CATALOG c TO ROLE r_cat WITH (select) MAIN COLUMNS (id, 0 AS amount);
 
 query II
 ACL ROLE 'r_cat' SELECT * FROM raw.orders;
@@ -111,7 +111,7 @@ statement ok
 ACL ADMIN CREATE ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN COLUMNS (id, amount = 0);
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN COLUMNS (id, 0 AS amount);
 
 statement ok
 ACL ADMIN CREATE ROLE auditor;
@@ -250,7 +250,7 @@ statement ok
 ACL ADMIN CREATE ROLE r_mask_types;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_mask_types WITH (select) MAIN COLUMNS (id, amount = NULL, addr.city, addr.secret = 0);
+ACL ADMIN GRANT CATALOG c TO ROLE r_mask_types WITH (select) MAIN COLUMNS (id, NULL AS amount, addr.city, addr.secret = 0);
 
 query TT
 ACL ROLE 'r_mask_types' SELECT typeof(amount), typeof(addr) FROM t;
@@ -268,7 +268,7 @@ statement ok
 ACL ADMIN CREATE ROLE r_whole_mask;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r_whole_mask WITH (select) MAIN COLUMNS (id, addr = NULL);
+ACL ADMIN GRANT CATALOG c TO ROLE r_whole_mask WITH (select) MAIN COLUMNS (id, NULL AS addr);
 
 query TT
 ACL ROLE 'r_whole_mask' SELECT table_schema, data_type FROM information_schema.columns WHERE column_name = 'addr' ORDER BY 1;

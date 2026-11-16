@@ -223,7 +223,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.masked AS pending.main.t;
 
 statement ok
-ACL ADMIN GRANT TABLE c.masked TO ROLE r WITH (select) COLUMNS (id, label = coalesce(tenant, 'none'));
+ACL ADMIN GRANT TABLE c.masked TO ROLE r WITH (select) COLUMNS (id, label) MASK (label AS coalesce(tenant, 'none'));
 
 query I
 SELECT count(*) FROM acl_grant_columns() WHERE vname = 'masked';

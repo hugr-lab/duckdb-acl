@@ -43,7 +43,7 @@ ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
 
 query TTTTT
 ACL ROLE "boss" SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', 'tenant = acl_claim(''tenant'')',
-    'id, amount, ssn = 42, address.city');
+    'id, amount, 42 AS ssn, address.city');
 ----
 rls	tenant = acl_claim('tenant')	NULL	ok	NULL
 columns	id, amount, ssn = 42, address.city	NULL	ok	NULL
@@ -61,7 +61,7 @@ ACL ROLE "boss" SELECT count(*) FROM platform.object_grants WHERE role = 'analys
 # the write agrees: it succeeds, and stores the projection the check answered
 statement ok
 ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst WITH (select) RLS (tenant = acl_claim('tenant'))
-    COLUMNS (id, amount, ssn = 42, address.city);
+    COLUMNS (id, amount, ssn, address.city) MASK (ssn AS 42);
 
 query TT
 ACL ROLE "boss" SELECT name, type FROM platform.grant_columns WHERE role = 'analyst' ORDER BY pos;

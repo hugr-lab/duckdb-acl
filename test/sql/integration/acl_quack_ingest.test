@@ -108,7 +108,7 @@ statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'id,tenant=acl_claim(''tenant'')';
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'id,acl_claim(''tenant'') AS tenant';
 
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=false;

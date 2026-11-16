@@ -32,7 +32,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.filtered AS phys.main.orders RLS (tenant = acl_claim('tenant'));
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (id, amount, ssn = NULL::VARCHAR) RLS (tenant = acl_claim('tenant'));
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (id, amount, NULL::VARCHAR AS ssn) RLS (tenant = acl_claim('tenant'));
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.plain AS phys.main.orders;

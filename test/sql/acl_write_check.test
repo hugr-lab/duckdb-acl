@@ -192,7 +192,7 @@ ACL ADMIN GRANT CATALOG c TO ROLE inj CAPS '{}' MAIN;
 
 statement ok
 ACL ADMIN GRANT TABLE c.orders TO ROLE inj WITH (select, insert, update)
-    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant) MASK (tenant AS acl_claim('tenant'));
 
 # the writer names neither tenant nor a value for it, and the row still lands inside the slice
 statement ok

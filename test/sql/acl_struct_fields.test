@@ -556,7 +556,7 @@ ACL ROLE "rv" UPDATE r SET note = 'q' WHERE address.zip = 'Z1';
 
 # a masked column reads as its mask in a WHERE, even a mask computed from the row
 statement ok
-ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note, hidden = left(hidden, 0) || '***');
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note, hidden) MASK (hidden AS left(hidden, 0) || '***');
 
 statement ok
 ACL ROLE "rv" UPDATE r SET note = 'masked-match' WHERE hidden = '***';

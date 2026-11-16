@@ -318,8 +318,8 @@ bool CatalogBackend::ExposedColumns(const string &source, const vector<string> &
 	return true;
 }
 
-string CatalogBackend::ProjectionSchema(const string &source, const string &column_csv,
-                                        const case_insensitive_map_t<string> &own,
+string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns &columns,
+                                        const vector<string> &own_order, const case_insensitive_map_t<string> &own,
                                         vector<std::pair<string, string>> &out, bool *checked) {
 	if (checked) {
 		*checked = false;
@@ -327,12 +327,12 @@ string CatalogBackend::ProjectionSchema(const string &source, const string &colu
 	// spec 148: nothing is spliced into the probe that is not one expression - a FROM written after a mask bound its
 	// table function here, as the node, before the shape was refused
 	string problem;
-	for (auto &item : ParseColumnList(column_csv)) {
-		if (!item.second.empty() && !OneExpression(item.second, problem)) {
+	for (auto &mask : columns.masks) {
+		if (!OneExpression(mask.second, problem)) {
 			if (checked) {
 				*checked = true;
 			}
-			return "\"" + item.first + "\" is " + problem + " (spec 148: one expression)";
+			return "the mask of \"" + mask.first + "\" is " + problem + " (spec 148: one expression)";
 		}
 	}
 	for (auto &item : own) {
@@ -343,22 +343,7 @@ string CatalogBackend::ProjectionSchema(const string &source, const string &colu
 			return "the object's \"" + item.first + "\" is " + problem + " (spec 148: one expression)";
 		}
 	}
-	vector<string> items;
-	// spec 102: items are grouped by column first, so a path into one compiles to what the role reads
-	for (auto &column : ColumnTrees::From(ParseColumnList(column_csv)).columns) {
-		// the alias is an identifier and the bare source is one too - quoted, or a column whose name
-		// is not a bare word could never be granted at all, since the probe would not parse
-		if (column->masked) {
-			items.push_back(column->mask + " AS " + Ident(column->name)); // the grant masks it
-			continue;
-		}
-		auto object = own.find(column->name);
-		// a bare name is the object's column, which its own projection may have renamed
-		auto source = object != own.end() && !object->second.empty() ? object->second : Ident(column->name);
-		auto read = column->Plain() ? source : CompileNode(*column, "(" + source + ")");
-		items.push_back(read + " AS " + Ident(column->name));
-	}
-	if (items.empty()) {
+	if (columns.test.All() && columns.masks.empty()) {
 		return string();
 	}
 	auto instance = Db();
@@ -369,7 +354,15 @@ string CatalogBackend::ProjectionSchema(const string &source, const string &colu
 	if (checked) {
 		*checked = true; // whatever the answer, the projection was probed rather than waved through
 	}
-	auto sql = "SELECT " + StringUtil::Join(items, ", ") + " FROM " + source;
+	// the object's read: its own columns over the source (a computed one by its expression), else the source's
+	vector<string> items;
+	for (auto &name : own_order) {
+		auto entry = own.find(name);
+		auto expr = entry == own.end() || entry->second.empty() ? Ident(name) : entry->second;
+		items.push_back(expr + " AS " + Ident(name));
+	}
+	auto object = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + source;
+	auto sql = GrantOverSql(columns, object);
 	if (ProbeSchema(sql, false, {}, out)) {
 		return string();
 	}

@@ -5,6 +5,8 @@
 //! `struct_update` / `list_transform`). Header-only: the grant types use it, and so does its test.
 #pragma once
 
+#include "duckdb/parser/keyword_helper.hpp"
+
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -669,13 +671,22 @@ inline string ItemHead(const string &name_p, bool &is_path) {
 	return path.head;
 }
 
-//! COLUMNS items as the csv the grant rows store
+//! COLUMNS items as the text the grant rows store (spec 158): a SELECT list - `name`, `<expr> AS name`, each name
+//! quoted as duckdb quotes an identifier
 inline string ItemsCsv(const vector<std::pair<string, string>> &items) {
 	vector<string> parts;
 	for (auto &item : items) {
-		parts.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
+		bool is_path = false;
+		auto name = ItemHead(item.first, is_path);
+		auto written = is_path ? item.first : KeywordHelper::WriteOptionallyQuoted(name, '"', true);
+		parts.push_back(item.second.empty() ? written : item.second + " AS " + written);
 	}
 	return StringUtil::Join(parts, ", ");
+}
+
+//! One COLUMNS item as the list writes it (`name` or `<expr> AS name`)
+inline string ItemText(const std::pair<string, string> &item) {
+	return ItemsCsv({item});
 }
 
 //! True when an item list names any path (not only columns) - the fast path keeps today's behaviour

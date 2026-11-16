@@ -62,7 +62,7 @@ statement ok
 ACL ADMIN GRANT TABLE c.report TO ROLE analyst WITH (select, insert);
 
 statement ok
-ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) RLS (region <> 'hidden') COLUMNS (region, quarter, amount, margin = NULL);
+ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) RLS (region <> 'hidden') COLUMNS (region, quarter, amount, margin) MASK (margin AS NULL);
 
 statement ok
 ACL ADMIN GRANT TABLE c.wide TO ROLE analyst WITH (select) RLS (region <> 'hidden') COLUMNS (region, q1, q2);
@@ -243,7 +243,7 @@ ACL ROLE "analyst" CREATE TYPE __pivot_enum_by_hand AS ENUM ('a', 'b');
 # a refusal inside the enum step refuses the whole statement: nothing was created, so a second try
 # under a wider grant is not answered from a stale enum
 statement ok
-ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) COLUMNS (region, quarter, amount, margin = NULL);
+ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) COLUMNS (region, quarter, amount, margin) MASK (margin AS NULL);
 
 query IIII
 ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDER BY region;

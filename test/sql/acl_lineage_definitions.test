@@ -37,7 +37,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG hr;
 
 # a declared list: a column, a mask over the source's own column, a constant, a nested field
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders COLUMNS (id, amount, ssn = left(ssn, 1), note = 'n/a', city = address.city);
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders COLUMNS (id, amount, left(ssn, 1) AS ssn, 'n/a' AS note, address.city AS city);
 
 statement ok
 ACL ADMIN CREATE VIRTUAL VIEW sales.totals AS SELECT tenant, sum(amount) AS total FROM phys.main.orders GROUP BY tenant;

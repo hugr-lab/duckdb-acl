@@ -766,8 +766,9 @@ void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_grant_object(role, vcat, vname, caps_json[, rls, columns[, versions]]): grant one object of a catalog,
-//! with the capabilities and the policy this role gets on it (spec 011); versions (spec 167) '' = the catalog grant's
+//! acl_grant_object(role, vcat, vname, caps_json[, rls, columns[, versions[, masks]]]): grant one object of a catalog,
+//! with the capabilities and the policy this role gets on it (spec 011); versions (spec 167) '' = the catalog grant's;
+//! columns (spec 158) `name, …` / `*` / `* EXCLUDE (name, …)`, masks `<column> AS <expression>, …`
 void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RoleArg(args, 0, row, "acl_grant_object");
@@ -777,11 +778,12 @@ void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto rls = OptionalArg(args, 4, row, "");
 		auto columns = OptionalArg(args, 5, row, "");
 		auto versions = OptionalArg(args, 6, row, "");
+		auto masks = OptionalArg(args, 7, row, "");
 		auto &store = StoreOf(state);
 		// a grant on an object nobody defined is a policy that never applies: refuse it now
-		store.CatalogRequireGrantTarget(vcat, vname, !rls.empty() || !columns.empty(), caps);
+		store.CatalogRequireGrantTarget(vcat, vname, !rls.empty() || !columns.empty() || !masks.empty(), caps);
 		// the role's catalog grant is ensured in the object grant's own write: a refused grant leaves none behind
-		store.CatalogSetObjectCaps(role, vcat, vname, caps, rls, columns, true, true, true, &versions);
+		store.CatalogSetObjectCaps(role, vcat, vname, caps, rls, columns, true, true, true, &versions, &masks);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -837,15 +839,12 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));
 			continue;
 		}
-		// spec 148: the memory store pastes this text at read too - a quoted name quoted again (the reader took its
-		// quotes off, spec 150 4f), any other as written
+		// spec 148: the memory store pastes this text at read too - each name as duckdb writes an identifier (the
+		// reader, duckdb's parser, gives the name itself, spec 158)
 		acl_detail::RequireOneExpression("the grant's RLS", rls);
-		auto written = SplitDeclaredColumns(OptionalArg(args, 3, row, ""), "the relation's column list");
 		for (idx_t i = 0; i < columns.size(); i++) {
 			auto &column = columns[i];
-			if (written[i].quoted) {
-				column.first = KeywordHelper::WriteOptionallyQuoted(column.first, '"', true);
-			}
+			column.first = KeywordHelper::WriteOptionallyQuoted(column.first, '"', true);
 			acl_detail::RequireColumnName("the grant's column list", column.first);
 			acl_detail::RequireOneExpression("the grant's column list", column.second);
 		}
@@ -2547,7 +2546,8 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	                   AclAddScalarAliasCatalogFunc);
 	register_admin_set("acl_grant_catalog", {{v, v, v}, {v, v, v, b}, {v, v, v, b, v, v}, {v, v, v, b, v, v, v}},
 	                   AclGrantCatalogFunc);
-	register_admin_set("acl_grant_object", {{v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	register_admin_set("acl_grant_object",
+	                   {{v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}},
 	                   AclGrantObjectFunc);
 	register_admin("acl_revoke_catalog", {v, v}, AclRevokeCatalogFunc);
 	register_admin_set("acl_drop_relation", {{v, v}, {v, v, v}}, AclDropRelationFunc);

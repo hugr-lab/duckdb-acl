@@ -36,7 +36,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG sales;
 # --- inline bodies: no doubled quotes ---------------------------------------------------------------
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS (id, amount, ssn = NULL) RLS (tenant = acl_claim('tenant'));
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS (id, amount, NULL AS ssn) RLS (tenant = acl_claim('tenant'));
 
 query II
 SELECT rls, form FROM aclcat.acl.relations WHERE vname = 'orders';
@@ -52,7 +52,7 @@ ssn	NULL	2
 
 # the legacy spelling of the very same object stores the very same rows
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.legacy COLUMNS 'id,amount,ssn=NULL' RLS 'tenant = acl_claim(''tenant'')';
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.legacy COLUMNS 'id,amount,NULL AS ssn' RLS 'tenant = acl_claim(''tenant'')';
 
 query I
 SELECT count(*) FROM aclcat.acl.relations a JOIN aclcat.acl.relations b ON a.rls = b.rls AND a.form = b.form AND a.phys = b.phys WHERE a.vname = 'orders' AND b.vname = 'legacy';
@@ -224,7 +224,7 @@ ACL ROLE "futurist" INSERT INTO orders(id) VALUES (9);
 # splitting on every ',' used to break `coalesce(a, b)` into two nonsense entries, silently
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.labelled COLUMNS (id, label = coalesce(tenant, 'none'));
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.labelled COLUMNS (id, coalesce(tenant, 'none') AS label);
 
 query II
 SELECT name, expr FROM aclcat.acl.relation_columns WHERE vname = 'labelled' ORDER BY pos;
@@ -233,7 +233,7 @@ id	(empty)
 label	coalesce(tenant, 'none')
 
 statement ok
-ACL ADMIN GRANT TABLE sales.labelled TO ROLE analyst WITH (select) COLUMNS (id, label = coalesce(tenant, 'none'));
+ACL ADMIN GRANT TABLE sales.labelled TO ROLE analyst WITH (select) COLUMNS (id, label) MASK (label AS coalesce(tenant, 'none'));
 
 query II
 ACL ROLE "analyst" SELECT id, label FROM labelled ORDER BY id;

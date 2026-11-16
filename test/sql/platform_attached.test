@@ -199,7 +199,7 @@ ACL ROLE "cadm" CREATE VIRTUAL TABLE FUNCTION c.f(m INTEGER) RETURNS TABLE (id I
 <REGEX>:.*the definition's body names "pg.hr.salaries".*
 
 statement error
-ACL ROLE "cadm" REPAIR VIRTUAL TABLE c.orders REMAP (amount = (SELECT max(pay) FROM pg.hr.salaries));
+ACL ROLE "cadm" REPAIR VIRTUAL TABLE c.orders REMAP ((SELECT max(pay) FROM pg.hr.salaries) AS amount);
 ----
 <REGEX>:.*the definition's body names "pg.hr.salaries".*
 

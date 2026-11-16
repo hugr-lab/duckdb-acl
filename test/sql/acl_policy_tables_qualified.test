@@ -43,7 +43,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL VIEW c.v AS 'SELECT id FROM phys.main.t WHERE id IN (SELECT k FROM main.tenants)';
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r MAIN WITH (select, temp); GRANT TABLE c.t TO ROLE r RLS (id IN (SELECT k FROM tenants)); GRANT TABLE c.m TO ROLE r COLUMNS (id, note = (SELECT max(k)::VARCHAR FROM tenants));
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN WITH (select, temp); GRANT TABLE c.t TO ROLE r RLS (id IN (SELECT k FROM tenants)); GRANT TABLE c.m TO ROLE r COLUMNS (id, note) MASK (note AS (SELECT max(k)::VARCHAR FROM tenants));
 
 # stored whole; what was written whole stays as written
 query T
@@ -54,7 +54,7 @@ id IN (SELECT k FROM memory.main.tenants)
 query T
 SELECT columns FROM store.acl.role_object_caps WHERE vname = 'm';
 ----
-id, note = (SELECT max(k)::VARCHAR FROM memory.main.tenants)
+id, (SELECT CAST(max(k) AS VARCHAR) FROM memory.main.tenants) AS note
 
 query T
 SELECT view_sql FROM store.acl.relations WHERE vname = 'v';
@@ -150,18 +150,6 @@ query T
 SELECT view_sql FROM store.acl.relations WHERE vname = 'sh';
 ----
 SELECT count(*) AS n FROM (SHOW memory.main.tenants) s, memory.main.tenants
-
-# a list that is no select list as a whole (a path into a list of structs): each mask is qualified where it is written
-statement ok
-CREATE TABLE phys.main.s (id INTEGER, items STRUCT(price INTEGER)[], note VARCHAR);
-
-statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.s AS phys.main.s; GRANT TABLE c.s TO ROLE r COLUMNS (id, items[].price, note = (SELECT max(k)::VARCHAR FROM tenants));
-
-query T
-SELECT columns LIKE '%FROM memory.main.tenants)%' FROM store.acl.role_object_caps WHERE vname = 's';
-----
-true
 
 # a table named in a form not rewritten in place is refused where written: write it whole
 statement error

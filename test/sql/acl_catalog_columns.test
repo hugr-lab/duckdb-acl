@@ -92,7 +92,7 @@ shaped	CREATE TABLE "shaped"("id" INTEGER);
 # obligation, and absent means it cannot be met - which must never pass silently
 
 statement ok
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, ssn = NULL');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, NULL AS ssn');
 
 query II
 ACL ROLE "r" SELECT * FROM orders;
@@ -135,7 +135,7 @@ ACL ROLE "r" SELECT * FROM by_tenant('acme');
 
 # a grant hides and masks - and answers in the function's own order, not the grant's
 statement ok
-SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'ssn = ''***'', id');
+SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'ssn, id', NULL, 'ssn AS ''***''');
 
 query II
 ACL ROLE "r" SELECT * FROM by_tenant('acme');
@@ -153,7 +153,7 @@ ACL ROLE "r" SELECT * FROM by_tenant('acme');
 
 # ... while a mask it cannot apply refuses
 statement ok
-SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'id, nosuch = 1');
+SELECT acl_grant_object('r', 'c', 'by_tenant', '{"select": true}', '', 'id, nosuch', NULL, 'nosuch AS 1');
 
 statement error
 ACL ROLE "r" SELECT * FROM by_tenant('acme');

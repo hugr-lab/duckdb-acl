@@ -75,7 +75,7 @@ statement ok
 SELECT acl_add_table_function('other', 'rep', 'SELECT 1 AS id, ''S'' AS ssn, 2 AS amount', '', 'id INTEGER, ssn VARCHAR, amount INTEGER', '');
 
 statement ok
-ACL ADMIN GRANT OBJECT other.rep TO ROLE r CAPS '{"select": true}' COLUMNS 'id,ssn = ''***''';
+ACL ADMIN GRANT OBJECT other.rep TO ROLE r CAPS '{"select": true}' COLUMNS 'id,''***'' AS ssn';
 
 # the same name in two held catalogs: bare is MAIN's, qualified is each catalog's own
 statement ok

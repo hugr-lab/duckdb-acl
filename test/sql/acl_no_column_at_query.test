@@ -131,7 +131,7 @@ statement ok
 INSERT INTO phys.main.e VALUES (1, 10), (2, 20);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.ed AS phys.main.e COLUMNS (vv = v);
+ACL ADMIN CREATE VIRTUAL TABLE c.ed AS phys.main.e COLUMNS (v AS vv);
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE e MAIN; GRANT TABLE c.ed TO ROLE e COLUMNS (vv);
@@ -193,7 +193,7 @@ statement ok
 INSERT INTO phys.main.u VALUES (1, 10);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.uk AS phys.main.u COLUMNS (k = id, vv = v);
+ACL ADMIN CREATE VIRTUAL TABLE c.uk AS phys.main.u COLUMNS (id AS k, v AS vv);
 
 statement ok
 ACL ROLE "e" UPDATE uk SET k = 2;
@@ -213,7 +213,7 @@ SELECT id FROM phys.main.u;
 
 # a grant on an object names the object's columns: `id` is the source's name for `k` (spec 037's refusal)
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.ren AS phys.main.t COLUMNS (k = id, b);
+ACL ADMIN CREATE VIRTUAL TABLE c.ren AS phys.main.t COLUMNS (id AS k, b);
 
 statement error
 ACL ADMIN GRANT TABLE c.ren TO ROLE e COLUMNS (k, id);

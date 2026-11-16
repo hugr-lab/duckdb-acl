@@ -85,7 +85,7 @@ on
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders
-    COLUMNS (id, total = amount * 2, ssn = NULL) RLS 'tenant = acl_claim(''tenant'')';
+    COLUMNS (id, amount * 2 AS total, NULL AS ssn) RLS 'tenant = acl_claim(''tenant'')';
 
 statement ok
 SELECT acl_lineage_flush();
@@ -238,7 +238,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.sink AS phys.main.sink;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.src AS phys.main.orders COLUMNS (id, total = amount * 2, ssn = left(ssn, 1) || '***');
+ACL ADMIN CREATE VIRTUAL TABLE c.src AS phys.main.orders COLUMNS (id, amount * 2 AS total, left(ssn, 1) || '***' AS ssn);
 
 statement ok
 SELECT acl_lineage_flush();
@@ -818,7 +818,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE clerk WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.people TO ROLE clerk COLUMNS (id, name, ssn = NULL, address.city);
+ACL ADMIN GRANT TABLE c.people TO ROLE clerk COLUMNS (id, name, ssn, address.city) MASK (ssn AS NULL);
 
 statement ok
 SELECT acl_lineage_flush();
@@ -1942,7 +1942,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.drifting AS phys.main.drifting;
 
 statement ok
-ACL ADMIN GRANT TABLE c.drifting TO ROLE clerk COLUMNS (id, secret = NULL);
+ACL ADMIN GRANT TABLE c.drifting TO ROLE clerk COLUMNS (id, secret) MASK (secret AS NULL);
 
 statement ok
 ALTER TABLE phys.main.drifting DROP COLUMN secret;

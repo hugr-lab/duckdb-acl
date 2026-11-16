@@ -835,7 +835,7 @@ ACL ADMIN CREATE VIRTUAL TABLE objects.split AS phys.main.t COLUMNS (a, $$x, b, 
 an object's column list is items
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE objects.split AS phys.main.t COLUMNS (a, d = $$x, b, y$$);
+ACL ADMIN CREATE VIRTUAL TABLE objects.split AS phys.main.t COLUMNS (a, $$x AS d, b, y$$);
 
 query II
 SELECT name, expr FROM aclcat.acl.relation_columns WHERE vcat = 'objects' AND vname = 'split' ORDER BY pos;
@@ -858,7 +858,7 @@ a	INTEGER
 
 # an E'...' string without a backslash splits as written: a mask may be one
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE objects.masked AS phys.main.t COLUMNS (a, tenant = E'***');
+ACL ADMIN CREATE VIRTUAL TABLE objects.masked AS phys.main.t COLUMNS (a, E'***' AS tenant);
 
 # a statement the tokenizer refuses (`""`) is compiled from its text only when the split kept no `;` inside its
 # parentheses - there duckdb's tokenizer ends a statement, and a body would take the next one into it
@@ -920,7 +920,7 @@ statement ok
 ACL ADMIN ALTER VIRTUAL VIEW changes.v SET AS SELECT a, b /* kept */ FROM phys.main.t;
 ALTER VIRTUAL VIEW changes.v SET PRIMARY KEY (a);
 ALTER VIRTUAL TABLE changes.t SET RLS (a > 0 -- positive only
-); ALTER VIRTUAL TABLE changes.t SET COLUMNS (a, b, tenant = '***'); ALTER VIRTUAL TABLE changes.t SET TYPES (aliases = keep);
+); ALTER VIRTUAL TABLE changes.t SET COLUMNS (a, b, '***' AS tenant); ALTER VIRTUAL TABLE changes.t SET TYPES (aliases = keep);
 ALTER VIRTUAL TABLE changes.t SET PHYS phys.main.t;
 
 query III
@@ -972,7 +972,7 @@ ACL ADMIN CHECK VIRTUAL CATALOG changes;
 
 statement ok
 ACL ADMIN ANALYZE VIRTUAL CATALOG changes; ANALYZE VIRTUAL TABLE changes.t; ANALYZE VIRTUAL changes.v;
-REPAIR VIRTUAL TABLE changes.t DROP MISSING COLUMNS AND MASKS; REPAIR VIRTUAL TABLE changes.t REMAP (a = a);
+REPAIR VIRTUAL TABLE changes.t DROP MISSING COLUMNS AND MASKS; REPAIR VIRTUAL TABLE changes.t REMAP (a AS a);
 
 # a view's key between SET and DROP; a table function's key is the result's (kind table); ALIAS without OF; a
 # reference's comment by ALTER; ANALYZE of a scalar and of a table function
@@ -1041,7 +1041,7 @@ ALTER TABLE phys.main.w DROP COLUMN b;
 query IIIIIII
 ACL ADMIN CHECK VIRTUAL CATALOG "Sales Mart";
 ----
-Sales Mart	table	w	NULL	column_missing	declared column "b" reads a source column of that name, which "phys.main.w" no longer has: Binder Error: Referenced column "b" not found in FROM clause!	REPAIR VIRTUAL TABLE "Sales Mart".w REMAP (b = <column>)  -- or DROP MISSING COLUMNS
+Sales Mart	table	w	NULL	column_missing	declared column "b" reads a source column of that name, which "phys.main.w" no longer has: Binder Error: Referenced column "b" not found in FROM clause!	REPAIR VIRTUAL TABLE "Sales Mart".w REMAP (<column> AS b)  -- or DROP MISSING COLUMNS
 
 statement ok
 ACL ADMIN DROP VIRTUAL CATALOG "Sales Mart" CASCADE;
@@ -1357,7 +1357,7 @@ t
 
 # a mask is SQL: a string continued on the next line is duckdb's to join, kept as written
 statement ok
-ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) RLS (a > 1) COLUMNS (a = 1 + length('X'
+ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) RLS (a > 1) COLUMNS (a) MASK (a AS 1 + length('X'
 'Y'));
 
 query I
@@ -2332,10 +2332,10 @@ statement ok
 CREATE TABLE phys_4a_u(a INT, "größe" INT, b INT);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE продажи.u AS memory.main.phys_4a_u COLUMNS (a = a, x = größe) PRIMARY KEY (x);
+ACL ADMIN CREATE VIRTUAL TABLE продажи.u AS memory.main.phys_4a_u COLUMNS (a AS a, größe AS x) PRIMARY KEY (x);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE продажи.p AS memory.main.phys_4a_u COLUMNS (a = a, y = (b));
+ACL ADMIN CREATE VIRTUAL TABLE продажи.p AS memory.main.phys_4a_u COLUMNS (a AS a, (b) AS y);
 
 query TT
 SELECT vname, form FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname IN ('u', 'p') ORDER BY 1;
@@ -2505,7 +2505,7 @@ ACL ADMIN ADD SCALAR продажи.l ALIAS OF left;
 # a backtick-quoted physical name is a computed reading, as a double-quoted one (a write would map the column to the
 # name as written)
 statement ok
-SELECT acl_add_relation('продажи', 'bt', 'memory.main.phys_4a_u', 'a = a, x = `b`', '');
+SELECT acl_add_relation('продажи', 'bt', 'memory.main.phys_4a_u', 'a AS a, `b` AS x', '');
 
 query T
 SELECT form FROM aclcat.acl.relations WHERE vcat = 'продажи' AND vname = 'bt';
@@ -3132,8 +3132,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG c4e; CREATE VIRTUAL TABLE c4e.t AS memory.main.
 # a list, a struct, a MAP and a lambda in a mask: one item each, stored as written (a comment a space), read as duckdb
 # reads them
 statement ok
-ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS (id, tags = ['m', /* c */ 'n'], s = {'x': 9, 'y': 8},
-    m = MAP {'z': 0}, items = list_transform(items, lambda e: {'price': 0, 'q': e.q}));
+ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS (id, tags, s, m, items) MASK (tags AS ['m', /* c */ 'n'], s AS {'x': 9, 'y': 8}, m AS MAP {'z': 0}, items AS list_transform(items, lambda e: {'price': 0, 'q': e.q}));
 
 query I
 SELECT columns FROM aclcat.acl.role_object_caps WHERE role = 'r4e';
@@ -3185,7 +3184,7 @@ ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS (id, tags = );
 a grant's column list is items
 
 statement error
-ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS (id, tags = [1, 2] note);
+ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS (id, tags) MASK (tags AS [1, 2] note);
 ----
 a grant's column list is items
 
@@ -3232,7 +3231,7 @@ ACL ROLE "r4e" SELECT * FROM odd;
 # from the re-review: the operator's screens match a quoted name by its column - the check finds nothing wrong with a
 # mask on `a,b` (it said mask_broken and its repair took the mask away), effective_rights shows the mask
 statement ok
-ACL ADMIN GRANT TABLE c4e.odd TO ROLE r4e WITH (select) COLUMNS (id, "a,b" = 0, "od'd");
+ACL ADMIN GRANT TABLE c4e.odd TO ROLE r4e WITH (select) COLUMNS (id, "a,b", "od'd") MASK ("a,b" AS 0);
 
 query I
 SELECT count(*) FROM acl_check_catalog('c4e') WHERE object = 'odd';
@@ -3246,12 +3245,12 @@ SELECT masks FROM acl_effective_rights('r4e', 'c4e', 'odd');
 
 # a column named twice is refused where written (a catalog list's read let the bare item win over the mask)
 statement error
-ACL ADMIN GRANT CATALOG c4e TO ROLE r4e MAIN COLUMNS (id, "a,b", "a,b" = 0);
+ACL ADMIN GRANT CATALOG c4e TO ROLE r4e MAIN COLUMNS (id, "a,b", 0 AS "a,b");
 ----
 names "a,b" twice
 
 statement error
-SELECT acl_grant_catalog('r4e', 'c4e', '', true, '', 'id, note, "NOTE" = ''m''');
+SELECT acl_grant_catalog('r4e', 'c4e', '', true, '', 'id, note, ''m'' AS "NOTE"');
 ----
 names "NOTE" twice
 
@@ -3275,8 +3274,8 @@ statement ok
 CREATE TABLE rep4e (id INT, k INT, ssn INT);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c4e.rep AS memory.main.rep4e COLUMNS (id, "a--b" = k, ssn);
-    GRANT TABLE c4e.rep TO ROLE r4e WITH (select) COLUMNS ("a--b" = 0, id);
+ACL ADMIN CREATE VIRTUAL TABLE c4e.rep AS memory.main.rep4e COLUMNS (id, k AS "a--b", ssn);
+    GRANT TABLE c4e.rep TO ROLE r4e WITH (select) COLUMNS ("a--b", id) MASK ("a--b" AS 0);
 
 statement ok
 ALTER TABLE rep4e DROP COLUMN k;
@@ -3322,7 +3321,7 @@ SELECT count(*) FROM aclcat.acl.roles WHERE role = 'r4e_b';
 
 # empty items are none, as before; the catalog grant's list is the same rule
 statement ok
-ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS (, id,, note = upper(note),);
+ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS (id, note) MASK (note AS upper(note));
 
 query I
 SELECT columns FROM aclcat.acl.role_object_caps WHERE role = 'r4e';
@@ -3330,7 +3329,7 @@ SELECT columns FROM aclcat.acl.role_object_caps WHERE role = 'r4e';
 id, note = upper(note)
 
 statement ok
-ACL ADMIN GRANT CATALOG c4e TO ROLE r4e MAIN COLUMNS (id, tags = ['q'], note = concat(note, ',', note));
+ACL ADMIN GRANT CATALOG c4e TO ROLE r4e MAIN COLUMNS (id, ['q'] AS tags, concat(note, ',', note) AS note);
 
 query I
 SELECT columns FROM aclcat.acl.role_catalogs WHERE role = 'r4e';
@@ -3348,7 +3347,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c4e TO ROLE r4e MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS 'id, tags = [''a'', ''b'']';
+ACL ADMIN GRANT TABLE c4e.t TO ROLE r4e WITH (select) COLUMNS 'id, [''a'', ''b''] AS tags';
 
 query II
 ACL ROLE "r4e" SELECT * FROM t;
@@ -3356,7 +3355,7 @@ ACL ROLE "r4e" SELECT * FROM t;
 1	[a, b]
 
 statement ok
-SELECT acl_grant_object('r4e', 'c4e', 't', '{"select": true}', '', 'id, s = {''x'': 1, ''y'': 2}');
+SELECT acl_grant_object('r4e', 'c4e', 't', '{"select": true}', '', 'id, s', NULL, 's AS {''x'': 1, ''y'': 2}');
 
 query II
 ACL ROLE "r4e" SELECT * FROM t;
@@ -3366,12 +3365,12 @@ ACL ROLE "r4e" SELECT * FROM t;
 # a function form's text that ends with a line comment, or inside a comment, is refused (spec 148): the read leaves it
 # out, the stored text would keep it
 statement error
-SELECT acl_grant_object('r4e', 'c4e', 't', '{"select": true}', '', 'id, note = upper(note) -- hidden');
+SELECT acl_grant_object('r4e', 'c4e', 't', '{"select": true}', '', 'id, note', NULL, 'note AS upper(note) -- hidden');
 ----
 spec 148
 
 statement error
-SELECT acl_grant_object('r4e', 'c4e', 't', '{"select": true}', '', 'id, note = ''x');
+SELECT acl_grant_object('r4e', 'c4e', 't', '{"select": true}', '', 'id, ''x AS note');
 ----
 ends inside a literal
 
@@ -3495,9 +3494,9 @@ ACL ADMIN CREATE VIRTUAL CATALOG c4f; CREATE ROLE r4f; GRANT CATALOG c4f TO ROLE
 # name the name it quotes (`,` and all), a path written with spaces, a literal duckdb's tokens read as one (`$$x,y$$`,
 # `['a', 'b']`), a comment a space
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c4f.v AS phys.main.t4f COLUMNS (id NOT NULL, "odd name" NULL, upper(ssn) AS u,
-    k = id + 1 NOT NULL, has = ssn IS NOT NULL, id + 0 NOT NULL AS z, "a,b", s . x, d = $$x,y$$ /* a note */,
-    tags = ['a', 'b']);
+ACL ADMIN CREATE VIRTUAL TABLE c4f.v AS phys.main.t4f COLUMNS (id, "odd name", upper(ssn) AS u,
+    id + 1 AS k, ssn IS NOT NULL AS has, id + 0 NOT NULL AS z, "a,b", s . x, $$x AS d,y$$ /* a note */,
+    ['a', 'b'] AS tags);
 
 query III
 SELECT name, expr, nullable FROM aclcat.acl.relation_columns WHERE vcat = 'c4f' AND vname = 'v' ORDER BY pos;
@@ -3543,7 +3542,7 @@ holds no '.' or '['
 # an item with a top-level AS is the AS form, as SQL reads it - in the rule and in the reader alike: `id = 1 AS f` is
 # f = (id = 1), a CASE's own `=` stays in it
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c4f.cmp AS phys.main.t4f COLUMNS (id = 1 AS f, CASE WHEN id = 1 THEN ssn END AS u,
+ACL ADMIN CREATE VIRTUAL TABLE c4f.cmp AS phys.main.t4f COLUMNS (1 AS f AS id, CASE WHEN id = 1 THEN ssn END AS u,
     id AS order, ssn AS left);
 
 query II
@@ -3562,7 +3561,7 @@ ACL ADMIN CREATE VIRTUAL TABLE c4f.bad AS phys.main.t4f COLUMNS (id, left);
 an object's column list is items
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c4f.kw AS phys.main.t4f COLUMNS (id, "left" = ssn);
+ACL ADMIN CREATE VIRTUAL TABLE c4f.kw AS phys.main.t4f COLUMNS (id, ssn AS "left");
 
 statement ok
 SELECT acl_add_relation('c4f', 'cmp2', 'phys.main.t4f', 'CASE WHEN id = 1 THEN ssn END AS u', '');
@@ -3574,7 +3573,7 @@ CASE WHEN id = 1 THEN ssn END
 
 # a bare NULL after a value is no mark (the expression's own `x NOT NULL` is)
 statement error
-ACL ADMIN CREATE VIRTUAL TABLE c4f.bad AS phys.main.t4f COLUMNS (u = ssn NULL);
+ACL ADMIN CREATE VIRTUAL TABLE c4f.bad AS phys.main.t4f COLUMNS (ssn NULL AS u);
 ----
 an object's column list is items
 
@@ -3599,7 +3598,7 @@ my col.x
 
 # the legacy quoted form is read by the same reader: a quoted name unquoted, a mark kept
 statement ok
-ACL ADMIN ALTER VIRTUAL TABLE c4f.v SET COLUMNS 'id, "odd name" NOT NULL, ssn AS s2';
+ACL ADMIN ALTER VIRTUAL TABLE c4f.v SET COLUMNS 'id, "odd name", ssn AS s2';
 
 query III
 SELECT name, expr, nullable FROM aclcat.acl.relation_columns WHERE vcat = 'c4f' AND vname = 'v' ORDER BY pos;
@@ -3611,7 +3610,7 @@ s2	ssn	NULL
 # the function form reads its list the same way: a quoted name is the name it quotes (it was stored with its quotes,
 # and the object read nothing)
 statement ok
-SELECT acl_add_relation('c4f', 'f', 'phys.main.t4f', '"odd name", id, "ssn" = upper(ssn)', '');
+SELECT acl_add_relation('c4f', 'f', 'phys.main.t4f', '"odd name", id, upper(ssn) AS "ssn"', '');
 
 query III
 ACL ROLE "r4f" SELECT * FROM f;
@@ -3636,7 +3635,7 @@ names no column
 
 # REMAP reads the list as the declaration does (`expr AS name` too); a NULL mark is the declaration's, not REMAP's
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c4f.r AS phys.main.t4f COLUMNS (id, u = upper(ssn));
+ACL ADMIN CREATE VIRTUAL TABLE c4f.r AS phys.main.t4f COLUMNS (id, upper(ssn) AS u);
 
 statement ok
 ACL ADMIN REPAIR VIRTUAL TABLE c4f.r REMAP (lower(ssn) AS u);
@@ -3648,7 +3647,7 @@ id	(empty)
 u	lower(ssn)
 
 statement error
-ACL ADMIN REPAIR VIRTUAL TABLE c4f.r REMAP (u = ssn NOT NULL);
+ACL ADMIN REPAIR VIRTUAL TABLE c4f.r REMAP (ssn AS u);
 ----
 carries a NULL mark
 
@@ -3681,11 +3680,11 @@ ALTER TABLE phys.main.t4f_gone DROP COLUMN "order";
 query I
 SELECT repair FROM acl_check_catalog('c4f') WHERE object = 'gone' AND problem = 'column_missing' ORDER BY 1;
 ----
-REPAIR VIRTUAL TABLE c4f.gone REMAP ("odd name" = <column>)  -- or DROP MISSING COLUMNS
-REPAIR VIRTUAL TABLE c4f.gone REMAP ("order" = <column>)  -- or DROP MISSING COLUMNS
+REPAIR VIRTUAL TABLE c4f.gone REMAP (<column> AS "odd name")  -- or DROP MISSING COLUMNS
+REPAIR VIRTUAL TABLE c4f.gone REMAP (<column> AS "order")  -- or DROP MISSING COLUMNS
 
 statement ok
-ACL ADMIN REPAIR VIRTUAL TABLE c4f.gone REMAP ("odd name" = id, "order" = id + 1);
+ACL ADMIN REPAIR VIRTUAL TABLE c4f.gone REMAP (id AS "odd name", id + 1 AS "order");
 
 statement ok
 ACL ADMIN DROP ROLE r4f; DROP VIRTUAL CATALOG c4f;

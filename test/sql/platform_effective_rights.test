@@ -76,7 +76,7 @@ statement ok
 ACL ADMIN GRANT SCHEMA c.sales TO ROLE r WITH (select);
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE r CAPS '{"select": true, "insert": true}' COLUMNS (id, amount = 0);
+ACL ADMIN GRANT TABLE c.orders TO ROLE r CAPS '{"select": true, "insert": true}' COLUMNS (id, amount) MASK (amount AS 0);
 
 statement ok
 ACL ADMIN GRANT VIEW c.small TO ROLE r CAPS '{}';
@@ -368,7 +368,7 @@ statement ok
 UPDATE store.acl.relations SET phys = 'phys.orders' WHERE vname = 'o4';
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE w COLUMNS (id, amount = (SELECT max(x) FROM phys.main.secret));
+ACL ADMIN GRANT TABLE c.orders TO ROLE w COLUMNS (id, amount) MASK (amount AS (SELECT max(x) FROM phys.main.secret));
 
 query TTTT
 ACL ROLE "pol" SELECT DISTINCT catalog, object, kind, coalesce(role, '') FROM platform.exposures('phys', 'main', 'secret') WHERE kind <> 'grant' OR role = 'w' ORDER BY object, 4;

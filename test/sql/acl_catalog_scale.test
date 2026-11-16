@@ -946,7 +946,7 @@ ACL ADMIN CREATE ROLE lister;
 
 # a plain column, a constant mask, a cast mask and a mask that reads a column
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE lister WITH (select) MAIN COLUMNS (c0, c1 = 0, c2 = NULL::BIGINT, tenant = tenant * 2);
+ACL ADMIN GRANT CATALOG c TO ROLE lister WITH (select) MAIN COLUMNS (c0, 0 AS c1, NULL::BIGINT AS c2, tenant * 2 AS tenant);
 
 statement ok
 ACL ADMIN GRANT TABLE c.f001 TO ROLE lister WITH ();
@@ -1058,11 +1058,11 @@ statement ok
 ACL ADMIN CREATE ROLE masker;
 
 statement ok
-ACL ADMIN GRANT CATALOG m TO ROLE masker WITH (select) MAIN COLUMNS (C0 = c0::INT8, c1 = c1::TEXT, c2, d = d::DECIMAL);
+ACL ADMIN GRANT CATALOG m TO ROLE masker WITH (select) MAIN COLUMNS (c0::INT8 AS C0, c1::TEXT AS c1, c2, d::DECIMAL AS d);
 
 # (spec 148 refuses such a mask where it is written; the listing's own guard is pinned by fy below)
 statement error
-SELECT acl_grant_object('masker', 'm', 'fx', '{"select": true}', '', 'c0 = j AS m FROM range(3) j --, c2');
+SELECT acl_grant_object('masker', 'm', 'fx', '{"select": true}', '', 'c0, c2', NULL, 'c0 AS j AS m FROM range(3) j --');
 ----
 spec 148
 
@@ -1099,10 +1099,10 @@ statement ok
 ACL ADMIN ADD TABLE FUNCTION m.fz MACRO 'SELECT * FROM phys.main.w';
 
 statement ok
-SELECT acl_grant_object('masker', 'm', 'fy', '{"select": true}', '', 'c0 = count(*), c2');
+SELECT acl_grant_object('masker', 'm', 'fy', '{"select": true}', '', 'c0, c2', NULL, 'c0 AS count(*)');
 
 statement error
-SELECT acl_grant_object('masker', 'm', 'fz', '{"select": true}', '', 'c0 = c1 AS m, c2');
+SELECT acl_grant_object('masker', 'm', 'fz', '{"select": true}', '', 'c0, c2', NULL, 'c0 AS c1 AS m');
 ----
 spec 148
 

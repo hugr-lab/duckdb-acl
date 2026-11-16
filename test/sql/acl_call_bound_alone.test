@@ -58,7 +58,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.tfm(p VARCHAR) AS 'SELECT *, acl_arg(1) AS key FROM phys.main.logs';
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT OBJECT c.tfa TO ROLE r RLS (region = 'eu'); GRANT OBJECT c.mac TO ROLE r RLS (region = 'eu'); GRANT OBJECT c.tfm TO ROLE r COLUMNS (id, msg = upper(msg), key);
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN; GRANT OBJECT c.tfa TO ROLE r RLS (region = 'eu'); GRANT OBJECT c.mac TO ROLE r RLS (region = 'eu'); GRANT OBJECT c.tfm TO ROLE r COLUMNS (id, msg, key) MASK (msg AS upper(msg));
 
 # a probe whose untyped NULL leaves an overload or an UNNEST without a type is no refusal: only a lost name is
 query I

@@ -26,7 +26,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders
-    COLUMNS (id NOT NULL, tenant, amount) PRIMARY KEY (id);
+    COLUMNS (id, tenant, amount) PRIMARY KEY (id);
 
 statement ok
 ACL ADMIN CREATE VIRTUAL VIEW c.stats (day VARCHAR NOT NULL, total INTEGER) PRIMARY KEY (day)
@@ -271,13 +271,13 @@ a scalar has no PRIMARY KEY
 #    whatever the physical rows hold; an explicit NOT NULL is the admin's own promise and passes
 statement error
 ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders
-    COLUMNS (id = CASE WHEN id > 0 THEN id END, tenant) PRIMARY KEY (id);
+    COLUMNS (CASE WHEN id > 0 THEN id END AS id, tenant) PRIMARY KEY (id);
 ----
 NOT NULL explicitly
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders
-    COLUMNS (id = CASE WHEN id > 0 THEN id END NOT NULL, tenant) PRIMARY KEY (id);
+    COLUMNS (CASE WHEN id > 0 THEN id END AS id, tenant) PRIMARY KEY (id);
 
 query I
 ACL ROLE "r" SELECT is_nullable FROM information_schema.columns

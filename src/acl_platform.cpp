@@ -130,6 +130,21 @@ LogicalType GroupsType() {
 	return LogicalType::MAP(LogicalType::VARCHAR, LogicalType::STRUCT(std::move(children)));
 }
 
+//! spec 158: an object grant's COLUMNS as an editor reads it - `all`, `only` (the names) or `except` (all but them)
+constexpr const char *GRANT_COLUMNS = "GRANT_COLUMNS";
+LogicalType GrantColumnsType() {
+	child_list_t<LogicalType> children {{"mode", LogicalType::VARCHAR},
+	                                    {"names", LogicalType::LIST(LogicalType::VARCHAR)}};
+	return LogicalType::STRUCT(std::move(children));
+}
+
+//! spec 158: an object grant's MASK as LIST(STRUCT(column, mask))
+constexpr const char *GRANT_MASKS = "GRANT_MASKS";
+LogicalType GrantMasksType() {
+	child_list_t<LogicalType> children {{"column", LogicalType::VARCHAR}, {"mask", LogicalType::VARCHAR}};
+	return LogicalType::LIST(LogicalType::STRUCT(std::move(children)));
+}
+
 LogicalType TypeOf(const string &code) {
 	if (code == V) {
 		return LogicalType::VARCHAR;
@@ -170,6 +185,12 @@ LogicalType TypeOf(const string &code) {
 	}
 	if (code == GROUPS) {
 		return GroupsType();
+	}
+	if (code == GRANT_COLUMNS) {
+		return GrantColumnsType();
+	}
+	if (code == GRANT_MASKS) {
+		return GrantMasksType();
 	}
 	throw InternalException("acl platform: unknown column type %s", code);
 }
@@ -286,9 +307,11 @@ vector<PlatformView> BuildViews() {
 	      {"caps", CAPS},
 	      {"rls", V},
 	      {"rls_checked", B},
-	      {"columns", LV},
-	      {"versions", V}},
-	     "the object grants; caps / versions NULL = the catalog grant's"},
+	      {"columns", GRANT_COLUMNS},
+	      {"versions", V},
+	      {"masks", GRANT_MASKS}},
+	     "the object grants; caps / versions NULL = the catalog grant's; columns: mode all | only | except and the "
+	     "names (spec 158)"},
 	    {"grant_columns",
 	     PV::CATALOG,
 	     {{"role", V}, {"catalog", V}, {"object", V}, {"pos", I}, {"name", V}, {"type", V}},
@@ -708,8 +731,8 @@ vector<PlatformFunction> BuildFunctions() {
 	     "revoke a catalog grant"},
 	    {"grant_object",
 	     "acl_grant_object",
-	     {role, catalog, name, P("caps"), P("rls"), P("columns"), P("versions")},
-	     {4, 6, 7},
+	     {role, catalog, name, P("caps"), P("rls"), P("columns"), P("versions"), P("masks")},
+	     {4, 6, 7, 8},
 	     1,
 	     PR::HANDS_OUT,
 	     false,
@@ -1088,8 +1111,8 @@ vector<PlatformFunction> BuildFunctions() {
 	     "what a role gets of a catalog's objects: caps, the deciding grant, MAIN, RLS, columns (spec 120)"},
 	    {"check_grant",
 	     "acl_check_grant",
-	     {role, catalog, P("object"), P("rls"), P("columns"), P("caps")},
-	     {5, 6},
+	     {role, catalog, P("object"), P("rls"), P("columns"), P("caps"), P("masks")},
+	     {5, 6, 7},
 	     1,
 	     PR::HANDS_OUT,
 	     true,
@@ -1507,7 +1530,8 @@ void WalkBodyExpr(ParsedExpression &expr, const std::set<const ParsedExpression 
 	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expr.Cast<FunctionExpression>();
 		auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
-		bool marker = function.GetQualifiedName().Path().size() <= 1 && (name == "acl_claim" || name == "acl_arg");
+		bool marker = function.GetQualifiedName().Path().size() <= 1 &&
+		              (name == "acl_claim" || name == "acl_arg" || name == "acl_has_role");
 		if (!marker) {
 			callback(function.GetQualifiedName(),
 			         table_functions.count(&expr) ? FunctionKind::TABLE : FunctionKind::SCALAR);
@@ -1591,12 +1615,10 @@ void WalkBodyCalls(const string &text, BodyShape shape,
 			WalkBodyExpr(*expr, none, callback);
 		}
 		return;
-	case BodyShape::COLUMNS:
-		for (auto &item : acl_detail::ParseColumnList(trimmed)) {
-			if (!item.second.empty()) {
-				for (auto &expr : Parser(options).ParseExpressionList(item.second)) {
-					WalkBodyExpr(*expr, none, callback);
-				}
+	case BodyShape::COLUMNS: // spec 158: a grant's MASK items
+		for (auto &mask : ReadMasks(trimmed)) {
+			for (auto &expr : Parser(options).ParseExpressionList(mask.second)) {
+				WalkBodyExpr(*expr, none, callback);
 			}
 		}
 		return;
@@ -1687,17 +1709,18 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 		if (field == "rls") {
 			return {{3, BodyShape::EXPRESSION, S}};
 		}
-		if (field == "columns") {
-			return {{3, BodyShape::COLUMNS, S}};
-		}
-		return {};
+		return {}; // spec 158: COLUMNS are names, never an expression
 	}
-	if (target == "acl_grant_catalog" || target == "acl_grant_object") {
-		return {{4, BodyShape::EXPRESSION, S}, {5, BodyShape::COLUMNS, S}};
+	if (target == "acl_grant_catalog") {
+		return {{4, BodyShape::EXPRESSION, S}};
+	}
+	if (target == "acl_grant_object") {
+		// spec 158: the MASK items' expressions are bodies; COLUMNS are names
+		return {{4, BodyShape::EXPRESSION, S}, {7, BodyShape::COLUMNS, S}};
 	}
 	if (target == "acl_check_grant") {
 		// spec 122: a check is judged like the write it stands for
-		return {{3, BodyShape::EXPRESSION, S}, {4, BodyShape::COLUMNS, S}};
+		return {{3, BodyShape::EXPRESSION, S}, {6, BodyShape::COLUMNS, S}};
 	}
 	if (target == "acl_repair_relation") {
 		return {{3, BodyShape::DECLARED_COLUMNS, S}};
@@ -1821,10 +1844,8 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 					}
 				}
 			} else if (body.shape == BodyShape::COLUMNS) {
-				for (auto &item : acl_detail::ParseColumnList(text)) {
-					if (!item.second.empty()) {
-						pieces.emplace_back(item.second, true); // a column or a path reads no table
-					}
+				for (auto &mask : ReadMasks(text)) {
+					pieces.emplace_back(mask.second, true); // spec 158: a grant's MASK items
 				}
 			} else {
 				pieces.emplace_back(text, body.shape == BodyShape::EXPRESSION);
@@ -1866,10 +1887,8 @@ vector<string> BodyItemExpressions(const string &text, BodyShape shape) {
 	vector<string> out;
 	try {
 		if (shape == BodyShape::COLUMNS) {
-			for (auto &item : acl_detail::ParseColumnList(text)) {
-				if (!item.second.empty()) {
-					out.push_back(item.second);
-				}
+			for (auto &mask : ReadMasks(text)) {
+				out.push_back(mask.second); // spec 158: a grant's MASK items
 			}
 		} else if (shape == BodyShape::DECLARED_COLUMNS) {
 			for (auto &column : SplitDeclaredColumns(text, "the object's column list")) {
@@ -2545,7 +2564,8 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 	}
 	if (view == "object_grants") {
 		return "SELECT \"role\", \"vcat\" AS \"catalog\", \"vname\" AS \"object\", acl_platform_caps(\"caps\") AS "
-		       "\"caps\", \"rls\", \"rls_checked\", acl_platform_list(\"columns\") AS \"columns\", \"versions\" FROM " +
+		       "\"caps\", \"rls\", \"rls_checked\", acl_platform_grant_columns(\"columns\") AS \"columns\", "
+		       "\"versions\", acl_platform_grant_masks(\"masks\") AS \"masks\" FROM " +
 		       table("role_object_caps") + where("\"vcat\"");
 	}
 	if (view == "grant_columns") {
@@ -3221,6 +3241,45 @@ void AttributesFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
+//! acl_platform_grant_columns(text) - spec 158: an object grant's stored COLUMNS as GRANT_COLUMNS; NULL when it does not
+//! read
+void GrantColumnsFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto value = args.GetValue(0, row);
+		try {
+			auto test = ReadColumnTest(value.IsNull() ? string() : value.ToString());
+			vector<Value> names;
+			for (auto &name : test.names) {
+				names.emplace_back(name);
+			}
+			auto mode = test.All() ? "all" : test.kind == acl_detail::ColumnTest::Kind::EXCEPT ? "except" : "only";
+			child_list_t<Value> children {{"mode", Value(mode)},
+			                              {"names", Value::LIST(LogicalType::VARCHAR, std::move(names))}};
+			result.SetValue(row, Value::STRUCT(std::move(children)));
+		} catch (std::exception &) {
+			result.SetValue(row, Value(GrantColumnsType()));
+		}
+	}
+}
+
+//! acl_platform_grant_masks(text) - spec 158: an object grant's stored MASK as GRANT_MASKS; NULL when it does not read
+void GrantMasksFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	auto item_type = ListType::GetChildType(GrantMasksType());
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto value = args.GetValue(0, row);
+		try {
+			vector<Value> items;
+			for (auto &mask : ReadMasks(value.IsNull() ? string() : value.ToString())) {
+				child_list_t<Value> children {{"column", Value(mask.first)}, {"mask", Value(mask.second)}};
+				items.push_back(Value::STRUCT(std::move(children)));
+			}
+			result.SetValue(row, Value::LIST(item_type, std::move(items)));
+		} catch (std::exception &) {
+			result.SetValue(row, Value(GrantMasksType()));
+		}
+	}
+}
+
 } // namespace
 
 void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
@@ -3240,6 +3299,8 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 	scalar("acl_platform_map", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR), MapFunc);
 	scalar("acl_platform_conditions", ConditionsType(), ConditionsFunc);
 	scalar("acl_platform_attributes", AttributesType(), AttributesFunc);
+	scalar("acl_platform_grant_columns", GrantColumnsType(), GrantColumnsFunc);
+	scalar("acl_platform_grant_masks", GrantMasksType(), GrantMasksFunc);
 	RegisterAclPlatformSources(loader, store);
 	RegisterAclPrincipalFunctionRows(loader, store);
 	RegisterAclPlatformRights(loader, store);

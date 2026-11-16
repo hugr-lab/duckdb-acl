@@ -461,7 +461,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// (a quoted head unquoted, else the part before the first '.' or '['), folded. Read here, from the grants of the
 	// principal's roles, and written as a constant CASE over the stored text: no subquery for the planner to
 	// decorrelate under the listing's own
-	std::map<string, vector<string>> stated_lists;
+	std::map<string, acl_detail::ColumnTest> stated_lists;
 	// spec 144: the columns some list narrows by a path (spec 102) or masks - their type is the read's projection,
 	// which nothing probed for a catalog grant (spec 026 probes an object grant's), folded
 	std::set<string> path_heads;
@@ -474,26 +474,22 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	bool alias_caps_vary = false;
 	string alias_readers;
 	if (!function_mode) {
-		auto lists_sql = "SELECT DISTINCT \"columns\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
-		                 LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''";
+		// spec 158: an object grant's COLUMNS is a test on names - read here, once per stored text
 		if (HasObjectCaps()) {
-			lists_sql += " UNION SELECT DISTINCT \"columns\" FROM " + Tbl("role_object_caps") + " WHERE \"role\" IN (" +
-			             LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''";
-		}
-		auto lists = Query(lists_sql);
-		ResultRows list_rows(*lists);
-		for (idx_t i = 0; i < list_rows.Count(); i++) {
-			auto text = list_rows.GetValue(0, i).ToString();
-			vector<string> names;
-			for (auto &item : ParseColumnList(text)) {
-				bool path = false;
-				auto head = acl_detail::ItemHead(item.first, path);
-				names.push_back(StringUtil::Lower(head));
-				if (path || !item.second.empty()) {
-					path_heads.insert(StringUtil::Lower(head));
+			auto lists = Query("SELECT DISTINCT \"columns\" FROM " + Tbl("role_object_caps") + " WHERE \"role\" IN (" +
+			                   LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''");
+			ResultRows list_rows(*lists);
+			for (idx_t i = 0; i < list_rows.Count(); i++) {
+				auto text = list_rows.GetValue(0, i).ToString();
+				try {
+					stated_lists[text] = ReadColumnTest(text);
+				} catch (std::exception &) {
+					// a stored list that does not read refuses the read: it keeps nothing here either (fail closed)
+					acl_detail::ColumnTest none;
+					none.kind = acl_detail::ColumnTest::Kind::ONLY;
+					stated_lists[text] = none;
 				}
 			}
-			stated_lists[text] = std::move(names);
 		}
 		auto has = [&](const string &sql) {
 			return Query(sql)->RowCount() > 0;
@@ -564,23 +560,28 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 			}
 		}
 	}
-	auto stated = [&](const string &column_expr) {
+	// spec 158: whether an object grant's stored COLUMNS (`column_expr`) admits the column `name_expr` - a constant CASE
+	// over the texts read above; a text read after this was composed admits nothing (fail closed)
+	auto keeps = [&](const string &column_expr, const string &name_expr) {
 		string cases;
 		for (auto &list : stated_lists) {
 			vector<string> names;
-			for (auto &name : list.second) {
-				names.push_back(Lit(name));
+			for (auto &name : list.second.names) {
+				names.push_back(Lit(acl_detail::FoldColumn(name)));
 			}
-			// a list of nothing but separators names no item: it narrows nothing, as the read reads it
-			cases += " WHEN " + Lit(list.first) + " THEN " +
-			         (names.empty() ? string("NULL") : "[" + StringUtil::Join(names, ", ") + "]") + "::VARCHAR[]";
+			auto in = "list_contains([" + StringUtil::Join(names, ", ") + "]::VARCHAR[], " + KeyFoldSql(name_expr) + ")";
+			string admits = list.second.All()                                           ? string("true")
+			                : list.second.kind == acl_detail::ColumnTest::Kind::EXCEPT ? "NOT " + in
+			                                                                            : in;
+			cases += " WHEN " + Lit(list.first) + " THEN " + admits;
 		}
-		// a list read after this text was composed matches nothing: nothing it names is kept (fail closed)
-		return cases.empty() ? string("[]::VARCHAR[]") : "CASE " + column_expr + cases + " ELSE []::VARCHAR[] END";
+		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = ''" +
+		       (cases.empty() ? string() : " OR CASE " + column_expr + cases + " ELSE false END") + ")";
 	};
-	auto keeps = [&](const string &column_expr, const string &name_expr) {
-		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR coalesce(list_contains(" +
-		       stated(column_expr) + ", " + KeyFoldSql(name_expr) + "), true))";
+	// spec 158: a catalog grant states no columns - one stored (an older build's) refuses every read under it, and
+	// keeps no column here
+	auto keeps_catalog = [](const string &column_expr) {
+		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '')";
 	};
 	// Visible for at least one role: a principal may read what any of its roles may (spec 011). A
 	// row with no grant row at all is not an object of the catalog - it is a column of a live
@@ -590,7 +591,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		return "(NOT EXISTS (SELECT 1 FROM glists gc WHERE " + key + ")" +
 		       " OR EXISTS (SELECT 1 FROM glists gc"
 		       " WHERE " +
-		       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) + "))";
+		       key + " AND " + keeps_catalog("gc.cat_columns") + " AND " + keeps("gc.obj_columns", name_expr) + "))";
 	};
 	// spec 144: a column some list narrows by a path is listed as the read projects it - the roles' lists folded over
 	// its type (spec 102's acl_listed_type, which the grant projection's rows already pass through); any other keeps
@@ -925,7 +926,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	string alias_visible =
 	    !catalog_lists && !alias_object_lists
 	        ? string()
-	        : " AND EXISTS (SELECT 1 FROM " + alias_grants + " AND " + keeps("ag.cat", "i.\"column_name\"") +
+	        : " AND EXISTS (SELECT 1 FROM " + alias_grants + " AND " + keeps_catalog("ag.cat") +
 	              (alias_object_lists ? " AND " + keeps("ag.obj", "i.\"column_name\"") : string()) + ")";
 	// review 144: an object a relation of the catalog names is that relation's, read through it (LookupRelation wins
 	// over an alias) - the alias leg leaves it alone
@@ -1175,7 +1176,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		string fkey = "gf.vcat = k.\"vcat\" AND gf.vname = k.\"vname\"";
 		string fcolumn_visible = "(NOT EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey +
 		                         ") OR EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey + " AND " +
-		                         keeps("gf.cat_columns", "k2.\"column\"") + " AND " +
+		                         keeps_catalog("gf.cat_columns") + " AND " +
 		                         keeps("gf.obj_columns", "k2.\"column\"") + "))";
 		return prelude + ", vcolumns AS (" + effective_columns + "), " + gfcolumns + " " +
 		       named("SELECT k.\"vcat\" AS vcat, k.\"vname\" AS object, k.\"kind\" AS kind,"
