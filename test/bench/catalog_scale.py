@@ -3,7 +3,8 @@
 
 The deployment it models (owner, 2026-10-23): ONE virtual catalog of 10,000 tables, 10,000 views and 10,000 table
 functions spread over schemas, a policy of 1,000 roles (each a catalog grant with a row filter and a column list,
-plus object grants), and principals holding 1, 10 or 100 of those roles.
+plus object grants - since spec 158 the column lists are the object grants' alone), and principals holding 1, 10 or
+100 of those roles.
 
     python3 test/bench/catalog_scale.py [--tables 10000] [--views 10000] [--functions 10000] [--schemas 100]
                                         [--columns 10] [--roles 1000] [--object-grants 10] [--principal-roles 1,10,100]
@@ -103,8 +104,9 @@ class Bench:
                                  "ACL ADMIN CREATE VIRTUAL CATALOG c;\n")
         if errors:
             sys.exit("policy: " + "; ".join(errors[:3]))
+        # spec 158: a catalog grant states no columns - the roles' column lists are their object grants' (below)
         grant = lambda j: (f"ACL ADMIN GRANT CATALOG c TO ROLE r{j:04d} WITH (select, insert, update, delete) MAIN "
-                           f"RLS (tenant = {j % 10}) COLUMNS (c0, c1, c2, tenant);")
+                           f"RLS (tenant = {j % 10});")
         # the catalog grants first: one with a row filter probes it against every relation of the catalog (spec 027),
         # which is measured at full size below on a sample rather than paid a thousand times
         kinds = [
