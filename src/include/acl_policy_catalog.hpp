@@ -322,6 +322,29 @@ bool OneExpression(const string &text, string &problem);
 bool StoredExpressionsOk(const vector<string> &texts);
 //! spec 148: refuse, where it is written, a policy expression that is not one expression
 void RequireOneExpression(const char *what, const string &text);
+
+//! spec 158 stage 2: an object's own column list as stored (`relation_columns`, in its order) - (name, expression),
+//! '' the source's column of that name; the one star item has no name and the star as duckdb prints it
+using DeclaredList = vector<std::pair<string, string>>;
+inline bool IsStarItem(const std::pair<string, string> &item) {
+	return item.first.empty() && !item.second.empty();
+}
+inline bool HoldsStar(const DeclaredList &list) {
+	for (auto &item : list) {
+		if (IsStarItem(item)) {
+			return true;
+		}
+	}
+	return false;
+}
+//! The rows of `SELECT "name", "expr" FROM relation_columns … ORDER BY "pos"` (further columns ignored) as a list
+DeclaredList DeclaredListFrom(QueryResult &rows);
+//! The SELECT that reads an object's own list over `from` (` FROM <source> [WHERE …]`): each item as written; a star
+//! beside named items is read after them, then put back in its place as `COLUMNS(lambda …)` without their names - so
+//! a source column that comes to share a named item's name never takes it (duckdb suffixes the later one)
+string ObjectListSelect(const DeclaredList &list, const string &from);
+//! spec 148 for a stored list: each named item's expression one expression, the star one star and nothing more
+bool StoredListOk(const DeclaredList &list);
 //! spec 148: a name the memory store pastes as it is written must be one column reference
 void RequireColumnName(const char *what, const string &name);
 
@@ -845,18 +868,20 @@ struct CatalogBackend {
 	//! What an object exposes, in its own order: the column list it declares, or - when it declares
 	//! none - the columns of the source it stands for. False when the source cannot be bound here, in
 	//! which case the object is not ours to judge and a grant on it is left alone (spec 037).
-	bool ExposedColumns(const string &source, const vector<string> &declared, vector<string> &out);
+	bool ExposedColumns(const string &source, const DeclaredList &declared, vector<string> &out);
 
 	//! Bind a projection over a relation and return the columns it produces (spec 026). Never fatal: an
 	//! unbindable projection leaves the listing as it was rather than refusing the grant.
 	//! Returns the binder's message when the projection is at fault, and an empty string when it binds -
 	//! or when the object itself does not bind, since then there is nothing to judge it against. The
 	//! same two steps as a predicate's check (spec 021), for the same reason.
-	//! spec 158: the grant's `columns` (test and masks) over the object's read - its own columns (`own_order` in its
-	//! order, `own` their expressions; none = every column of the source)
-	string ProjectionSchema(const string &source, const RoleColumns &columns, const vector<string> &own_order,
-	                        const case_insensitive_map_t<string> &own, vector<std::pair<string, string>> &out,
-	                        bool *checked = nullptr);
+	//! spec 158: the grant's `columns` (test and masks) over the object's read - its own list (none = every column of
+	//! the source)
+	string ProjectionSchema(const string &source, const RoleColumns &columns, const DeclaredList &own,
+	                        vector<std::pair<string, string>> &out, bool *checked = nullptr);
+	//! spec 158 stage 2: a name the object's star and one of its named items both read (the first), '' when none or the
+	//! source does not bind here
+	string StarCollision(const string &source, const DeclaredList &list);
 
 	//! Whether a relation has a column of that name. False only when the relation itself binds and the
 	//! column does not: a source that cannot be reached at all answers true, since it cannot answer.

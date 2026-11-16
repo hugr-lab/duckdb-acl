@@ -641,7 +641,12 @@ void RequireStoredExpressions(const string &object, const string &own_rls,
                               const vector<std::pair<string, GrantPolicy>> &united) {
 	vector<string> texts = {own_rls};
 	for (auto &column : own_columns) {
-		texts.push_back(column.second);
+		if (!IsStarItem(column)) {
+			texts.push_back(column.second);
+		}
+	}
+	if (HoldsStar(own_columns) && !StoredListOk(own_columns)) {
+		texts.push_back(";"); // spec 158 stage 2: a stored star that does not read back as one star refuses as well
 	}
 	for (auto &role : united) {
 		for (auto &predicate : role.second.predicates) {
@@ -781,7 +786,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	if (!cols.IsNull() && form != "view") {
 		for (auto &item : ListValue::GetChildren(cols)) {
 			auto &fields = StructValue::GetChildren(item);
-			auto name = fields[0].ToString();
+			auto name = fields[0].IsNull() ? string() : fields[0].ToString(); // spec 158 stage 2: the star has none
 			auto expr = fields[1].IsNull() ? string() : fields[1].ToString();
 			if (form == "alias" && !expr.empty()) {
 				// the list maps virtual -> physical, and a write maps the name back (spec 010)
@@ -826,7 +831,9 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	// spec 146: the object's columns where it declares them (type facts are only the columns exposed differently)
 	vector<string> known;
 	for (auto &column : object_columns) {
-		known.push_back(column.first);
+		if (!IsStarItem(column)) {
+			known.push_back(column.first);
+		}
 	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
 	NoteUnionWidens(out.canonical.empty() ? vname : out.canonical, capability, united, known);
@@ -1092,6 +1099,31 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		                (predicate.empty() ? "" : " WHERE " + predicate);
 		out.casts.clear();
 		out.query = restricts ? GrantOver(columns, filtered) : filtered;
+		return;
+	}
+	if (!out.is_view && HoldsStar(object_columns)) {
+		// spec 158 stage 2: the object's list holds a star - read live, as duckdb expands it; the grant goes over that
+		// read as over an object with no list (the test and the masks by duckdb, over the object's columns), the
+		// predicate inside it, so RLS reads the source's values. Read-only: what it writes is known only at bind
+		if (!predicate.empty()) {
+			out.rls = out.rls.empty() ? predicate : "(" + out.rls + ") AND (" + predicate + ")";
+		}
+		auto read = ObjectListSelect(object_columns, out.ReadFrom());
+		if (restricts) {
+			auto exposed = columns;
+			for (auto &mask : exposed.masks) {
+				bool named = false;
+				for (auto &item : object_columns) {
+					named = named || (!IsStarItem(item) && StringUtil::CIEquals(item.first, mask.first));
+				}
+				if (!named) {
+					mask.second = ExposedMask(mask.second, mask.first, out.casts); // a source column the star passes
+				}
+			}
+			read = GrantOver(exposed, read);
+		}
+		out.query = read;
+		out.subquery_form = true;
 		return;
 	}
 	if (predicate.empty() && !restricts) {

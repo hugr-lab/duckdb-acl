@@ -4,6 +4,9 @@
 // acl_policy_catalog.cpp (plan 4.2).
 
 #include "acl_result_rows.hpp"
+#include "acl_grant_columns.hpp"
+#include "acl_list_items.hpp"
+#include "acl_name_path.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_types.hpp"
@@ -301,14 +304,119 @@ bool CatalogBackend::CatalogPredicateChecked(const std::function<unique_ptr<Quer
 	return any;
 }
 
-bool CatalogBackend::ExposedColumns(const string &source, const vector<string> &declared, vector<string> &out) {
-	if (!declared.empty()) {
-		out = declared;
+DeclaredList DeclaredListFrom(QueryResult &rows) {
+	DeclaredList list;
+	ResultRows read(rows);
+	for (idx_t row = 0; row < read.Count(); row++) {
+		auto name = read.GetValue(0, row);
+		auto expr = read.GetValue(1, row);
+		list.emplace_back(name.IsNull() ? string() : name.ToString(), expr.IsNull() ? string() : expr.ToString());
+	}
+	return list;
+}
+
+namespace {
+
+string ListItem(const std::pair<string, string> &item) {
+	if (IsStarItem(item)) {
+		return item.second;
+	}
+	return item.second.empty() ? Ident(item.first) : item.second + " AS " + Ident(item.first);
+}
+
+} // namespace
+
+string ObjectListSelect(const DeclaredList &list, const string &from) {
+	vector<string> named, star, written;
+	for (auto &item : list) {
+		(IsStarItem(item) ? star : named).push_back(ListItem(item));
+	}
+	if (star.empty() || named.empty()) {
+		for (auto &item : list) {
+			written.push_back(ListItem(item));
+		}
+		return "SELECT " + (written.empty() ? string("*") : StringUtil::Join(written, ", ")) + from;
+	}
+	// the named items first, so each keeps its name whatever the source comes to hold; the star's columns after them
+	vector<string> names;
+	for (auto &item : list) {
+		if (!IsStarItem(item)) {
+			names.push_back(Lit(FoldColumn(item.first)));
+		}
+	}
+	for (auto &item : list) {
+		written.push_back(IsStarItem(item) ? "COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " NOT IN (" +
+		                                         StringUtil::Join(names, ", ") + "))"
+		                                   : Ident(item.first));
+	}
+	return "SELECT " + StringUtil::Join(written, ", ") + " FROM (SELECT " + StringUtil::Join(named, ", ") + ", " +
+	       star[0] + from + ") AS __acl_listed";
+}
+
+bool StoredListOk(const DeclaredList &list) {
+	vector<string> expressions;
+	for (auto &item : list) {
+		if (!IsStarItem(item)) {
+			expressions.push_back(item.second);
+			continue;
+		}
+		try {
+			// one star and nothing after it (an EXCLUDE set prints its names in no fixed order: not compared as text)
+			auto read = ReadSelectList(item.second, "the object's column list", true);
+			if (read.size() != 1 || !read[0].star) {
+				return false;
+			}
+		} catch (std::exception &) {
+			return false;
+		}
+	}
+	return StoredExpressionsOk(expressions);
+}
+
+string CatalogBackend::StarCollision(const string &source, const DeclaredList &list) {
+	if (!HoldsStar(list)) {
+		return string();
+	}
+	string star;
+	case_insensitive_set_t named;
+	for (auto &item : list) {
+		if (IsStarItem(item)) {
+			star = item.second;
+		} else {
+			named.insert(item.first);
+		}
+	}
+	if (named.empty()) {
+		return string();
+	}
+	auto instance = Db();
+	Connection con(*instance);
+	auto probe = con.Query("SELECT " + star + " FROM " + source + " WHERE false");
+	if (probe->HasError()) {
+		return string(); // judged where it binds
+	}
+	for (auto &name : probe->GetNames()) {
+		if (named.count(name.GetIdentifierName())) {
+			return name.GetIdentifierName();
+		}
+	}
+	return string();
+}
+
+bool CatalogBackend::ExposedColumns(const string &source, const DeclaredList &declared, vector<string> &out) {
+	if (!declared.empty() && !HoldsStar(declared)) {
+		for (auto &item : declared) {
+			out.push_back(item.first);
+		}
 		return true;
 	}
 	auto instance = Db();
 	Connection con(*instance);
-	auto probe = con.Query("SELECT * FROM " + source + " WHERE false");
+	auto read = declared.empty() ? "SELECT * FROM " + source : ObjectListSelect(declared, " FROM " + source);
+	if (!declared.empty() && !StoredListOk(declared)) {
+		return false;
+	}
+	auto probe = con.Query("SELECT * FROM (" + read + ") WHERE false");
 	if (probe->HasError()) {
 		return false;
 	}
@@ -318,8 +426,7 @@ bool CatalogBackend::ExposedColumns(const string &source, const vector<string> &
 	return true;
 }
 
-string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns &columns,
-                                        const vector<string> &own_order, const case_insensitive_map_t<string> &own,
+string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns &columns, const DeclaredList &own,
                                         vector<std::pair<string, string>> &out, bool *checked) {
 	if (checked) {
 		*checked = false;
@@ -336,12 +443,18 @@ string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns 
 		}
 	}
 	for (auto &item : own) {
-		if (!item.second.empty() && !OneExpression(item.second, problem)) {
+		if (!IsStarItem(item) && !item.second.empty() && !OneExpression(item.second, problem)) {
 			if (checked) {
 				*checked = true;
 			}
 			return "the object's \"" + item.first + "\" is " + problem + " (spec 148: one expression)";
 		}
+	}
+	if (!StoredListOk(own)) {
+		if (checked) {
+			*checked = true;
+		}
+		return "the object's column list does not read back as stored (spec 148)";
 	}
 	if (columns.test.All() && columns.masks.empty()) {
 		return string();
@@ -355,13 +468,7 @@ string CatalogBackend::ProjectionSchema(const string &source, const RoleColumns 
 		*checked = true; // whatever the answer, the projection was probed rather than waved through
 	}
 	// the object's read: its own columns over the source (a computed one by its expression), else the source's
-	vector<string> items;
-	for (auto &name : own_order) {
-		auto entry = own.find(name);
-		auto expr = entry == own.end() || entry->second.empty() ? Ident(name) : entry->second;
-		items.push_back(expr + " AS " + Ident(name));
-	}
-	auto object = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + source;
+	auto object = ObjectListSelect(own, " FROM " + source);
 	auto sql = GrantOverSql(columns, object);
 	if (ProbeSchema(sql, false, {}, out)) {
 		return string();

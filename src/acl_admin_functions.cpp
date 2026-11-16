@@ -50,9 +50,10 @@ vector<string> SplitCsv(const string &csv) {
 //! An object's declared column list (spec 150 4f: `SplitDeclaredColumns`, on duckdb's tokens): (name, expr) pairs, an
 //! empty expr the source's column as it is; a nullability mark (spec 048) into `marks` by name
 vector<std::pair<string, string>> ParseColumns(const string &csv, case_insensitive_map_t<int8_t> *marks = nullptr,
-                                               const char *what = "the relation's column list") {
+                                               const char *what = "the relation's column list",
+                                               bool allow_star = false) {
 	vector<std::pair<string, string>> columns;
-	for (auto &column : SplitDeclaredColumns(csv, what)) {
+	for (auto &column : SplitDeclaredColumns(csv, what, allow_star)) {
 		if (marks && column.nullable >= 0) {
 			(*marks)[column.name] = column.nullable;
 		}
@@ -255,7 +256,7 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		                                      OptionalArg(args, 6, row, "") != "skip");
 		auto phys_key = KeyArg(args, 2, row, "acl_add_relation", "phys");
 		case_insensitive_map_t<int8_t> marks;
-		auto columns = ParseColumns(OptionalArg(args, 3, row, ""), &marks);
+		auto columns = ParseColumns(OptionalArg(args, 3, row, ""), &marks, "the relation's column list", true);
 		auto rls = OptionalArg(args, 4, row, "");
 		auto pk = OptionalArg(args, 7, row, "");
 		// renaming is not restricting: a pure rename list keeps the relation writable
@@ -1547,7 +1548,8 @@ void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &resul
 			value = StoreOf(state).SpellRelationPhysical(NameKey(value, "acl_alter_relation", "phys"));
 		}
 		case_insensitive_map_t<int8_t> marks;
-		auto columns = field == "columns" ? ParseColumns(value, &marks) : vector<std::pair<string, string>>();
+		auto columns = field == "columns" ? ParseColumns(value, &marks, "the relation's column list", true)
+		                                  : vector<std::pair<string, string>>();
 		StoreOf(state).CatalogAlterRelation(vcat, vname, field, value, columns, marks);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));

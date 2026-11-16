@@ -1,6 +1,6 @@
 # Spec 158: columns - the object's shape, the grant's visibility and masks
 
-- **Status**: accepted (stages 1 and 3 built)
+- **Status**: accepted (stages 1 and 3 built, stage 2 in progress)
 - **Date**: 2026-11-16
 - **Author**: duckdb-acl
 - **Supersedes**: spec 011's column lists at the catalog level, spec 038's catalog-wide list, spec 102's field paths
@@ -107,6 +107,40 @@ stand in an object's expression, an RLS or a mask.
 - A mask is a cast-checked expression over the object's columns; it is judged by the author's function gate (spec 117)
   and its tables qualified (spec 160).
 
+## Stage 2: a star in the object's list
+
+An object's list may hold one star item, as SELECT writes it: `*`, `* EXCLUDE (…)`, `* REPLACE (<expr> AS c, …)`,
+`* RENAME (a AS b, …)`, `COLUMNS('<regex>')`, `COLUMNS(lambda c: …)` - beside named items, anywhere in the list:
+
+```sql
+CREATE VIRTUAL TABLE c.people FROM pg.public.people
+  COLUMNS (* EXCLUDE (ssn), '***-**-' || right(ssn, 4) AS ssn_tail);
+```
+
+- **One star, unqualified, standing alone.** A second star, `t.*`, a star inside an expression
+  (`upper(COLUMNS(*))`, `*COLUMNS(…)`) or a named star are refused where written: the star reads the object's one
+  source, and one star is enough to say "the source's columns".
+- **The read is live.** The star goes to duckdb as written, so a column the source gains appears and one it loses
+  goes, as for an object with no list. Beside named items, the named ones are read first and the star's columns after
+  them (`SELECT <named items>, <star> FROM <source>`), then put back in the written order, the star as
+  `COLUMNS(lambda c: c NOT IN (<named>))`. So a source column that comes to share a named item's name never takes
+  that name: duckdb keeps a name for the first column that has it and suffixes the rest (`uname_1`). A grant's mask
+  or test on the named item still reads the named item (review).
+- **At write**, the star and the named items must not share a name: a name both read is refused (`EXCLUDE` it or
+  rename the item), and `acl_check_catalog` reports it later as `schema_stale`.
+- **The grant** goes over the object's read as over an object with no list (`GrantOver`): duckdb applies the test and
+  the masks over the object's columns, a mask of a column the object lost refuses at bind.
+- **Listings** keep the snapshot every declared list has (`object_columns`, probed at write and at `ANALYZE`): the
+  read follows the source at once, the listing at the next `ANALYZE`, and `acl_check_catalog`'s `schema_stale` says
+  when the two part. Expanding the star in the listing's SQL would be a second reader of duckdb's star rules
+  (`REPLACE`, `RENAME`, a regex, a lambda) - the drift spec 158 removed.
+- **Read-only.** An object whose list holds a star is the subquery form: which source columns it writes is known only
+  where duckdb binds it, and an INSERT that names no columns matches by position against a width nobody published.
+- **Stored** as one `relation_columns` row with no name and the star as duckdb prints it; every reader by name skips
+  it. REMAP and `DROP MISSING COLUMNS` leave it as it is (it names no column of its own). A REPLACE expression or a
+  COLUMNS lambda is a body like a computed column: the author's function gate (spec 117), qualified tables (spec
+  160), the source gate (spec 138).
+
 ## Known limits (stage 1)
 
 - A mask is cast to its column's type where the grant is written, and that the cast holds is judged where duckdb binds
@@ -119,7 +153,7 @@ stand in an object's expression, an RLS or a mask.
 
 1. The grant model: COLUMNS forms, MASK, the union, `acl_has_role`, the listing's filter, schema v25; the object's
    list as a SELECT list without stars.
-2. Live stars in the object's list.
+2. Live stars in the object's list - see the section above.
 3. Spec 102's machinery removed (field trees, field writes, `acl_listed_type`, `grant_columns`) - built: none of it
    was reached since stage 1 (nothing filled `field_writes` / `narrowed_reads`, nothing wrote `grant_columns`). Schema
    v27, `min_reader` 27 (`grant_columns` dropped - a v26 build's listings still read it); `platform.grant_columns` and
@@ -130,6 +164,10 @@ stand in an object's expression, an RLS or a mask.
    duckdb's own (the removed projection branch widened it to BIGINT; Flight's Arrow type int64 -> int32).
 
 ## Testing
+
+`test/sql/acl_object_list_star.test` (stage 2): each star form, a grant over a star list, the source gaining and losing
+columns (the read at once, the listing at ANALYZE, `schema_stale` between), a source column named like an item, the
+forms refused where written, read-only, REPAIR keeping the star.
 
 `test/sql/acl_grant_columns.test` (stage 1): every form and its union, masks and their union, a mask's cast, writes,
 the listing's rows against the read's, `acl_has_role`, the catalog grant's refusal. The existing tests move to the new

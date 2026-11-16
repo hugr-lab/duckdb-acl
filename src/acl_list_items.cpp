@@ -249,6 +249,32 @@ bool OnlyTheList(const SelectNode &node) {
 	return shape.ToString() == bare.ToString();
 }
 
+bool HoldsClass(const ParsedExpression &expr, ExpressionClass kind) {
+	if (expr.GetExpressionClass() == kind) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HoldsClass(child, kind); });
+	return found;
+}
+
+//! A star inside a star's expressions other than duckdb's own `*` of `COLUMNS(lambda …)` (`list_filter(*, …)`): a
+//! qualified one or a `COLUMNS(…)` of its own
+bool HoldsOtherStar(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::STAR) {
+		auto &star = expr.Cast<StarExpression>();
+		if (star.IsColumns() || !star.RelationName().empty() || star.Expression() || !star.ReplaceList().empty() ||
+		    !star.RenameList().empty() || !star.ExcludeList().empty()) {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HoldsOtherStar(child); });
+	return found;
+}
+
 bool HoldsPositional(const ParsedExpression &expr) {
 	if (expr.GetExpressionClass() == ExpressionClass::POSITIONAL_REFERENCE) {
 		return true;
@@ -293,6 +319,7 @@ vector<SelectListItem> ReadSelectList(const string &text_p, const char *what, bo
 	    node.from_table->ToString() != LIST_TABLE || !OnlyTheList(node)) {
 		RefuseList(what, "holds more than a column list");
 	}
+	bool starred = false;
 	for (auto &expr : node.select_list) {
 		SelectListItem item;
 		auto alias = expr->GetAlias().GetIdentifierName();
@@ -300,13 +327,39 @@ vector<SelectListItem> ReadSelectList(const string &text_p, const char *what, bo
 			if (!allow_star) {
 				RefuseList(what, "holds a star (" + expr->ToString() + ")");
 			}
+			// spec 158 stage 2: one star over the object's one source - unqualified, unnamed, standing alone, reading
+			// no table of its own
+			auto &star = expr->Cast<StarExpression>();
 			if (!alias.empty()) {
 				RefuseList(what, "names a star (" + expr->ToString() + ")");
 			}
+			if (starred) {
+				RefuseList(what,
+				           "holds a second star (" + expr->ToString() + ") - one star reads the source's columns");
+			}
+			if (!star.RelationName().empty() || StarExpression::IsColumnsUnpacked(*expr)) {
+				RefuseList(what, "holds the star " + expr->ToString() +
+				                     " - a star of the list is `*` or `COLUMNS(…)` "
+				                     "over the object's one source");
+			}
+			bool reads_table = false;
+			ParsedExpressionIterator::EnumerateChildren(*expr, [&](const ParsedExpression &child) {
+				reads_table = reads_table || HoldsClass(child, ExpressionClass::SUBQUERY) || HoldsOtherStar(child) ||
+				              HoldsPositional(child);
+			});
+			if (reads_table) {
+				RefuseList(what, "holds the star " + expr->ToString() +
+				                     " - its expressions read the object's source by name: no subquery, star or "
+				                     "position inside it");
+			}
+			starred = true;
 			item.star = true;
 			item.expr = expr->ToString();
 			items.push_back(std::move(item));
 			continue;
+		}
+		if (HoldsClass(*expr, ExpressionClass::STAR)) {
+			RefuseList(what, "holds a star inside " + expr->ToString() + " - a star stands alone in the list");
 		}
 		if (HoldsPositional(*expr)) {
 			RefuseList(what, "reads a column by its position (" + expr->ToString() + ") - name it");
@@ -480,10 +533,16 @@ string MasksText(const acl_detail::GrantMasks &masks) {
 	return StringUtil::Join(items, ", ");
 }
 
-vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what) {
+vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *what, bool allow_star) {
 	vector<DeclaredColumnText> columns;
 	case_insensitive_set_t named;
-	for (auto &item : ReadSelectList(text, what, false)) {
+	for (auto &item : ReadSelectList(text, what, allow_star)) {
+		if (item.star) {
+			DeclaredColumnText column; // spec 158 stage 2: no name, the star as duckdb prints it
+			column.expr = std::move(item.expr);
+			columns.push_back(std::move(column));
+			continue;
+		}
 		if (!named.insert(item.name).second) {
 			throw BinderException("acl admin: %s declares the column \"%s\" twice", what, item.name);
 		}

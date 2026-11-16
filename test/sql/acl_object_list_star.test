@@ -1,0 +1,236 @@
+# name: test/sql/acl_object_list_star.test
+# description: spec 158 stage 2 - a star in an object's own column list (`*`, `* EXCLUDE`, `* REPLACE`, `* RENAME`,
+#   `COLUMNS(…)`) is read live by duckdb, a grant goes over that read, the listing keeps the snapshot of the write /
+#   ANALYZE, the object is read-only; negative tests for the forms a list refuses and for a source column that comes
+#   to share a named item's name (it never takes the item's mask).
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.p (id INTEGER, name VARCHAR, ssn VARCHAR, salary INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.p VALUES (1, 'ann', '123-45-6789', 1000, 't1'), (2, 'bob', '987-65-4321', 2000, 't2');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE a; CREATE ROLE m; CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE a MAIN; GRANT CATALOG c TO ROLE m MAIN; GRANT CATALOG c TO ROLE r MAIN;
+
+# --- the forms ---------------------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ex AS phys.main.p COLUMNS (* EXCLUDE (ssn, salary), '***-' || right(ssn, 4) AS ssn_tail);
+
+query T
+SELECT string_agg(coalesce(name, '<star>') || '=' || expr, ' | ' ORDER BY pos) FROM store.acl.relation_columns WHERE vname = 'ex';
+----
+<star>=* EXCLUDE (salary, ssn) | ssn_tail=('***-' || "right"(ssn, 4))
+
+query ITTT
+ACL ROLE "a" SELECT * FROM ex ORDER BY id;
+----
+1	ann	t1	***-6789
+2	bob	t2	***-4321
+
+query T
+ACL ROLE "a" SELECT string_agg(column_name || ':' || data_type, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'ex';
+----
+id:INTEGER,name:VARCHAR,tenant:VARCHAR,ssn_tail:VARCHAR
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.rep AS phys.main.p COLUMNS (* EXCLUDE (ssn) REPLACE (upper(name) AS name));
+
+query ITIT
+ACL ROLE "a" SELECT * FROM rep ORDER BY id;
+----
+1	ANN	1000	t1
+2	BOB	2000	t2
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ren AS phys.main.p COLUMNS (* EXCLUDE (ssn, salary) RENAME (tenant AS org));
+
+query T
+ACL ROLE "a" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'ren';
+----
+id,name,org
+
+query IT
+ACL ROLE "a" SELECT id, org FROM ren ORDER BY id;
+----
+1	t1
+2	t2
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.rx AS phys.main.p COLUMNS (id, COLUMNS('^(name|tenant)$'));
+
+query ITT
+ACL ROLE "a" SELECT * FROM rx ORDER BY id;
+----
+1	ann	t1
+2	bob	t2
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.lm AS phys.main.p COLUMNS (COLUMNS(lambda c: c NOT IN ('ssn', 'salary')));
+
+query T
+ACL ROLE "a" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'lm';
+----
+id,name,tenant
+
+# --- a grant over a star list: the test and the masks by duckdb, the RLS reads the source ------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.ex TO ROLE m RLS (tenant = 't1') COLUMNS (* EXCLUDE (name)) MASK (ssn_tail AS 'hidden');
+
+query ITT
+ACL ROLE "m" SELECT * FROM ex;
+----
+1	t1	hidden
+
+query T
+ACL ROLE "m" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'ex';
+----
+id,tenant,ssn_tail
+
+statement error
+ACL ROLE "m" SELECT name FROM ex;
+----
+name
+
+# --- the source gains and loses columns: the read follows at once, the listing at ANALYZE ------------------------
+
+statement ok
+ALTER TABLE phys.main.p ADD COLUMN email VARCHAR DEFAULT 'x@y';
+
+query ITTTT
+ACL ROLE "a" SELECT * FROM ex ORDER BY id;
+----
+1	ann	t1	x@y	***-6789
+2	bob	t2	x@y	***-4321
+
+query TTT
+SELECT kind, problem, repair FROM acl_check_catalog('c') WHERE object = 'ex';
+----
+table	schema_stale	ANALYZE VIRTUAL TABLE c.ex
+
+statement ok
+ACL ADMIN ANALYZE VIRTUAL TABLE c.ex;
+
+query T
+ACL ROLE "a" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'ex';
+----
+id,name,tenant,email,ssn_tail
+
+# a source column that comes to share a named item's name is suffixed: the named item keeps its name and its mask
+
+statement ok
+ALTER TABLE phys.main.p ADD COLUMN ssn_tail VARCHAR DEFAULT 'raw';
+
+query T
+ACL ROLE "m" SELECT string_agg(ssn_tail, ',') FROM ex;
+----
+hidden
+
+query T
+ACL ROLE "a" SELECT ssn_tail FROM ex WHERE id = 1;
+----
+***-6789
+
+statement ok
+ALTER TABLE phys.main.p DROP COLUMN ssn_tail;
+
+# --- refused where written ----------------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (*, *);
+----
+holds a second star
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (p.*);
+----
+over the object's one source
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (id, upper(COLUMNS('name')) AS u);
+----
+a star stands alone in the list
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (* REPLACE ((SELECT max(name) FROM phys.main.p) AS name));
+----
+no subquery
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (*, upper(name) AS name);
+----
+reads "name" twice
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (* EXCLUDE (ssn) AS everything);
+----
+names a star
+
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.ex REMAP (* AS x);
+----
+REMAP
+
+# --- read-only ----------------------------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "a" INSERT INTO ex (id) VALUES (3);
+----
+read-only
+
+# --- a star list read with the session's RLS of its own (the object's RLS reads the source) ----------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.own AS phys.main.p COLUMNS (* EXCLUDE (ssn)) ;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.own SET RLS 'salary > 1500';
+
+query IT
+ACL ROLE "r" SELECT id, name FROM own;
+----
+2	bob
+
+# DROP MISSING COLUMNS keeps the star (it names no column of its own)
+
+statement ok
+ALTER TABLE phys.main.p ADD COLUMN gone INTEGER;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.dm AS phys.main.p COLUMNS (* EXCLUDE (ssn), gone AS g2);
+
+statement ok
+ALTER TABLE phys.main.p DROP COLUMN gone;
+
+statement ok
+ACL ADMIN REPAIR VIRTUAL TABLE c.dm DROP MISSING COLUMNS;
+
+query T
+SELECT string_agg(coalesce(name, '<star>'), ',' ORDER BY pos) FROM store.acl.relation_columns WHERE vname = 'dm';
+----
+<star>
+
+query T
+ACL ROLE "a" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'dm';
+----
+id,name,salary,tenant,email
