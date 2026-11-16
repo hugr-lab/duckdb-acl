@@ -701,6 +701,9 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	                : "r.\"alias_types\", r.\"enum_types\", (SELECT list(struct_pack(tcol := t.\"column\","
 	                  " tbase := t.\"as_base\", tvarchar := t.\"as_varchar\", tboth := t.\"as_both\")) FROM " +
 	                      Tbl("relation_types") + " t WHERE t.\"vcat\" = r.\"vcat\" AND t.\"vname\" = r.\"vname\")") +
+	           // spec 169: a principal's view's query (a driver keeps none) - before the last three, read from the end
+	           (function_mode ? string(", NULL") : string(", r.\"query\"")) +
+	           " AS vquery"
 	           // spec 107: where the name resolved - the object's canonical virtual name, last so no index moves
 	           ", r.\"vcat\" AS cvcat, r.\"vname\" AS cvname"
 	           // spec 146: whose row it is - after them, so no index moves
@@ -747,7 +750,11 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	out.query = view_sql.IsNull() ? string() : view_sql.ToString();
 	out.is_view = form == "view";
 	if (out.is_view) {
-		SplitViewProbes(out.query, out.probes); // spec 165: before a grant wraps the body
+		// spec 169: a principal's view is read as its query, rewritten under the reader's grants; `query` (its
+		// author's resolution) is then its shape only, replaced by that rewrite where the view is read
+		auto vquery = result->Collection().GetValue(result->ColumnCount() - 4, 0);
+		out.invoker_query = vquery.IsNull() ? string() : vquery.ToString();
+		out.invoker_shape = out.invoker_query.empty() ? string() : out.query;
 	}
 	out.rls = rls.IsNull() ? string() : rls.ToString();
 	auto rchk = result->Collection().GetValue(13, 0);

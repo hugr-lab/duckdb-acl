@@ -445,10 +445,28 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
                                   const vector<std::pair<string, string>> &columns, const string &comment,
                                   const string &returns, const string &origin = string(), const string &pk = string(),
                                   const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false,
-                                  const string &alias_types = string(), const string &enum_types = string()) {
+                                  const string &alias_types = string(), const string &enum_types = string(),
+                                  optional_ptr<const string> query = nullptr) {
 	vector<string> statements;
 	auto created_by =
 	    CreatedByLit(catalog, "relations", " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+	// spec 169: a principal's view keeps its query (what its readers read) across a write of another field - a
+	// comment, its types - and loses it when its SQL is written again (an operator's ALTER ... SET SQL: the view is
+	// then the operator's); a principal's own CREATE gives it
+	string query_lit = "NULL";
+	if (query) {
+		query_lit = query->empty() ? string("NULL") : Lit(*query);
+	} else if (!catalog.FunctionMode() && form == "view") {
+		auto kept = catalog.Query("SELECT \"query\", \"view_sql\" FROM " + catalog.Tbl("relations") +
+		                          " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		if (kept->RowCount() > 0) {
+			auto stored = kept->Collection().GetValue(0, 0);
+			auto stored_sql = kept->Collection().GetValue(1, 0);
+			if (!stored.IsNull() && !stored_sql.IsNull() && stored_sql.ToString() == view_sql) {
+				query_lit = Lit(stored.ToString());
+			}
+		}
+	}
 	statements.push_back("DELETE FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
 	statements.push_back("DELETE FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -465,16 +483,16 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	}
 	// the comment is read by the caller BEFORE the delete above and carried through: a definition
 	// change is not a reason to lose an operator's documentation
-	statements.push_back("INSERT INTO " + catalog.Tbl("relations") +
-	                     "(\"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"comment\", \"origin\","
-	                     " \"rls_checked\", \"alias_types\", \"enum_types\", \"created_by\", \"created_roles\")"
-	                     " VALUES (" +
-	                     Lit(vcat) + ", " + Lit(vname) + ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) +
-	                     ", " + Lit(rls) + ", " + (comment.empty() ? string("NULL") : Lit(comment)) + ", " +
-	                     (origin.empty() ? string("NULL") : Lit(origin)) + ", " +
-	                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ", " +
-	                     (alias_types.empty() ? string("NULL") : Lit(alias_types)) + ", " +
-	                     (enum_types.empty() ? string("NULL") : Lit(enum_types)) + ", " + created_by + ")");
+	statements.push_back(
+	    "INSERT INTO " + catalog.Tbl("relations") +
+	    "(\"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"comment\", \"origin\","
+	    " \"rls_checked\", \"alias_types\", \"enum_types\", \"created_by\", \"created_roles\", \"query\")"
+	    " VALUES (" +
+	    Lit(vcat) + ", " + Lit(vname) + ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) + ", " + Lit(rls) +
+	    ", " + (comment.empty() ? string("NULL") : Lit(comment)) + ", " +
+	    (origin.empty() ? string("NULL") : Lit(origin)) + ", " + (rls.empty() ? "NULL" : (checked ? "true" : "false")) +
+	    ", " + (alias_types.empty() ? string("NULL") : Lit(alias_types)) + ", " +
+	    (enum_types.empty() ? string("NULL") : Lit(enum_types)) + ", " + created_by + ", " + query_lit + ")");
 	// spec 099: the source's types, probed here so the read can cast them without looking
 	for (auto &statement : catalog.TypeFactStatements(vcat, vname, form, phys, view_sql)) {
 		statements.push_back(statement);
@@ -1193,15 +1211,6 @@ void RequirePolicyFreeExpressions(CatalogBackend &catalog, const char *what, con
 	}
 }
 
-//! spec 165: an operator's view body names no root CTE as a principal view's probe - a reader takes such a CTE off
-void RequireNoProbeCte(const string &view_sql) {
-	auto body = view_sql;
-	vector<string> probes;
-	if (!view_sql.empty() && SplitViewProbes(body, probes)) {
-		throw BinderException("acl admin: the name %s<n> is reserved in a view", VIEW_PROBE_PREFIX);
-	}
-}
-
 } // namespace
 
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form_p, const string &phys,
@@ -1211,7 +1220,6 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
 	RequireNotPolicyStore(*catalog, "the relation", phys, false, view_sql);
-	RequireNoProbeCte(view_sql);
 	RequirePolicyFreeExpressions(*catalog, "the relation's RLS or column list", rls, columns_p);
 	auto columns = columns_p;
 	auto form = form_p;
@@ -2124,7 +2132,7 @@ struct UndoRefused {
 
 } // namespace
 
-void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, const string &body,
+void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, const string &body, const string &query,
                                       optional_ptr<RecordWrite> write) {
 	RequireCatalog(catalog, "acl_register_view");
 	RequireNotReserved(vname);
@@ -2132,7 +2140,10 @@ void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, c
 	auto version = catalog->WriteWithReads(
 	    [&](const ReadFn &read, vector<string> &statements) {
 		    CaptureBefore(read, *catalog, write, vcat, {vname});
-		    statements = RelationStatements(*catalog, vcat, vname, "view", "", body, "", {}, "", "");
+		    // spec 169: `body` is the author's resolution - the view's shape, what the probes bind; `query` what a
+		    // reader reads, rewritten under the reader's grants
+		    statements = RelationStatements(*catalog, vcat, vname, "view", "", body, "", {}, "", "", string(), string(),
+		                                    {}, false, string(), string(), &query);
 	    },
 	    CaptureAfter(*catalog, write, vcat));
 	if (write) {
@@ -3710,7 +3721,6 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		RequireNotPolicyStore(*catalog, "the relation", value, false);
 	} else if (field == "view") {
 		RequireNotPolicyStore(*catalog, "the view", string(), false, value);
-		RequireNoProbeCte(value);
 	}
 	RequirePolicyFreeExpressions(*catalog, "the relation's RLS or column list", field == "rls" ? value : string(),
 	                             columns);

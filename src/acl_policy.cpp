@@ -144,36 +144,6 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 	return claims;
 }
 
-bool SplitViewProbes(string &body, vector<string> &probes) {
-	if (!StringUtil::Contains(StringUtil::Lower(body), VIEW_PROBE_PREFIX)) {
-		return false;
-	}
-	Parser parser(ParserOptions::Builtin());
-	parser.ParseQuery(body);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		return false; // not a view body: its reader refuses it
-	}
-	auto &root = *parser.statements[0]->Cast<SelectStatement>().node;
-	bool any = false;
-	CommonTableExpressionMap kept;
-	for (auto &entry : root.cte_map.map) {
-		if (!StringUtil::StartsWith(StringUtil::Lower(entry.first.GetIdentifierName()), VIEW_PROBE_PREFIX)) {
-			kept.map[entry.first] = std::move(entry.second);
-			continue;
-		}
-		any = true;
-		SelectStatement probe;
-		probe.node = std::move(entry.second->query_node);
-		probes.push_back(probe.ToString());
-	}
-	if (!any) {
-		return false;
-	}
-	root.cte_map = std::move(kept);
-	body = parser.statements[0]->ToString();
-	return true;
-}
-
 unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, const ParserOptions &options,
                                                            bool cached) {
 	auto parse = [&]() -> unique_ptr<QueryNode> {

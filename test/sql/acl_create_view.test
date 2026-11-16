@@ -77,8 +77,8 @@ ACL ROLE "narrow" CREATE VIEW vs.nope AS SELECT id FROM vs.orders;
 statement ok
 ACL ROLE "wide" CREATE VIEW vs.report AS SELECT id, amount FROM vs.orders;
 
-# nothing physical was made, and the stored body is the *resolved* query: the author's policy is
-# inlined (their projection, their predicate), while the claim stays a marker
+# nothing physical was made; the view's shape is its author's resolution (their projection, their predicate, the
+# claim a marker) and what it reads is its query, its relations qualified (spec 169)
 query I
 SELECT count(*) FROM duckdb_views() WHERE view_name = 'report';
 ----
@@ -88,6 +88,11 @@ query II
 SELECT form, view_sql LIKE '%phys.lake.orders%' AND view_sql LIKE '%acl_claim(''tenant'')%' FROM aclcat.acl.relations WHERE vname = 'vs.report';
 ----
 view	true
+
+query T
+SELECT query FROM aclcat.acl.relations WHERE vname = 'vs.report';
+----
+SELECT id, amount FROM sales.vs.orders
 
 # the author's reach is the whole of the author's reach: a body cannot name a physical object, so
 # `create` publishes what its holder can read and nothing beyond it
@@ -112,14 +117,18 @@ ACL ROLE "wide" SELECT id, amount FROM vs.report ORDER BY id;
 3	300
 
 # --- read by a role whose own grant on the source is narrower ------------------------------------------
-# a view is an object of the catalog in its own right: reading it is decided by the grant on the view,
-# not by grants on what it reads. `narrow` cannot see `amount` on the table and does see it here - the
-# author's rights shaped the body, which is what a view is for.
+# spec 169: a principal's view is read under its reader's grants. `narrow` cannot see `amount` on the table, and
+# cannot read it through the view either - the view names it, so the read is refused, never narrowed
 
-query II
+statement error
 ACL ROLE "narrow" SELECT id, amount FROM vs.report;
 ----
-2	200
+amount
+
+statement error
+ACL ROLE "narrow" SELECT * FROM vs.report;
+----
+does not exist in its source
 
 query I
 ACL ROLE "narrow" SELECT count(*) FROM vs.orders;
@@ -148,11 +157,11 @@ ACL ROLE "outsider" SELECT * FROM vs.report;
 statement ok
 ACL ADMIN GRANT TABLE sales.vs.report TO ROLE outsider WITH (select);
 
-# outsider holds nothing on the table the view reads, and reads the view all the same
-query I
+# outsider holds nothing on the table the view reads: the grant on the view alone reads nothing (spec 169)
+statement error
 ACL ROLE "outsider" SELECT count(*) FROM vs.report;
 ----
-0
+reads what this principal may not read
 
 statement error
 ACL ROLE "outsider" SELECT count(*) FROM vs.orders;

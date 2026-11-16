@@ -212,6 +212,11 @@ void BodyReferences(const string &body, bool expression, vector<vector<string>> 
 //! the parts, a SUMMARIZE / DESCRIBE / SHOW's table.
 string QualifiedBodyTables(DatabaseInstance &db, const string &text, bool select,
                            const vector<string> &item_expressions = {}, vector<string> *unwritable = nullptr);
+//! spec 169: a SELECT with each relation it names (not a CTE of its scope) written as `resolve` reads it - the parts it
+//! answers, or itself when it answers none; the rest of the text as written. `unwritable`: names `resolve` rewrote that
+//! are written in a form not replaced in place (see QualifiedBodyTables). Throws when the text is not one SELECT.
+string QualifyWrittenNames(const string &text, const std::function<vector<string>(const vector<string> &)> &resolve,
+                           vector<string> &unwritable);
 //! spec 160: ResolvedReference on a context the caller holds a transaction on (one connection for many names)
 vector<string> ResolvedReference(ClientContext &context, const vector<string> &parts);
 //! spec 160: a list body's item expressions (a grant's masks, an object's computed columns); empty for other shapes

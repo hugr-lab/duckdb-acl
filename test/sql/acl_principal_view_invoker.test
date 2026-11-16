@@ -1,0 +1,185 @@
+# name: test/sql/acl_principal_view_invoker.test
+# description: spec 169 - a principal's view is stored as its query (relations qualified to canonical virtual keys)
+#   and read under its READER's grants: the author's grants never show through, a reader reads through it what it
+#   may read directly, and the author's rights decide only whether the view may be created
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.people (id INTEGER, region VARCHAR, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.lake.people VALUES (1, 'eu', '111-11-1111'), (2, 'us', '222-22-2222'), (3, 'us', '333-33-3333');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE VIRTUAL SCHEMA c.vs FROM phys.lake; CREATE VIRTUAL SCHEMA c.home FROM phys.main; CREATE ROLE author; CREATE ROLE hr; CREATE ROLE eu; CREATE ROLE outsider; CREATE ROLE onlyview;
+
+# the author reads every row and the ssn in full, and creates in c.home; hr reads every row, its ssn masked unless
+# the reader holds hr (the owner's case: a mask keyed on the reader's role); eu reads its region and no ssn
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE author MAIN; GRANT SCHEMA c.vs TO ROLE author; GRANT SCHEMA c.home TO ROLE author WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE hr MAIN; GRANT SCHEMA c.vs TO ROLE hr; GRANT SCHEMA c.home TO ROLE hr; GRANT TABLE c.vs.people TO ROLE hr MASK (ssn AS CASE WHEN acl_has_role('hr') THEN '***-**-' || right(ssn, 4) ELSE '***' END);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE eu MAIN; GRANT SCHEMA c.vs TO ROLE eu; GRANT SCHEMA c.home TO ROLE eu; GRANT TABLE c.vs.people TO ROLE eu RLS (region = 'eu') COLUMNS (* EXCLUDE (ssn));
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE outsider WITH (temp) MAIN; GRANT SCHEMA c.home TO ROLE outsider WITH (select);
+
+# --- the author creates views; the stored query names its relations by their canonical keys ------------------------
+
+statement ok
+ACL ROLE "author" CREATE VIEW home.ids AS SELECT id, region FROM vs.people;
+
+statement ok
+ACL ROLE "author" CREATE VIEW home.cards AS SELECT id, ssn FROM c.vs.people;
+
+query T
+SELECT query FROM aclcat.acl.relations WHERE vname = 'home.ids';
+----
+SELECT id, region FROM c.vs.people
+
+query T
+SELECT query FROM aclcat.acl.relations WHERE vname = 'home.cards';
+----
+SELECT id, ssn FROM c.vs.people
+
+# the author reads through its own view what it reads directly
+query IT
+ACL ROLE "author" SELECT * FROM home.cards ORDER BY id;
+----
+1	111-11-1111
+2	222-22-2222
+3	333-33-3333
+
+# --- each reader reads under its own grants ------------------------------------------------------------------------
+
+query IT
+ACL ROLE "hr" SELECT * FROM home.cards ORDER BY id;
+----
+1	***-**-1111
+2	***-**-2222
+3	***-**-3333
+
+query IT
+ACL ROLE "eu" SELECT * FROM home.ids;
+----
+1	eu
+
+# eu's grant hides ssn: the view names it, so eu cannot read the view (refused, never narrowed)
+statement error
+ACL ROLE "eu" SELECT * FROM home.cards;
+----
+does not exist in its source
+
+# a reader with no grant on what the view reads cannot read it, whatever its grant on the view
+statement error
+ACL ROLE "outsider" SELECT * FROM home.ids;
+----
+the view "c.home.ids" reads what this principal may not read
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE onlyview WITH (temp) MAIN; GRANT VIEW c.home.ids TO ROLE onlyview WITH (select);
+
+statement error
+ACL ROLE "onlyview" SELECT * FROM home.ids;
+----
+the view "c.home.ids" reads what this principal may not read
+
+# --- the reader's grant on the view itself still applies ------------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT VIEW c.home.ids TO ROLE hr RLS (region = 'us');
+
+query IT
+ACL ROLE "hr" SELECT * FROM home.ids ORDER BY id;
+----
+2	us
+3	us
+
+# --- a view over a view nests under the reader's grants -------------------------------------------------------------
+
+statement ok
+ACL ROLE "author" CREATE VIEW home.us_ids AS SELECT id FROM home.ids WHERE region = 'us';
+
+query T
+SELECT query FROM aclcat.acl.relations WHERE vname = 'home.us_ids';
+----
+SELECT id FROM c.home.ids WHERE (region = 'us')
+
+query I
+ACL ROLE "author" SELECT count(*) FROM home.us_ids;
+----
+2
+
+query I
+ACL ROLE "eu" SELECT count(*) FROM home.us_ids;
+----
+0
+
+# a view that reaches itself (redefined over the view that reads it) is refused where it is read
+statement ok
+ACL ROLE "author" CREATE OR REPLACE VIEW home.ids AS SELECT id, 'us' AS region FROM home.us_ids;
+
+statement error
+ACL ROLE "author" SELECT * FROM home.ids;
+----
+reads itself
+
+statement ok
+ACL ROLE "author" CREATE OR REPLACE VIEW home.ids AS SELECT id, region FROM vs.people;
+
+# --- a session temp table cannot be named; a virtual function call names its catalog ------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.tf AS 'SELECT id FROM phys.lake.people'; GRANT OBJECT c.tf TO ROLE author; GRANT OBJECT c.tf TO ROLE hr;
+
+statement error
+ACL ROLE "author" CREATE VIEW home.viaf AS SELECT id FROM tf();
+----
+names its catalog
+
+statement ok
+ACL ROLE "author" CREATE VIEW home.viaf AS SELECT id FROM c.tf();
+
+query I
+ACL ROLE "hr" SELECT count(*) FROM home.viaf;
+----
+3
+
+# eu calls c.tf under its catalog grant: through the view as directly
+query II
+ACL ROLE "eu" SELECT (SELECT count(*) FROM home.viaf), (SELECT count(*) FROM c.tf());
+----
+3	3
+
+# outsider may not call it: neither may it through the view
+statement error
+ACL ROLE "outsider" SELECT count(*) FROM home.viaf;
+----
+the view "c.home.viaf" reads what this principal may not read
+
+# --- the listing describes the view as its author's resolution probed it -------------------------------------------
+
+query T
+ACL ROLE "hr" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'cards';
+----
+id,ssn

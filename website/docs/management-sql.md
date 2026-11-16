@@ -1394,7 +1394,7 @@ section.
 | `acl_drop_reference(vcat, name[, mode])`                                                              | drop it                                                                 |
 | `acl_register_created(vcat, vname, phys[, origin])`                                                   | internal: the record a principal's own `CREATE` writes                  |
 | `acl_register_existing(vcat, vname, phys[, origin])`                                                  | internal: the `VIRTUAL ONLY` form (refuses a missing physical object)   |
-| `acl_register_view(vcat, vname, body)`                                                                | internal: the record a principal's own `CREATE VIEW` writes             |
+| `acl_register_view(vcat, vname, body[, author[, query]])`                                             | internal: the record a principal's own `CREATE VIEW` writes             |
 | `acl_rematerialize_schema_caps(vcat[, path])`                                                         | rebuild a subtree's inherited schema capabilities                       |
 
 **Grants and scopes**

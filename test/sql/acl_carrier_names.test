@@ -135,14 +135,14 @@ ACL ROLE "r" SELECT lookup((SELECT max(o.tenant) FROM orders o WHERE o.id = s.ke
 ----
 source column (SELECT max(o.tenant) FROM orders AS o WHERE (o.id = s."key"))
 
-# a principal's own view keeps its author's written names (spec 162's body: its reads are CTEs, never in a name)
+# a principal's own view: its reader reads its query as stored (spec 169), the relations qualified
 statement ok
 ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM phys.main; GRANT SCHEMA c.vs TO ROLE r WITH (select, create, drop); CREATE ROLE r2; GRANT CATALOG c TO ROLE r2 MAIN; GRANT SCHEMA c.vs TO ROLE r2 WITH (select);
 
 statement ok
-ACL ROLE "r" CREATE VIEW vs.v1 AS SELECT f.* FROM (SELECT 1 AS k) s, raw((SELECT max(o.amount) + s.k FROM orders o)) f;
+ACL ROLE "r" CREATE VIEW vs.v1 AS SELECT f.* FROM (SELECT 1 AS k) s, c.raw((SELECT max(o.amount) + s.k FROM orders o)) f;
 
 query T
 ACL ROLE "r2" SELECT column_name FROM (DESCRIBE vs.v1);
 ----
-(SELECT (max(o.amount) + s.k) FROM orders AS o)
+(SELECT (max(o.amount) + s.k) FROM c.orders AS o)

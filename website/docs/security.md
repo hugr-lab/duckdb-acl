@@ -116,8 +116,12 @@ share sessions" (spec 040).
   its shape is fixed (`alias` form, the schema's origin) - a principal cannot choose a form, a
   projection or an RLS clause" (spec 016). `create` "is a data capability, not a manage scope, and
   no amount of DDL produces one".
-- A principal's `CREATE VIEW` is "resolved once, with its author's rights, and reading it is decided
-  by the grant on the view" (spec 018).
+- A principal's `CREATE VIEW` is stored as its query, each relation it names qualified to its virtual
+  catalog, and **read under the reader's grants** (spec 169): a reader reads through it exactly what the
+  reader may read directly - its own rows, columns and masks - and needs `select` on the view as well. The
+  author's rights decide only whether the view may be created (the author must read and call everything it
+  names; a virtual function call names its catalog; a session temp table cannot be named). An operator's
+  `CREATE VIRTUAL VIEW` still reads with the SQL the operator wrote.
 - The record runs as a `PRAGMA` after the DDL and answers `Success` with no row: nothing of its
   arguments (the physical name, a view's rewritten body) reaches the client (spec 151). An `EXPLAIN`
   of a DDL that writes a record is refused.

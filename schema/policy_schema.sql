@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS <meta>("key" ACL_KEY_TEXT PRIMARY KEY, "value" VARCHA
 
 CREATE TABLE IF NOT EXISTS <catalogs>("vcat" ACL_KEY_TEXT PRIMARY KEY, "comment" VARCHAR);
 
-CREATE TABLE IF NOT EXISTS <relations>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "vname"));
+CREATE TABLE IF NOT EXISTS <relations>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, "query" VARCHAR, PRIMARY KEY ("vcat", "vname"));
 
 CREATE TABLE IF NOT EXISTS <relation_columns>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
 
@@ -142,11 +142,11 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '25' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '26' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
 INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO <meta> SELECT 'min_reader_version', '25' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');
+INSERT INTO <meta> SELECT 'min_reader_version', '26' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');

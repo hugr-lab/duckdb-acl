@@ -556,16 +556,19 @@ void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &res
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_register_view(vcat, vname, body): the write a role's own CREATE VIEW performs (spec 018) -
-//! the body as written, in virtual names, and nothing else to choose
+//! acl_register_view(vcat, vname, body[, author[, query]]): the write a role's own CREATE VIEW performs (spec 018) -
+//! `body` its author's resolution (the view's shape, spec 169) and `query` the view as written, its relations
+//! qualified: what each reader reads, under the reader's grants. Without `query` the view reads `body` (an
+//! operator's form) - only the rewriter composes this record
 void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		AuthorScope author(OptionalArg(args, 3, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_view", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_view", "name"), true);
 		auto body = RequiredArg(args, 2, row, "acl_register_view", "body");
+		auto query = OptionalArg(args, 4, row, "");
 		RecordWriteStep(state, vcat, false, [&](optional_ptr<PolicyStore::RecordWrite> write) {
-			StoreOf(state).CatalogRegisterView(vcat, vname, body, write);
+			StoreOf(state).CatalogRegisterView(vcat, vname, body, query, write);
 		});
 		RefreshRecordAtCommit(state, vcat, vname);
 	}
@@ -2535,7 +2538,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_register_created", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclRegisterCreatedFunc);
 	register_admin_set("acl_register_existing", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclRegisterExistingFunc);
 	register_admin_set("acl_rename_relation", {{v, v, v}, {v, v, v, v}}, AclRenameRelationFunc);
-	register_admin_set("acl_register_view", {{v, v, v}, {v, v, v, v}}, AclRegisterViewFunc);
+	register_admin_set("acl_register_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclRegisterViewFunc);
 	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
 	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);
 	register_admin_set(
