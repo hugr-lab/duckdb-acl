@@ -167,13 +167,19 @@ any duckdb expression - `['a', 'b']`, `{'k': 1}`, a lambda. An expression withou
 source's: the list carries no `NULL` / `NOT NULL` marks. The legacy quoted form `COLUMNS '<list>'`, `SET COLUMNS`,
 `REMAP` and the function forms (`acl_add_relation`, `acl_alter_relation`) read their text the same way.
 
-**A star** (spec 158 stage 2) is read by duckdb as written, so a column the source gains appears and one it loses goes,
-at once. A list holds one star, unqualified and standing alone (not `t.*`, not inside an expression), and its
-expressions (`REPLACE`, the lambda of `COLUMNS`) read the source by name - no subquery. The star and a named item may
-not read the same name (`EXCLUDE` it from the star, or name the item otherwise); if the source comes to hold a column
-named like an item later, the item keeps its name and the source's column is read with duckdb's suffix (`name_1`).
-Listings describe the columns as of the write or the last `ANALYZE VIRTUAL TABLE` - `acl_check_catalog` says
-`schema_stale` when the source moved on. An object whose list holds a star is read-only.
+**A star** (spec 158 stage 2) is read by duckdb as written, so a column the source gains appears at once, and one it
+loses goes at once.
+- A list holds one star, unqualified and standing alone. Not allowed: `t.*`, a star inside an expression, or
+  `* LIKE` (write `COLUMNS('<regex>')`).
+- Its expressions (`REPLACE`, the selector of `COLUMNS`) read the source by its columns' names: no subquery, no
+  qualified name, no marker in the selector.
+- **No name may be read twice.** A star's column and a named item, or two of the star's own, never share a name.
+  This is refused where the list is written. If the source later gains a column named like an item, every read
+  refuses ("reads a column name twice") and `acl_check_catalog` says `column_duplicate`; `EXCLUDE` the name from the
+  star.
+- Listings describe the columns as of the write or the last `ANALYZE VIRTUAL TABLE`. `acl_check_catalog` says
+  `schema_stale` when the source has moved on.
+- An object whose list holds a star is read-only.
 
 ```sql
 ACL ADMIN CREATE VIRTUAL TABLE c.people AS pg.public.people

@@ -339,10 +339,12 @@ inline bool HoldsStar(const DeclaredList &list) {
 }
 //! The rows of `SELECT "name", "expr" FROM relation_columns … ORDER BY "pos"` (further columns ignored) as a list
 DeclaredList DeclaredListFrom(QueryResult &rows);
-//! The SELECT that reads an object's own list over `from` (` FROM <source> [WHERE …]`): each item as written; a star
-//! beside named items is read after them, then put back in its place as `COLUMNS(lambda …)` without their names - so
-//! a source column that comes to share a named item's name never takes it (duckdb suffixes the later one)
+//! The SELECT that reads an object's own list over `from` (` FROM <source> [WHERE …]`), each item as written
 string ObjectListSelect(const DeclaredList &list, const string &from);
+//! spec 158 stage 2: a read of the list that does not bind when two of its columns share a name (a star's and an
+//! item's, or a star's own) - bound alone before a read runs (spec 157 / 159's guard), since a subquery suffixes a
+//! duplicate (`ssn_1`) where a grant's test and masks name only the first
+string DistinctNamesGuard(const DeclaredList &list, const string &from);
 //! spec 148 for a stored list: each named item's expression one expression, the star one star and nothing more
 bool StoredListOk(const DeclaredList &list);
 //! spec 148: a name the memory store pastes as it is written must be one column reference
@@ -879,9 +881,9 @@ struct CatalogBackend {
 	//! the source)
 	string ProjectionSchema(const string &source, const RoleColumns &columns, const DeclaredList &own,
 	                        vector<std::pair<string, string>> &out, bool *checked = nullptr);
-	//! spec 158 stage 2: a name the object's star and one of its named items both read (the first), '' when none or the
-	//! source does not bind here
-	string StarCollision(const string &source, const DeclaredList &list);
+	//! spec 158 stage 2: a name a list holding a star reads twice over `source` (the first such), '' when none or the
+	//! source does not bind here; `error` gets why the list did not bind over a source that does
+	string DuplicateName(const string &source, const DeclaredList &list, string *error = nullptr);
 
 	//! Whether a relation has a column of that name. False only when the relation itself binds and the
 	//! column does not: a source that cannot be reached at all answers true, since it cannot answer.

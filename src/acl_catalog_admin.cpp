@@ -525,21 +525,16 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		auto source = NamePath::KeyToSql(phys);
 		derived = acl_detail::StoredListOk(columns) &&
 		          catalog.ProbeSchema(acl_detail::ObjectListSelect(columns, " FROM " + source), false, {}, schema);
-		if (derived) {
-			// spec 158 stage 2: the star's columns and a named item never share a name - the read would suffix one
-			auto both = catalog.StarCollision(source, columns);
-			if (!both.empty()) {
-				throw InvalidInputException("acl: the column list of \"%s\" reads \"%s\" twice - by its star and by "
-				                            "an item of that name: EXCLUDE it from the star or name the item otherwise",
-				                            vname, both);
-			}
-		} else {
+		if (!derived) {
 			schema.clear();
 			for (auto &column : columns) {
 				if (!acl_detail::IsStarItem(column)) {
 					schema.emplace_back(column.first, string()); // the probe could not bind: names only
 				}
 			}
+			// spec 158 stage 2: a star's columns are known only from a probe - the names kept are re-derived at the
+			// next ANALYZE and compared by the check, as a probed schema is
+			derived = acl_detail::HoldsStar(columns);
 		}
 	} else {
 		for (auto &column : columns) {
@@ -570,14 +565,43 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 			}
 		}
 	}
+	// spec 158 stage 2: a column a star's REPLACE computes is a computed column to a key, as a named expression is
+	auto key_columns = columns;
+	for (auto &column : columns) {
+		if (acl_detail::IsStarItem(column)) {
+			for (auto &replaced : ReadStarParts(column.second).replaced) {
+				key_columns.push_back(replaced);
+			}
+		}
+	}
 	for (auto &statement :
-	     catalog.KeyStatements(vcat, vname, "relation", pk, known, nullable_marks, &columns, pk_carried)) {
+	     catalog.KeyStatements(vcat, vname, "relation", pk, known, nullable_marks, &key_columns, pk_carried)) {
 		statements.push_back(statement);
 	}
 	return statements;
 }
 
 using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
+
+//! spec 158 stage 2: where a list holding a star is written over a source that binds here, it must bind over it and
+//! read no name twice (the read refuses both: a duplicate is suffixed in a subquery, `ssn_1`, where a grant's test and
+//! masks name only the first)
+void RequireStarListReads(CatalogBackend &catalog, const string &vname, const string &phys,
+                          const vector<std::pair<string, string>> &columns) {
+	if (!acl_detail::HoldsStar(columns) || phys.empty()) {
+		return;
+	}
+	string error;
+	auto twice = catalog.DuplicateName(NamePath::KeyToSql(phys), columns, &error);
+	if (!twice.empty()) {
+		throw InvalidInputException("acl: the column list of \"%s\" reads \"%s\" twice - EXCLUDE it from the star or "
+		                            "name the other column otherwise",
+		                            vname, twice);
+	}
+	if (!error.empty()) {
+		throw InvalidInputException("acl: the column list of \"%s\" does not bind over \"%s\": %s", vname, phys, error);
+	}
+}
 
 //! An object's own list as stored, in its order (read by `DeclaredListFrom`)
 string DeclaredListSql(CatalogBackend &catalog, const string &vcat, const string &vname) {
@@ -1096,6 +1120,7 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 			kept_pk = StringUtil::Join(parts, ", ");
 			pk_carried = !kept_pk.empty();
 		}
+		RequireStarListReads(*catalog, vname, phys, columns);
 		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns,
 		                                string(), kept_pk, nullable_marks, pk_carried, alias_types, enum_types);
 	});
@@ -1305,7 +1330,13 @@ bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname
 		declared = acl_detail::DeclaredListFrom(*columns);
 		for (auto &item : declared) {
 			if (acl_detail::IsStarItem(item)) {
-				continue; // spec 158 stage 2: judged with the list (StoredListOk below)
+				// spec 158 stage 2: judged with the list (StoredListOk below); a REPLACE of a source column masks it
+				for (auto &replaced : ReadStarParts(item.second).replaced) {
+					if (source_columns.count(replaced.first)) {
+						masks.insert(replaced.first);
+					}
+				}
+				continue;
 			}
 			stored_expressions.push_back(item.second);
 			if (!item.second.empty() && source_columns.count(item.first)) {
@@ -2355,7 +2386,12 @@ void PolicyStore::CatalogSetKey(const string &vcat, const string &vname, const s
 		vector<string> projected;
 		for (idx_t row = 0; row < declared->RowCount(); row++) {
 			if (declared_rows.GetValue(0, row).IsNull()) {
-				continue; // spec 158 stage 2: the star - its columns are the stored schema's (known)
+				// spec 158 stage 2: the star - its columns are the stored schema's (known), its REPLACEs computed
+				auto star = declared_rows.GetValue(1, row);
+				for (auto &replaced : ReadStarParts(star.IsNull() ? string() : star.ToString()).replaced) {
+					masked.push_back(replaced);
+				}
+				continue;
 			}
 			auto name = declared_rows.GetValue(0, row).ToString();
 			auto expr = declared_rows.GetValue(1, row);
@@ -3588,6 +3624,10 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 				parts.push_back(key_rows_rows.GetValue(0, key_row).ToString());
 			}
 			kept_pk = StringUtil::Join(parts, ", ");
+		}
+		if (field == "columns" || field == "phys") {
+			RequireStarListReads(*catalog, vname, new_phys,
+			                     new_columns); // only where the list or its source is written
 		}
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
 		                                comment, string(), origin, kept_pk, kept_marks, true, alias_types, enum_types);

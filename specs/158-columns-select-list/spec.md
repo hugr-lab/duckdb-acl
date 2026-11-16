@@ -117,29 +117,65 @@ CREATE VIRTUAL TABLE c.people FROM pg.public.people
   COLUMNS (* EXCLUDE (ssn), '***-**-' || right(ssn, 4) AS ssn_tail);
 ```
 
-- **One star, unqualified, standing alone.** A second star, `t.*`, a star inside an expression
-  (`upper(COLUMNS(*))`, `*COLUMNS(…)`) or a named star are refused where written: the star reads the object's one
-  source, and one star is enough to say "the source's columns".
-- **The read is live.** The star goes to duckdb as written, so a column the source gains appears and one it loses
-  goes, as for an object with no list. Beside named items, the named ones are read first and the star's columns after
-  them (`SELECT <named items>, <star> FROM <source>`), then put back in the written order, the star as
-  `COLUMNS(lambda c: c NOT IN (<named>))`. So a source column that comes to share a named item's name never takes
-  that name: duckdb keeps a name for the first column that has it and suffixes the rest (`uname_1`). A grant's mask
-  or test on the named item still reads the named item (review).
-- **At write**, the star and the named items must not share a name: a name both read is refused (`EXCLUDE` it or
-  rename the item), and `acl_check_catalog` reports it later as `schema_stale`.
+- **One star, unqualified, standing alone.** Refused where written:
+  - a second star;
+  - `t.*`;
+  - a star inside an expression (`upper(COLUMNS(*))`, `*COLUMNS(…)`), or a named star;
+  - `* LIKE | GLOB | SIMILAR TO` (write `COLUMNS('<regex>')`);
+  - a subquery, a qualified name or a field path inside the star (its `REPLACE` expressions, its `COLUMNS` selector, its
+    `EXCLUDE` / `RENAME` names);
+  - a marker (`acl_claim`, `acl_has_role`) in the `COLUMNS` selector: the object's columns are the object's, never the
+    reader's (a marker in `REPLACE` is fine).
+- **The read is live and as written**: `SELECT <list> FROM <source>`, so a column the source gains appears and one it
+  loses goes, as for an object with no list.
+- **No name twice.** A subquery suffixes a duplicate name (`ssn_1`), while a grant's test and masks name only the first,
+  so a duplicate fails closed everywhere (review):
+  - where the list or its source is written over a source that binds, the list must bind and read no name twice
+    (`DuplicateName`, markers baked as in every probe);
+  - every read binds `<the list's read> UNION ALL BY NAME …` alone first (`DistinctNamesGuard`, a spec 157 / 159 guard;
+    duckdb refuses a duplicate there), refused as "reads a column name twice";
+  - `acl_check_catalog` says `column_duplicate`.
+
+  So a source that comes to hold a column named like one of the list's makes the object refuse until the list is
+  altered (`EXCLUDE` it from the star).
 - **The grant** goes over the object's read as over an object with no list (`GrantOver`): duckdb applies the test and
-  the masks over the object's columns, a mask of a column the object lost refuses at bind.
-- **Listings** keep the snapshot every declared list has (`object_columns`, probed at write and at `ANALYZE`): the
-  read follows the source at once, the listing at the next `ANALYZE`, and `acl_check_catalog`'s `schema_stale` says
-  when the two part. Expanding the star in the listing's SQL would be a second reader of duckdb's star rules
-  (`REPLACE`, `RENAME`, a regex, a lambda) - the drift spec 158 removed.
-- **Read-only.** An object whose list holds a star is the subquery form: which source columns it writes is known only
-  where duckdb binds it, and an INSERT that names no columns matches by position against a width nobody published.
+  the masks over the object's columns, and a mask of a column the object lost refuses at bind. A mask is read as the
+  type the object exposes its column as (spec 099), found by column: a column the star passes by its name, a RENAME's
+  source, a named item by stage 1's rule; a computed one (a REPLACE, a named expression) is cast to nothing.
+- **Listings** keep the snapshot every declared list has (`object_columns`, probed at write and at `ANALYZE`). The read
+  follows the source at once, the listing at the next `ANALYZE`, and `acl_check_catalog`'s `schema_stale` says when
+  the two part. A star written over a source that does not bind keeps its named items, marked derived so `ANALYZE`
+  re-derives them. Expanding the star in the listing's SQL would be a second reader of duckdb's star rules (`REPLACE`,
+  `RENAME`, a regex, a lambda): the drift spec 158 removed.
+- **Read-only, whatever form is stored.** Which source columns the object writes is known only where duckdb binds it,
+  and an INSERT that names no columns matches by position against a width nobody published.
 - **Stored** as one `relation_columns` row with no name and the star as duckdb prints it; every reader by name skips
-  it. REMAP and `DROP MISSING COLUMNS` leave it as it is (it names no column of its own). A REPLACE expression or a
-  COLUMNS lambda is a body like a computed column: the author's function gate (spec 117), qualified tables (spec
-  160), the source gate (spec 138).
+  it.
+  - REMAP and `DROP MISSING COLUMNS` leave it as it is (it names no column of its own).
+  - A column its REPLACE computes is computed to a key (spec 048) and masking to lineage (spec 129).
+  - A column it passes carries its source column's tags (spec 143).
+  - Its REPLACE expressions and its selector are a body like a computed column: the author's function gate (spec 117);
+    no table to qualify (spec 160) or gate (spec 138).
+
+## Known limits (stage 2)
+
+- A star that no longer binds over its source (an `EXCLUDE` of a dropped column) refuses every read and is the check's
+  `column_missing`, but the listing's broken-list mark (spec 039) is computed only for named items.
+- A `COLUMNS` selector may read the session (`current_setting('TimeZone')`), which a client sets (spec 068): the
+  object's columns then differ by session, while the listing shows the snapshot's. The grants' tests still apply to
+  what the read returns.
+- A column a RENAME names carries the tags of a source column of the new name, if one exists (more tags, never fewer).
+
+## Found by the reviews (stage 2)
+
+- A duplicate name, whether a star's own (`RENAME (name AS ssn)`), a star's against an item, or one the source gained,
+  was suffixed (`ssn_1`): the second column read raw past a grant's mask and `EXCLUDE`. It is now refused at write, at
+  read and by the check (see "No name twice"). Reading the named items before the star (the first build) only moved
+  the suffix onto the next column.
+- A marker in the star made the write's probe fail, which skipped its checks: the probes now bake the markers.
+- A mask over a star object was cast by the output name; it is now cast by the column it reads.
+- The role-union audit (spec 146), lineage's per-role tags (spec 107), the key check (spec 048), the check under the
+  exposed types (spec 099) and `enum_domain_exposed` now see the star's columns.
 
 ## Known limits (stage 1)
 

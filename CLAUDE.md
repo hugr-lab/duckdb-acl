@@ -906,11 +906,12 @@ COLUMNS(lambda …) FROM (SELECT * REPLACE (masks) FROM <read>)` - and its DML j
 from the principal's roles. Function forms: `acl_grant_object(…, versions, masks)`, `acl_check_grant(…, caps, masks)`;
 `platform.object_grants.columns` STRUCT(mode, names) and `masks` LIST(STRUCT(column, mask)) for the editors.
 Stage 2: one star in an object's list (`*`, `EXCLUDE` / `REPLACE` / `RENAME`, `COLUMNS(…)`; stored as a
-`relation_columns` row with a NULL name - `IsStarItem`, `DeclaredListFrom`) is read live by duckdb
-(`ObjectListSelect`: named items first, the star after them as `COLUMNS(lambda …)` without their names, so a source
-column never takes an item's name), the grant over it as over a live object (`GrantOver`), listings from the
-snapshot (`object_columns`, write / ANALYZE), read-only; `StarCollision` refuses a name both read where written. Test
-`acl_object_list_star.test`.
+`relation_columns` row with a NULL name - `IsStarItem`, `DeclaredListFrom`) is read live by duckdb as
+written (`ObjectListSelect`), the grant over it as over a live object (`GrantOver`, masks cast by `StarCastKey`),
+listings from the snapshot (`object_columns`, write / ANALYZE), read-only. A name read twice (a subquery suffixes it,
+`ssn_1`, past a grant's mask) fails closed: `DuplicateName` where the list or its source is written, a guard per read
+(`DistinctNamesGuard`: `… UNION ALL BY NAME …`, first line `WRITE_GUARD_DISTINCT`), the check's `column_duplicate`.
+Test `acl_object_list_star.test`.
 
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema

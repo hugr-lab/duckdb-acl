@@ -317,8 +317,8 @@ mode of default-deny is a refusal, and the refusal names the function.
   listing filters the object's columns by the same test the read applies.
 - **A star in the object's list is read live** (stage 2): a column the source gains is the object's at once, and a
   grant's `*` / `* EXCLUDE (…)` shows it to its roles before any listing does (the listing follows at the next
-  `ANALYZE`). Use a named list where a new source column must wait for the operator. A named item beside the star
-  keeps its name and its masks even when the source comes to hold a column of that name.
+  `ANALYZE`). Use a named list where a new source column must wait for the operator. A name the list would read
+  twice (duckdb suffixes the second, past a grant's mask) refuses every read instead.
 - **A catalog grant carries no columns.** One stored by an older build refuses every read under the grant (fail
   closed) and is the check's `catalog_columns`.
 - **The union of roles is monotone**: a role adds what it sees; a column is unmasked when some role shows it without a

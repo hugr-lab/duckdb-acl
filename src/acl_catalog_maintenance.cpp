@@ -112,7 +112,12 @@ bool EntryBinds(CatalogBackend &catalog, const string &source, const std::pair<s
 		error = "the star does not read back as stored (spec 148)";
 		return false;
 	}
-	return Binds(catalog, "SELECT " + entry.second + " FROM " + source + " WHERE false", error);
+	auto sql = "SELECT " + entry.second + " FROM " + source + " WHERE false";
+	try {
+		sql = BakeTemplateForProbe(sql, ParserOptions::Builtin(), false, {}); // markers NULL, as in every probe
+	} catch (std::exception &) {
+	}
+	return Binds(catalog, sql, error);
 }
 
 //! What the object's stored schema says (spec 010), and whether it was derived by a probe or declared
@@ -303,6 +308,18 @@ private:
 					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (<column> AS " +
 					        KeywordHelper::WriteOptionallyQuoted(entry.first) + ")  -- or DROP MISSING COLUMNS");
 				}
+				auto twice = any_missing ? string()
+				                         : catalog.DuplicateName(NamePath::KeyToSql(relation.phys), relation.declared);
+				if (!twice.empty()) {
+					// spec 158 stage 2: every read refuses it (a subquery would suffix the second, `x_1`)
+					any_missing = true;
+					Add(kind, relation.vname, "", "column_duplicate",
+					    "the column list reads \"" + twice +
+					        "\" twice - its star and another column share the name, "
+					        "and every read refuses",
+					    "ALTER VIRTUAL TABLE " + Named(relation.vname) +
+					        " SET COLUMNS (<the list, the name EXCLUDEd from the star or the other column renamed>)");
+				}
 				if (!any_missing && stored_derived) {
 					Columns probed;
 					if (catalog.ProbeSchema(acl_detail::ObjectListSelect(relation.declared,
@@ -428,9 +445,36 @@ private:
 		bool strip_alias = alias_types.IsNull() ? NodeStripsAliases(*instance) : Text(alias_types) == "base";
 		bool enums_to_varchar = enum_types.IsNull() ? NodeEnumsToVarchar(*instance) : Text(enum_types) == "varchar";
 		// the columns the object exposes: a declared list shows only what its entries read by name
+		// spec 158 stage 2: a star passes the source columns it names as it is (not those it leaves out or computes)
+		case_insensitive_set_t star_passes;
+		for (auto &entry : relation.declared) {
+			if (!acl_detail::IsStarItem(entry)) {
+				continue;
+			}
+			auto parts = ReadStarParts(entry.second);
+			vector<std::pair<string, string>> probed;
+			string star_read;
+			try {
+				star_read = BakeTemplateForProbe("SELECT " + entry.second + " FROM " + relation.Source(),
+				                                 ParserOptions::Builtin(), false, {});
+			} catch (std::exception &) {
+			}
+			if (!star_read.empty() && catalog.ProbeSchema(star_read, false, {}, probed)) {
+				for (auto &column : probed) {
+					star_passes.insert(column.first);
+				}
+			}
+			for (auto &replaced : parts.replaced) {
+				star_passes.erase(replaced.first);
+			}
+			for (auto &renamed : parts.renamed) {
+				star_passes.erase(renamed.first);
+				star_passes.insert(renamed.second);
+			}
+		}
 		auto exposed = [&](const string &column) {
-			if (relation.declared.empty() || acl_detail::HoldsStar(relation.declared)) {
-				return true; // a star passes the source's columns (spec 158 stage 2)
+			if (relation.declared.empty() || star_passes.count(column)) {
+				return true;
 			}
 			for (auto &entry : relation.declared) {
 				auto reads = entry.second.empty() ? entry.first : entry.second;
@@ -498,7 +542,13 @@ private:
 		auto stored = StoredSchema(catalog, vcat, relation.vname, "relation", stored_derived);
 		for (auto &entry : relation.declared) {
 			if (acl_detail::IsStarItem(entry)) {
-				continue; // a star passes the source's columns as they are exposed
+				// its REPLACE expressions read the exposed types too (spec 099)
+				if (EntryBinds(catalog, relation.Source(), entry, error) && !EntryBinds(catalog, typed, entry, error)) {
+					Add(kind, relation.vname, "", "types_incompatible",
+					    "the star " + entry.second + " does not bind once the source's types are exposed: " + error,
+					    repair_types);
+				}
+				continue;
 			}
 			auto item = EntryItem(entry);
 			if (!ItemBinds(catalog, relation.Source(), item, error)) {

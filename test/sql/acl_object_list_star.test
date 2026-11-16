@@ -136,23 +136,80 @@ ACL ROLE "a" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM 
 ----
 id,name,tenant,email,ssn_tail
 
-# a source column that comes to share a named item's name is suffixed: the named item keeps its name and its mask
+# a source column that comes to share a named item's name: duckdb would suffix one of them (`ssn_tail_1`) where the
+# grant's test and mask name only the first - every read refuses instead, and the check names it (review)
 
 statement ok
 ALTER TABLE phys.main.p ADD COLUMN ssn_tail VARCHAR DEFAULT 'raw';
 
-query T
-ACL ROLE "m" SELECT string_agg(ssn_tail, ',') FROM ex;
+statement error
+ACL ROLE "m" SELECT * FROM ex;
 ----
-hidden
+reads a column name twice
 
-query T
-ACL ROLE "a" SELECT ssn_tail FROM ex WHERE id = 1;
+statement error
+ACL ROLE "a" SELECT id FROM ex;
 ----
-***-6789
+reads a column name twice
+
+query TT
+SELECT problem, repair FROM acl_check_catalog('c') WHERE object = 'ex';
+----
+column_duplicate	ALTER VIRTUAL TABLE c.ex SET COLUMNS (<the list, the name EXCLUDEd from the star or the other column renamed>)
+
+# an ALTER of another field is not refused for it (only a write of the list or its source is judged)
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.ex IS 'people';
 
 statement ok
 ALTER TABLE phys.main.p DROP COLUMN ssn_tail;
+
+query I
+ACL ROLE "a" SELECT count(*) FROM ex;
+----
+2
+
+# a star that makes a name twice by itself (a RENAME onto a column it passes) is refused where written
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (* EXCLUDE (salary) RENAME (name AS ssn));
+----
+reads "ssn" twice
+
+# a marker in the star does not hide a duplicate from the write's probe (review)
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (* REPLACE (CASE WHEN acl_has_role('hr') THEN salary END AS salary), '***' AS ssn);
+----
+reads "ssn" twice
+
+# an object written while its source does not bind is judged where it is read: the duplicate refuses
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.late AS phys.main.q COLUMNS (*, '***-' || right(ssn, 4) AS ssn);
+
+statement ok
+CREATE TABLE phys.main.q AS SELECT * FROM phys.main.p;
+
+statement ok
+ACL ADMIN GRANT TABLE c.late TO ROLE m MASK (ssn AS 'hidden');
+
+statement error
+ACL ROLE "m" SELECT * FROM late;
+----
+reads a column name twice
+
+query T
+SELECT problem FROM acl_check_catalog('c') WHERE object = 'late';
+----
+column_duplicate
+
+# a list that does not bind over a source that does is refused where written
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (id, * EXCLUDE (nosuch));
+----
+does not bind over
 
 # --- refused where written ----------------------------------------------------------------------------------------
 
@@ -164,7 +221,27 @@ holds a second star
 statement error
 ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (p.*);
 ----
-over the object's one source
+no qualified name
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (* REPLACE (upper(main.p.name) AS name));
+----
+no qualified name
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (* EXCLUDE (p.ssn));
+----
+no qualified name
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (COLUMNS(lambda c: acl_has_role('m') OR c <> 'ssn'));
+----
+reads a marker
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (* LIKE 'n%');
+----
+COLUMNS('<regex>')
 
 statement error
 ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.p COLUMNS (id, upper(COLUMNS('name')) AS u);
@@ -234,3 +311,57 @@ query T
 ACL ROLE "a" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'dm';
 ----
 id,name,salary,tenant,email
+
+# a column a star's REPLACE computes is computed to a key, as a named expression is (review)
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.k1 AS phys.main.p COLUMNS (* REPLACE (nullif(name, 'ann') AS name));
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.k1 SET PRIMARY KEY (name);
+----
+computed by an expression
+
+# a mask over a star object is read as the object's column's type, by column (spec 099 casts; review)
+
+statement ok
+CREATE TYPE mood AS ENUM ('ok', 'sad');
+
+statement ok
+CREATE TABLE phys.main.e (id INTEGER, m mood, name VARCHAR);
+
+statement ok
+INSERT INTO phys.main.e VALUES (1, 'ok', 'ann');
+
+statement ok
+SET GLOBAL acl_enum_types = 'varchar';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.er AS phys.main.e COLUMNS (* RENAME (m AS mood, name AS m));
+
+statement ok
+ACL ADMIN GRANT TABLE c.er TO ROLE m MASK (mood AS 'ok');
+
+query TT
+ACL ROLE "a" SELECT typeof(mood), typeof(m) FROM er;
+----
+VARCHAR	VARCHAR
+
+query TT
+ACL ROLE "m" SELECT typeof(mood), typeof(m) FROM er;
+----
+VARCHAR	VARCHAR
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ep AS phys.main.e COLUMNS (* REPLACE (length(m::VARCHAR) AS m));
+
+statement ok
+ACL ADMIN GRANT TABLE c.ep TO ROLE m MASK (m AS 0);
+
+query T
+ACL ROLE "m" SELECT typeof(m) FROM ep;
+----
+BIGINT
+
+statement ok
+SET GLOBAL acl_enum_types = 'keep';

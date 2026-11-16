@@ -3118,6 +3118,12 @@ private:
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr);
 		SourceAt(*select_stmt->node, std::move(original.at_clause), vname);
+		if (!policy.distinct_guard.empty()) {
+			// spec 158 stage 2: a list with a star reads no name twice, judged where it binds
+			auto guard = store.InstantiateSelect(policy.distinct_guard, template_options);
+			BakeMarkersInNode(*guard->node, nullptr);
+			guards.push_back(string(WRITE_GUARD_DISTINCT) + Shown(vname) + "\n" + guard->ToString());
+		}
 		return ReadRef(std::move(select_stmt), vname, original);
 	}
 
@@ -5391,10 +5397,12 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 				// bound with each marker a NULL, as the shape's own probes bind it
 				auto read = guard;
 				if (guarded.get() != stmt.get() && guarded.get() != rewriter.replacement.get()) {
-					bool names_only = StringUtil::StartsWith(guard, WRITE_GUARD_NAMES_ONLY);
-					auto text = names_only ? guard.substr(strlen(WRITE_GUARD_NAMES_ONLY)) : guard;
-					read = (names_only ? string(WRITE_GUARD_NAMES_ONLY) : string()) +
-					       BakeTemplateForProbe(text, ParserOptions::Builtin(), false, {});
+					// a first line `-- acl:…` (names only, distinct) stays as it is
+					string head;
+					if (StringUtil::StartsWith(guard, "-- acl:")) {
+						head = guard.substr(0, guard.find('\n') + 1);
+					}
+					read = head + BakeTemplateForProbe(guard.substr(head.size()), ParserOptions::Builtin(), false, {});
 				}
 				auto key = WriteGuardKey(read);
 				if (std::find(keys.begin(), keys.end(), key) == keys.end()) {

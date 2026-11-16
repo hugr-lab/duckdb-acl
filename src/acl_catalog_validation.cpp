@@ -327,30 +327,16 @@ string ListItem(const std::pair<string, string> &item) {
 } // namespace
 
 string ObjectListSelect(const DeclaredList &list, const string &from) {
-	vector<string> named, star, written;
+	vector<string> written;
 	for (auto &item : list) {
-		(IsStarItem(item) ? star : named).push_back(ListItem(item));
+		written.push_back(ListItem(item));
 	}
-	if (star.empty() || named.empty()) {
-		for (auto &item : list) {
-			written.push_back(ListItem(item));
-		}
-		return "SELECT " + (written.empty() ? string("*") : StringUtil::Join(written, ", ")) + from;
-	}
-	// the named items first, so each keeps its name whatever the source comes to hold; the star's columns after them
-	vector<string> names;
-	for (auto &item : list) {
-		if (!IsStarItem(item)) {
-			names.push_back(Lit(FoldColumn(item.first)));
-		}
-	}
-	for (auto &item : list) {
-		written.push_back(IsStarItem(item) ? "COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " NOT IN (" +
-		                                         StringUtil::Join(names, ", ") + "))"
-		                                   : Ident(item.first));
-	}
-	return "SELECT " + StringUtil::Join(written, ", ") + " FROM (SELECT " + StringUtil::Join(named, ", ") + ", " +
-	       star[0] + from + ") AS __acl_listed";
+	return "SELECT " + (written.empty() ? string("*") : StringUtil::Join(written, ", ")) + from;
+}
+
+string DistinctNamesGuard(const DeclaredList &list, const string &from) {
+	// duckdb refuses a duplicate name in a UNION BY NAME's select list (a subquery would suffix it: `ssn_1`)
+	return ObjectListSelect(list, from) + " UNION ALL BY NAME SELECT NULL AS \"__acl_distinct\" WHERE false";
 }
 
 bool StoredListOk(const DeclaredList &list) {
@@ -373,30 +359,36 @@ bool StoredListOk(const DeclaredList &list) {
 	return StoredExpressionsOk(expressions);
 }
 
-string CatalogBackend::StarCollision(const string &source, const DeclaredList &list) {
-	if (!HoldsStar(list)) {
-		return string();
-	}
-	string star;
-	case_insensitive_set_t named;
-	for (auto &item : list) {
-		if (IsStarItem(item)) {
-			star = item.second;
-		} else {
-			named.insert(item.first);
-		}
-	}
-	if (named.empty()) {
+string CatalogBackend::DuplicateName(const string &source, const DeclaredList &list, string *error) {
+	if (!HoldsStar(list) || !StoredListOk(list)) {
 		return string();
 	}
 	auto instance = Db();
 	Connection con(*instance);
-	auto probe = con.Query("SELECT " + star + " FROM " + source + " WHERE false");
-	if (probe->HasError()) {
-		return string(); // judged where it binds
+	if (con.Query("SELECT * FROM " + source + " WHERE false")->HasError()) {
+		return string(); // the source does not bind here: judged where it does
 	}
+	string baked;
+	try {
+		// the markers a read bakes (acl_claim, acl_has_role) are NULLs here, as every probe has them
+		baked = BakeTemplateForProbe(ObjectListSelect(list, " FROM " + source + " WHERE false"),
+		                             ParserOptions::Builtin(), false, {});
+	} catch (std::exception &ex) {
+		if (error) {
+			*error = ErrorData(ex).RawMessage();
+		}
+		return string();
+	}
+	auto probe = con.Query(baked);
+	if (probe->HasError()) {
+		if (error) {
+			*error = probe->GetError();
+		}
+		return string();
+	}
+	case_insensitive_set_t seen;
 	for (auto &name : probe->GetNames()) {
-		if (named.count(name.GetIdentifierName())) {
+		if (!seen.insert(name.GetIdentifierName()).second) {
 			return name.GetIdentifierName();
 		}
 	}
@@ -413,8 +405,15 @@ bool CatalogBackend::ExposedColumns(const string &source, const DeclaredList &de
 	auto instance = Db();
 	Connection con(*instance);
 	auto read = declared.empty() ? "SELECT * FROM " + source : ObjectListSelect(declared, " FROM " + source);
-	if (!declared.empty() && !StoredListOk(declared)) {
-		return false;
+	if (!declared.empty()) {
+		if (!StoredListOk(declared)) {
+			return false;
+		}
+		try {
+			read = BakeTemplateForProbe(read, ParserOptions::Builtin(), false, {}); // markers NULL, as in every probe
+		} catch (std::exception &) {
+			return false;
+		}
 	}
 	auto probe = con.Query("SELECT * FROM (" + read + ") WHERE false");
 	if (probe->HasError()) {

@@ -130,6 +130,9 @@ uint64_t StatementTextHash(const string &text);
 //! (`\n/* acl:guard:<key>[,<key>…] */`, a line of its own); the keys a text ends with (empty when none)
 //! spec 164: the first line of a call's probe read - a guard that refuses only a name it cannot resolve
 static constexpr const char *WRITE_GUARD_NAMES_ONLY = "-- acl:names\n";
+//! spec 158 stage 2: the first line of an object's distinct-names read, `-- acl:distinct <object>` - a duplicate name
+//! refuses naming the object
+static constexpr const char *WRITE_GUARD_DISTINCT = "-- acl:distinct ";
 string WriteGuardKey(const string &read);
 string WriteGuardMarker(const string &keys);
 vector<string> WriteGuardKeys(const string &text);
