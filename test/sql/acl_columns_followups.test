@@ -1,6 +1,7 @@
 # name: test/sql/acl_columns_followups.test
-# description: spec 170 - spec 158 stage 1's follow-ups: DROP RELATION of a relation that shadowed a live alias's
-#   object keeps that object's grants (their COLUMNS and MASK); acl_object_grants() shows masks and versions;
+# description: spec 170 - spec 158 stage 1's follow-ups: DROP RELATION of a name a live alias's object shares while
+#   object grants are on it is refused (kept, a relation's grant became the alias object's; deleted, the alias object
+#   lost its COLUMNS and MASK) - a principal's record takes them with it; acl_object_grants() shows masks and versions;
 #   platform.check_grant with no caps answers no caps row; a COLUMNS that leaves no column is said in the grant's words.
 # group: [sql]
 
@@ -48,7 +49,9 @@ ACL ROLE "r" SELECT * FROM raw.t;
 ----
 1	***
 
-# a relation of the same name shadows it, then goes: the grant on the name stays - the alias's object is read as before
+# a relation of the same name shadows it; its drop is refused while the name holds object grants - neither keeping
+# them (a relation's grant would become the alias object's) nor dropping them (the alias object would lose its COLUMNS
+# and MASK) is the drop's to decide
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.raw.t AS phys.main.t2;
 
@@ -57,18 +60,67 @@ ACL ROLE "r" SELECT * FROM raw.t;
 ----
 2	***
 
+statement error
+ACL ADMIN DROP RELATION c.raw.t;
+----
+holds object grants (role r) that the live schema alias's object of that name would take over
+
+statement ok
+ACL ADMIN REVOKE TABLE c.raw.t FROM ROLE r;
+
 statement ok
 ACL ADMIN DROP RELATION c.raw.t;
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.t TO ROLE r COLUMNS (id, ssn) MASK (ssn AS '***');
 
 query IT
 ACL ROLE "r" SELECT * FROM raw.t;
 ----
 1	***
 
+# a relation-only grant is not handed to the alias's object either: the role named by it reads nothing there
+statement ok
+ACL ADMIN CREATE ROLE outsider; CREATE VIRTUAL TABLE c.raw.pub2 AS phys.main.t2;
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.pub2 TO ROLE outsider WITH (select);
+
+statement error
+ACL ADMIN DROP RELATION c.raw.pub2;
+----
+holds object grants (role outsider)
+
+# a principal's own record takes its grants with it (spec 151): the reader's grant does not land on what comes next
+statement ok
+CREATE TABLE phys.main.hr (id INTEGER, salary INTEGER);
+
+statement ok
+INSERT INTO phys.main.hr VALUES (1, 100000);
+
+statement ok
+ACL ADMIN CREATE ROLE dev; CREATE ROLE ana; GRANT CATALOG c TO ROLE dev WITH (select) MAIN; GRANT CATALOG c TO ROLE ana CAPS '{}' MAIN; GRANT SCHEMA c.raw TO ROLE dev WITH (select, create, drop);
+
+statement ok
+ACL ROLE "dev" CREATE VIEW raw.v AS SELECT id FROM raw.t2;
+
+statement ok
+ACL ADMIN GRANT VIEW c.raw.v TO ROLE ana WITH (select);
+
+statement ok
+ACL ROLE "dev" DROP VIEW raw.v;
+
+statement ok
+ACL ROLE "dev" CREATE TABLE raw.v AS SELECT * FROM raw.hr;
+
+statement error
+ACL ROLE "ana" SELECT * FROM raw.v;
+----
+
 # --- acl_object_grants() shows what spec 158 / 167 store -----------------------------------------------------------
 
 query TTT
-SELECT vname, columns, masks FROM acl_object_grants() WHERE role = 'r';
+SELECT vname, columns, masks FROM acl_object_grants() WHERE role = 'r' AND vname = 'raw.t';
 ----
 raw.t	id, ssn	ssn AS CAST(('***') AS VARCHAR)
 

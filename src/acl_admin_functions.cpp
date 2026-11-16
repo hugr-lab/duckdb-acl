@@ -808,7 +808,7 @@ void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result
 		auto &store = StoreOf(state);
 		if (AllowDrop(store, vcat, vname, "relation", OptionalArg(args, 2, row, ""))) {
 			RecordWriteStep(state, vcat, false, [&](optional_ptr<PolicyStore::RecordWrite> write) {
-				store.CatalogDropRelation(vcat, vname, write);
+				store.CatalogDropRelation(vcat, vname, write, running_record);
 			});
 		}
 	}

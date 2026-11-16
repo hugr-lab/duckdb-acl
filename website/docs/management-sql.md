@@ -1332,7 +1332,10 @@ Without `IF EXISTS` a missing target is an error.
 
 `mode` is `skip` for `IF EXISTS`, otherwise empty. Dropping an object takes its stored schema,
 comments, declared key and every reference that names it with it; a schema dropped with `CASCADE`
-takes those of its expanded records too.
+takes those of its expanded records too. A relation whose name is also an object of a live schema alias
+(`c.raw.t` under `CREATE VIRTUAL SCHEMA c.raw AS …`) is not dropped while object grants are on that name: a grant is
+kept by name and cannot say which of the two it was written for, so revoke them first and grant the alias's object
+what it should read (spec 170). A principal's own `DROP TABLE | VIEW` takes its grants with it.
 
 ## Batches and authorization
 

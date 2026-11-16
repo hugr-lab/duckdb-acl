@@ -329,10 +329,19 @@ ACL ROLE 'r_all' SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'raw' 
 ----
 1
 
+# spec 170: the name holds object grants the alias's object shares - the drop is refused until they are revoked
+statement error
+ACL ADMIN DROP RELATION c.raw.orders;
+----
+holds object grants (role analyst, r_cat, r_obj, r_path, r_positions, r_whole_mask)
+
+statement ok
+ACL ADMIN REVOKE TABLE c.raw.orders FROM ROLE analyst; REVOKE TABLE c.raw.orders FROM ROLE r_cat; REVOKE TABLE c.raw.orders FROM ROLE r_obj; REVOKE TABLE c.raw.orders FROM ROLE r_path; REVOKE TABLE c.raw.orders FROM ROLE r_positions; REVOKE TABLE c.raw.orders FROM ROLE r_whole_mask;
+
 statement ok
 ACL ADMIN DROP RELATION c.raw.orders;
 
-# (the drop took the object grants on that name with it - r_cat's on the alias object among them; grant it again)
+# (r_cat's grant on the alias object, revoked above; grant it again)
 statement ok
 ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_cat WITH (select) COLUMNS (id, amount) MASK (amount AS 0);
 
