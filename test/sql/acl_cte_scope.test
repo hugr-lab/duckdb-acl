@@ -1,0 +1,85 @@
+# name: test/sql/acl_cte_scope.test
+# description: spec 169's review - a CTE name is in scope where duckdb's binder sees it: in the CTEs written after it
+#   and the query after the WITH, never in its own definition nor an earlier sibling's (only a recursive CTE's right
+#   side reads itself). A self or forward reference is a catalog name, resolved by the gate - it was skipped as a CTE
+#   and read the default database's table or a file
+# group: [sql]
+
+require acl
+
+statement ok
+CREATE TABLE b AS SELECT 42 AS id;
+
+statement ok
+COPY (SELECT 7 AS id) TO '__TEST_DIR__/cte_scope.csv';
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t AS SELECT 1 AS id;
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE VIRTUAL TABLE c.t AS phys.main.t; CREATE ROLE r; GRANT CATALOG c TO ROLE r MAIN;
+
+# a self reference
+statement error
+ACL ROLE "r" WITH b AS (SELECT * FROM b) SELECT * FROM b;
+----
+no access to object "b"
+
+# a forward reference
+statement error
+ACL ROLE "r" WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS id) SELECT * FROM a;
+----
+no access to object "b"
+
+# a file named as its own CTE
+statement error
+ACL ROLE "r" WITH "__TEST_DIR__/cte_scope.csv" AS (SELECT * FROM "__TEST_DIR__/cte_scope.csv") SELECT * FROM "__TEST_DIR__/cte_scope.csv";
+----
+no access to object
+
+# what duckdb scopes as a CTE still reads as one
+query I
+ACL ROLE "r" WITH a AS (SELECT id FROM t), b AS (SELECT id + 1 AS id FROM a) SELECT id FROM b;
+----
+2
+
+query I
+ACL ROLE "r" WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) SELECT count(*) FROM n;
+----
+3
+
+query I
+ACL ROLE "r" WITH b AS (SELECT id FROM t) SELECT (WITH c AS (SELECT * FROM b) SELECT id FROM c);
+----
+1
+
+statement error
+ACL ROLE "r" WITH b AS MATERIALIZED (SELECT * FROM b) SELECT count(*) FROM b;
+----
+no access to object "b"
+
+statement error
+ACL ROLE "r" WITH RECURSIVE b AS (SELECT * FROM b) SELECT count(*) FROM b;
+----
+no access to object "b"
+
+# through a principal's view: its author cannot create one (the name is resolved, and nothing answers it)
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.home FROM phys.main; GRANT SCHEMA c.home TO ROLE r WITH (select, create, drop);
+
+statement error
+ACL ROLE "r" CREATE VIEW home.leak AS WITH b AS (SELECT * FROM b) SELECT * FROM b;
+----
+no access to object "b"

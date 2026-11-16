@@ -755,6 +755,12 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 		auto vquery = result->Collection().GetValue(result->ColumnCount() - 4, 0);
 		out.invoker_query = vquery.IsNull() ? string() : vquery.ToString();
 		out.invoker_shape = out.invoker_query.empty() ? string() : out.query;
+		if (out.invoker_query.empty() && LegacyPrincipalView(out.query)) {
+			NoteDenyReason(Reason::POLICY_ERROR);
+			throw BinderException("acl: the view \"%s\" was created by a principal on an earlier build - its body "
+			                      "holds its author's policy (spec 169): create it again",
+			                      vname);
+		}
 	}
 	out.rls = rls.IsNull() ? string() : rls.ToString();
 	auto rchk = result->Collection().GetValue(13, 0);

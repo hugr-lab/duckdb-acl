@@ -450,9 +450,9 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	vector<string> statements;
 	auto created_by =
 	    CreatedByLit(catalog, "relations", " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-	// spec 169: a principal's view keeps its query (what its readers read) across a write of another field - a
-	// comment, its types - and loses it when its SQL is written again (an operator's ALTER ... SET SQL: the view is
-	// then the operator's); a principal's own CREATE gives it
+	// spec 169: a principal's view keeps its query (what its readers read) across a write that leaves its SQL as it is
+	// - a comment, its types, an operator's re-declaration of the same text - and loses it when its SQL changes (an
+	// operator's ALTER ... SET AS other text: the view is then the operator's); a principal's own CREATE gives it
 	string query_lit = "NULL";
 	if (query) {
 		query_lit = query->empty() ? string("NULL") : Lit(*query);
@@ -2067,11 +2067,12 @@ PolicyStore::RelationRows ReadRelationRows(const ReadFn &read, CatalogBackend &c
 		std::sort(table.rows.begin(), table.rows.end());
 		rows.tables.push_back(std::move(table));
 	}
-	auto record = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog.Tbl("relations") +
+	// spec 169: a principal's view's query is part of what the record is
+	auto record = read("SELECT \"form\", \"phys\", \"view_sql\", \"query\" FROM " + catalog.Tbl("relations") +
 	                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 	if (record->RowCount() > 0) {
 		ResultRows values(*record);
-		for (idx_t column = 0; column < 3; column++) {
+		for (idx_t column = 0; column < 4; column++) {
 			auto value = values.GetValue(column, 0);
 			rows.record += (column ? "\x1f" : "") + (value.IsNull() ? string("NULL") : value.ToSQLString());
 		}

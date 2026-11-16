@@ -43,7 +43,12 @@ it gives `view_sql`. In addition:
 - a call to a virtual function must name its catalog (`c.f(…)`, `c.s.f(…)`): a bare one resolves in the reader's
   MAIN catalog, which may not be the author's - refused where written;
 - a session temp table cannot be named (it is the author's connection's);
-- the body is one SELECT.
+- the body is one SELECT, reading only: a data-modifying CTE (`WITH x AS (INSERT … RETURNING …)`) and a parameter
+  are refused (review);
+- the author's own reads are bound alone before the record is written (spec 159's guards, the markers NULL), so a
+  policy name the author's source lost refuses the create;
+- the composed read of a statement's principal views is bounded at 4 MiB (a view read twice per level doubles per
+  level).
 
 **Read.** Resolving the view gives its `query`. The rewriter parses it (one SELECT, else refused) and rewrites it as
 part of the reader's statement - the reader's grants, masks, row filters, markers, function gate, types - with each
@@ -73,17 +78,34 @@ read the view.
 - The author's rights decide only whether the view may be created; a later change of the author's grants changes
   nothing a reader reads.
 - A stored `query` is data, parsed by duckdb's parser at each read, and refused unless it is one SELECT.
-- Views created before v26 have no `query` and stay as their author resolved them (an operator-like view); creating
-  them again moves them to this model. There is no automatic rewrite (no backward compatibility before the release,
-  and none is needed: their behaviour does not widen).
+- Views created before v26 have no `query`. One stored by specs 162 / 165 (a `__acl_read_` / `__acl_probe_` CTE in
+  its body) is refused where read and named by `acl_check_catalog` (`view_recreate`): its probes are gone and it holds
+  its author's policy (review). One stored before spec 162 cannot be told from an administrator's view written
+  through a principal, and is read as stored - its author creates it again (no backward compatibility before the
+  release; such views exist only in development catalogs of the last weeks).
 
 ## Known limits
+
+- A view's query runs with its reader's data: a function with an effect outside the node (a URL read, a log) that
+  both the author and the reader may call carries the reader's values where the author's query sends them. The
+  default categories grant no such function; an operator who grants one to a role that creates views grants this too.
+- `platform.effective_rights` reports a role's rights on the view itself, not on what the view reads.
 
 - The listings describe the view by its author's shape. A column duckdb names after its expression's text (a table
   function's column named by its argument, spec 166) is named after the stored query's text when read, its relations
   qualified (`… FROM c.orders AS o` where the author wrote `orders`), while the listing shows the author's spelling.
 - A principal's view over a table function: the call's arguments are the reader's to evaluate, like any query of the
   reader's (spec 163).
+
+## Found by the reviews (fixed with tests)
+
+- **A CTE's scope** (older than this spec, `acl_cte_scope.test`): the rewriter put every CTE name of a WITH in scope
+  before it rewrote any CTE's definition, while duckdb's binder sees a CTE only after its own definition (a recursive
+  CTE's right side excepted). A self or forward reference was skipped as a CTE and bound by duckdb to the default
+  database's table or a file - past the gate, and through a principal's view for its readers. The scope now follows
+  the binder's; a name a view's query names that no policy answers is refused at create.
+- The shape is replaced only where it occurs once (a mask holding its text is refused); a refusal inside a nested view
+  names the outermost view; the rewriter's state is restored on a refusal.
 
 ## Testing
 

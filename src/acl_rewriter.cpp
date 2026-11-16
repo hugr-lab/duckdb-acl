@@ -1404,9 +1404,9 @@ private:
 		                                                     Value(AuthorOf(principal)), Value(query)}));
 	}
 
-	//! spec 169: the canonical virtual key of a relation a view's query names, as the author reads it - empty when it
-	//! is none (a metadata surface or platform's view, read by name wherever the view is read; a name nothing answers,
-	//! which the author's resolution refuses); a session's temp table is refused (it is the author's connection's)
+	//! spec 169: the canonical virtual key of a relation a view's query names, as the author reads it - empty for a
+	//! metadata surface or a platform view (read by name wherever the view is read); a name no policy answers is
+	//! refused, and so is a session's temp table (it is the author's connection's)
 	vector<string> ViewNameReading(const vector<string> &parts) {
 		string written;
 		for (auto &part : parts) {
@@ -1427,7 +1427,8 @@ private:
 				Deny(Reason::DDL_HOME, "a view cannot read the session's temp table " + Shown(written) +
 				                           " - it is this connection's, not its readers'");
 			}
-			return {};
+			// never left bare for its readers to read: a name no policy answers is no object of the view's
+			Deny(Reason::NO_ACCESS, "no access to object " + Shown(key));
 		}
 		return NamePath::FromKey(policy.canonical.empty() ? key : policy.canonical).Parts();
 	}
@@ -1446,7 +1447,7 @@ private:
 			invoker_shape_error = true;
 			Deny(Reason::POLICY_ERROR, "the view " + Shown(view) + " nests views deeper than 16");
 		}
-		auto select = store.InstantiateSelect(query, template_options);
+		bool outermost = invoker_views.empty();
 		auto saved_scope = std::move(cte_scope);
 		auto saved_catalog = std::move(use_catalog);
 		auto saved_schema = std::move(use_schema);
@@ -1454,21 +1455,39 @@ private:
 		use_catalog.clear();
 		use_schema.clear();
 		invoker_views.push_back(view);
+		auto restore = [&]() {
+			invoker_views.pop_back();
+			cte_scope = std::move(saved_scope);
+			use_catalog = std::move(saved_catalog);
+			use_schema = std::move(saved_schema);
+		};
+		string read;
 		try {
+			auto select = store.InstantiateSelect(query, template_options);
 			RewriteQueryNode(*select->node);
+			read = select->ToString();
 		} catch (BinderException &) {
-			if (invoker_shape_error || invoker_views.size() > 1) {
-				throw; // the view's own shape, or the outermost view's to say
+			restore();
+			if (invoker_shape_error || !outermost) {
+				throw; // the views' own nesting, or the outermost view's to say
 			}
 			// what the view reads is its author's query, not the reader's: the refusal names the view the reader
 			// wrote, never an object the reader was not shown (spec 155) - the reason noted by the refusal stays
 			throw BinderException("acl_rewrite: the view %s reads what this principal may not read", Shown(view));
+		} catch (ParserException &) {
+			restore();
+			NoteDenyReason(Reason::POLICY_ERROR);
+			throw BinderException("acl_rewrite: the view %s does not read as a query", Shown(view));
 		}
-		invoker_views.pop_back();
-		cte_scope = std::move(saved_scope);
-		use_catalog = std::move(saved_catalog);
-		use_schema = std::move(saved_schema);
-		return select->ToString();
+		restore();
+		invoker_bytes += read.size();
+		if (invoker_bytes > MAX_INVOKER_READ_BYTES) {
+			// a view read twice per level doubles per level: bounded here, not by the time it takes
+			invoker_shape_error = true;
+			Deny(Reason::POLICY_ERROR, "the view " + Shown(view) + " composes a read past " +
+			                               std::to_string(MAX_INVOKER_READ_BYTES / (1024 * 1024)) + " MiB");
+		}
+		return read;
 	}
 
 	void RewriteDropStatement(DropStatement &stmt) {
@@ -1615,19 +1634,27 @@ private:
 	// Query nodes
 	//===------------------------------------------------------------------===//
 	void RewriteQueryNode(QueryNode &node) {
-		// CTE names shadow catalog objects within this node and its descendants (scoped)
+		// CTE names shadow catalog objects within this node and its descendants (scoped) - as duckdb's binder scopes
+		// them (spec 169's review, the rule spec 138's ScopedReferences follows): a CTE's definition sees the CTEs
+		// written before it and those around it, never itself nor a later sibling; only a recursive CTE's right side
+		// sees its own name (RECURSIVE_CTE_NODE below). A name the binder reads in the catalog is resolved here too -
+		// a self or forward reference skipped as a CTE read a physical table or a file past the gate
 		auto saved_scope = cte_scope;
-		for (auto &entry : node.cte_map.map) {
-			cte_scope.insert(entry.first.GetIdentifierName());
-		}
 		for (auto &entry : node.cte_map.map) {
 			if (entry.second->query_node) {
 				RewriteQueryNode(*entry.second->query_node);
 			}
+			cte_scope.insert(entry.first.GetIdentifierName());
 		}
 		ParsedExpressionIterator::EnumerateQueryNodeModifiers(
 		    node, [&](unique_ptr<ParsedExpression> &child) { RewriteExpr(child); });
 
+		if ((creating_view || !invoker_views.empty()) &&
+		    (node.type == QueryNodeType::INSERT_QUERY_NODE || node.type == QueryNodeType::UPDATE_QUERY_NODE ||
+		     node.type == QueryNodeType::DELETE_QUERY_NODE || node.type == QueryNodeType::MERGE_QUERY_NODE)) {
+			// spec 169: a view reads - a data-modifying CTE in it would write as each of its readers
+			Deny(Reason::STATEMENT_TYPE, "a view only reads: a data-modifying statement in it is not permitted");
+		}
 		switch (node.type) {
 		case QueryNodeType::SELECT_NODE:
 			RewriteSelectNode(node.Cast<SelectNode>());
@@ -1649,10 +1676,10 @@ private:
 		}
 		case QueryNodeType::RECURSIVE_CTE_NODE: {
 			auto &rcte = node.Cast<RecursiveCTENode>();
-			cte_scope.insert(rcte.ctename.GetIdentifierName());
 			if (rcte.left) {
 				RewriteQueryNode(*rcte.left);
 			}
+			cte_scope.insert(rcte.ctename.GetIdentifierName()); // its right side reads itself, its left side does not
 			if (rcte.right) {
 				RewriteQueryNode(*rcte.right);
 			}
@@ -2297,7 +2324,9 @@ private:
 					auto at = policy.query.find(shape);
 					if (policy.query == policy.invoker_shape) {
 						policy.query = read;
-					} else if (at != string::npos) {
+					} else if (at != string::npos && policy.query.find(shape, at + 1) == string::npos) {
+						// once: the wrapping's FROM always holds it, so a second (a mask's text) leaves no way to
+						// tell which is the read - refused, never the author's shape run for the reader
 						policy.query.replace(at, shape.size(), "(" + read + ")");
 					} else {
 						Deny(Reason::POLICY_ERROR, "the read of the view " + Shown(key) + " could not be composed");
@@ -4785,6 +4814,11 @@ private:
 		if (!expr) {
 			return;
 		}
+		if (expr->GetExpressionClass() == ExpressionClass::PARAMETER && (creating_view || !invoker_views.empty())) {
+			// spec 169: a view's query is read inside its readers' statements, where its parameter would be theirs
+			// (the rewriter adds no parameters)
+			Deny(Reason::STATEMENT_TYPE, "a view takes no parameters");
+		}
 		if (expr->GetExpressionClass() == ExpressionClass::CAST) {
 			GateTypeExpression(expr->Cast<CastExpression>().TargetTypeMutable()); // spec 099
 		}
@@ -5210,8 +5244,11 @@ private:
 	bool creating_view = false;
 	//! spec 169: the principal's views whose query is being rewritten under the reader's grants, outermost first
 	vector<string> invoker_views;
-	//! spec 169: the refusal is of the views' own nesting (a cycle, too deep) - said as it is
+	//! spec 169: the refusal is of the views' own nesting (a cycle, too deep, too large) - said as it is
 	bool invoker_shape_error = false;
+	//! spec 169: the text the statement's principal views composed - bounded
+	idx_t invoker_bytes = 0;
+	static constexpr idx_t MAX_INVOKER_READ_BYTES = 4 * 1024 * 1024;
 	ParserOptions template_options = ParserOptions::Builtin();
 
 public:
@@ -5443,12 +5480,30 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 				}
 			}
 		}
-		if (!rewriter.guards.empty() && !rewriter.drop_statement) {
+		// spec 169: a statement dropped for its record (a principal's CREATE VIEW: its author's resolution is the
+		// view's shape) has its reads bound alone before the record runs - a policy name the author's source lost
+		// refuses the create rather than giving the shape a binding to the body's own relations
+		optional_ptr<SQLStatement> guarded;
+		if (!rewriter.drop_statement) {
+			guarded = rewriter.replacement ? rewriter.replacement.get() : stmt.get();
+		} else if (!rewriter.follow_ups.empty()) {
+			guarded = rewriter.follow_ups.front().get();
+		}
+		if (!rewriter.guards.empty() && guarded) {
 			// spec 157 / 159: each read by the hash of its text, the keys at the end of the statement's text - every
 			// execution of it carries them; the same read is one entry whoever reads it
-			auto &written = rewriter.replacement ? *rewriter.replacement : *stmt;
+			auto &written = *guarded;
 			vector<string> keys;
-			for (auto &read : rewriter.guards) {
+			for (auto &guard : rewriter.guards) {
+				// a record's guards are its author's resolution with the claims left as markers (the view's shape):
+				// bound with each marker a NULL, as the shape's own probes bind it
+				auto read = guard;
+				if (guarded.get() != stmt.get() && guarded.get() != rewriter.replacement.get()) {
+					bool names_only = StringUtil::StartsWith(guard, WRITE_GUARD_NAMES_ONLY);
+					auto text = names_only ? guard.substr(strlen(WRITE_GUARD_NAMES_ONLY)) : guard;
+					read = (names_only ? string(WRITE_GUARD_NAMES_ONLY) : string()) +
+					       BakeTemplateForProbe(text, ParserOptions::Builtin(), false, {});
+				}
 				auto key = WriteGuardKey(read);
 				if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
 					store.write_guards.Note(key, read);
@@ -5470,6 +5525,9 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 				entry.text_hash = StatementTextHash(rewriter.replacement->query);
 			} else if (!rewriter.drop_statement) {
 				entry.text_hash = StatementTextHash(stmt->query);
+			} else if (guarded && !rewriter.guards.empty()) {
+				// spec 169: the record runs the statement's guards - its error is the principal's (spec 155)
+				entry.text_hash = StatementTextHash(guarded->query);
 			} else {
 				entry.executes = false;
 			}

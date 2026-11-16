@@ -16,6 +16,9 @@ statement ok
 CREATE TABLE phys.lake.people (id INTEGER, region VARCHAR, ssn VARCHAR);
 
 statement ok
+CREATE TABLE phys.lake.lost (id INTEGER, region VARCHAR);
+
+statement ok
 INSERT INTO phys.lake.people VALUES (1, 'eu', '111-11-1111'), (2, 'us', '222-22-2222'), (3, 'us', '333-33-3333');
 
 statement ok
@@ -183,3 +186,72 @@ query T
 ACL ROLE "hr" SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'cards';
 ----
 id,ssn
+
+# --- review: a refusal inside a nested view names the view the reader wrote ------------------------------------------
+
+statement error
+ACL ROLE "outsider" SELECT * FROM home.us_ids;
+----
+the view "c.home.us_ids" reads what this principal may not read
+
+# --- review: a view grant's mask holding the view's shape text leaves no way to tell the read - refused ------------
+
+statement ok
+ACL ADMIN CREATE ROLE m; GRANT CATALOG c TO ROLE m MAIN; GRANT SCHEMA c.home TO ROLE m;
+
+statement ok
+ACL ADMIN GRANT VIEW c.home.cards TO ROLE m MASK (ssn AS (SELECT max(ssn) FROM (SELECT id, ssn FROM phys.lake.people AS people) AS q));
+
+statement error
+ACL ROLE "m" SELECT * FROM home.cards;
+----
+could not be composed
+
+# --- review: a view only reads - a data-modifying CTE in it is refused ---------------------------------------------
+
+statement error
+ACL ROLE "author" CREATE VIEW home.iv AS WITH x AS (INSERT INTO vs.lost VALUES (9, 'x') RETURNING id) SELECT * FROM x;
+----
+a view only reads
+
+# --- review: a view takes no parameters (its readers' statements would bind them) ----------------------------------
+
+statement error
+ACL ROLE "author" CREATE VIEW home.byid AS SELECT id FROM vs.people WHERE id = $1;
+----
+a view takes no parameters
+
+# --- review: a view stored by an earlier build (its author's policy in its body) is refused where read --------------
+
+statement ok
+INSERT INTO aclcat.acl.relations(vcat, vname, form, view_sql) VALUES ('c', 'home.legacy', 'view', 'WITH __acl_probe_1 AS NOT MATERIALIZED (SELECT 1 AS id) SELECT id FROM phys.lake.people');
+
+statement ok
+SELECT acl_refresh_schema('c');
+
+statement error
+ACL ROLE "author" SELECT * FROM home.legacy;
+----
+create it again
+
+query TT
+SELECT object, problem FROM acl_check_catalog('c') WHERE problem = 'view_recreate';
+----
+home.legacy	view_recreate
+
+statement ok
+DELETE FROM aclcat.acl.relations WHERE vname = 'home.legacy';
+
+# --- review: the author's own reads are bound alone at create - a policy name the author's source lost refuses the
+# create, rather than giving the view's shape a binding to the body's own relations ---------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.vs.lost TO ROLE author RLS (region = 'eu');
+
+statement ok
+ALTER TABLE phys.lake.lost DROP COLUMN region;
+
+statement error
+ACL ROLE "author" CREATE VIEW home.lostv AS SELECT l.id FROM (SELECT 'eu' AS region) s, vs.lost l;
+----
+does not exist in its source

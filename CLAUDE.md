@@ -891,8 +891,12 @@ the resolver gives `TablePolicy::invoker_query` / `invoker_shape`, and the rewri
 query under the reader's grants (canonical names checked, USE and CTE scope cleared, a cycle or nesting past 16
 refused) and puts it in place of the shape inside the reader's grant wrapping on the view. A refusal inside names
 the outermost view (`reads what this principal may not read`). Reading needs `select` on the view AND the reader's
-rights on what it reads; an operator's `CREATE VIRTUAL VIEW` still reads its own SQL. Test
-`acl_principal_view_invoker.test`.
+rights on what it reads; an operator's `CREATE VIRTUAL VIEW` still reads its own SQL. A view only reads (a
+data-modifying CTE, a parameter refused), its author's reads are bound alone at create (the record carries the
+guards, markers NULL), the composed read is bounded (4 MiB), a pre-v26 body with spec 162/165's CTEs is refused
+(`LegacyPrincipalView`, check `view_recreate`). Found by its review: `RewriteQueryNode` scopes a CTE as duckdb's binder
+does (in scope after its own definition; a recursive CTE's right side sees itself) - a self or forward reference read
+a physical table or a file past the gate. Tests `acl_principal_view_invoker.test`, `acl_cte_scope.test`.
 
 **Spec 158 — columns: the object's shape, the grant's test and masks** (owner, 2026-11-16; stage 1 built): every
 column list is read by duckdb's parser. An object's list is a SELECT list (`ReadSelectList`, acl_list_items.cpp: `name`,

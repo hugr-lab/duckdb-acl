@@ -107,6 +107,14 @@ vector<string> TempCatalogNames(ClientContext &context);
 //! (the 2026-09-03 review).
 string MintRandomHex(idx_t bytes);
 
+//! spec 169: a view body a principal's CREATE VIEW stored before v26 - its policy reads hoisted to root CTEs (spec
+//! 162, `__acl_read_<n>`) or its calls' probes kept there (spec 165, `__acl_probe_<n>`): its author's policy, read
+//! with its reader's markers, and no longer probed. Refused where read, named by acl_check_catalog.
+inline bool LegacyPrincipalView(const string &view_sql) {
+	auto lower = StringUtil::Lower(view_sql);
+	return StringUtil::Contains(lower, "__acl_read_") || StringUtil::Contains(lower, "__acl_probe_");
+}
+
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement
 //! form: RENAME (subquery_form=false) swaps the name in place for a physical object - it stays a real
 //! table, so it is writable; SUBQUERY (subquery_form=true) wraps a SELECT - projection with computed
