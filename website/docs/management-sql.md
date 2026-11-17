@@ -191,7 +191,8 @@ or a clause after it is refused where it is written (spec 148); a stored one ref
 and `acl_check_catalog` names it.
 
 Any column not listed is hidden. With no `COLUMNS` and no `RLS` the relation is an **alias**
-(RENAME in place, writable); a list made only of bare names and renames keeps the alias form; a computed
+(RENAME in place, writable); a list made only of bare names and renames keeps the alias form (spec 171: a listless
+`INSERT` writes the columns it shows, a column not listed takes its default); a computed
 column or an `RLS` predicate makes it a read-only **subquery**. `RLS` is a predicate over
 the physical columns, AND-ed into every read and write; `acl_claim('<name>')` inside it is replaced
 by the principal's claim. `PRIMARY KEY` is declared, never enforced; it may name only columns the

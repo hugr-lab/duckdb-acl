@@ -81,7 +81,7 @@ sales	the sales namespace
 query IIII
 SELECT vcat, vname, form, comment FROM acl_relations();
 ----
-sales	orders	subquery	orders, id only
+sales	orders	alias	orders, id only
 
 query III
 SELECT vcat, path, phys_path FROM acl_schemas();

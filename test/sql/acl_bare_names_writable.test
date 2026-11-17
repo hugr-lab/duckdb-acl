@@ -1,0 +1,129 @@
+# name: test/sql/acl_bare_names_writable.test
+# description: spec 171 - an object's list of bare names and renames is the writable alias form (it was the read-only
+#   subquery form unless every item was a rename); a listless INSERT writes the columns the object shows; a column the
+#   list leaves out is never written; a computed item keeps the object read-only; the listing describes a list from its
+#   snapshot whatever the form, a column read by name over its source's comment.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.o (id INTEGER, amount INTEGER, secret VARCHAR DEFAULT 'hidden');
+
+statement ok
+COMMENT ON COLUMN phys.main.o.amount IS 'PHYS amount';
+
+statement ok
+INSERT INTO phys.main.o VALUES (1, 10, 's1');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE w;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE w MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.o COLUMNS (id, amount AS total);
+
+query T
+SELECT form FROM store.acl.relations WHERE vname = 't';
+----
+alias
+
+# a listless INSERT writes the columns the object shows, in its order; the left-out column takes its default
+statement ok
+ACL ROLE "w" INSERT INTO t VALUES (2, 20);
+
+statement ok
+ACL ROLE "w" INSERT INTO t (total, id) VALUES (30, 3);
+
+statement ok
+ACL ROLE "w" UPDATE t SET total = total + 1 WHERE id = 2;
+
+statement ok
+ACL ROLE "w" DELETE FROM t WHERE id = 3;
+
+query IIT
+SELECT id, amount, secret FROM phys.main.o ORDER BY id;
+----
+1	10	s1
+2	21	hidden
+
+# the left-out column is not the role's to write or read, by any name
+statement error
+ACL ROLE "w" INSERT INTO t (id, secret) VALUES (4, 'x');
+----
+secret
+
+statement error
+ACL ROLE "w" UPDATE t SET total = 0 WHERE secret = 's1';
+----
+secret
+
+# the listing is the object's snapshot; a column read by name shows its source's comment
+query TT
+ACL ROLE "w" SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position;
+----
+id	NULL
+total	PHYS amount
+
+# a computed item keeps it read-only
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.r AS phys.main.o COLUMNS (id, amount * 2 AS twice);
+
+query T
+SELECT form FROM store.acl.relations WHERE vname = 'r';
+----
+subquery
+
+statement error
+ACL ROLE "w" INSERT INTO r (id) VALUES (5);
+----
+read-only
+
+# --- what a write reads is the role's (review): a hidden struct's field through RETURNING, a hidden column named like
+#     a value keyword (`user`, `current_date`) in a write's conditions - the keyword then reads as the value
+
+statement ok
+CREATE TABLE phys.main.h (id INTEGER, amount INTEGER, s STRUCT(id INTEGER) DEFAULT {'id': 7}, "user" VARCHAR DEFAULT 'u', "current_date" VARCHAR DEFAULT 'cd');
+
+statement ok
+INSERT INTO phys.main.h VALUES (1, 10, {'id': 100}, 'u1', 'cd1');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.hx AS phys.main.h COLUMNS (id, amount AS total);
+
+statement error
+ACL ROLE "w" UPDATE hx SET total = total WHERE id = 1 RETURNING s.id;
+----
+not readable
+
+statement error
+ACL ROLE "w" DELETE FROM hx WHERE id = 1 AND false RETURNING s.id;
+----
+not readable
+
+query I
+ACL ROLE "w" UPDATE hx SET total = 0 WHERE "user" = 'u1';
+----
+0
+
+statement ok
+ACL ROLE "w" UPDATE hx SET total = length(user) WHERE id = 1;
+
+query II
+SELECT amount = length(current_user), amount <> length("user") FROM phys.main.h WHERE id = 1;
+----
+true	true

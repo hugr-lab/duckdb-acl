@@ -272,7 +272,7 @@ ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE sales.curated.orders_physical AS phys.
 query III
 SELECT form, comment, origin FROM aclcat.acl.relations WHERE vname = 'curated.orders_physical';
 ----
-subquery	mine	NULL
+alias	mine	NULL
 
 # and a refresh leaves it alone: it never rewrites what is already registered
 statement ok
@@ -281,7 +281,7 @@ ACL ADMIN ALTER VIRTUAL SCHEMA sales.curated REFRESH;
 query II
 SELECT form, comment FROM aclcat.acl.relations WHERE vname = 'curated.orders_physical';
 ----
-subquery	mine
+alias	mine
 
 # editing an expanded record keeps it part of the expansion: REFRESH still leaves it alone, and its
 # origin is not silently forgotten
@@ -296,7 +296,7 @@ ACL ADMIN ALTER VIRTUAL TABLE sales.curated.late SET COLUMNS (id);
 query II
 SELECT form, origin FROM aclcat.acl.relations WHERE vname = 'curated.late';
 ----
-subquery	phys.main
+alias	phys.main
 
 # expanding a source that is not there would leave a schema that can never resolve anything
 statement error

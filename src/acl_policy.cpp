@@ -88,6 +88,10 @@ bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns) {
 		return false;
 	}
 	for (auto &column : columns) {
+		// spec 171: a bare name (no expression) reads the source's column of its name, as a rename reads another
+		if (!column.first.empty() && column.second.empty()) {
+			continue;
+		}
 		if (!IsPlainColumnReference(column.second)) {
 			return false;
 		}

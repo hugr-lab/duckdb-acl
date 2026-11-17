@@ -805,6 +805,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 		for (auto &column : object_columns) {
 			out.write_columns.insert(column.second.empty() ? column.first : column.second);
 			out.visible_columns.insert(column.second.empty() ? column.first : column.second);
+			out.write_order.push_back(column.first); // spec 171: a listless INSERT writes the columns it was shown
 		}
 	}
 	// remaining rows of the winning interpretation differ only by role: union their caps, and the
