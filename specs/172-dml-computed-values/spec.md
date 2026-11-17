@@ -46,11 +46,37 @@ object computes on a write is the object's, like its columns (spec 158), not a r
   `platform` view lists both.
 - **Writable objects only**: an object whose list computes a column is read-only, and so are its ON clauses' targets'.
 
+## Bulk ingest (checked first, the owner 2026-11-17)
+
+How each load path meets the ON clauses, read from today's code:
+
+| Path | What the node runs | ON INSERT |
+|---|---|---|
+| Flight `DoPutCommandStatementIngest`, append (spec 049) | ONE statement for the whole stream: `ACL INGEST '<h>' INSERT INTO t ("a", "b") SELECT "a", "b" FROM arrow_scan()`, rewritten like any INSERT | the named injection path (`ApplyInsertPolicy`): `SELECT <client's columns>, <computed> FROM (<arrow_scan>) AS __acl_insert(<names>)` - `new.x` is `__acl_insert.x`; a computed column the stream lacks is added |
+| quack `SEND_DATA` drain (spec 042) | `INSERT INTO t SELECT * FROM scan_data_from_quack_client(…)`, positional, columns `col0…`; the list supplied from the object's (`write_order`, spec 171) | the stream path (`ApplyStreamInjections`): `SELECT * REPLACE (<computed> AS col<i>)` - `new.x` is the position of x; a computed column must be in the stream (else the positions shift - refused, as an injection is today) |
+| Flight `temporary = true` (spec 050) | the session's temp table, no virtual object | none: applied when the client moves the rows with its own `INSERT … SELECT` |
+| Flight `mode = create / replace` (spec 051) | `CREATE [OR REPLACE] TABLE … AS SELECT * FROM arrow_scan()` in a granted home | a new object has none; a replace of an object that carries ON clauses is refused - they are the operator's declarations |
+
+What follows for the design:
+
+- **Cost**: one projection over the stream, vectorized; no row materialized; the load stays one statement, so
+  duckdb's atomicity and the delivered-row cross-check (spec 049) hold. `now()` / `current_timestamp` is the
+  statement's: every row of a load gets the same `created_at`.
+- **Markers** (`acl_claim('tenant')`) are the session principal's, baked once per statement.
+- **A computed column the client also sends.** A bulk loader sends the frame it has - often the object's whole
+  listed shape, `tenant_id` and `created_at` included. Refusing it (question 1's option b) fails such a load on
+  every batch; today's injection already drops the client's value on the named path and replaces it in place on
+  the stream path. So for ingest the consistent answer is (a): the object's value wins, the client's is dropped,
+  and the listing says the column is computed (`column_default` / `is_generated`).
+- **The write check** (spec 024) sees the computed value: a tenant RLS is satisfied by `tenant_id =
+  acl_claim('tenant')` by construction, so a loader no longer sends the tenant at all.
+
 ## Open questions (the owner's)
 
-1. **The client's own value for a computed column**: (a) overridden silently (as an injection is today), (b) refused
-   ("<column> is computed on INSERT"), or (c) used when given - ON INSERT as a default only. Proposed: (b) for ON
-   INSERT and ON UPDATE alike - a silent override hides a client bug; a default is duckdb's own DEFAULT.
+1. **The client's own value for a computed column**: (a) overridden (as an injection is today), (b) refused
+   ("<column> is computed on INSERT"), or (c) used when given - ON INSERT as a default only. Proposed after the
+   ingest check: (a) - bulk loaders send the whole frame, and an injection already overrides on both ingest paths;
+   the listing marks the column computed. (b) was proposed before it.
 2. **A grant's mask on a computed column** (the injection also assigns it): refuse writing such a grant, or let the
    object's value win on writes and the mask on reads. Proposed: the object's value on writes, the mask on reads.
 3. **Per role**: ON clauses on the object only (proposed), or also on an object grant (`GRANT … ON INSERT SET …`), as
