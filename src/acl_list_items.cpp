@@ -638,6 +638,13 @@ vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *
 	return columns;
 }
 
+bool IsSqlValueKeyword(const string &name) {
+	static const case_insensitive_set_t KEYWORDS = {
+	    "current_date", "current_time", "current_timestamp", "localtime",       "localtimestamp", "current_user",
+	    "user",         "session_user", "current_role",      "current_catalog", "current_schema"};
+	return KEYWORDS.count(name) > 0;
+}
+
 namespace {
 
 //! A column reference that is neither `new.<column>` nor (`bare_ok`) a bare column of the row: a qualified name, a
@@ -665,8 +672,8 @@ bool HoldsOtherColumnRef(const ParsedExpression &expr, bool bare_ok, const case_
 		if (names.size() == 2 && StringUtil::CIEquals(names[0].GetIdentifierName(), "new")) {
 			return false;
 		}
-		if (names.size() == 1 && bare_ok) {
-			return false;
+		if (names.size() == 1 && (bare_ok || IsSqlValueKeyword(names[0].GetIdentifierName()))) {
+			return false; // a value keyword (`current_timestamp`) is the value where no column has its name
 		}
 		found = expr.ToString();
 		return true;

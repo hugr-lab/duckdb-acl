@@ -190,9 +190,13 @@ ACL ADMIN CREATE VIRTUAL TABLE c.people AS pg.public.people
 clause once, beside the others - are set by the node on every write it decides: an INSERT (VALUES or SELECT, a Flight
 ingest, a quack stream), an UPDATE, each branch of a MERGE. The client's own value of such a column is overwritten.
 `new.<column>` is the value the client's write gives a column (NULL on an INSERT that writes none; the row's current
-value on an UPDATE that sets none); on an UPDATE a bare column is the row's current value. No subquery, star,
-parameter or window inside; the object must be writable (an alias form). An upsert (`ON CONFLICT DO UPDATE`, `INSERT
-OR REPLACE`) into such an object is refused - write a MERGE. `ALTER VIRTUAL TABLE c.t SET ON INSERT (…) | SET ON UPDATE
+value on an UPDATE that sets none); on an UPDATE a bare column is the row's current value; `current_timestamp` and the
+other SQL value keywords are values. No subquery, star, positional reference, parameter, window or DEFAULT inside; the
+object must be writable (an alias form). A column computed on an INSERT and not on an UPDATE keeps its value when an
+UPDATE sets it. An upsert (`ON CONFLICT DO UPDATE`, `INSERT OR REPLACE`) into such an object is refused - write a MERGE;
+so is a principal's `CREATE OR REPLACE` of it. `new.<column>` has the type of what the client wrote (a VALUES literal
+is text until it is stored: cast it), and on an UPDATE it repeats the client's expression (a volatile one runs
+again). `ALTER VIRTUAL TABLE c.t SET ON INSERT (…) | SET ON UPDATE
 (…) | DROP ON INSERT | DROP ON UPDATE` change them; `information_schema.columns.column_default` shows the ON INSERT
 expression, `platform.write_values` both.
 
@@ -1236,6 +1240,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `grant_column_missing` | a name of an object grant's `COLUMNS` (listed or excluded) matches no column of the object | `acl_grant_object(…)` without it |
 | `catalog_columns` | a catalog grant stores a column list (an older build's; spec 158 writes none) - every read under that grant refuses | `acl_alter_grant(role, vcat, 'columns', '')`, then object grants |
 | `columns_unreadable` | an object grant's stored `COLUMNS` or `MASK` does not read (an older build's `name = expr`) - every read of the object by that role refuses | `acl_grant_object(…)` with the new forms |
+| `write_value_broken` | an ON INSERT / ON UPDATE value no longer binds over the object (a column renamed or dropped) - every such write refuses (spec 172) | `ALTER VIRTUAL TABLE … SET ON INSERT (…)` or `DROP ON INSERT` (likewise UPDATE) |
 | `grant_exposes_nothing` | a role's object grant lists columns and its grants leave it none of the object's: the levels intersect to nothing, the object's list changed under the grant, or (an object without a list) the source dropped them - it replaces that grant's `grant_column_missing` rows (spec 157; a catalog-wide list naming nothing of an object is by design) | `acl_grant_object(…, '<columns>')` naming what the role reads |
 | `body_table_unqualified` | a stored body (an RLS, a view, a template, a declared column, a grant's RLS or list) names a table without its database - a principal's CTE or temp table of that name would stand in for it (spec 160) | redefine it; a write through the grammar stores the table whole |
 | `mask_broken` | an object grant's `MASK` names a column the object does not expose, or its expression does not bind - every read of that object by that role refuses (spec 038) | `acl_grant_object(…)` without it |
@@ -1311,6 +1316,8 @@ forms carry the `VIRTUAL` marker so duckdb's own `ALTER TABLE` stays native.
 | `ALTER VIRTUAL TABLE <c>.<n> SET PHYS <phys>`                                                    | `acl_alter_relation(vcat, vname, 'phys', value)`            |
 | `ALTER VIRTUAL TABLE <c>.<n> SET COLUMNS (<item>, …)`                                            | `acl_alter_relation(vcat, vname, 'columns', csv)`           |
 | `ALTER VIRTUAL TABLE <c>.<n> SET RLS (<predicate>)`                                              | `acl_alter_relation(vcat, vname, 'rls', predicate)`         |
+| `ALTER VIRTUAL TABLE <c>.<n> SET ON INSERT (<items>)` / `SET ON UPDATE (…)`                      | `acl_alter_relation(vcat, vname, 'on_insert' \| 'on_update', items)` |
+| `ALTER VIRTUAL TABLE <c>.<n> DROP ON INSERT` / `DROP ON UPDATE`                                  | `acl_alter_relation(vcat, vname, 'on_insert' \| 'on_update', '')` |
 | `ALTER VIRTUAL TABLE <c>.<n> SET PRIMARY KEY (<column>, …)` / `DROP PRIMARY KEY`                 | `acl_set_key(vcat, vname, 'relation', pk_csv)` (empty = drop) |
 | `ALTER VIRTUAL TABLE <c>.<n> SET TYPES (aliases = …, enums = …)` (or `VIEW`)                  | `acl_alter_relation(vcat, vname, 'types', list)` (spec 099) |
 | `ALTER VIRTUAL VIEW <c>.<n> SET AS <select>`                                                     | `acl_alter_relation(vcat, vname, 'view', sql)`              |

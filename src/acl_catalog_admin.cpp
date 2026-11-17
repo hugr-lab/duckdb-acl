@@ -15,6 +15,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -472,22 +473,44 @@ void RequireWriteValues(CatalogBackend &catalog, const string &vname, const stri
 			                            item.first);
 		}
 		auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(item.second);
-		std::function<void(const ParsedExpression &)> walk = [&](const ParsedExpression &expr) {
-			if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-				auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
-				auto name = names.back().GetIdentifierName();
-				// `new.<x>` is what the client's write gives x - a computed one's own too (`email = lower(new.email)`),
-				// never another item's result
-				if (!known.empty() && !known.count(name)) {
-					throw InvalidInputException("acl: %s of \"%s\" reads \"%s\", which is not one of its columns",
-					                            clause, vname, name);
-				}
-				return;
-			}
-			ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) { walk(child); });
-		};
+		std::function<void(const ParsedExpression &, const case_insensitive_set_t &)> walk =
+		    [&](const ParsedExpression &expr, const case_insensitive_set_t &params) {
+			    if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
+				    auto &lambda = expr.Cast<LambdaExpression>();
+				    auto inner = params;
+				    if (lambda.Left().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+					    inner.insert(lambda.Left().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+				    }
+				    ParsedExpressionIterator::EnumerateChildren(lambda.Left(), [&](const ParsedExpression &child) {
+					    if (child.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+						    inner.insert(child.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+					    }
+				    });
+				    walk(lambda.Right(), inner);
+				    return;
+			    }
+			    if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				    auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+				    if (params.count(names[0].GetIdentifierName())) {
+					    return; // a lambda's parameter
+				    }
+				    auto name = names.back().GetIdentifierName();
+				    if (names.size() == 1 && IsSqlValueKeyword(name) && !known.count(name)) {
+					    return; // `current_timestamp`: the value, no column of that name
+				    }
+				    // `new.<x>` is what the client's write gives x - a computed one's own too
+				    // (`email = lower(new.email)`), never another item's result
+				    if (!known.empty() && !known.count(name)) {
+					    throw InvalidInputException("acl: %s of \"%s\" reads \"%s\", which is not one of its columns",
+					                                clause, vname, name);
+				    }
+				    return;
+			    }
+			    ParsedExpressionIterator::EnumerateChildren(
+			        expr, [&](const ParsedExpression &child) { walk(child, params); });
+		    };
 		for (auto &expr : parsed) {
-			walk(*expr);
+			walk(*expr, case_insensitive_set_t());
 		}
 		if (!binds) {
 			continue; // judged where the source binds
@@ -540,9 +563,12 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		}
 		auto items =
 		    ReadWriteValues(text, string(verb) == "insert" ? "ON INSERT" : "ON UPDATE", string(verb) == "update");
+		if (!given && (on_insert || on_update)) {
+			continue; // kept as stored: a change of the other verb's is not a change of what this one reads
+		}
 		RequireWriteValues(catalog, vname, form, phys, columns, verb, items);
 		if (!given) {
-			continue; // kept as stored
+			continue; // kept as stored, judged against the definition this write gives it
 		}
 		statements.push_back("DELETE FROM " + catalog.Tbl("relation_write_values") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"verb\" = " + Lit(verb));
@@ -2205,6 +2231,16 @@ void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname
 	}
 }
 
+bool PolicyStore::CatalogHasWriteValues(const string &vcat, const string &vname) {
+	if (!catalog || catalog->FunctionMode()) {
+		return false;
+	}
+	return catalog
+	           ->Query("SELECT 1 FROM " + catalog->Tbl("relation_write_values") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                   " AND \"vname\" = " + Lit(vname) + " LIMIT 1")
+	           ->RowCount() > 0;
+}
+
 bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vname) {
 	if (!catalog) {
 		return false;
@@ -2238,7 +2274,7 @@ bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 		}
 		statements.push_back("UPDATE " + catalog->Tbl("relations") + " SET \"vname\" = " + Lit(new_vname) +
 		                     (new_phys.empty() ? string() : ", \"phys\" = " + Lit(new_phys)) + where(vname));
-		for (auto table : {"relation_types", "object_columns", "column_comments"}) {
+		for (auto table : {"relation_types", "object_columns", "column_comments", "relation_write_values"}) {
 			statements.push_back("UPDATE " + string(catalog->Tbl(table)) + " SET \"vname\" = " + Lit(new_vname) +
 			                     where(vname));
 		}

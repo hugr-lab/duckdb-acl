@@ -312,7 +312,13 @@ mode of default-deny is a refusal, and the refusal names the function.
 
 - **The object's, never the client's.** `ON INSERT SET` / `ON UPDATE SET` values are written by the rewrite of every
   write the node decides, over whatever the client sent: `tenant_id = acl_claim('tenant')` makes every row the
-  writer's tenant by construction, so a grant's tenant RLS (spec 024) is satisfied without the client sending it.
+  writer's tenant by construction, so a grant's tenant RLS (spec 024) is satisfied without the client sending it. An
+  UPDATE never rewrites a column the object computes on an INSERT unless ON UPDATE computes it too.
+- **The object's only.** The values belong to the virtual table: another path to the same physical table (a schema
+  alias over it, a second relation, `ACL NATIVE`) computes nothing - give it the same clauses, or no write right.
+- **They read the row as the object does**, whatever the writer's grant shows (like an object's computed column):
+  `note = 'by ' || secret` writes a hidden column's value into a visible one - write values over what the writers
+  may read.
 - **Markers are the writer's**, baked where the statement is rewritten; `ACL NATIVE` and the operator's physical
   writes compute nothing (break-glass).
 - **Fail closed**: a value that no longer binds refuses every such write (`write_value_broken`); an older build that

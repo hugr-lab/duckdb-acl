@@ -99,6 +99,8 @@ StarParts ReadStarParts(const string &star_text);
 //! duckdb prints it); `new.<column>` is the value the write gives a column, a bare column (ON UPDATE only) the row's
 //! current value; no subquery, star, position, parameter, DEFAULT or other qualified name; a column set twice refuses
 vector<std::pair<string, string>> ReadWriteValues(const string &text, const char *what, bool on_update);
+//! The bare names duckdb reads as a value where no column has the name (`current_timestamp`, `user`, …)
+bool IsSqlValueKeyword(const string &name);
 //! The items as their rows show them (`"col" = <expr>, …`)
 string WriteValuesText(const vector<std::pair<string, string>> &items);
 

@@ -235,3 +235,109 @@ write_value_broken	ALTER VIRTUAL TABLE c.people SET ON UPDATE (<items>)  -- or D
 statement error
 ACL ROLE "w" INSERT INTO people (id) VALUES (9);
 ----
+
+# --- the reviews ---------------------------------------------------------------------------------------------------
+
+# an upsert is refused on an object with only ON UPDATE too: its update branch would write without it
+statement ok
+CREATE TABLE phys.main.u (id INTEGER PRIMARY KEY, amount INTEGER, updated_at TIMESTAMP);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.u AS phys.main.u ON UPDATE SET (updated_at = current_timestamp);
+
+statement ok
+ACL ROLE "w" INSERT INTO u (id, amount) VALUES (1, 1);
+
+statement error
+ACL ROLE "w" INSERT INTO u (id, amount, updated_at) VALUES (1, 2, TIMESTAMP '2000-01-01') ON CONFLICT (id) DO UPDATE SET amount = excluded.amount, updated_at = TIMESTAMP '2000-01-01';
+----
+write a MERGE
+
+statement error
+ACL ROLE "w" INSERT OR REPLACE INTO u (id, amount, updated_at) VALUES (1, 3, TIMESTAMP '1999-01-01');
+----
+write a MERGE
+
+# a target aliased `new` reads its row, not the write: a freeze stays a freeze
+statement ok
+CREATE TABLE phys.main.f (id INTEGER, tenant_id VARCHAR, created_at TIMESTAMP, n INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.f AS phys.main.f ON INSERT SET (tenant_id = acl_claim('tenant'), created_at = now(), n = 0) ON UPDATE SET (n = n + 1);
+
+statement ok
+ACL ROLE "w" INSERT INTO f (id) VALUES (1), (2);
+
+statement ok
+ACL ROLE "w" UPDATE f AS new SET tenant_id = 'globex', created_at = TIMESTAMP '2000-01-01', n = 100 FROM (SELECT 1 AS id) s WHERE new.id = s.id;
+
+statement ok
+ACL ROLE "w" MERGE INTO f AS new USING (SELECT 2 AS id) s ON new.id = s.id WHEN MATCHED THEN UPDATE SET tenant_id = 'globex', created_at = TIMESTAMP '1999-01-01', n = 500;
+
+# an ON INSERT column the client sets on an UPDATE keeps the row's value (ON UPDATE does not compute it)
+statement ok
+ACL ROLE "w" UPDATE f SET tenant_id = 'globex' WHERE id = 1;
+
+query ITTI
+SELECT id, tenant_id, created_at > TIMESTAMP '2001-01-01', n FROM phys.main.f ORDER BY id;
+----
+1	acme	true	2
+2	acme	true	1
+
+# a source wider than the column list is the insert's own width error, as without ON clauses
+statement error
+ACL ROLE "w" INSERT INTO f (id) VALUES (3, 'extra');
+----
+<REGEX>:.*(columns|values).*
+
+# a lambda's parameter is no column
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.f SET ON UPDATE (n = list_aggregate(list_transform([n], lambda v: v + 1), 'sum'));
+
+# both values broken: each verb's DROP still works (only the verb written is judged)
+statement ok
+CREATE TABLE phys.main.b (id INTEGER, a INTEGER, t VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.b AS phys.main.b ON INSERT SET (t = 'k' || "new".a) ON UPDATE SET (t = 'u' || "new".a);
+
+statement ok
+ALTER TABLE phys.main.b RENAME COLUMN a TO aa;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.b DROP ON INSERT;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.b DROP ON UPDATE;
+
+# the operator's rename moves the values with the object
+statement ok
+SELECT acl_rename_relation('c', 'f', 'f2', '');
+
+query I
+SELECT count(*) FROM store.acl.relation_write_values WHERE vname = 'f2';
+----
+4
+
+# a principal's CREATE OR REPLACE of an object that computes values is refused before its DDL runs
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM phys.lake; GRANT SCHEMA c.vs TO ROLE w WITH (select, insert, update, create, drop);
+
+statement ok
+ACL ROLE "w" CREATE TABLE vs.t1(id INTEGER, tenant VARCHAR);
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.vs.t1 SET ON INSERT (tenant = acl_claim('tenant'));
+
+statement error
+ACL ROLE "w" CREATE OR REPLACE TABLE vs.t1(id INTEGER);
+----
+it is not replaced
+
+query I
+SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'phys' AND table_name = 't1';
+----
+2

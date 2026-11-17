@@ -42,7 +42,8 @@ it a rewrite of the statement, no trigger.
 - **Judged where written** (`RequireWriteValues`): the object writable (the alias form - not a view, a computed list or
   an object RLS), each column and each `new.x` one of its columns, each expression binding over the object's row
   (`SELECT (<expr>) FROM (<the object's read>) AS "new"`, markers NULL); the author's function gate (spec 117,
-  `BodyShape::SET_ITEMS`); no table to qualify or gate (no subquery). Any other ALTER re-judges the stored items.
+  `BodyShape::SET_ITEMS`); no table to qualify or gate (no subquery). An ALTER of the definition re-judges the stored
+  items; one of a verb's items judges only that verb's.
 - **The rewrite.**
   - INSERT: `SELECT <the client's columns but the computed>, <computed> FROM (<source>) AS __acl_written(<columns>)`
     (the injection path's shape); a drained quack stream (spec 042) by position, `SELECT * REPLACE (<computed> AS
@@ -84,6 +85,36 @@ What follows for the design:
   and the listing shows the computed expression as the column's `column_default`.
 - **The write check** (spec 024) sees the computed value: a tenant RLS is satisfied by `tenant_id =
   acl_claim('tenant')` by construction, so a loader no longer sends the tenant at all.
+
+## Known limits
+
+- `new.<c>` has the type of what the client wrote: a VALUES literal is text until it is stored (`'100'` times a rate
+  fails) - cast it in the expression.
+- On an UPDATE / a MERGE branch, `new.<c>` repeats the client's expression: a volatile one (`random()`, a sequence) runs
+  again, so the stored value and the computed one may differ.
+- The values read the row as the object does, whatever the writer's grant hides (as an object's computed column
+  does).
+- The values are the virtual table's: a schema alias over the same physical table, a second relation, `ACL NATIVE`
+  compute nothing; a principal holding `drop` and `create` may drop the object and create it again without them (its
+  drop takes the operator's declarations, as it takes keys and comments).
+- `DESCRIBE` / `PRAGMA table_info` show the physical default, only `information_schema.columns.column_default` (and
+  `duckdb_columns()`) the ON INSERT expression.
+
+## Found by the reviews
+
+- An upsert into an object with ON UPDATE only was not refused (its update branch wrote without it).
+- A target aliased `new` (`UPDATE f AS new …`, `MERGE INTO f AS new`) turned ON UPDATE's current row into the client's
+  value: the bare column was qualified first, then read as `new.`. One pass now does both.
+- An ON INSERT column was writable by an UPDATE (a tenant set in two steps): it now keeps the row's value unless ON
+  UPDATE computes it - the owner's rule that the client's value is overwritten.
+- A source wider than the column list lost its extra values silently: the INSERT's projection keeps the source's width
+  (`* REPLACE`), so duckdb's own width check still refuses it.
+- `current_timestamp` (any SQL value keyword) was read as a column.
+- A lambda's parameter was judged as a column where written.
+- With both verbs broken, neither could be dropped: a change of one verb no longer re-judges the other.
+- A principal's `CREATE OR REPLACE` of an object with values failed after its DDL had run: it is refused before.
+- The operator's `acl_rename_relation` left the values under the old name: they move with the object.
+- `platform.add_relation` lacked `on_insert` / `on_update`.
 
 ## Found while building it
 

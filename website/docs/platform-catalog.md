@@ -137,7 +137,7 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | `catalogs` *c* | catalog, comment |
 | `relations` *c* | catalog, name, form, phys, view_sql, rls, rls_checked BOOLEAN, origin, comment, alias_types, enum_types, created_by |
 | `relation_columns` *c* | catalog, relation, pos BIGINT, name, expr, nullable BOOLEAN |
-| `write_values` *c* | catalog, relation, verb (`insert` / `update`), pos INTEGER, column, expr - what a write sets by itself (spec 172) |
+| `write_values` *c* | catalog, relation, verb (`insert` / `update`), pos BIGINT, column, expr - what a write sets by itself (spec 172) |
 | `schemas` *c* | catalog, path, phys_path, origin, comment, created_by |
 | `functions` *c* | catalog, name, kind, form, target, template, params VARCHAR[], comment, created_by |
 | `function_columns` *c* | catalog, function, kind, pos BIGINT, name, type, comment, nullable BOOLEAN |
@@ -281,7 +281,7 @@ ESCALATES and INFRASTRUCTURE.
 | --- | --- | --- |
 | `create_catalog` | catalog\*, comment, mode | CATALOG |
 | `alter_catalog` | catalog\*, comment | CATALOG |
-| `add_relation` | catalog\*, name\*, phys\*, columns, rls, comment, mode, primary_key | CATALOG |
+| `add_relation` | catalog\*, name\*, phys\*, columns, rls, comment, mode, primary_key, on_insert, on_update (both or neither) | CATALOG |
 | `add_view` | catalog\*, name\*, sql, returns, comment, mode, primary_key | CATALOG |
 | `add_schema_alias` / `expand_schema` | catalog\*, path\*, phys_path\*, comment, mode | CATALOG |
 | `refresh_schema_objects` | catalog\*, path\*, prune | CATALOG |
@@ -290,7 +290,7 @@ ESCALATES and INFRASTRUCTURE.
 | `add_scalar` | catalog\*, name\*, definition, params, returns, comment, mode | CATALOG |
 | `add_scalar_alias` | catalog\*, name\*, target\*, params, returns, comment, mode | CATALOG |
 | `drop_relation` | catalog\*, name\*, mode | CATALOG |
-| `alter_relation` | catalog\*, name\*, property\*, value | CATALOG |
+| `alter_relation` | catalog\*, name\*, property\* (phys, columns, rls, view, types, on_insert, on_update), value | CATALOG |
 | `alter_schema_alias` | catalog\*, path\*, phys_path\* | CATALOG |
 | `alter_function` | catalog\*, name\*, kind\*, form\*, definition | CATALOG |
 | `drop_schema_alias` | catalog\*, path\*, mode, cascade | CATALOG |

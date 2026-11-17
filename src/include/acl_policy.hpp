@@ -777,6 +777,8 @@ struct PolicyStore {
 	//! spec 113: the object carries the operator's own declarations - a predicate, a column list, keys,
 	//! references, or a grant on it by name: its name is what they are tied to, so no principal renames it
 	bool CatalogRelationDeclared(const string &vcat, const string &vname);
+	//! spec 172: whether a relation computes values on a write (ON INSERT / ON UPDATE)
+	bool CatalogHasWriteValues(const string &vcat, const string &vname);
 	//! The SQL behind a metadata surface for this principal (spec 010 part 3): duckdb's own shape,
 	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
