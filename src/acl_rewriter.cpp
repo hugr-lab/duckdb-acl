@@ -2163,7 +2163,7 @@ private:
 				MapColumnRefs(action->condition, policy, vname, alias);
 				MapReadable(action->condition, reads, vname, alias, false, others);
 				if (action->action_type == MergeActionType::MERGE_UPDATE &&
-				    (HasWritePolicy(policy) || !policy.on_update.empty()) &&
+				    (HasWritePolicy(policy) || !policy.on_update.empty() || !policy.on_insert.empty()) &&
 				    (!action->update_info || action->update_info->columns.empty())) {
 					// `UPDATE SET *` / `UPDATE BY NAME` writes every column the source carries - the
 					// grant's columns, values and fields are judged per named column, so name them

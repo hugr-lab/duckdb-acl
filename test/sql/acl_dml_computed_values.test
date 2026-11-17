@@ -341,3 +341,29 @@ query I
 SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'phys' AND table_name = 't1';
 ----
 2
+
+# a MERGE's UPDATE SET * / BY NAME would write an ON INSERT column by the source's name: refused (re-review)
+statement ok
+CREATE TABLE phys.main.q (id INTEGER, tenant_id VARCHAR, created_at TIMESTAMP, amount INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.q AS phys.main.q ON INSERT SET (tenant_id = acl_claim('tenant'), created_at = now());
+
+statement ok
+ACL ROLE "w" INSERT INTO q (id, amount) VALUES (1, 1), (2, 2);
+
+statement error
+ACL ROLE "w" MERGE INTO q USING (SELECT 1 AS id, 'globex' AS tenant_id, TIMESTAMP '2000-01-01' AS created_at, 5 AS amount) s ON q.id = s.id WHEN MATCHED THEN UPDATE SET *;
+----
+must name its columns
+
+statement error
+ACL ROLE "w" MERGE INTO q USING (SELECT 2 AS id, 'globex' AS tenant_id, TIMESTAMP '2000-01-01' AS created_at, 6 AS amount) s ON q.id = s.id WHEN MATCHED THEN UPDATE BY NAME;
+----
+must name its columns
+
+query IT
+SELECT id, tenant_id FROM phys.main.q WHERE created_at > TIMESTAMP '2001-01-01' ORDER BY id;
+----
+1	acme
+2	acme

@@ -42,6 +42,8 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
 - **Columns after spec 158** (spec 170 closed the rest):
   - `acl_check_catalog`'s `CheckGrants` judges only grants whose name is a relation: an object grant on a live alias's
     object (COLUMNS / MASK / RLS that no longer bind there) has no finding (spec 170's review);
+  - a grant's injection wraps an INSERT's source as `__acl_insert(<list>)`, which trims a source wider than the list
+    (its extra value dropped, no width error) - spec 172's re-review; no value of the principal's choosing is written;
   - spec 158 stage 2's known limits (a broken star is not marked in the listing; a `COLUMNS` selector reading the
     session; a RENAME's tags).
 - **Versioned tables after spec 167** (a grant's `VERSIONS`, built 2026-11-15):

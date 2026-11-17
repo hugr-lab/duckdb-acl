@@ -107,6 +107,8 @@ What follows for the design:
   value: the bare column was qualified first, then read as `new.`. One pass now does both.
 - An ON INSERT column was writable by an UPDATE (a tenant set in two steps): it now keeps the row's value unless ON
   UPDATE computes it - the owner's rule that the client's value is overwritten.
+- A MERGE's `UPDATE SET *` / `UPDATE BY NAME` wrote ON INSERT columns by the source's names (re-review): refused like
+  any write policy's.
 - A source wider than the column list lost its extra values silently: the INSERT's projection keeps the source's width
   (`* REPLACE`), so duckdb's own width check still refuses it.
 - `current_timestamp` (any SQL value keyword) was read as a column.
