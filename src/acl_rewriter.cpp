@@ -164,6 +164,23 @@ bool IsValueKeyword(const string &name) {
 	return KEYWORDS.count(name) > 0;
 }
 
+//! The function duckdb reads a value keyword as when no column has its name (duckdb's GetSQLValueFunctionName)
+string ValueFunctionOf(const string &name) {
+	static const case_insensitive_map_t<string> FUNCTIONS = {{"current_catalog", "current_catalog"},
+	                                                         {"current_date", "current_date"},
+	                                                         {"current_schema", "current_schema"},
+	                                                         {"current_role", "current_role"},
+	                                                         {"current_time", "get_current_time"},
+	                                                         {"current_timestamp", "get_current_timestamp"},
+	                                                         {"current_user", "current_user"},
+	                                                         {"localtime", "current_localtime"},
+	                                                         {"localtimestamp", "current_localtimestamp"},
+	                                                         {"session_user", "session_user"},
+	                                                         {"user", "user"}};
+	auto entry = FUNCTIONS.find(name);
+	return entry == FUNCTIONS.end() ? name : entry->second;
+}
+
 //! Build a QualifiedName from a stored physical name (a key) of any depth: the last part is the name,
 //! the preceding ones the (possibly nested) catalog/schema path - each part one identifier, so
 //! `phys."Raw Data"."Order Items"` binds as the three names it holds (spec 116). Preserves depth beyond
@@ -1845,7 +1862,7 @@ private:
 			// without the ACL - so a qualifier the principal wrote is mapped rather than aliased.
 			MapTargetQualifier(item, vname, node.qualified_name.Name().GetIdentifierName());
 		}
-		RequireReadableReturning(node.returning_list, policy, vname);
+		RequireReadableReturning(node.returning_list, policy, vname, node.qualified_name.Name());
 	}
 
 	//! spec 145: what a DML statement's own conditions may read of its target where a role the verb unites may not read
@@ -2085,7 +2102,7 @@ private:
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname);
 		}
-		RequireReadableReturning(node.returning_list, policy, vname);
+		RequireReadableReturning(node.returning_list, policy, vname, TargetAliasOf(node.table));
 	}
 
 	void RewriteDeleteNode(DeleteQueryNode &node) {
@@ -2113,7 +2130,7 @@ private:
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname);
 		}
-		RequireReadableReturning(node.returning_list, policy, vname);
+		RequireReadableReturning(node.returning_list, policy, vname, TargetAliasOf(node.table));
 	}
 
 	void RewriteMergeNode(MergeQueryNode &node) {
@@ -2178,7 +2195,7 @@ private:
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname, alias);
 		}
-		RequireReadableReturning(node.returning_list, policy, vname);
+		RequireReadableReturning(node.returning_list, policy, vname, TargetAliasOf(node.target));
 	}
 
 	//! A grant's value column is assigned, not suggested - the same rule the UPDATE path applies
@@ -3791,6 +3808,16 @@ private:
 			return; // `other.x`: qualified by another relation in scope - not the target's
 		}
 		if (!qualified && names.size() == 1 && IsValueKeyword(head)) {
+			// duckdb binds `user` / `current_date` to a column of that name before the value: where the role does not
+			// read such a column, the value is written as the call duckdb would make, so a hidden one is never read
+			// (spec 171's review; the column the role reads keeps its name)
+			auto mapped = MapWrittenColumn(policy, names[0], vname).GetIdentifierName();
+			if (!policy.ColumnsNarrowed() || policy.Readable(mapped)) {
+				return;
+			}
+			expr = make_uniq<FunctionExpression>(
+			    QualifiedName::FromPath({Identifier("system"), Identifier("main"), Identifier(ValueFunctionOf(head))}),
+			    vector<unique_ptr<ParsedExpression>>());
 			return;
 		}
 		idx_t at = qualified ? 1 : 0;
@@ -4296,7 +4323,7 @@ private:
 	//! what the grant hid or masked: only columns the grant exposes as-is may be named, and a star -
 	//! which expands to every physical column - never is.
 	void RequireReadableReturning(const vector<unique_ptr<ParsedExpression>> &returning, const TablePolicy &policy,
-	                              const string &vname) {
+	                              const string &vname, const Identifier &target) {
 		if (!returning.empty() && !policy.returning_refused.empty()) {
 			Deny(Reason::CAPABILITY, "RETURNING: " + policy.returning_refused); // spec 145: RETURNING is a read
 		}
@@ -4304,11 +4331,12 @@ private:
 			return; // no column policy: the relation is the table, and RETURNING reads the table
 		}
 		for (auto &item : returning) {
-			RequireReadableExpr(*item, policy, vname);
+			RequireReadableExpr(*item, policy, vname, target);
 		}
 	}
 
-	void RequireReadableExpr(const ParsedExpression &expr, const TablePolicy &policy, const string &vname) {
+	void RequireReadableExpr(const ParsedExpression &expr, const TablePolicy &policy, const string &vname,
+	                         const Identifier &target) {
 		if (expr.GetExpressionClass() == ExpressionClass::STAR) {
 			Deny(Reason::WRITE_POLICY, "RETURNING * on " + Shown(vname) + " is not allowed under a column policy");
 		}
@@ -4318,10 +4346,18 @@ private:
 				return;
 			}
 			// spec 158 review: the column is the first part, or the second after a qualifier (`t.s.f`) - never a field
-			// (`s.f` names column s); both are judged, so a qualifier named like a hidden column refuses (fail closed)
+			// (`s.f` names column s); both are judged, so a qualifier named like a hidden column refuses (fail closed).
+			// Each candidate must be readable (spec 171's review: `s.id` with `s` hidden and `id` shown read s's field)
+			// - unless it is the target's own name, the qualifier
 			vector<string> candidates {names[0].GetIdentifierName()};
 			if (names.size() >= 2) {
 				candidates.push_back(names[1].GetIdentifierName());
+			}
+			string parent, leaf;
+			NamePath::SplitLeaf(vname, parent, leaf);
+			if (candidates.size() == 2 && (StringUtil::CIEquals(candidates[0], target.GetIdentifierName()) ||
+			                               StringUtil::CIEquals(candidates[0], leaf))) {
+				candidates.erase(candidates.begin());
 			}
 			auto masked = [&](const string &name) {
 				for (auto &injection : policy.injections) {
@@ -4331,20 +4367,18 @@ private:
 				}
 				return policy.columns_excluded && policy.excluded_columns.count(name) > 0;
 			};
-			bool listed = policy.columns_excluded;
 			for (auto &name : candidates) {
 				if (masked(name)) {
 					Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of " + Shown(vname) + " is not readable");
 				}
-				listed = listed || policy.write_columns.count(name) > 0;
-			}
-			if (!listed) {
-				Deny(Reason::WRITE_POLICY, "column \"" + candidates[0] + "\" of " + Shown(vname) + " is not readable");
+				if (!policy.columns_excluded && !policy.write_columns.count(name)) {
+					Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of " + Shown(vname) + " is not readable");
+				}
 			}
 			return;
 		}
 		ParsedExpressionIterator::EnumerateChildren(
-		    expr, [&](const ParsedExpression &child) { RequireReadableExpr(child, policy, vname); });
+		    expr, [&](const ParsedExpression &child) { RequireReadableExpr(child, policy, vname, target); });
 	}
 
 	//! Qualify every bare column reference with the target's alias. Without this, a column of the same

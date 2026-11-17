@@ -26,6 +26,20 @@ object the read-only subquery form.
   none of the source's before).
 - **Ingest** (Flight, quack's SEND_DATA) into such an object writes the columns it shows.
 
+## Found by the review
+
+Older holes in what a write reads, reachable now through objects that were read-only:
+
+- **RETURNING `s.id`** passed when either part was a listed column: a hidden struct `s` gave its field `id` back.
+  Each part is judged now, but the target's own name or alias (the qualifier).
+- **A hidden column named like a value keyword** (`user`, `current_date`, …) was left to duckdb in a write's SET /
+  WHERE / MERGE conditions, and duckdb binds a column of that name before the value. Where the role reads no such
+  column, the keyword is written as the call duckdb would make (`system.main.user()`), so the hidden one is never read.
+
+Not changed: a renaming list's listing is its snapshot now, so an undeclared column's `is_nullable` is NULL (spec 048's
+"undeclared stays open" for declared lists) where the source's row said YES / NO, and a source change is seen at the
+next ANALYZE (`schema_stale` before it), as for every declared list.
+
 ## Tests
 
 `test/sql/acl_bare_names_writable.test`; the form, comment and ingest expectations of `acl_introspection`,
