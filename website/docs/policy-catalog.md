@@ -74,6 +74,7 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `relations` | virtual tables and views: `form` (`alias` / `subquery` / `view`), physical target, view SQL, inline RLS, origin, whether the RLS was checked, the object's own type policy (`alias_types`, `enum_types`; NULL = the node's, spec 099) |
 | `relation_types` | the source's column types an exposure policy changes, probed where the object is written: per column the exposed spelling with aliases stripped, with ENUMs as VARCHAR, and with both (spec 099) |
 | `relation_columns` | an object's own projection: position, name, expression, nullability |
+| `relation_write_values` | what an INSERT (`verb` 'insert') or an UPDATE ('update') of a relation sets by itself: position, column, expression (spec 172) |
 | `object_columns` | the declared or derived column schema (name, type, comment, nullable) of every object, keyed by kind - what `DESCRIBE` and the listings answer with (spec 010) |
 | `functions` | virtual table functions and scalars: kind, `form` (`alias` / `macro`), target, template, params |
 | `schemas` | virtual schemas: path, physical path (an alias) or none, origin (an expansion), comment |

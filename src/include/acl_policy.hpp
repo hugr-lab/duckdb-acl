@@ -205,6 +205,10 @@ struct TablePolicy {
 	//! spec 158 stage 2: a read of an object whose list holds a star that does not bind when two of its columns share
 	//! a name - the rewriter binds it alone before the statement runs (spec 157 / 159's guards)
 	string distinct_guard;
+	//! spec 172: what an INSERT / an UPDATE of the object sets by itself - (physical column, expression), its column
+	//! references physical names and `new.<physical>` the value the write gives that column
+	vector<std::pair<string, string>> on_insert;
+	vector<std::pair<string, string>> on_update;
 
 	//! Whether a column policy narrows what a DML statement reads or writes
 	bool ColumnsNarrowed() const {
@@ -722,10 +726,13 @@ struct PolicyStore {
 	// catalog admin operations (spec 006); each throws unless the catalog backend is enabled.
 	// columns are (name, expr) pairs with an empty expr for a plain projected column.
 	void CatalogCreate(const string &vcat, const string &comment);
+	//! `on_insert` / `on_update` (spec 172): the items as written, '' none; nullptr keeps what is stored
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
 	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
 	                        const string &returns = string(), const string &pk = string(),
-	                        const case_insensitive_map_t<int8_t> &nullable_marks = {});
+	                        const case_insensitive_map_t<int8_t> &nullable_marks = {},
+	                        optional_ptr<const string> on_insert = nullptr,
+	                        optional_ptr<const string> on_update = nullptr);
 	//! The declared primary key of an existing object (spec 048): empty csv drops it. Declared,
 	//! never enforced; validated against the object's declared columns where they are known.
 	void CatalogSetKey(const string &vcat, const string &vname, const string &kind, const string &pk);
@@ -770,6 +777,8 @@ struct PolicyStore {
 	//! spec 113: the object carries the operator's own declarations - a predicate, a column list, keys,
 	//! references, or a grant on it by name: its name is what they are tied to, so no principal renames it
 	bool CatalogRelationDeclared(const string &vcat, const string &vname);
+	//! spec 172: whether a relation computes values on a write (ON INSERT / ON UPDATE)
+	bool CatalogHasWriteValues(const string &vcat, const string &vname);
 	//! The SQL behind a metadata surface for this principal (spec 010 part 3): duckdb's own shape,
 	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.

@@ -15,6 +15,8 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 
 namespace duckdb {
@@ -634,6 +636,118 @@ vector<DeclaredColumnText> SplitDeclaredColumns(const string &text, const char *
 		columns.push_back(std::move(column));
 	}
 	return columns;
+}
+
+bool IsSqlValueKeyword(const string &name) {
+	static const case_insensitive_set_t KEYWORDS = {
+	    "current_date", "current_time", "current_timestamp", "localtime",       "localtimestamp", "current_user",
+	    "user",         "session_user", "current_role",      "current_catalog", "current_schema"};
+	return KEYWORDS.count(name) > 0;
+}
+
+namespace {
+
+//! A column reference that is neither `new.<column>` nor (`bare_ok`) a bare column of the row: a qualified name, a
+//! field path, a bare name where none is allowed
+bool HoldsOtherColumnRef(const ParsedExpression &expr, bool bare_ok, const case_insensitive_set_t &params,
+                         string &found) {
+	if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
+		auto &lambda = expr.Cast<LambdaExpression>();
+		auto inner = params;
+		if (lambda.Left().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			inner.insert(lambda.Left().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+		}
+		ParsedExpressionIterator::EnumerateChildren(lambda.Left(), [&](const ParsedExpression &child) {
+			if (child.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				inner.insert(child.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+			}
+		});
+		return HoldsOtherColumnRef(lambda.Right(), bare_ok, inner, found);
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+		if (params.count(names[0].GetIdentifierName())) {
+			return false;
+		}
+		if (names.size() == 2 && StringUtil::CIEquals(names[0].GetIdentifierName(), "new")) {
+			return false;
+		}
+		if (names.size() == 1 && (bare_ok || IsSqlValueKeyword(names[0].GetIdentifierName()))) {
+			return false; // a value keyword (`current_timestamp`) is the value where no column has its name
+		}
+		found = expr.ToString();
+		return true;
+	}
+	bool holds = false;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		holds = holds || HoldsOtherColumnRef(child, bare_ok, params, found);
+	});
+	return holds;
+}
+
+} // namespace
+
+vector<std::pair<string, string>> ReadWriteValues(const string &text_p, const char *what, bool on_update) {
+	vector<std::pair<string, string>> items;
+	auto text = text_p;
+	StringUtil::Trim(text);
+	if (text.empty()) {
+		return items;
+	}
+	auto refuse = [&](const string &why) {
+		throw BinderException("acl admin: %s %s - it is items `<column> = <expression>`, `new.<column>` the value this "
+		                      "write gives a column%s",
+		                      what, why, on_update ? ", a bare column the row's current value" : "");
+	};
+	bool open = false, comment = false;
+	ListTokens(text, &open, &comment);
+	if (comment || open) {
+		refuse("holds a comment or ends inside a literal or a quoted name");
+	}
+	Parser parser(ParserOptions::Builtin());
+	try {
+		parser.ParseQuery("UPDATE __acl_list SET " + text);
+	} catch (std::exception &ex) {
+		refuse("does not read as a SET list (" + ErrorData(ex).RawMessage() + ")");
+	}
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::UPDATE_STATEMENT) {
+		refuse("holds more than a SET list");
+	}
+	auto &update = parser.statements[0]->Cast<UpdateStatement>();
+	auto &node = *update.node;
+	if (!node.set_info || node.from_table || !node.returning_list.empty() || node.set_info->condition ||
+	    !node.cte_map.map.empty()) {
+		refuse("holds more than a SET list");
+	}
+	case_insensitive_set_t named;
+	for (idx_t i = 0; i < node.set_info->columns.size(); i++) {
+		auto column = node.set_info->columns[i].GetIdentifierName();
+		auto &expr = *node.set_info->expressions[i];
+		if (!named.insert(column).second) {
+			throw BinderException("acl admin: %s sets \"%s\" twice", what, column);
+		}
+		if (HoldsClass(expr, ExpressionClass::SUBQUERY) || HoldsClass(expr, ExpressionClass::STAR) ||
+		    HoldsPositional(expr) || HoldsClass(expr, ExpressionClass::PARAMETER) ||
+		    HoldsClass(expr, ExpressionClass::WINDOW) || expr.GetExpressionClass() == ExpressionClass::DEFAULT) {
+			refuse("sets \"" + column + "\" to " + expr.ToString() +
+			       " - an expression over the row being written: no subquery, star, position, parameter or DEFAULT");
+		}
+		string other;
+		if (HoldsOtherColumnRef(expr, on_update, case_insensitive_set_t(), other)) {
+			refuse("sets \"" + column + "\" reading " + other +
+			       (on_update ? string() : string(" - on an INSERT there is no current row: write new.<column>")));
+		}
+		items.emplace_back(column, expr.ToString());
+	}
+	return items;
+}
+
+string WriteValuesText(const vector<std::pair<string, string>> &items) {
+	vector<string> parts;
+	for (auto &item : items) {
+		parts.push_back(KeywordHelper::WriteOptionallyQuoted(item.first, '"', true) + " = " + item.second);
+	}
+	return StringUtil::Join(parts, ", ");
 }
 
 StarParts ReadStarParts(const string &star_text) {

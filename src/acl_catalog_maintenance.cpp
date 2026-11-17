@@ -336,6 +336,7 @@ private:
 			}
 			if (!relation.dead && !is_view) {
 				JudgeWholeName(kind, relation);
+				JudgeWriteValues(kind, relation);
 			}
 			if (!relation.dead && !is_view) {
 				JudgeColumnComments(relation);
@@ -349,6 +350,40 @@ private:
 				                   " SET RLS '<predicate>'");
 			}
 			relations[relation.vname] = std::move(relation);
+		}
+	}
+
+	//! spec 172: each value a write sets by itself must bind over the object's row as it stands - else every INSERT /
+	//! UPDATE of it refuses at bind (fail closed); the repair writes it again
+	void JudgeWriteValues(const string &kind, const Relation &relation) {
+		auto rows = Read("SELECT \"verb\", \"column\", \"expr\" FROM " + catalog.Tbl("relation_write_values") +
+		                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(relation.vname) +
+		                 " ORDER BY \"verb\", \"pos\"");
+		ResultRows read(*rows);
+		if (read.Count() == 0 || !acl_detail::StoredListOk(relation.declared)) {
+			return;
+		}
+		auto row = acl_detail::ObjectListSelect(relation.declared, " FROM " + relation.Source());
+		for (idx_t i = 0; i < read.Count(); i++) {
+			auto verb = StringUtil::Upper(read.GetValue(0, i).ToString());
+			auto column = read.GetValue(1, i).ToString();
+			string error;
+			string probe;
+			try {
+				probe = BakeTemplateForProbe("SELECT (" + Text(read.GetValue(2, i)) + ") AS \"__acl_value\" FROM (" +
+				                                 row + " WHERE false) AS \"new\"",
+				                             ParserOptions::Builtin(), false, {});
+			} catch (std::exception &ex) {
+				error = ErrorData(ex).RawMessage();
+			}
+			if (error.empty() && Binds(catalog, probe, error)) {
+				continue;
+			}
+			Add(kind, relation.vname, "", "write_value_broken",
+			    "ON " + verb + " sets \"" + column + "\" to an expression that no longer binds over the object: " +
+			        FirstLine(error) + " - every " + verb + " of it refuses",
+			    "ALTER VIRTUAL TABLE " + Named(relation.vname) + " SET ON " + verb + " (<items>)  -- or DROP ON " +
+			        verb);
 		}
 	}
 
@@ -697,6 +732,17 @@ private:
 		for (idx_t row = 0; row < column_rows.Count(); row++) {
 			CheckBody("table", column_rows.GetValue(0, row).ToString(), "", "a declared column",
 			          Text(column_rows.GetValue(1, row)), BodyShape::EXPRESSION);
+		}
+		// spec 172: what a write sets by itself - a stored body like a computed column
+		auto values =
+		    Read("SELECT \"vname\", \"verb\", \"column\", \"expr\" FROM " + catalog.Tbl("relation_write_values") +
+		         " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\", \"verb\", \"pos\"");
+		ResultRows value_rows(*values);
+		for (idx_t row = 0; row < value_rows.Count(); row++) {
+			CheckBody("table", value_rows.GetValue(0, row).ToString(), "",
+			          "ON " + StringUtil::Upper(value_rows.GetValue(1, row).ToString()) + " of \"" +
+			              value_rows.GetValue(2, row).ToString() + "\"",
+			          Text(value_rows.GetValue(3, row)), BodyShape::EXPRESSION);
 		}
 		auto functions = Read("SELECT \"vname\", \"kind\", \"form\", \"target\", \"template\" FROM " +
 		                      catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\"");

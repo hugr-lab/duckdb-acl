@@ -929,6 +929,12 @@ private:
 		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
 			Deny(Reason::DDL_HOME, "" + Shown(key) + " already exists");
 		}
+		if (store.CatalogHasWriteValues(vcat, key)) {
+			// spec 172: judged before the DDL runs - its record would keep the operator's values over a new shape
+			Deny(Reason::DDL_HOME, "" + Shown(key) +
+			                           " computes values on a write (the operator's ON INSERT / ON UPDATE), which are "
+			                           "tied to its definition - it is not replaced");
+		}
 		return true;
 	}
 
@@ -1842,6 +1848,7 @@ private:
 			RewriteQueryNode(*node.select_statement->node);
 		}
 		ApplyInsertPolicy(node, policy, vname);
+		ApplyComputedInsert(node, policy, vname); // spec 172
 		ApplyInsertCheck(node, policy, vname);
 		auto conflict_update = ConflictUpdatePolicy(node, policy, vname);
 		ApplyConflictPolicy(node, policy, conflict_update, vname);
@@ -2086,6 +2093,8 @@ private:
 					}
 				}
 			}
+			ApplyComputedUpdate(*node.set_info, policy, vname,
+			                    node.from_table ? TargetAliasOf(node.table) : Identifier()); // spec 172
 			ApplyUpdateCheck(*node.set_info, policy, vname, node.from_table ? TargetAliasOf(node.table) : Identifier());
 			RewriteExpr(node.set_info->condition);
 			MapColumnRefs(node.set_info->condition, policy, vname,
@@ -2153,7 +2162,8 @@ private:
 				RewriteExpr(action->condition);
 				MapColumnRefs(action->condition, policy, vname, alias);
 				MapReadable(action->condition, reads, vname, alias, false, others);
-				if (action->action_type == MergeActionType::MERGE_UPDATE && HasWritePolicy(policy) &&
+				if (action->action_type == MergeActionType::MERGE_UPDATE &&
+				    (HasWritePolicy(policy) || !policy.on_update.empty() || !policy.on_insert.empty()) &&
 				    (!action->update_info || action->update_info->columns.empty())) {
 					// `UPDATE SET *` / `UPDATE BY NAME` writes every column the source carries - the
 					// grant's columns, values and fields are judged per named column, so name them
@@ -2176,6 +2186,7 @@ private:
 						MapReadable(expr, reads, vname, alias, false, others);
 					}
 					ApplySetInjections(*action->update_info, policy, vname);
+					ApplyComputedUpdate(*action->update_info, policy, vname, alias); // spec 172
 					ApplyUpdateCheck(*action->update_info, policy, vname, alias);
 					RewriteExpr(action->update_info->condition);
 					MapColumnRefs(action->update_info->condition, policy, vname, alias);
@@ -2187,6 +2198,7 @@ private:
 				}
 				if (action->action_type == MergeActionType::MERGE_INSERT) {
 					ApplyMergeInsertPolicy(*action, policy, vname);
+					ApplyComputedMergeInsert(*action, policy, vname); // spec 172
 					ApplyMergeInsertCheck(*action, policy, vname);
 				}
 			}
@@ -2196,6 +2208,268 @@ private:
 			MapColumnRefs(item, policy, vname, alias);
 		}
 		RequireReadableReturning(node.returning_list, policy, vname, TargetAliasOf(node.target));
+	}
+
+	//===------------------------------------------------------------------===//
+	// spec 172: values an object computes on a write
+	//===------------------------------------------------------------------===//
+	using ValueOf = std::function<unique_ptr<ParsedExpression>(const string &)>;
+
+	//! One pass over a stored value: `new.<c>` becomes `value_of(c)` (never walked again - a client's expression is
+	//! the client's), a SQL value keyword (`current_timestamp`) the call duckdb would make, any other bare column the
+	//! target's (`target`, when another relation is in scope) - so a target aliased `new` reads its row, not the write
+	static void SubstituteNew(unique_ptr<ParsedExpression> &expr, const ValueOf &value_of, const Identifier &target,
+	                          const case_insensitive_set_t &params) {
+		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
+			auto &lambda = expr->Cast<LambdaExpression>();
+			auto inner = params;
+			if (lambda.Left().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				inner.insert(lambda.Left().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+			}
+			ParsedExpressionIterator::EnumerateChildren(lambda.Left(), [&](const ParsedExpression &child) {
+				if (child.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+					inner.insert(child.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+				}
+			});
+			SubstituteNew(lambda.RightMutable(), value_of, target, inner);
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr->Cast<ColumnRefExpression>().ColumnNamesMutable();
+			if (params.count(names[0].GetIdentifierName())) {
+				return;
+			}
+			if (names.size() == 2 && StringUtil::CIEquals(names[0].GetIdentifierName(), "new")) {
+				expr = value_of(names[1].GetIdentifierName());
+				return;
+			}
+			if (names.size() == 1 && IsValueKeyword(names[0].GetIdentifierName())) {
+				expr = make_uniq<FunctionExpression>(
+				    QualifiedName::FromPath({Identifier("system"), Identifier("main"),
+				                             Identifier(ValueFunctionOf(names[0].GetIdentifierName()))}),
+				    vector<unique_ptr<ParsedExpression>>());
+				return;
+			}
+			if (names.size() == 1 && !target.empty()) {
+				names.insert(names.begin(), target);
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { SubstituteNew(child, value_of, target, params); });
+	}
+
+	//! One computed value as the write writes it: markers baked (the writer's), the system's calls written whole, then
+	//! the one pass above
+	unique_ptr<ParsedExpression> ComputedValue(const std::pair<string, string> &item, const Identifier &target,
+	                                           const ValueOf &value_of) {
+		auto value = store.InstantiateExpr(item.second, template_options);
+		BakeMarkers(value, nullptr);
+		QualifyTemplateCalls(value);
+		SubstituteNew(value, value_of, target, case_insensitive_set_t());
+		return value;
+	}
+
+	static bool Computes(const vector<std::pair<string, string>> &items, const string &column) {
+		for (auto &item : items) {
+			if (StringUtil::CIEquals(item.first, column)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! An INSERT into an object that computes values: each one set (the client's value of that column dropped - the
+	//! object's wins, as a grant's injection does), `new.<c>` the value the insert gives c (NULL when it writes none).
+	//! Named columns are read by name; a drained stream (spec 042) is replaced in place by position
+	void ApplyComputedInsert(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+		if (policy.on_insert.empty() && policy.on_update.empty()) {
+			return;
+		}
+		if (node.on_conflict_info && (node.on_conflict_info->action_type == OnConflictAction::UPDATE ||
+		                              node.on_conflict_info->action_type == OnConflictAction::REPLACE)) {
+			Deny(Reason::WRITE_POLICY, "insert into " + Shown(vname) +
+			                               " cannot use ON CONFLICT DO UPDATE / INSERT OR REPLACE: the object computes "
+			                               "values on a write - write a MERGE");
+		}
+		if (policy.on_insert.empty()) {
+			return; // an ON UPDATE alone: only the upsert above is the INSERT's to refuse
+		}
+		if (node.columns.empty() && !node.default_values && node.column_order != InsertColumnOrder::INSERT_BY_NAME) {
+			for (auto &column : policy.write_order) {
+				node.columns.emplace_back(MapWrittenColumn(policy, Identifier(column), vname));
+			}
+		}
+		if (node.columns.empty() || node.default_values || node.column_order == InsertColumnOrder::INSERT_BY_NAME ||
+		    !node.select_statement) {
+			Deny(Reason::WRITE_POLICY,
+			     "insert into " + Shown(vname) + " must name its columns: the object computes values on an INSERT");
+		}
+		auto position_of = [&](const string &column) {
+			for (idx_t i = 0; i < node.columns.size(); i++) {
+				if (StringUtil::CIEquals(node.columns[i].GetIdentifierName(), column)) {
+					return optional_idx(i);
+				}
+			}
+			return optional_idx();
+		};
+		auto null_value = []() {
+			return ConstantExpression::FromValue(Value());
+		};
+		if (SourceIsOwnDrain(node)) {
+			// spec 042's stream: by position, its width kept (a narrower stream fails the REPLACE, a wider the width)
+			auto star = make_uniq<StarExpression>();
+			auto &replacements = star->ReplaceListMutable();
+			for (auto &item : policy.on_insert) {
+				auto position = position_of(item.first);
+				if (!position.IsValid()) {
+					Deny(Reason::WRITE_POLICY, "insert into " + Shown(vname) + " cannot set \"" + item.first +
+					                               "\", which it computes: the streamed shape does not carry it");
+				}
+				replacements[Identifier("__acl_w" + to_string(position.GetIndex()))] =
+				    ComputedValue(item, Identifier(), [&](const string &column) -> unique_ptr<ParsedExpression> {
+					    auto at = position_of(column);
+					    return at.IsValid()
+					               ? make_uniq<ColumnRefExpression>(Identifier("__acl_w" + to_string(at.GetIndex())))
+					               : null_value();
+				    });
+			}
+			auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_written"));
+			for (idx_t i = 0; i < node.columns.size(); i++) {
+				source->column_name_alias.emplace_back("__acl_w" + to_string(i));
+			}
+			auto select = make_uniq<SelectNode>();
+			select->from_table = std::move(source);
+			select->select_list.push_back(std::move(star));
+			auto statement = make_uniq<SelectStatement>();
+			statement->node = std::move(select);
+			node.select_statement = std::move(statement);
+			return;
+		}
+		// the source's width kept (`*`): one too wide still fails the insert's own width check (review), a column the
+		// client wrote is replaced in place, one it did not write is appended
+		auto star = make_uniq<StarExpression>();
+		auto &replacements = star->ReplaceListMutable();
+		vector<unique_ptr<ParsedExpression>> items;
+		auto columns = node.columns;
+		vector<std::pair<string, unique_ptr<ParsedExpression>>> appended;
+		for (auto &item : policy.on_insert) {
+			auto value = ComputedValue(item, Identifier(), [&](const string &column) -> unique_ptr<ParsedExpression> {
+				auto at = position_of(column);
+				return at.IsValid() ? make_uniq<ColumnRefExpression>(node.columns[at.GetIndex()]) : null_value();
+			});
+			auto at = position_of(item.first);
+			if (at.IsValid()) {
+				replacements[node.columns[at.GetIndex()]] = std::move(value);
+			} else {
+				columns.emplace_back(item.first);
+				appended.emplace_back(item.first, std::move(value));
+			}
+		}
+		items.push_back(std::move(star));
+		for (auto &value : appended) {
+			value.second->SetAlias(Identifier(value.first));
+			items.push_back(std::move(value.second));
+		}
+		auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_written"));
+		source->column_name_alias = node.columns;
+		auto select = make_uniq<SelectNode>();
+		select->from_table = std::move(source);
+		select->select_list = std::move(items);
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		node.select_statement = std::move(statement);
+		node.columns = std::move(columns);
+	}
+
+	//! An UPDATE (or a MERGE's update branch) of an object that computes values: each one set on every row it updates,
+	//! `new.<c>` the value this SET gives c (else c as it stands), a bare column the row's current value
+	void ApplyComputedUpdate(UpdateSetInfo &set_info, const TablePolicy &policy, const string &vname,
+	                         const Identifier &target) {
+		// a column the object computes on an INSERT is never the client's to write: unless ON UPDATE computes it too,
+		// an UPDATE that sets it leaves the row's value (the owner's rule - the client's value is overwritten)
+		for (idx_t i = 0; i < set_info.columns.size() && i < set_info.expressions.size(); i++) {
+			auto column = set_info.columns[i].GetIdentifierName();
+			if (Computes(policy.on_insert, column) && !Computes(policy.on_update, column)) {
+				set_info.expressions[i] = target.empty() ? make_uniq<ColumnRefExpression>(Identifier(column))
+				                                         : make_uniq<ColumnRefExpression>(Identifier(column), target);
+			}
+		}
+		if (policy.on_update.empty()) {
+			return;
+		}
+		vector<std::pair<string, unique_ptr<ParsedExpression>>> values;
+		for (auto &item : policy.on_update) {
+			values.emplace_back(item.first,
+			                    ComputedValue(item, target, [&](const string &column) -> unique_ptr<ParsedExpression> {
+				                    for (idx_t i = 0; i < set_info.columns.size(); i++) {
+					                    if (StringUtil::CIEquals(set_info.columns[i].GetIdentifierName(), column)) {
+						                    return set_info.expressions[i]->Copy();
+					                    }
+				                    }
+				                    if (target.empty()) {
+					                    return make_uniq<ColumnRefExpression>(Identifier(column));
+				                    }
+				                    return make_uniq<ColumnRefExpression>(Identifier(column), target);
+			                    }));
+		}
+		for (auto &value : values) {
+			bool set = false;
+			for (idx_t i = 0; i < set_info.columns.size(); i++) {
+				if (StringUtil::CIEquals(set_info.columns[i].GetIdentifierName(), value.first)) {
+					set_info.expressions[i] = std::move(value.second);
+					set = true;
+					break;
+				}
+			}
+			if (!set) {
+				set_info.columns.emplace_back(value.first);
+				set_info.expressions.push_back(std::move(value.second));
+			}
+		}
+	}
+
+	//! A MERGE's insert branch writes a new row: the ON INSERT values as a plain INSERT has them
+	void ApplyComputedMergeInsert(MergeIntoAction &action, const TablePolicy &policy, const string &vname) {
+		if (policy.on_insert.empty()) {
+			return;
+		}
+		if (action.default_values || action.insert_columns.empty() ||
+		    action.column_order == InsertColumnOrder::INSERT_BY_NAME) {
+			Deny(Reason::WRITE_POLICY, "the insert branch of a merge into " + Shown(vname) +
+			                               " must name its columns: the object computes values on an INSERT");
+		}
+		vector<Identifier> columns;
+		vector<unique_ptr<ParsedExpression>> items;
+		vector<std::pair<string, unique_ptr<ParsedExpression>>> computed;
+		for (auto &item : policy.on_insert) {
+			computed.emplace_back(
+			    item.first,
+			    ComputedValue(item, Identifier(), [&](const string &column) -> unique_ptr<ParsedExpression> {
+				    for (idx_t i = 0; i < action.insert_columns.size(); i++) {
+					    if (StringUtil::CIEquals(action.insert_columns[i].GetIdentifierName(), column) &&
+					        i < action.expressions.size()) {
+						    return action.expressions[i]->Copy();
+					    }
+				    }
+				    return ConstantExpression::FromValue(Value());
+			    }));
+		}
+		for (idx_t i = 0; i < action.insert_columns.size() && i < action.expressions.size(); i++) {
+			if (!Computes(policy.on_insert, action.insert_columns[i].GetIdentifierName())) {
+				columns.push_back(action.insert_columns[i]);
+				items.push_back(std::move(action.expressions[i]));
+			}
+		}
+		for (auto &value : computed) {
+			columns.emplace_back(value.first);
+			items.push_back(std::move(value.second));
+		}
+		action.insert_columns = std::move(columns);
+		action.expressions = std::move(items);
 	}
 
 	//! A grant's value column is assigned, not suggested - the same rule the UPDATE path applies
@@ -2607,6 +2881,11 @@ private:
 			if (factory) {
 				tf.bind_info = std::move(factory);
 			}
+			// the door's factory hands its stream whole: read through duckdb's scan that pushes no projection or filter
+			// into it (`arrow_scan` would read a projected column at the stream's position - a write that reads one
+			// of the stream's columns but not the one before it read the wrong buffer, spec 172's e2e)
+			function.SetQualifiedName(
+			    QualifiedName::FromPath({Identifier("system"), Identifier("main"), Identifier("arrow_scan_dumb")}));
 			return;
 		}
 		// not a virtual table function: the gate decides by its key (spec 072), and the call is emitted

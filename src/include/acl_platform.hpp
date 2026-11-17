@@ -137,7 +137,8 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 
 //! The shape a stored definition body is written in
 //! COLUMNS a grant's MASK items (`ReadMasks`, spec 158), DECLARED_COLUMNS an object's own list (`SplitDeclaredColumns`)
-enum class BodyShape : uint8_t { SELECT, EXPRESSION, COLUMNS, DECLARED_COLUMNS, FUNCTION_NAME };
+//! SET_ITEMS: an object's ON INSERT / ON UPDATE items (spec 172, `ReadWriteValues`)
+enum class BodyShape : uint8_t { SELECT, EXPRESSION, COLUMNS, DECLARED_COLUMNS, FUNCTION_NAME, SET_ITEMS };
 //! Every function a stored body calls, as written (a table function's kind TABLE) - the markers acl_claim /
 //! acl_arg left out. Throws when the body does not parse (a body nobody can judge is refused).
 void WalkBodyCalls(const string &text, BodyShape shape,

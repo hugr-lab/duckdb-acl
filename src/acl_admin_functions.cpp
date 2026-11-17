@@ -266,7 +266,11 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 			continue; // IF NOT EXISTS over an existing object: its name is not even read (review 137)
 		}
 		auto phys = store.SpellRelationPhysical(phys_key);
-		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns, "", pk, marks);
+		// spec 172: ON INSERT / ON UPDATE as written (the grammar always passes both); a shorter call keeps the stored
+		string on_insert = OptionalArg(args, 8, row, ""), on_update = OptionalArg(args, 9, row, "");
+		bool stated = args.ColumnCount() > 8;
+		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns, "", pk, marks,
+		                         stated ? &on_insert : nullptr, stated ? &on_update : nullptr);
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -2529,7 +2533,11 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_create_catalog", {{v}, {v, v}, {v, v, v}}, AclCreateCatalogFunc);
 	register_admin_set("acl_set_key", {{v, v, v}, {v, v, v, v}}, AclSetKeyFunc);
 	register_admin_set("acl_add_relation",
-	                   {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}},
+	                   {{v, v, v, v, v},
+	                    {v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v, v, v, v}},
 	                   AclAddRelationFunc);
 	register_admin_set("acl_add_view",
 	                   {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},

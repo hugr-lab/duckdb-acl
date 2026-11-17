@@ -1184,11 +1184,24 @@ arena_ptr<TransformResultValue> FinalizeCreateTable(PEGTransformer &transformer,
 	auto comment = AddArg(*data);
 	data->args.emplace_back(CreateMode(list, 1, 4));
 	auto pk = AddArg(*data);
+	// spec 172: both always passed ('' = none), so a CREATE OR REPLACE states what the object computes
+	auto on_insert = AddArg(*data);
+	auto on_update = AddArg(*data);
+	data->args[on_insert] = Value("");
+	data->args[on_update] = Value("");
 	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 8)) {
 		auto keyword = KeywordOf(clause);
-		ClauseOnce(seen, keyword);
 		auto &value = ClauseList(clause);
+		if (keyword == "on") {
+			// AclOnWriteClause <- 'ON' AclWriteVerb 'SET' AclList
+			auto verb = KeywordOf(value.GetChild(1));
+			ClauseOnce(seen, "on " + verb);
+			ListInto(transformer, value.GetChild(3), verb == "insert" ? on_insert : on_update,
+			         MgmtParsed::TextKind::TEXT, true, verb == "insert" ? "ON INSERT" : "ON UPDATE", *data);
+			continue;
+		}
+		ClauseOnce(seen, keyword);
 		if (keyword == "columns") {
 			DeclaredColumnsInto(transformer, value.GetChild(1), columns, *data);
 		} else if (keyword == "rls") {
@@ -1364,6 +1377,16 @@ void ObjectChangeInto(PEGTransformer &transformer, ParseResult &result, const ch
 		data.args.emplace_back("rls");
 		ListInto(transformer, ClauseList(parts.GetChild(1)).GetChild(1), AddArg(data), MgmtParsed::TextKind::TEXT, true,
 		         "RLS predicate", data);
+	} else if (name == "AclSetOnWrite") {
+		// AclSetOnWrite <- 'SET' 'ON' AclWriteVerb AclList (spec 172)
+		auto verb = KeywordOf(parts.GetChild(2));
+		data.args.emplace_back("on_" + verb);
+		ListInto(transformer, parts.GetChild(3), AddArg(data), MgmtParsed::TextKind::TEXT, true,
+		         verb == "insert" ? "ON INSERT" : "ON UPDATE", data);
+	} else if (name == "AclDropOnWrite") {
+		// AclDropOnWrite <- 'DROP' 'ON' AclWriteVerb
+		data.args.emplace_back("on_" + KeywordOf(parts.GetChild(2)));
+		data.args.emplace_back("");
 	} else {
 		throw ParserException("acl admin: an object change no rule names");
 	}
@@ -2869,8 +2892,11 @@ public:
 		    "AclCreateFunction <- 'CREATE' AclOrReplace? 'VIRTUAL' AclFunctionKind AclIfNotExists? AclPath "
 		    "AclParenList? AclReturns? AclPrimaryKey? AclComment? AclFunctionDefinition",
 		    Start<FinalizeCreateFunction>));
-		changes.push_back(
-		    GrammarChange::AddRule("AclTableClause <- AclColumnsClause / AclRlsClause / AclPrimaryKey / AclComment"));
+		changes.push_back(GrammarChange::AddRule("AclWriteVerb <- 'INSERT' / 'UPDATE'"));
+		// spec 172: ON INSERT SET (<column> = <expression>, …) / ON UPDATE SET (…), read as duckdb's SET list
+		changes.push_back(GrammarChange::AddRule("AclOnWriteClause <- 'ON' AclWriteVerb 'SET' AclList"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclTableClause <- AclColumnsClause / AclRlsClause / AclPrimaryKey / AclComment / AclOnWriteClause"));
 		changes.push_back(GrammarChange::AddRule("AclCreateTable <- 'CREATE' AclOrReplace? 'VIRTUAL' 'TABLE' "
 		                                         "AclIfNotExists? AclPath 'AS' AclPathName AclTableClause*",
 		                                         Start<FinalizeCreateTable>));
@@ -2913,8 +2939,11 @@ public:
 		changes.push_back(
 		    GrammarChange::AddRule("AclAlterFunction <- 'ALTER' 'VIRTUAL' AclFunctionKind AclPath AclFunctionChange",
 		                           Start<FinalizeAlterFunction>));
-		changes.push_back(GrammarChange::AddRule(
-		    "AclTableChange <- AclDropKey / AclSetKey / AclSetPhys / AclSetTypes / AclSetColumns / AclSetRls"));
+		changes.push_back(GrammarChange::AddRule("AclSetOnWrite <- 'SET' 'ON' AclWriteVerb AclList"));
+		changes.push_back(GrammarChange::AddRule("AclDropOnWrite <- 'DROP' 'ON' AclWriteVerb"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclTableChange <- AclDropKey / AclSetKey / AclSetPhys / AclSetTypes / "
+		                           "AclSetColumns / AclSetRls / AclSetOnWrite / AclDropOnWrite"));
 		changes.push_back(GrammarChange::AddRule("AclAlterTable <- 'ALTER' 'VIRTUAL' 'TABLE' AclPath AclTableChange",
 		                                         Start<FinalizeAlterRelation>));
 		changes.push_back(GrammarChange::AddRule("AclPrune <- 'PRUNE'"));

@@ -7,6 +7,9 @@ CREATE TABLE orders AS
            i % 3 AS customer_id
     FROM range(10) t(i);
 
+-- spec 172: an object that computes the tenant and the stamps on a write - bulk ingest and a staged MERGE fill them
+CREATE TABLE ledger (id INTEGER, tenant VARCHAR, amount INTEGER, created_at TIMESTAMP, updated_at TIMESTAMP);
+
 -- a second object, so a listing has something to be a listing *of*, and a reference has two ends.
 -- `ssn` is granted to nobody: it is what proves a hidden column is hidden from the schema a client is
 -- promised, not only from its rows (spec 046).
@@ -50,6 +53,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 -- itself is what promises id NOT NULL
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders PRIMARY KEY (id);
 ACL ADMIN CREATE VIRTUAL TABLE c.customers AS memory.main.customers;
+ACL ADMIN CREATE VIRTUAL TABLE c.ledger AS memory.main.ledger ON INSERT SET (tenant = acl_claim('tenant'), created_at = now()) ON UPDATE SET (updated_at = now());
 ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
     ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the ordering customer';
 ACL ADMIN CREATE VIRTUAL TABLE c.typed AS memory.main.typed;
@@ -74,6 +78,7 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     CAPS '{"select": true, "insert": true}'
     RLS 'tenant = acl_claim(''tenant'')';
 ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select) COLUMNS (id, name);
+ACL ADMIN GRANT TABLE c.ledger TO ROLE analyst WITH (select, insert, update, merge) RLS (tenant = acl_claim('tenant'));
 ACL ADMIN GRANT TABLE c.nested TO ROLE analyst WITH (select) COLUMNS (id, address);
 -- spec 051: create prices CREATE, drop prices REPLACE and DROP - a live-alias schema as the home
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;

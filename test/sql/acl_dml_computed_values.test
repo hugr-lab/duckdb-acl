@@ -1,0 +1,369 @@
+# name: test/sql/acl_dml_computed_values.test
+# description: spec 172 - values an object computes on a write: ON INSERT SET / ON UPDATE SET on a virtual table, set
+#   by the rewrite on every INSERT (VALUES, SELECT), UPDATE, MERGE branch; the client's value of such a column dropped;
+#   `new.<c>` the value the write gives c, a bare column (ON UPDATE) the row's current; markers the writer's; a grant's
+#   predicate satisfied by a computed tenant; refusals where written; ALTER SET / DROP ON …; a quack drain's stream.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.o (id INTEGER, amount INTEGER, discount_rate DOUBLE, discount DOUBLE, tenant_id VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP, changes INTEGER DEFAULT 0);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE ROLE w CLAIMS (tenant = 'acme'); CREATE ROLE other CLAIMS (tenant = 'globex');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE w MAIN; GRANT CATALOG c TO ROLE other MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.o ON INSERT SET (tenant_id = acl_claim('tenant'), created_at = now(), discount = new.amount * new.discount_rate) ON UPDATE SET (updated_at = now(), discount = new.amount * new.discount_rate, changes = changes + 1);
+
+query TITT
+SELECT verb, pos, "column", expr FROM store.acl.relation_write_values ORDER BY verb, pos;
+----
+insert	0	tenant_id	acl_claim('tenant')
+insert	1	created_at	now()
+insert	2	discount	("new".amount * "new".discount_rate)
+update	0	updated_at	now()
+update	1	discount	("new".amount * "new".discount_rate)
+update	2	changes	(changes + 1)
+
+# --- INSERT: computed, the client's value dropped -----------------------------------------------------------------
+
+statement ok
+ACL ROLE "w" INSERT INTO orders (id, amount, discount_rate) VALUES (1, 100, 0.1);
+
+statement ok
+ACL ROLE "w" INSERT INTO orders (id, amount, discount_rate, tenant_id, discount) VALUES (2, 50, 0.2, 'globex', 999);
+
+statement ok
+ACL ROLE "other" INSERT INTO orders (id, amount, discount_rate) SELECT 3, 10, 0.5;
+
+query ITRTII
+SELECT id, tenant_id, discount, created_at IS NOT NULL, updated_at IS NULL, changes FROM phys.main.o ORDER BY id;
+----
+1	acme	10.0	true	true	0
+2	acme	10.0	true	true	0
+3	globex	5.0	true	true	0
+
+# --- UPDATE: every updated row; new.x the SET's value, else the row's -----------------------------------------------
+
+statement ok
+ACL ROLE "w" UPDATE orders SET amount = 200 WHERE id = 1;
+
+statement ok
+ACL ROLE "w" UPDATE orders SET discount_rate = 0.5, discount = 0 WHERE id = 2;
+
+query IRTI
+SELECT id, discount, updated_at IS NOT NULL, changes FROM phys.main.o WHERE id IN (1, 2) ORDER BY id;
+----
+1	20.0	true	1
+2	25.0	true	1
+
+# --- MERGE: the update branch has ON UPDATE, the insert branch ON INSERT -----------------------------------------
+
+statement ok
+CREATE TABLE phys.main.stage AS SELECT * FROM (VALUES (1, 300, 0.1), (4, 40, 0.25)) t(id, amount, discount_rate);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.stage AS phys.main.stage;
+
+statement ok
+ACL ROLE "w" MERGE INTO orders o USING stage s ON o.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amount WHEN NOT MATCHED THEN INSERT (id, amount, discount_rate) VALUES (s.id, s.amount, s.discount_rate);
+
+query ITRTI
+SELECT id, tenant_id, discount, created_at IS NOT NULL, changes FROM phys.main.o WHERE id IN (1, 4) ORDER BY id;
+----
+1	acme	30.0	true	2
+4	acme	10.0	true	0
+
+# --- refusals where written ----------------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET ON INSERT (tenant_id = amount);
+----
+on an INSERT there is no current row
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET ON INSERT (tenant_id = (SELECT 'x'));
+----
+no subquery
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET ON INSERT (nosuch = 1);
+----
+not one of its columns
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET ON UPDATE (amount = amount + 'x');
+----
+does not bind over it
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET ON INSERT (id = 1, id = 2);
+----
+sets "id" twice
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.ro AS phys.main.o COLUMNS (id, amount * 2 AS twice) ON INSERT SET (id = 1);
+----
+is read-only
+
+# an upsert is refused: a MERGE says which branch computes what
+statement error
+ACL ROLE "w" INSERT INTO orders (id, amount) VALUES (1, 1) ON CONFLICT DO UPDATE SET amount = 2;
+----
+write a MERGE
+
+# --- ALTER: a change of another field keeps them; DROP ON INSERT removes them ----------------------------------------
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders IS 'orders';
+
+query I
+SELECT count(*) FROM store.acl.relation_write_values;
+----
+6
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders DROP ON INSERT;
+
+statement ok
+ACL ROLE "w" INSERT INTO orders (id, amount, tenant_id) VALUES (5, 1, 'mine');
+
+query TT
+SELECT tenant_id, created_at FROM phys.main.o WHERE id = 5;
+----
+mine	NULL
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET ON INSERT (tenant_id = acl_claim('tenant'));
+
+# --- a grant's predicate is satisfied by the computed tenant: the client never sends it ----------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE t CLAIMS (tenant = 'acme'); GRANT CATALOG c TO ROLE t MAIN RLS (tenant_id = acl_claim('tenant'));
+
+statement ok
+ACL ROLE "t" INSERT INTO orders (id, amount) VALUES (6, 1);
+
+statement ok
+ACL ROLE "t" INSERT INTO orders (id, amount, tenant_id) VALUES (7, 1, 'globex');
+
+query IT
+SELECT id, tenant_id FROM phys.main.o WHERE id IN (6, 7) ORDER BY id;
+----
+6	acme
+7	acme
+
+# --- a dropped relation takes its values with it ------------------------------------------------------------------
+
+statement ok
+ACL ADMIN DROP RELATION c.orders;
+
+query I
+SELECT count(*) FROM store.acl.relation_write_values;
+----
+0
+
+# --- `new.<c>` of a computed column is the client's value: a column normalized on its way in ----------------------
+
+statement ok
+CREATE TABLE phys.main.people (id INTEGER, email VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.people AS phys.main.people ON INSERT SET (email = lower(trim("new".email))) ON UPDATE SET (email = lower(trim("new".email)));
+
+# an object with no list of its own: its source's width is not known where the write is rewritten - name the columns
+statement error
+ACL ROLE "w" INSERT INTO people VALUES (1, '  Ann@Example.COM ');
+----
+must name its columns
+
+statement ok
+ACL ROLE "w" INSERT INTO people (id, email) VALUES (1, '  Ann@Example.COM ');
+
+statement ok
+ACL ROLE "w" UPDATE people SET email = 'BOB@X.ORG' WHERE id = 1;
+
+query T
+SELECT email FROM phys.main.people;
+----
+bob@x.org
+
+# --- the listing shows what an INSERT computes as the column's default --------------------------------------------
+
+query TT
+ACL ROLE "w" SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'people' ORDER BY ordinal_position;
+----
+id	NULL
+email	lower("trim"("new".email))
+
+# --- the operator's screens: platform.write_values, and the check when a value stops binding -----------------------
+
+statement ok
+ACL ADMIN CREATE ROLE boss; GRANT ADMIN policy TO ROLE boss;
+
+query TTTT
+ACL ROLE "boss" SELECT relation, verb, "column", expr FROM platform.write_values ORDER BY relation, verb, pos;
+----
+people	insert	email	lower("trim"("new".email))
+people	update	email	lower("trim"("new".email))
+
+statement ok
+ALTER TABLE phys.main.people RENAME COLUMN email TO mail;
+
+query TT
+SELECT problem, repair FROM acl_check_catalog('c') WHERE object = 'people' AND problem = 'write_value_broken' ORDER BY detail;
+----
+write_value_broken	ALTER VIRTUAL TABLE c.people SET ON INSERT (<items>)  -- or DROP ON INSERT
+write_value_broken	ALTER VIRTUAL TABLE c.people SET ON UPDATE (<items>)  -- or DROP ON UPDATE
+
+statement error
+ACL ROLE "w" INSERT INTO people (id) VALUES (9);
+----
+
+# --- the reviews ---------------------------------------------------------------------------------------------------
+
+# an upsert is refused on an object with only ON UPDATE too: its update branch would write without it
+statement ok
+CREATE TABLE phys.main.u (id INTEGER PRIMARY KEY, amount INTEGER, updated_at TIMESTAMP);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.u AS phys.main.u ON UPDATE SET (updated_at = current_timestamp);
+
+statement ok
+ACL ROLE "w" INSERT INTO u (id, amount) VALUES (1, 1);
+
+statement error
+ACL ROLE "w" INSERT INTO u (id, amount, updated_at) VALUES (1, 2, TIMESTAMP '2000-01-01') ON CONFLICT (id) DO UPDATE SET amount = excluded.amount, updated_at = TIMESTAMP '2000-01-01';
+----
+write a MERGE
+
+statement error
+ACL ROLE "w" INSERT OR REPLACE INTO u (id, amount, updated_at) VALUES (1, 3, TIMESTAMP '1999-01-01');
+----
+write a MERGE
+
+# a target aliased `new` reads its row, not the write: a freeze stays a freeze
+statement ok
+CREATE TABLE phys.main.f (id INTEGER, tenant_id VARCHAR, created_at TIMESTAMP, n INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.f AS phys.main.f ON INSERT SET (tenant_id = acl_claim('tenant'), created_at = now(), n = 0) ON UPDATE SET (n = n + 1);
+
+statement ok
+ACL ROLE "w" INSERT INTO f (id) VALUES (1), (2);
+
+statement ok
+ACL ROLE "w" UPDATE f AS new SET tenant_id = 'globex', created_at = TIMESTAMP '2000-01-01', n = 100 FROM (SELECT 1 AS id) s WHERE new.id = s.id;
+
+statement ok
+ACL ROLE "w" MERGE INTO f AS new USING (SELECT 2 AS id) s ON new.id = s.id WHEN MATCHED THEN UPDATE SET tenant_id = 'globex', created_at = TIMESTAMP '1999-01-01', n = 500;
+
+# an ON INSERT column the client sets on an UPDATE keeps the row's value (ON UPDATE does not compute it)
+statement ok
+ACL ROLE "w" UPDATE f SET tenant_id = 'globex' WHERE id = 1;
+
+query ITTI
+SELECT id, tenant_id, created_at > TIMESTAMP '2001-01-01', n FROM phys.main.f ORDER BY id;
+----
+1	acme	true	2
+2	acme	true	1
+
+# a source wider than the column list is the insert's own width error, as without ON clauses
+statement error
+ACL ROLE "w" INSERT INTO f (id) VALUES (3, 'extra');
+----
+<REGEX>:.*(columns|values).*
+
+# a lambda's parameter is no column
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.f SET ON UPDATE (n = list_aggregate(list_transform([n], lambda v: v + 1), 'sum'));
+
+# both values broken: each verb's DROP still works (only the verb written is judged)
+statement ok
+CREATE TABLE phys.main.b (id INTEGER, a INTEGER, t VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.b AS phys.main.b ON INSERT SET (t = 'k' || "new".a) ON UPDATE SET (t = 'u' || "new".a);
+
+statement ok
+ALTER TABLE phys.main.b RENAME COLUMN a TO aa;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.b DROP ON INSERT;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.b DROP ON UPDATE;
+
+# the operator's rename moves the values with the object
+statement ok
+SELECT acl_rename_relation('c', 'f', 'f2', '');
+
+query I
+SELECT count(*) FROM store.acl.relation_write_values WHERE vname = 'f2';
+----
+4
+
+# a principal's CREATE OR REPLACE of an object that computes values is refused before its DDL runs
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM phys.lake; GRANT SCHEMA c.vs TO ROLE w WITH (select, insert, update, create, drop);
+
+statement ok
+ACL ROLE "w" CREATE TABLE vs.t1(id INTEGER, tenant VARCHAR);
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.vs.t1 SET ON INSERT (tenant = acl_claim('tenant'));
+
+statement error
+ACL ROLE "w" CREATE OR REPLACE TABLE vs.t1(id INTEGER);
+----
+it is not replaced
+
+query I
+SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'phys' AND table_name = 't1';
+----
+2
+
+# a MERGE's UPDATE SET * / BY NAME would write an ON INSERT column by the source's name: refused (re-review)
+statement ok
+CREATE TABLE phys.main.q (id INTEGER, tenant_id VARCHAR, created_at TIMESTAMP, amount INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.q AS phys.main.q ON INSERT SET (tenant_id = acl_claim('tenant'), created_at = now());
+
+statement ok
+ACL ROLE "w" INSERT INTO q (id, amount) VALUES (1, 1), (2, 2);
+
+statement error
+ACL ROLE "w" MERGE INTO q USING (SELECT 1 AS id, 'globex' AS tenant_id, TIMESTAMP '2000-01-01' AS created_at, 5 AS amount) s ON q.id = s.id WHEN MATCHED THEN UPDATE SET *;
+----
+must name its columns
+
+statement error
+ACL ROLE "w" MERGE INTO q USING (SELECT 2 AS id, 'globex' AS tenant_id, TIMESTAMP '2000-01-01' AS created_at, 6 AS amount) s ON q.id = s.id WHEN MATCHED THEN UPDATE BY NAME;
+----
+must name its columns
+
+query IT
+SELECT id, tenant_id FROM phys.main.q WHERE created_at > TIMESTAMP '2001-01-01' ORDER BY id;
+----
+1	acme
+2	acme

@@ -225,6 +225,10 @@ vector<PlatformView> BuildViews() {
 	     PV::CATALOG,
 	     {{"catalog", V}, {"relation", V}, {"pos", I}, {"name", V}, {"expr", V}, {"nullable", B}},
 	     "the declared column lists of the relations"},
+	    {"write_values",
+	     PV::CATALOG,
+	     {{"catalog", V}, {"relation", V}, {"verb", V}, {"pos", I}, {"column", V}, {"expr", V}},
+	     "what an INSERT or an UPDATE of a relation sets by itself (spec 172)"},
 	    {"schemas",
 	     PV::CATALOG,
 	     {{"catalog", V}, {"path", V}, {"phys_path", V}, {"origin", V}, {"comment", V}, {"created_by", V}},
@@ -509,8 +513,9 @@ vector<PlatformFunction> BuildFunctions() {
 	     "change a catalog's comment"},
 	    {"add_relation",
 	     "acl_add_relation",
-	     {catalog, name, A("phys"), P("columns"), P("rls"), comment, mode, P("primary_key")},
-	     {5, 6, 7, 8},
+	     {catalog, name, A("phys"), P("columns"), P("rls"), comment, mode, P("primary_key"), P("on_insert"),
+	      P("on_update")},
+	     {5, 6, 7, 8, 10},
 	     0,
 	     PR::CATALOG,
 	     false,
@@ -605,7 +610,7 @@ vector<PlatformFunction> BuildFunctions() {
 	     PR::CATALOG,
 	     false,
 	     B,
-	     "change one property of a relation: phys | columns | rls | view"},
+	     "change one property of a relation: phys | columns | rls | view | types | on_insert | on_update"},
 	    {"alter_schema_alias",
 	     "acl_alter_schema_alias",
 	     {catalog, A("path"), A("phys_path")},
@@ -1618,6 +1623,13 @@ void WalkBodyCalls(const string &text, BodyShape shape,
 			}
 		}
 		return;
+	case BodyShape::SET_ITEMS: // spec 172: each item's expression
+		for (auto &item : ReadWriteValues(trimmed, "the computed values", true)) {
+			for (auto &expr : Parser(options).ParseExpressionList(item.second)) {
+				WalkBodyExpr(*expr, none, callback);
+			}
+		}
+		return;
 	case BodyShape::DECLARED_COLUMNS:
 		for (auto &column : SplitDeclaredColumns(trimmed, "the object's column list", true)) {
 			if (!column.expr.empty()) {
@@ -1662,7 +1674,10 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 	auto S = FunctionKind::SCALAR;
 	auto T = FunctionKind::TABLE;
 	if (target == "acl_add_relation") {
-		return {{3, BodyShape::DECLARED_COLUMNS, S}, {4, BodyShape::EXPRESSION, S}};
+		return {{3, BodyShape::DECLARED_COLUMNS, S},
+		        {4, BodyShape::EXPRESSION, S},
+		        {8, BodyShape::SET_ITEMS, S},
+		        {9, BodyShape::SET_ITEMS, S}};
 	}
 	if (target == "acl_add_view") {
 		return {{2, BodyShape::SELECT, S}};
@@ -1689,6 +1704,9 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 		}
 		if (field == "columns") {
 			return {{3, BodyShape::DECLARED_COLUMNS, S}};
+		}
+		if (field == "on_insert" || field == "on_update") {
+			return {{3, BodyShape::SET_ITEMS, S}}; // spec 172
 		}
 		return {};
 	}
@@ -1824,8 +1842,8 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 		}
 		// the tables a stored body reads: bound on the node, every one inside a granted source
 		for (auto &body : BodiesOf(target, call)) {
-			if (body.shape == BodyShape::FUNCTION_NAME) {
-				continue;
+			if (body.shape == BodyShape::FUNCTION_NAME || body.shape == BodyShape::SET_ITEMS) {
+				continue; // a function name reads no table, nor does a computed value (no subquery in it, spec 172)
 			}
 			string text;
 			if (!text_of(call, body.index, text) || StringUtil::Replace(text, " ", "").empty()) {
@@ -1906,8 +1924,8 @@ void QualifyBodies(vector<unique_ptr<SQLStatement>> &statements, PolicyStore &st
 		auto &call = CompiledCall(*statement);
 		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
 		for (auto &body : BodiesOf(target, call)) {
-			if (body.shape == BodyShape::FUNCTION_NAME) {
-				continue;
+			if (body.shape == BodyShape::FUNCTION_NAME || body.shape == BodyShape::SET_ITEMS) {
+				continue; // spec 172: a computed value names no table
 			}
 			auto &arguments = call.GetArgumentsMutable();
 			if (body.index >= arguments.size()) {
@@ -2505,6 +2523,11 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 		return "SELECT \"vcat\" AS \"catalog\", \"vname\" AS \"relation\", \"pos\", \"name\", \"expr\", \"nullable\" "
 		       "FROM " +
 		       table("relation_columns") + where("\"vcat\"");
+	}
+	if (view == "write_values") {
+		return "SELECT \"vcat\" AS \"catalog\", \"vname\" AS \"relation\", \"verb\", \"pos\", \"column\", \"expr\" "
+		       "FROM " +
+		       table("relation_write_values") + where("\"vcat\"");
 	}
 	if (view == "schemas") {
 		return "SELECT \"vcat\" AS \"catalog\", \"path\", \"phys_path\", \"origin\", \"comment\", \"created_by\" "

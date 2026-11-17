@@ -95,6 +95,15 @@ struct StarParts {
 };
 StarParts ReadStarParts(const string &star_text);
 
+//! spec 172: an object's ON INSERT / ON UPDATE items read by duckdb's parser as a SET list - (column, expression as
+//! duckdb prints it); `new.<column>` is the value the write gives a column, a bare column (ON UPDATE only) the row's
+//! current value; no subquery, star, position, parameter, DEFAULT or other qualified name; a column set twice refuses
+vector<std::pair<string, string>> ReadWriteValues(const string &text, const char *what, bool on_update);
+//! The bare names duckdb reads as a value where no column has the name (`current_timestamp`, `user`, …)
+bool IsSqlValueKeyword(const string &name);
+//! The items as their rows show them (`"col" = <expr>, …`)
+string WriteValuesText(const vector<std::pair<string, string>> &items);
+
 //! Whether a column's name may be stored bare in a list (spec 150 4e): it reads back as one item that is itself - no
 //! `,` / `=` / bracket or quote that the split reads otherwise, no comment, no space at an end - and not as a path (no
 //! `.` / `[`, no leading `"`). Otherwise a writer quotes it, and the path reader takes the quotes off

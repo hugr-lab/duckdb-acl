@@ -884,6 +884,8 @@ struct CatalogBackend {
 	//! spec 158 stage 2: a name a list holding a star reads twice over `source` (the first such), '' when none or the
 	//! source does not bind here; `error` gets why the list did not bind over a source that does
 	string DuplicateName(const string &source, const DeclaredList &list, string *error = nullptr);
+	//! spec 172: the object's ON INSERT / ON UPDATE values into `out` (by its canonical name, its renames applied)
+	void ReadWriteValueRows(TablePolicy &out);
 
 	//! Whether a relation has a column of that name. False only when the relation itself binds and the
 	//! column does not: a source that cannot be reached at all answers true, since it cannot answer.

@@ -123,7 +123,7 @@ versions	VARCHAR
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name NOT IN ('cluster_items', 'cluster_effective', 'drift');
 ----
-237
+243
 
 foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
@@ -210,7 +210,7 @@ categorized	true
 query TTTTT
 ACL ROLE "root" SELECT build, build_min_reader, catalog, min_reader, mode FROM platform.catalog_schema;
 ----
-27	27	27	27	current
+28	28	28	28	current
 
 # --- the node views (observe) -------------------------------------------------------------------------
 
@@ -254,14 +254,14 @@ ACL ROLE "obs" SELECT count(*) FROM platform.node_streams WHERE budget_bytes > 0
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name NOT IN ('cluster_items', 'cluster_effective', 'drift');
 ----
-34
+35
 
 # policy: the policy views, all rows - never the node's, nor the cluster profile's (spec 118's cluster
 # bundle); the physical tree under attached is spec 118.3's (platform_attached.test)
 query I
 ACL ROLE "pol" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema = 'main';
 ----
-27
+28
 
 # nor a session's profile (spec 118: the operate bundle's)
 statement error
@@ -289,7 +289,7 @@ ACL ROLE "pol" SELECT * FROM platform.sessions;
 query T
 ACL ROLE "cat" SELECT list(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_catalog = 'platform';
 ----
-[catalogs, function_columns, functions, grants, keys, object_grants, reference_columns, references, relation_columns, relations, roles, schema_grants, schemas]
+[catalogs, function_columns, functions, grants, keys, object_grants, reference_columns, references, relation_columns, relations, roles, schema_grants, schemas, write_values]
 
 query TT
 ACL ROLE "cat" SELECT catalog, comment FROM platform.catalogs;
@@ -371,7 +371,7 @@ platform	the system catalog of administration (spec 117)
 query TTTTTT
 ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(list_filter(views, lambda v: v NOT IN ('cluster_items', 'cluster_effective', 'drift'))) FROM platform.console_info();
 ----
-3	2	27	[]	[sales]	34
+3	2	28	[]	[sales]	35
 
 query T
 ACL ROLE "cat" SELECT list_contains(my_views, 'grants') AND NOT list_contains(my_views, 'issuers') AND list_contains(my_functions, 'add_relation') AND NOT list_contains(my_functions, 'grant_catalog') FROM platform.console_info();
