@@ -146,7 +146,7 @@ echo "$got" | grep -q "'db_schema_name': \['Raw Data', 'main', 'stage', 'stage2'
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 got="$(ask "@tables")"
-echo "$got" | grep -q "'table_name': \['Line Items', 'Order Items', 'customers', 'nested', 'orders', 'typed', 'typed_v'\]" || fail "GetTables: $got"
+echo "$got" | grep -q "'table_name': \['Line Items', 'Order Items', 'customers', 'ledger', 'nested', 'orders', 'typed', 'typed_v'\]" || fail "GetTables: $got"
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 # A filter arrives as a parameter on our side and as a protobuf field on the client's; a field number

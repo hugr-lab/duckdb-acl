@@ -878,14 +878,18 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	           " coalesce(c.\"name\", i.\"column_name\") AS column_name,"
 	           " acl_exposed_type(i.\"data_type\", o.strip_alias, o.enums_to_varchar) AS data_type, ") +
 	    alias_nullable +
-	    " AS is_nullable, coalesce(ocv.\"comment\", cc.\"comment\", i.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\")" +
+	    " AS is_nullable, coalesce(ocv.\"comment\", cc.\"comment\", i.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\","
+	    // spec 172: a column the object computes on an INSERT shows that expression as its default
+	    " coalesce(wv.\"expr\", i.\"column_default\") AS column_default)" +
 	    " FROM objects o JOIN " + icolumns + " i ON " + physical + projection +
 	    // a renaming list keeps its columns' comments in object_columns (the writer's), under the virtual name
 	    " AND c.\"expr\" = i.\"column_name\" LEFT JOIN " + Tbl("object_columns") +
 	    " ocv ON c.\"name\" IS NOT NULL AND ocv.\"vcat\" = o.vcat AND ocv.\"kind\" = 'relation' AND ocv.\"vname\" = " +
 	    alias_vname + " AND ocv.\"name\" = c.\"name\" LEFT JOIN " + Tbl("column_comments") +
 	    " cc ON c.\"name\" IS NULL AND cc.\"vcat\" = o.vcat AND cc.\"vname\" = " + alias_vname +
-	    " AND cc.\"column_name\" = i.\"column_name\""
+	    " AND cc.\"column_name\" = i.\"column_name\" LEFT JOIN " + Tbl("relation_write_values") +
+	    " wv ON wv.\"vcat\" = o.vcat AND wv.\"vname\" = " + alias_vname + " AND wv.\"verb\" = 'insert' AND " +
+	    KeyFoldSql("wv.\"column\"") + " = " + KeyFoldSql("coalesce(c.\"name\", i.\"column_name\")") +
 	    // spec 171: the source's row for an object with no list of its own (an alias, an RLS-only relation); an object
 	    // that declares its columns - whatever its form - is described by its snapshot below (spec 158)
 	    " WHERE len(o.parts) = 3 AND o.form IN ('alias', 'subquery') AND NOT EXISTS"
@@ -904,7 +908,12 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    // `COLUMN_COMMENT` is what information_schema.columns calls it; a `comment` of our own
 	    // added a 46th column to a surface whose shape is fixed (spec 035)
 	    // spec 171 (143's rule): the column's own comment, else - a column read by name - its source column's
-	    " coalesce(oc.\"comment\", ip.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\", ip.acl_tags AS acl_tags FROM objects o"
+	    " coalesce(oc.\"comment\", ip.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\", ip.acl_tags AS acl_tags,"
+	    // spec 172: a column the object computes on an INSERT shows that expression as its default
+	    " (SELECT wv.\"expr\" FROM " +
+	    Tbl("relation_write_values") + " wv WHERE wv.\"vcat\" = o.vcat AND wv.\"vname\" = " + alias_vname +
+	    " AND wv.\"verb\" = 'insert' AND " + KeyFoldSql("wv.\"column\"") + " = " + KeyFoldSql("oc.\"name\"") +
+	    ") AS column_default FROM objects o"
 	    " JOIN " +
 	    Tbl("object_columns") +
 	    " oc ON oc.\"vcat\" = o.vcat AND oc.\"kind\" = 'relation'"

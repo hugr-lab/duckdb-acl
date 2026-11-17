@@ -14,6 +14,8 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -435,6 +437,80 @@ void PolicyStore::CatalogCreate(const string &vcat, const string &comment) {
 
 namespace {
 
+//! spec 172: an object's ON INSERT / ON UPDATE items judged against the definition they are written over - a writable
+//! (alias) object, each column one of the object's and not set twice, `new.<x>` one of its columns (the client's value
+//! of it), each expression binding over the object's row (markers a NULL, as in every probe)
+void RequireWriteValues(CatalogBackend &catalog, const string &vname, const string &form, const string &phys,
+                        const vector<std::pair<string, string>> &columns, const string &verb,
+                        const vector<std::pair<string, string>> &items) {
+	if (items.empty()) {
+		return;
+	}
+	auto clause = verb == "insert" ? "ON INSERT" : "ON UPDATE";
+	if (form != "alias") {
+		throw InvalidInputException("acl: \"%s\" is read-only (a view, a computed list or an RLS of its own), so it "
+		                            "sets nothing on a write - %s needs an object a write reaches",
+		                            vname, clause);
+	}
+	case_insensitive_set_t known;
+	for (auto &column : columns) {
+		known.insert(column.first);
+	}
+	auto source = NamePath::KeyToSql(phys);
+	auto instance = catalog.Db();
+	Connection con(*instance);
+	bool binds = !phys.empty() && !con.Query("SELECT * FROM " + source + " WHERE false")->HasError();
+	if (known.empty() && binds) {
+		auto probe = con.Query("SELECT * FROM " + source + " WHERE false"); // kept: GetNames is the result's
+		for (auto &name : probe->GetNames()) {
+			known.insert(name.GetIdentifierName());
+		}
+	}
+	for (auto &item : items) {
+		if (!known.empty() && !known.count(item.first)) {
+			throw InvalidInputException("acl: %s of \"%s\" sets \"%s\", which is not one of its columns", clause, vname,
+			                            item.first);
+		}
+		auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(item.second);
+		std::function<void(const ParsedExpression &)> walk = [&](const ParsedExpression &expr) {
+			if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+				auto name = names.back().GetIdentifierName();
+				// `new.<x>` is what the client's write gives x - a computed one's own too (`email = lower(new.email)`),
+				// never another item's result
+				if (!known.empty() && !known.count(name)) {
+					throw InvalidInputException("acl: %s of \"%s\" reads \"%s\", which is not one of its columns",
+					                            clause, vname, name);
+				}
+				return;
+			}
+			ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) { walk(child); });
+		};
+		for (auto &expr : parsed) {
+			walk(*expr);
+		}
+		if (!binds) {
+			continue; // judged where the source binds
+		}
+		// the object's row as the write gives it: `new` its columns (and a bare one, ON UPDATE, the row's current)
+		auto row = acl_detail::ObjectListSelect(columns, " FROM " + source);
+		string probe;
+		try {
+			probe = BakeTemplateForProbe("SELECT (" + item.second + ") AS \"__acl_value\" FROM (" + row +
+			                                 " WHERE false) AS \"new\"",
+			                             ParserOptions::Builtin(), false, {});
+		} catch (std::exception &ex) {
+			throw InvalidInputException("acl: %s of \"%s\": \"%s\" cannot be read: %s", clause, vname, item.first,
+			                            ErrorData(ex).RawMessage());
+		}
+		auto result = con.Query(probe);
+		if (result->HasError()) {
+			throw InvalidInputException("acl: %s of \"%s\": the value of \"%s\" does not bind over it: %s", clause,
+			                            vname, item.first, result->GetError());
+		}
+	}
+}
+
 //! The statements that (re)write one relation - shared by ADD and the transactional ALTER
 //! The declared shape of spec 048 rides the same write: `pk` is the csv of key columns (empty =
 //! none), `nullable_marks` the explicit per-column declarations (absent = undeclared). Both are
@@ -446,8 +522,37 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
                                   const string &returns, const string &origin = string(), const string &pk = string(),
                                   const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false,
                                   const string &alias_types = string(), const string &enum_types = string(),
-                                  optional_ptr<const string> query = nullptr) {
+                                  optional_ptr<const string> query = nullptr,
+                                  optional_ptr<const string> on_insert = nullptr,
+                                  optional_ptr<const string> on_update = nullptr) {
 	vector<string> statements;
+	// spec 172: what a write sets by itself, as written (given) or as stored (kept) - judged against this definition
+	for (auto verb : {"insert", "update"}) {
+		auto given = string(verb) == "insert" ? on_insert : on_update;
+		string text;
+		if (given) {
+			text = *given;
+		} else if (!catalog.FunctionMode()) {
+			auto stored = catalog.Query("SELECT \"column\", \"expr\" FROM " + catalog.Tbl("relation_write_values") +
+			                            " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+			                            " AND \"verb\" = " + Lit(verb) + " ORDER BY \"pos\"");
+			text = WriteValuesText(acl_detail::DeclaredListFrom(*stored));
+		}
+		auto items =
+		    ReadWriteValues(text, string(verb) == "insert" ? "ON INSERT" : "ON UPDATE", string(verb) == "update");
+		RequireWriteValues(catalog, vname, form, phys, columns, verb, items);
+		if (!given) {
+			continue; // kept as stored
+		}
+		statements.push_back("DELETE FROM " + catalog.Tbl("relation_write_values") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"verb\" = " + Lit(verb));
+		idx_t pos = 0;
+		for (auto &item : items) {
+			statements.push_back("INSERT INTO " + catalog.Tbl("relation_write_values") + " VALUES (" + Lit(vcat) +
+			                     ", " + Lit(vname) + ", " + Lit(verb) + ", " + std::to_string(pos++) + ", " +
+			                     Lit(item.first) + ", " + Lit(item.second) + ")");
+		}
+	}
 	auto created_by =
 	    CreatedByLit(catalog, "relations", " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 	// spec 169: a principal's view keeps its query (what its readers read) across a write that leaves its SQL as it is
@@ -911,6 +1016,7 @@ const char *const POLICY_TABLES[] = {"meta",
                                      "catalogs",
                                      "relations",
                                      "relation_columns",
+                                     "relation_write_values",
                                      "relation_types",
                                      "functions",
                                      "roles",
@@ -1135,7 +1241,8 @@ void RequirePolicyFreeExpressions(CatalogBackend &catalog, const char *what, con
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form_p, const string &phys,
                                      const string &view_sql, const string &rls,
                                      const vector<std::pair<string, string>> &columns_p, const string &returns,
-                                     const string &pk, const case_insensitive_map_t<int8_t> &nullable_marks) {
+                                     const string &pk, const case_insensitive_map_t<int8_t> &nullable_marks,
+                                     optional_ptr<const string> on_insert, optional_ptr<const string> on_update) {
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
 	RequireNotPolicyStore(*catalog, "the relation", phys, false, view_sql);
@@ -1173,7 +1280,8 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 		}
 		RequireStarListReads(*catalog, vname, phys, columns);
 		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns,
-		                                string(), kept_pk, nullable_marks, pk_carried, alias_types, enum_types);
+		                                string(), kept_pk, nullable_marks, pk_carried, alias_types, enum_types, nullptr,
+		                                on_insert, on_update);
 	});
 	NoteDefinitionLineage(vcat, vname, existed ? "ALTER" : "CREATE");
 }
@@ -1947,6 +2055,7 @@ vector<RelationRowSource> RelationRowSources(CatalogBackend &catalog, const stri
 	    {"relations", named},
 	    {"object_columns", named + " AND \"kind\" = 'relation'", false, false, true},
 	    {"relation_columns", named},
+	    {"relation_write_values", named}, // spec 172
 	    {"relation_types", named, false, false, true},
 	    {"column_comments", named},
 	    {"keys", named + " AND \"kind\" = 'relation'"},
@@ -2108,6 +2217,7 @@ bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vnam
 	};
 	auto named = "\"vname\" = " + Lit(vname);
 	return is("relations", named + " AND coalesce(\"rls\", '') <> ''") || is("relation_columns", named) ||
+	       is("relation_write_values", named) || // spec 172: the operator's values on a write
 	       is("keys", named) || is("role_object_caps", named) ||
 	       is("references", "(\"from_vname\" = " + Lit(vname) + " OR \"to_vname\" = " + Lit(vname) + ")");
 }
@@ -2372,8 +2482,8 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 			if (parent != path || std::find(names.begin(), names.end(), name) != names.end()) {
 				continue;
 			}
-			for (auto table :
-			     {"relations", "relation_columns", "relation_types", "column_comments", "role_object_caps"}) {
+			for (auto table : {"relations", "relation_columns", "relation_types", "column_comments", "role_object_caps",
+			                   "relation_write_values"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) +
 				                     " AND \"vname\" = " + Lit(vname));
 			}
@@ -3218,7 +3328,8 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
 		for (auto table : {"relations", "relation_columns", "relation_types", "schemas", "functions", "object_columns",
-		                   "column_comments", "references", "reference_columns", "schema_dropped", "keys"}) {
+		                   "column_comments", "references", "reference_columns", "schema_dropped", "keys",
+		                   "relation_write_values"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
@@ -3251,8 +3362,8 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 			                      vcat, alias_path, count);
 		}
 		if (cascade) {
-			for (auto table :
-			     {"relations", "relation_columns", "relation_types", "object_columns", "functions", "keys"}) {
+			for (auto table : {"relations", "relation_columns", "relation_types", "object_columns", "functions", "keys",
+			                   "relation_write_values"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) + prefix);
 			}
 			auto under = PrefixName(alias_path);
@@ -3634,7 +3745,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			new_rls = value;
 		} else if (field == "view") {
 			new_view = value;
-		} else if (field != "columns" && field != "types") {
+		} else if (field != "columns" && field != "types" && field != "on_insert" && field != "on_update") {
 			throw BinderException("acl admin: unknown relation property \"%s\"", field);
 		}
 		// the form follows the content, exactly as it does for ADD - through the same rule, so the same
@@ -3699,8 +3810,13 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			RequireStarListReads(*catalog, vname, new_phys,
 			                     new_columns); // only where the list or its source is written
 		}
+		// spec 172: SET | DROP ON INSERT / ON UPDATE writes that verb's items; any other change keeps (and re-judges)
+		// them
+		optional_ptr<const string> on_insert = field == "on_insert" ? &value : nullptr;
+		optional_ptr<const string> on_update = field == "on_update" ? &value : nullptr;
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
-		                                comment, string(), origin, kept_pk, kept_marks, true, alias_types, enum_types);
+		                                comment, string(), origin, kept_pk, kept_marks, true, alias_types, enum_types,
+		                                nullptr, on_insert, on_update);
 	});
 	NoteDefinitionLineage(vcat, vname, "ALTER");
 }

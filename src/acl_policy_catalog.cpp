@@ -840,12 +840,71 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
 	NoteUnionWidens(out.canonical.empty() ? vname : out.canonical, capability, united, known);
+	ReadWriteValueRows(out);
 	if (!out.is_view) { // a view reads what its body reads: the constructor's (spec 138), and refuses an AT
 		ApplyGrantVersions(united, result->Collection().GetValue(result->ColumnCount() - 3, 0).ToString(),
 		                   result->Collection().GetValue(result->ColumnCount() - 2, 0).ToString(),
 		                   out.canonical.empty() ? vname : out.canonical, capability, out);
 	}
 	return true;
+}
+
+namespace {
+
+//! spec 172: a stored ON INSERT / ON UPDATE expression in physical names - each column reference (bare or `new.x`) of a
+//! virtual column the object renames read as its physical column
+string PhysicalWriteValue(const string &expr, const vector<std::pair<string, string>> &renames) {
+	auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(expr);
+	if (parsed.size() != 1) {
+		throw BinderException("acl: a computed value is one expression (\"%s\")", expr);
+	}
+	auto physical = [&](const string &name) {
+		for (auto &rename : renames) {
+			if (StringUtil::CIEquals(rename.first, name)) {
+				return rename.second;
+			}
+		}
+		return name;
+	};
+	std::function<void(ParsedExpression &)> walk = [&](ParsedExpression &node) {
+		if (node.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = node.Cast<ColumnRefExpression>().ColumnNamesMutable();
+			auto &column = names.back();
+			if (names.size() == 1 || (names.size() == 2 && StringUtil::CIEquals(names[0].GetIdentifierName(), "new"))) {
+				column = Identifier(physical(column.GetIdentifierName()));
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(node, [&](ParsedExpression &child) { walk(child); });
+	};
+	walk(*parsed[0]);
+	return parsed[0]->ToString();
+}
+
+} // namespace
+
+void CatalogBackend::ReadWriteValueRows(TablePolicy &out) {
+	if (function_mode || out.canonical.empty()) {
+		return; // a driver's source has no such slot: nothing is computed on its writes
+	}
+	string vcat, vname;
+	NamePath::SplitHeadKey(out.canonical, vcat, vname);
+	auto rows = Query("SELECT \"verb\", \"column\", \"expr\" FROM " + Tbl("relation_write_values") + " WHERE " +
+	                  KeyEqSql("\"vcat\"", Lit(vcat)) + " AND " + KeyEqSql("\"vname\"", Lit(vname)) +
+	                  " ORDER BY \"verb\", \"pos\"");
+	ResultRows read(*rows);
+	for (idx_t row = 0; row < read.Count(); row++) {
+		auto verb = read.GetValue(0, row).ToString();
+		auto column = read.GetValue(1, row).ToString();
+		for (auto &rename : out.renames) {
+			if (StringUtil::CIEquals(rename.first, column)) {
+				column = rename.second;
+				break;
+			}
+		}
+		auto expr = PhysicalWriteValue(read.GetValue(2, row).ToString(), out.renames);
+		(verb == "insert" ? out.on_insert : out.on_update).emplace_back(column, expr);
+	}
 }
 
 void CatalogBackend::ApplyGrantVersions(const vector<std::pair<string, GrantPolicy>> &united, const string &vcat,

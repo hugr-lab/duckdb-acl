@@ -137,6 +137,7 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | `catalogs` *c* | catalog, comment |
 | `relations` *c* | catalog, name, form, phys, view_sql, rls, rls_checked BOOLEAN, origin, comment, alias_types, enum_types, created_by |
 | `relation_columns` *c* | catalog, relation, pos BIGINT, name, expr, nullable BOOLEAN |
+| `write_values` *c* | catalog, relation, verb (`insert` / `update`), pos INTEGER, column, expr - what a write sets by itself (spec 172) |
 | `schemas` *c* | catalog, path, phys_path, origin, comment, created_by |
 | `functions` *c* | catalog, name, kind, form, target, template, params VARCHAR[], comment, created_by |
 | `function_columns` *c* | catalog, function, kind, pos BIGINT, name, type, comment, nullable BOOLEAN |

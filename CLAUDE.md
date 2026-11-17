@@ -913,6 +913,17 @@ listings from the snapshot (`object_columns`, write / ANALYZE), read-only. A nam
 (`DistinctNamesGuard`: `… UNION ALL BY NAME …`, first line `WRITE_GUARD_DISTINCT`), the check's `column_duplicate`.
 Test `acl_object_list_star.test`.
 
+**Spec 172 — values an object computes on a write**: `ON INSERT SET (…)` / `ON UPDATE SET (…)` on `CREATE VIRTUAL
+TABLE` (`ALTER … SET ON INSERT (…) | DROP ON INSERT`; `acl_add_relation`'s args 8/9, `acl_alter_relation` fields
+`on_insert` / `on_update`), read as duckdb's SET list (`ReadWriteValues`), stored in `relation_write_values` (schema v28,
+min_reader 28), judged where written (`RequireWriteValues`: an alias-form object, its columns, binds over its row as
+`new`), read into `TablePolicy::on_insert` / `on_update` in physical names (`ReadWriteValueRows`). The rewrite sets them
+on every INSERT (named: a projection over the source; a quack drain: `* REPLACE` by position), UPDATE (replaced or
+appended to SET), MERGE branch; the client's value overwritten; `new.<c>` the client's value of c, a bare column (UPDATE)
+the row's current; an upsert refuses. `column_default`, `platform.write_values`, the check's `write_value_broken`. Flight
+ingest reads its stream through `arrow_scan_dumb` (the door's factory pushes no projection). Test
+`acl_dml_computed_values.test`.
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`

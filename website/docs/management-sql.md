@@ -186,6 +186,31 @@ ACL ADMIN CREATE VIRTUAL TABLE c.people AS pg.public.people
     COLUMNS (* EXCLUDE (ssn), '***-**-' || right(ssn, 4) AS ssn_tail);
 ```
 
+**Values a write computes** (spec 172): `ON INSERT SET (<column> = <expression>, …)` and `ON UPDATE SET (…)` - each
+clause once, beside the others - are set by the node on every write it decides: an INSERT (VALUES or SELECT, a Flight
+ingest, a quack stream), an UPDATE, each branch of a MERGE. The client's own value of such a column is overwritten.
+`new.<column>` is the value the client's write gives a column (NULL on an INSERT that writes none; the row's current
+value on an UPDATE that sets none); on an UPDATE a bare column is the row's current value. No subquery, star,
+parameter or window inside; the object must be writable (an alias form). An upsert (`ON CONFLICT DO UPDATE`, `INSERT
+OR REPLACE`) into such an object is refused - write a MERGE. `ALTER VIRTUAL TABLE c.t SET ON INSERT (…) | SET ON UPDATE
+(…) | DROP ON INSERT | DROP ON UPDATE` change them; `information_schema.columns.column_default` shows the ON INSERT
+expression, `platform.write_values` both.
+
+```sql
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS pg.public.orders
+    ON INSERT SET (tenant_id = acl_claim('tenant'), created_at = now(), discount = new.amount * new.discount_rate)
+    ON UPDATE SET (updated_at = now(), discount = new.amount * new.discount_rate, changes = changes + 1);
+```
+
+A bulk upsert stages the rows in the session, then merges them - each branch computes its own:
+
+```sql
+-- adbc_ingest("stage", data, temporary=True), then:
+MERGE INTO orders o USING stage s ON o.id = s.id
+WHEN MATCHED THEN UPDATE SET amount = s.amount
+WHEN NOT MATCHED THEN INSERT (id, amount, discount_rate) VALUES (s.id, s.amount, s.discount_rate);
+```
+
 A computed column and an `RLS` predicate are each **one SQL expression**: text with a comment left open, a parameter
 or a clause after it is refused where it is written (spec 148); a stored one refuses the reads it would have shaped,
 and `acl_check_catalog` names it.
@@ -214,8 +239,9 @@ ACL ADMIN CREATE VIRTUAL TABLE c.totals AS phys.main.orders
 ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS (id, amount) RLS (tenant = acl_claim('tenant'));
 ```
 
-Function: `acl_add_relation(vcat, vname, phys, columns, rls[, comment[, mode[, pk_csv]]])` -
-`columns` is the SELECT list as text (`id, amount * 2 AS total`), `pk_csv` the key columns.
+Function: `acl_add_relation(vcat, vname, phys, columns, rls[, comment[, mode[, pk_csv[, on_insert, on_update]]]])` -
+`columns` is the SELECT list as text (`id, amount * 2 AS total`), `pk_csv` the key columns, `on_insert` / `on_update`
+the items (`''` none; a call without them keeps what is stored).
 
 Related: `ALTER VIRTUAL TABLE`, `DROP VIRTUAL TABLE` / `DROP RELATION`, `COMMENT ON VIRTUAL TABLE`
 below.

@@ -94,6 +94,10 @@ CREATE TABLE IF NOT EXISTS <object_columns>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY
 -- columns are its source's, read live. The listings show it over the source's own comment.
 CREATE TABLE IF NOT EXISTS <column_comments>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "column_name" ACL_KEY_TEXT, "comment" VARCHAR, PRIMARY KEY ("vcat", "vname", "column_name"));
 
+-- spec 172 (schema v28): what an INSERT ('insert') or an UPDATE ('update') of a relation sets by itself - the column by
+-- its virtual name, the expression as duckdb prints it (`new.<column>` = the value this write gives that column).
+CREATE TABLE IF NOT EXISTS <relation_write_values>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "verb" ACL_KEY_TEXT, "pos" INTEGER, "column" VARCHAR, "expr" VARCHAR, PRIMARY KEY ("vcat", "vname", "verb", "pos"));
+
 CREATE TABLE IF NOT EXISTS <schemas>("vcat" ACL_KEY_TEXT, "path" ACL_KEY_TEXT, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "path"));
 
 CREATE TABLE IF NOT EXISTS <role_schemas>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "schema_path" ACL_KEY_TEXT, "caps" VARCHAR, "inherited" BOOLEAN, "comment" VARCHAR, "into" VARCHAR, "virtual_only" BOOLEAN, PRIMARY KEY ("role", "vcat", "schema_path"));
@@ -138,11 +142,11 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '27' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '28' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
 INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO <meta> SELECT 'min_reader_version', '27' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');
+INSERT INTO <meta> SELECT 'min_reader_version', '28' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');

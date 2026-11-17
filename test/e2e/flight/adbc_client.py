@@ -105,6 +105,27 @@ with connect(acme_token) as conn:
     except Exception as ex:
         check("mode create refused with the reason", "no schema of the catalog allows creating" in str(ex), ex)
 
+    # --- spec 172: bulk ingest into an object that computes values; a staged MERGE --------------
+    # The loader sends the frame it has - the tenant included, someone else's: the object's ON INSERT
+    # value wins (the claim's tenant, a timestamp), so every row is the principal's by construction.
+    frame = pa.table({"id": [1, 2, 3], "tenant": ["globex", "globex", "acme"], "amount": [10, 20, 30]})
+    n = cur.adbc_ingest("ledger", frame, mode="append")
+    check("ingest into a computing object lands", n == 3, n)
+    cur.execute("SELECT count(*), count(*) FILTER (WHERE tenant = 'acme' AND created_at IS NOT NULL) FROM ledger")
+    check("the object computed the tenant and the stamp on every ingested row", cur.fetchall() == [(3, 3)])
+    # upsert = stage in the session, then MERGE: the update branch stamps, the insert branch computes
+    staged = pa.table({"id": [2, 4], "amount": [200, 40]})
+    n = cur.adbc_ingest("ledger_stage", staged, temporary=True)
+    check("the merge source is staged in the session", n == 2, n)
+    cur.execute("MERGE INTO ledger l USING ledger_stage s ON l.id = s.id "
+                "WHEN MATCHED THEN UPDATE SET amount = s.amount "
+                "WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (s.id, s.amount)")
+    cur.fetchall()
+    cur.execute("SELECT id, amount, tenant, updated_at IS NOT NULL FROM ledger ORDER BY id")
+    check("a staged MERGE: ON UPDATE on the matched row, ON INSERT on the new one",
+          cur.fetchall() == [(1, 10, "acme", False), (2, 200, "acme", True), (3, 30, "acme", False),
+                             (4, 40, "acme", False)])
+
     # --- spec 050: a temporary ingest target lives in the session ---------------------------------
     # The staging pattern spec 049 promised: bulk rows into a session temp, then ordinary SQL moves
     # them into the granted table under every rule the grant carries - and the staging table is

@@ -308,6 +308,16 @@ mode of default-deny is a refusal, and the refusal names the function.
     (`types_incompatible`, e.g. `enum_code(...)`) or that makes a type of its own
     (`types_mismatch`).
 
+### Values a write computes (spec 172)
+
+- **The object's, never the client's.** `ON INSERT SET` / `ON UPDATE SET` values are written by the rewrite of every
+  write the node decides, over whatever the client sent: `tenant_id = acl_claim('tenant')` makes every row the
+  writer's tenant by construction, so a grant's tenant RLS (spec 024) is satisfied without the client sending it.
+- **Markers are the writer's**, baked where the statement is rewritten; `ACL NATIVE` and the operator's physical
+  writes compute nothing (break-glass).
+- **Fail closed**: a value that no longer binds refuses every such write (`write_value_broken`); an older build that
+  cannot read them cannot open the catalog (schema v28, `min_reader` 28).
+
 ### Columns and masks (spec 158)
 
 - **One place shapes a column: the object.** Its list is a SELECT list over the source; a grant never adds, renames
