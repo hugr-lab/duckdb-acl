@@ -54,6 +54,8 @@ it a rewrite of the statement, no trigger.
   - a MERGE's `WHEN NOT MATCHED INSERT`: as an INSERT's VALUES; `UPDATE SET *` refuses.
   - an upsert (`ON CONFLICT DO UPDATE`, `INSERT OR REPLACE`) refuses: a MERGE says which branch computes what.
   - after the grant's injections and before its write check (spec 024): the check sees the computed value.
+- **They read the row as the object does**, whatever the writer's grant hides (the owner, 2026-11-17: the admin who
+  grants decides how a column is written; the writer cannot influence it) - as an object's computed column does.
 - **Stored** in `relation_write_values(vcat, vname, verb, pos, column, expr)` (schema v28, `min_reader` 28 - an older
   build would write without computing them); a relation's drop, its undo (spec 154) and cascades take them; a
   principal's record never writes them.
@@ -92,8 +94,6 @@ What follows for the design:
   fails) - cast it in the expression.
 - On an UPDATE / a MERGE branch, `new.<c>` repeats the client's expression: a volatile one (`random()`, a sequence) runs
   again, so the stored value and the computed one may differ.
-- The values read the row as the object does, whatever the writer's grant hides (as an object's computed column
-  does).
 - The values are the virtual table's: a schema alias over the same physical table, a second relation, `ACL NATIVE`
   compute nothing; a principal holding `drop` and `create` may drop the object and create it again without them (its
   drop takes the operator's declarations, as it takes keys and comments).

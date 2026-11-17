@@ -316,9 +316,9 @@ mode of default-deny is a refusal, and the refusal names the function.
   UPDATE never rewrites a column the object computes on an INSERT unless ON UPDATE computes it too.
 - **The object's only.** The values belong to the virtual table: another path to the same physical table (a schema
   alias over it, a second relation, `ACL NATIVE`) computes nothing - give it the same clauses, or no write right.
-- **They read the row as the object does**, whatever the writer's grant shows (like an object's computed column):
-  `note = 'by ' || secret` writes a hidden column's value into a visible one - write values over what the writers
-  may read.
+- **They read the row as the object does**, whatever the writer's grant shows (like an object's computed column),
+  by design: the admin who grants decides how a column is written, and the writer cannot influence it. So
+  `note = 'by ' || secret` writes a hidden column's value into a visible one - write such values on purpose.
 - **Markers are the writer's**, baked where the statement is rewritten; `ACL NATIVE` and the operator's physical
   writes compute nothing (break-glass).
 - **Fail closed**: a value that no longer binds refuses every such write (`write_value_broken`); an older build that
