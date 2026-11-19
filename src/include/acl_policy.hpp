@@ -1006,6 +1006,9 @@ struct PolicyStore {
 	};
 	vector<DriftRow> ClusterDrift();
 	std::atomic<int64_t> cluster_applied {-1};
+	//! spec 175: when the node last had a session end (unix seconds; the store's creation before any) - with the
+	//! records' own `last_used`, the load report's `sessions.idle_since`
+	std::atomic<int64_t> sessions_quiet_since {0};
 	//! spec 126: what the platform's part says about this node, set at load by the module that knows it. An open
 	//! node has none of it: standalone, no group (serves everyone), no profile to target
 	struct NodeTraits {
@@ -1353,6 +1356,8 @@ struct PolicyStore {
 		idx_t live = 0;
 		vector<std::pair<string, int64_t>> by_door;
 		vector<std::pair<string, std::pair<idx_t, idx_t>>> by_group;
+		//! spec 175: the latest `last_used` of the records counted (live or not yet swept), unix seconds
+		int64_t last_used = 0;
 	};
 	//! Taken under one lock, `besides` (an ops id) left out of every count when it is a session of one call (spec
 	//! 066's addendum: the calling call's own). Counted apart, a call's own session that ended between two looks was

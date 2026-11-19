@@ -1,0 +1,209 @@
+# name: test/sql/acl_node_load_memory.test
+# description: the load report's memory and idle time (spec 175) - working RAM and the spill against their limits,
+#   the critical level that admits no new work, and since when the node has had no live session
+# group: [sql]
+
+require acl
+
+require json
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN;
+
+# --- idle_since: no live session - since when; a live one - null ------------------------------------
+
+query I
+SELECT json_extract(acl_node_load(), '$.sessions.idle_since')::BIGINT BETWEEN 1700000000 AND epoch(now())::BIGINT;
+----
+true
+
+statement ok
+CREATE TABLE before AS SELECT json_extract(acl_node_load(), '$.sessions.idle_since')::BIGINT AS t;
+
+statement ok
+CREATE TABLE s AS SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA') AS handle;
+
+query I
+SELECT acl_node_load() LIKE '%"sessions":{"live":1,%"idle_since":null,%';
+----
+true
+
+sleep 1100 millisecond
+
+statement ok
+SELECT acl_session_close(handle) FROM s;
+
+# the session's end is the node's last activity: idle again, since its close - after the first look
+query I
+SELECT json_extract(acl_node_load(), '$.sessions.idle_since')::BIGINT > t FROM before;
+----
+true
+
+# a record swept as idle ended when it was last used, not when the sweep found it (a sweep is no activity)
+statement ok
+SET GLOBAL acl_session_idle_timeout = 1;
+
+statement ok
+CREATE TABLE lapsed AS SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA') AS handle;
+
+sleep 2500 millisecond
+
+statement ok
+CREATE TABLE swept_at AS SELECT epoch(now())::BIGINT AS t;
+
+query I
+SELECT acl_session_sweep() >= 1;
+----
+true
+
+query I
+SELECT json_extract(acl_node_load(), '$.sessions.idle_since')::BIGINT < t FROM swept_at;
+----
+true
+
+statement ok
+SET GLOBAL acl_session_idle_timeout = 900;
+
+statement error
+SET GLOBAL acl_node_admit_memory = 1.5;
+----
+<REGEX>:.*a share between 0 and 1.*
+
+statement error
+SET GLOBAL acl_node_admit_memory = -0.1;
+----
+<REGEX>:.*a share between 0 and 1.*
+
+# --- memory: used, working (less the cache duckdb drops itself), the spill and its limit ----------------
+
+query I
+SELECT json_keys(json_extract(acl_node_load(), '$.memory'));
+----
+[used, working, limit, temp_used, temp_limit, critical]
+
+# a persistent table's blocks, once read, stay in the buffer pool as cache duckdb drops when it needs room (and so do
+# the object cache's entries and remote reads' file cache): used, not
+# working (the owner, 2026-11-19 - a node that read a lot would otherwise sit at its limit with nothing running)
+statement ok
+ATTACH '{TEST_DIR}/acl_node_load_cache.duckdb' AS disk;
+
+statement ok
+CREATE TABLE disk.main.cached AS SELECT i, repeat('y', 100) || i::VARCHAR AS s FROM range(2000000) t(i);
+
+statement ok
+DETACH disk;
+
+statement ok
+ATTACH '{TEST_DIR}/acl_node_load_cache.duckdb' AS disk;
+
+statement ok
+SELECT count(*), max(length(s)) FROM disk.main.cached;
+
+query I
+SELECT json_extract(acl_node_load(), '$.memory.used')::BIGINT - json_extract(acl_node_load(), '$.memory.working')::BIGINT
+    > 10000000;
+----
+true
+
+statement ok
+DETACH disk;
+
+statement ok
+SET temp_directory = '{TEST_DIR}/acl_node_load_spill';
+
+statement ok
+SET memory_limit = '100MB';
+
+statement ok
+SET max_temp_directory_size = '1GB';
+
+# an in-memory table larger than the limit: its blocks go to the spill and stay there
+statement ok
+CREATE TABLE big AS SELECT i, repeat('x', 100) || i::VARCHAR AS s FROM range(3000000) t(i);
+
+query II
+SELECT json_extract(acl_node_load(), '$.memory.temp_used')::BIGINT > 0,
+       json_extract(acl_node_load(), '$.memory.temp_limit')::BIGINT = 1000000000;
+----
+true	true
+
+query I
+SELECT json_extract(acl_node_load(), '$.memory.working')::BIGINT <= json_extract(acl_node_load(), '$.memory.used')::BIGINT;
+----
+true
+
+# --- the critical level: past it the node takes no new session nor stream; below it, again ------------
+
+statement ok
+SET GLOBAL acl_node_admit_memory = 0.01;
+
+query III
+SELECT json_extract(acl_node_load(), '$.memory.critical')::BOOLEAN,
+       json_extract(acl_node_load(), '$.admit.new_session')::BOOLEAN,
+       json_extract(acl_node_load(), '$.admit.new_stream')::BOOLEAN;
+----
+true	false	false
+
+statement ok
+SET GLOBAL acl_node_admit_memory = 0;
+
+query III
+SELECT json_extract(acl_node_load(), '$.memory.critical')::BOOLEAN,
+       json_extract(acl_node_load(), '$.admit.new_session')::BOOLEAN,
+       json_extract(acl_node_load(), '$.admit.new_stream')::BOOLEAN;
+----
+false	true	true
+
+# the default, 95%: the spill is far below it, the RAM is not - an in-memory table is working memory (it leaves RAM
+# only for the spill), and this one fills the 100MB limit
+statement ok
+RESET GLOBAL acl_node_admit_memory;
+
+query II
+SELECT json_extract(acl_node_load(), '$.memory.critical')::BOOLEAN,
+       json_extract(acl_node_load(), '$.memory.temp_used')::BIGINT < 950000000;
+----
+true	true
+
+# no limit (-1: duckdb keeps the largest index less one) is no share to take - null, never a size
+statement ok
+SET max_temp_directory_size = '-1';
+
+statement ok
+SET memory_limit = '-1';
+
+query III
+SELECT json_extract(acl_node_load(), '$.memory.limit') = 'null', json_extract(acl_node_load(), '$.memory.temp_limit') = 'null',
+       json_extract(acl_node_load(), '$.memory.critical')::BOOLEAN;
+----
+true	true	false
+
+statement ok
+RESET max_temp_directory_size;
+
+statement ok
+DROP TABLE big;
+
+statement ok
+RESET memory_limit;

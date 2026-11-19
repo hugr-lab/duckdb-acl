@@ -429,6 +429,13 @@ vector<PlatformView> BuildViews() {
 	      {"sessions_max", I},
 	      {"sessions_by_door", MAPI},
 	      {"sessions_by_group", GROUPS},
+	      {"sessions_idle_since", TS},
+	      {"memory_used", I},
+	      {"memory_working", I},
+	      {"memory_limit", I},
+	      {"temp_used", I},
+	      {"temp_limit", I},
+	      {"memory_critical", B},
 	      {"admit_new_session", B},
 	      {"admit_new_quack_client", B},
 	      {"admit_new_stream", B}},
@@ -3065,14 +3072,32 @@ vector<vector<Value>> NodeRows(ClientContext &context, PolicyStore &store, const
 		auto group_type = MapType::ValueType(GroupsType());
 		auto config = Field(root, "config");
 		auto admit = Field(root, "admit");
-		rows.push_back({JsonBool(Field(root, "draining")), JsonText(Field(root, "observe")),
-		                JsonText(Field(root, "group")), JsonBool(Field(root, "group_known")),
-		                JsonBool(Field(root, "group_default")), JsonBigint(Field(config, "target")),
-		                JsonBigint(Field(config, "applied")), JsonBigint(Field(sessions, "live")),
+		auto memory = Field(root, "memory");
+		// spec 175: since when the node has had no live session, as a time (null while it has one)
+		auto idle_since = JsonBigint(Field(sessions, "idle_since"));
+		auto idle_at = idle_since.IsNull()
+		                   ? Value(LogicalType::TIMESTAMP)
+		                   : Value::TIMESTAMP(Timestamp::FromEpochSeconds(idle_since.GetValue<int64_t>()));
+		rows.push_back({JsonBool(Field(root, "draining")),
+		                JsonText(Field(root, "observe")),
+		                JsonText(Field(root, "group")),
+		                JsonBool(Field(root, "group_known")),
+		                JsonBool(Field(root, "group_default")),
+		                JsonBigint(Field(config, "target")),
+		                JsonBigint(Field(config, "applied")),
+		                JsonBigint(Field(sessions, "live")),
 		                JsonBigint(Field(sessions, "max")),
 		                Value::MAP(LogicalType::VARCHAR, LogicalType::BIGINT, door_keys, door_values),
 		                Value::MAP(LogicalType::VARCHAR, group_type, group_keys, group_values),
-		                JsonBool(Field(admit, "new_session")), JsonBool(Field(admit, "new_quack_client")),
+		                idle_at,
+		                JsonBigint(Field(memory, "used")),
+		                JsonBigint(Field(memory, "working")),
+		                JsonBigint(Field(memory, "limit")),
+		                JsonBigint(Field(memory, "temp_used")),
+		                JsonBigint(Field(memory, "temp_limit")),
+		                JsonBool(Field(memory, "critical")),
+		                JsonBool(Field(admit, "new_session")),
+		                JsonBool(Field(admit, "new_quack_client")),
 		                JsonBool(Field(admit, "new_stream"))});
 		return rows;
 	}

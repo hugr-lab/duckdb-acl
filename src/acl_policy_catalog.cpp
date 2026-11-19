@@ -2533,6 +2533,9 @@ using acl_detail::CatalogBackend;
 using acl_detail::Lit;
 
 PolicyStore::PolicyStore() : memory_functions(FunctionCategoryModel::Seed()) {
+	// spec 175: a node that never had a session has been idle since it started
+	sessions_quiet_since =
+	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 PolicyStore::~PolicyStore() {
