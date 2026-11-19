@@ -10,6 +10,7 @@
 #include "acl_rewriter.hpp"
 
 #include "duckdb/main/config.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -29,6 +30,14 @@ idx_t SettingOf(DatabaseInstance &db, const char *name, idx_t fallback) {
 		return fallback;
 	}
 	return value.GetValue<idx_t>();
+}
+
+double DoubleSettingOf(DatabaseInstance &db, const char *name, double fallback) {
+	Value value;
+	if (!DBConfig::GetConfig(db).TryGetCurrentSetting(name, value) || value.IsNull()) {
+		return fallback;
+	}
+	return value.GetValue<double>();
 }
 
 void AclNodeLoadFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -205,7 +214,36 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 		store.node_load_policy = {now, group, group_known, group_default, target, writes, true};
 	}
 	auto applied = store.cluster_applied.load();
-	bool session_room = !draining && group_known && (max_sessions == 0 || live < max_sessions);
+	// spec 175: memory in its two parts - the buffer manager's working RAM against memory_limit, and what it spilled to
+	// the temp directory against max_temp_directory_size (none set: no share to take). Past acl_node_admit_memory of
+	// either, the node takes no new work: the front seats a new client elsewhere, running queries keep what is left
+	auto &buffers = BufferManager::GetBufferManager(db);
+	auto memory_used = buffers.GetUsedMemory();
+	// working memory (the owner, 2026-11-19): what the node uses less the cache duckdb drops whenever it needs room -
+	// a persistent table's blocks it read, the file cache of remote reads. A node that read a lot sits at its limit
+	// with nothing running; only the rest is pressure (an in-memory table's blocks evict to the spill, counted there)
+	idx_t cache = 0;
+	for (auto &tag : buffers.GetMemoryUsageInfo()) {
+		if (tag.tag == MemoryTag::BASE_TABLE || tag.tag == MemoryTag::EXTERNAL_FILE_CACHE) {
+			cache += tag.size;
+		}
+	}
+	auto memory_working = memory_used > cache ? memory_used - cache : 0;
+	auto memory_limit = buffers.GetMaxMemory();
+	auto temp_used = buffers.GetUsedSwap();
+	auto temp_max = buffers.GetMaxSwap();
+	bool temp_limited = temp_max.IsValid() && temp_max.GetIndex() > 0;
+	auto admit_memory = DoubleSettingOf(db, "acl_node_admit_memory", 0.95);
+	auto past = [&](idx_t used, idx_t limit) {
+		return admit_memory > 0 && limit > 0 && double(used) >= admit_memory * double(limit);
+	};
+	bool memory_critical = past(memory_working, memory_limit) || (temp_limited && past(temp_used, temp_max.GetIndex()));
+	// spec 175: since when the node has had no live session (null while it has one) - what an autoscaler stops by
+	string idle_since = "null";
+	if (live == 0) {
+		idle_since = std::to_string(MaxValue<int64_t>(store.sessions_quiet_since.load(), tally.last_used));
+	}
+	bool session_room = !draining && group_known && (max_sessions == 0 || live < max_sessions) && !memory_critical;
 
 	string by_door;
 	for (auto &door : tally.by_door) {
@@ -222,7 +260,7 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 	string quack = "null";
 	bool quack_room = false;
 	string streams = "null";
-	bool stream_room = true;
+	bool stream_room = !memory_critical;
 #ifdef ACL_QUACK_EMBED_ENABLED
 	{
 		auto per_client = SettingOf(db, "acl_quack_client_depth", ACL_QUACK_CLIENT_DEPTH_DEFAULT);
@@ -241,7 +279,7 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 		auto budget = AclNodeStreamBudget(db);
 		auto reserve = AclQuackStreamReserve(db);
 		auto now = store.stream_budget.Now();
-		stream_room = now.queued == 0 && (now.reserved == 0 || now.reserved + reserve <= budget);
+		stream_room = stream_room && now.queued == 0 && (now.reserved == 0 || now.reserved + reserve <= budget);
 		streams = "{\"budget_bytes\":" + std::to_string(budget) + ",\"reserve_bytes\":" + std::to_string(reserve) +
 		          ",\"reserved_bytes\":" + std::to_string(now.reserved) +
 		          ",\"producing\":" + std::to_string(now.producing) + ",\"queued\":" + std::to_string(now.queued) +
@@ -267,7 +305,11 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 	       ",\"label\":" + (label.empty() ? string("null") : JsonQuote(label)) + ",\"config\":{\"target\":" + target +
 	       ",\"applied\":" + (applied < 0 ? string("null") : std::to_string(applied)) + "}" +
 	       ",\"sessions\":{\"live\":" + std::to_string(live) + ",\"max\":" + std::to_string(max_sessions) +
-	       ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups + "}},\"quack\":" + quack +
+	       ",\"idle_since\":" + idle_since + ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups + "}}" +
+	       ",\"memory\":{\"used\":" + std::to_string(memory_used) + ",\"working\":" + std::to_string(memory_working) +
+	       ",\"limit\":" + std::to_string(memory_limit) + ",\"temp_used\":" + std::to_string(temp_used) +
+	       ",\"temp_limit\":" + (temp_limited ? std::to_string(temp_max.GetIndex()) : string("null")) +
+	       ",\"critical\":" + (memory_critical ? "true" : "false") + "},\"quack\":" + quack +
 	       ",\"streams\":" + streams + ",\"certificates\":[" + certificates + "]" +
 	       ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
 	       ",\"new_quack_client\":" + (session_room && quack_room ? "true" : "false") +

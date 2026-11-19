@@ -517,6 +517,10 @@ bool PolicyStore::SessionDeclaredViewAs(const string &id) {
 //! Caller holds the lock; the event itself takes nothing of the store's.
 void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
 	session_notices.QueueClose(session.id, how); // spec 078: delivered once the lock is released
+	// spec 175: every removal passes here - the end of a session is the node's last activity until another
+	if (now > sessions_quiet_since.load()) {
+		sessions_quiet_since.store(now);
+	}
 	if (!session.view_as.empty()) {
 		// every removal passes here, before its binding goes: the ids it was bound to are never seated again
 		for (auto &entry : sessions) {
@@ -707,6 +711,7 @@ PolicyStore::SessionTally PolicyStore::Tally(const string &besides, bool judge_l
 				tally.live++;
 			}
 			doors[session.door]++;
+			tally.last_used = MaxValue<int64_t>(tally.last_used, session.last_used);
 			if (!session.limits.charged.empty()) {
 				auto &count = groups[session.limits.charged];
 				count.first++;

@@ -123,7 +123,7 @@ versions	VARCHAR
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name NOT IN ('cluster_items', 'cluster_effective', 'drift');
 ----
-243
+250
 
 foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
@@ -218,6 +218,12 @@ query TTTTTT
 ACL ROLE "obs" SELECT draining, group_known, group_default, sessions_live, sessions_max, typeof(sessions_by_door) FROM platform.node_load;
 ----
 false	true	false	0	1000	MAP(VARCHAR, BIGINT)
+
+# spec 175: the node's memory in its two parts and since when it has had no session
+query IIIII
+ACL ROLE "obs" SELECT sessions_idle_since IS NOT NULL, memory_limit > 0, memory_working <= memory_used, temp_used >= 0, memory_critical FROM platform.node_load;
+----
+true	true	true	true	false
 
 query TT
 ACL ROLE "obs" SELECT draining, sessions FROM platform.drain;

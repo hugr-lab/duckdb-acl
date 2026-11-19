@@ -381,7 +381,11 @@ refused BEFORE authentication with `acl: node at capacity ...` (session refused,
 DISCONNECT or a lapsed lease ends the bound acl session at once (`SessionEndBound`, reasons
 client / idle). `acl_node_load()` (`acl_node_load.{hpp,cpp}`) is the load report - sessions per door,
 each quack door's seats, draining, admit flags - also `GET /.well-known/acl-node` and the Flight
-Handshake payload `node-load`, both behind `acl_metrics_endpoint` and (spec 097) an `observe` bearer. **Spec 080 - the stream budget**:
+Handshake payload `node-load`, both behind `acl_metrics_endpoint` and (spec 097) an `observe` bearer. **Spec 175** adds `memory` (`used`, `working` = used less the BASE_TABLE /
+EXTERNAL_FILE_CACHE tags - the cache duckdb drops -, `limit`, `temp_used` / `temp_limit` = GetUsedSwap / GetMaxSwap,
+`critical`: past `acl_node_admit_memory` (0.95) of either limit the admit flags are false, report only) and
+`sessions.idle_since` (unix s, null while a session is live: `sessions_quiet_since` at every `SessionClosed` and the
+records' `last_used`); `platform.node_load` carries them. **Spec 080 - the stream budget**:
 a producing quack statement reserves (`AclQuackStreamSlot` in the driver patch, inside the `try`
 around `Query()`, released when it returns) `acl_quack_stream_reserve_bytes` (0 = producer buffer +
 window cap or client depth x batch, 768 MiB default) against `acl_node_stream_budget` (0 = half the

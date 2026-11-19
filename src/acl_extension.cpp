@@ -145,6 +145,12 @@ shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	                          "acl: seconds a Flight bulk ingest may wait for its next batch before the load rolls "
 	                          "back and the session is free (0 = no limit: it waits for the client)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
+	// spec 175: the critical memory level - past this share of memory_limit or of max_temp_directory_size the load
+	// report admits no new session or stream (the front seats a new client on another node)
+	config.AddExtensionOption("acl_node_admit_memory",
+	                          "acl: the share (0-1) of memory_limit or of max_temp_directory_size past which the load "
+	                          "report admits no new session or stream (0 = never)",
+	                          LogicalType::DOUBLE, Value::DOUBLE(0.95), nullptr, SetScope::GLOBAL);
 	// spec 140: a door served from local files re-reads its certificate and key - the csi-driver renews
 	// them in place - and the renewed pair serves the new connections
 	config.AddExtensionOption(
