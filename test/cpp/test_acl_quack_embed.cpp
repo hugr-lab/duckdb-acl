@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <regex>
 #include <thread>
 
 using namespace duckdb;
@@ -387,8 +388,13 @@ int main(int argc, char *argv[]) {
 			// the same document acl_node_load() answers, never an identity
 			auto sql = con.Query("SELECT acl_node_load()");
 			if (CheckOk(*sql, "acl_node_load() answers")) {
-				Check(sql->Collection().GetValue(0, 0).ToString() == on.body,
+				// spec 175: the memory numbers move between two reads (the buffer pool is live) - compared apart
+				auto steady = [](const std::string &json) {
+					return std::regex_replace(json, std::regex("\"memory\":\\{[^}]*\\}"), "\"memory\":{}");
+				};
+				Check(steady(sql->Collection().GetValue(0, 0).ToString()) == steady(on.body),
 				      "the route and the function are one document");
+				Check(on.body.find("\"memory\":{\"used\":") != std::string::npos, "the route carries the memory");
 			}
 			Check(on.body.find("analyst") == std::string::npos && on.body.find("\"sub") == std::string::npos,
 			      "no role or subject in it");
