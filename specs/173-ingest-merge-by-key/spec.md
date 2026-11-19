@@ -98,13 +98,13 @@ rows into a table:
 | quack `SEND_DATA` drain (spec 042)          | the INSERT's target               | `ingest` + `insert` |
 
 The owner's "merge = insert + update" is the MERGE verb's own capability here: spec 003 prices a MERGE at `merge`,
-and a composed MERGE is one. A catalog grant's `ingest` reaches its objects as its other caps do; `CAPS` written on an
+and a composed MERGE is one - kept by the owner (2026-11-19). A catalog grant's `ingest` reaches its objects as its other caps do; `CAPS` written on an
 object without it withholds it. A create's `ingest` and `create` are judged as two lookups on the home - roles unite
 per capability there as everywhere (spec 145).
 
 **A quack client streams every insert.** quack plans each INSERT into an attached quack table - `VALUES (1)` included -
 as a `SEND_DATA` stream and a drain, so on that door `ingest` is needed for any write of rows, one or a billion; the
-door cannot tell them apart. And the drain is admitted only as the direct source of an INSERT (`INSERT INTO t SELECT *
+door cannot tell them apart - kept by the owner (2026-11-19): the by-key modes are Flight's alone anyway. And the drain is admitted only as the direct source of an INSERT (`INSERT INTO t SELECT *
 FROM <drain>`, what the client composes): a stream read in the INSERT's own `WITH`, as a MERGE's source, in a CTAS or
 an UPDATE's FROM judged no target's `ingest` - such a statement is refused (the review's finding).
 
@@ -152,5 +152,6 @@ with many parameter sets (`DoPutPreparedStatementUpdate`, at most 65,536 a call)
 
 ## Follow-ups
 
-- ADBC's Flight SQL driver passes no `options` (1.12): a driver option upstream, or our JDBC driver (acl-clients)
-  exposing `acl.mode` (Java's `FlightSqlClient.executeIngest` carries `options`).
+- ADBC's Flight SQL driver passes no `options` (1.12). Our JDBC driver carries them (the owner, 2026-11-19):
+  acl-clients spec 009, `connection.unwrap(AclIngest.class).ingest(…, Mode.MERGE | REMOVE)` on Arrow's own Flight SQL
+  client. An ADBC driver option stays upstream's.
