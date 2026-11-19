@@ -453,7 +453,7 @@ The embedded server's settings (registered with the door; UBIGINT unless noted):
 | `acl_quack_fetch_producer_buffer_bytes` | 268435456 | any | server-side fetch-ahead cap |
 | `acl_quack_fetch_window` | 8 | GLOBAL | batches with rows a client may have in flight when its result starts (0 = no window) |
 | `acl_quack_fetch_window_max` | 0 | GLOBAL | the most the window grows to while the client keeps reading (0 = no cap) |
-| `acl_node_admit_memory` | 0.95 | GLOBAL | the share of `memory_limit` (working memory) or of `max_temp_directory_size` past which the load report admits no new session or stream; `0` = never (spec 175) |
+| `acl_node_admit_memory` | 0.95 | GLOBAL | the share of `memory_limit` (working memory) or of `max_temp_directory_size` past which the load report admits no new session or stream; `0` = never, outside 0..1 refused (spec 175) |
 | `acl_node_stream_budget` | 0 | GLOBAL | bytes the node's producing quack streams reserve together (0 = half the memory limit) |
 | `acl_quack_stream_reserve_bytes` | 0 | GLOBAL | what one producing stream reserves (0 = producer buffer + window cap, or client depth, × batch) |
 | `acl_stream_queue_timeout` | 25 | GLOBAL | seconds a statement waits for room in the stream budget, then is refused (0 = at once) |
@@ -499,17 +499,19 @@ each quack door's seated clients against its seats, draining, the node's resourc
 and whether a new session or quack client would be admitted. Since spec 175 it also says:
 
 - `memory`: `used` (the buffer manager's memory), `working` (that, less the cache duckdb drops whenever it needs
-  room: a persistent table's blocks it has read, the file cache of remote reads - a node that read a lot sits at its
-  limit with nothing running), `limit` (`memory_limit`), `temp_used` (what it spilled to `temp_directory`) and
-  `temp_limit` (`max_temp_directory_size`; `null` until duckdb has opened its temp directory, or with no maximum),
+  room: a persistent table's blocks it has read, the object cache, the file cache of remote reads - a node that read a
+  lot sits at its limit with nothing running), `limit` (`memory_limit`; `null` with none), `temp_used` (what it
+  spilled to `temp_directory`) and `temp_limit` (`max_temp_directory_size`; `null` with none, or until duckdb has
+  opened its temp directory),
   `critical`. Past `acl_node_admit_memory` (GLOBAL, default 0.95; 0 = never) of the working memory's limit or of
   the spill's, the node is critical: `admit.new_session`, `admit.new_quack_client` and `admit.new_stream` are false,
   so a front seats a new client on another node while the running queries keep what is left. An in-memory table
   (a session's temp table, staging) is working memory: it leaves RAM only for the spill. The report only says it -
   a client that connects to the node directly is still seated;
 - `sessions.idle_since`: since when the node has had no live session (unix seconds; `null` while it has one) - the
-  latest end of a session or `last_used` of a lingering one, the node's start before any. An autoscaler stops a node
-  idle long enough.
+  latest end of a session (one that lapsed idle: its last use) or `last_used` of a lingering one, the node's start
+  before any. An autoscaler stops a node idle long enough. A cookie-less SQL read of the report (one session per
+  call) ends a session each time, so a poller reads it through the Handshake or the well-known route instead.
 
 An orchestrator reads the same document in two places while
 `acl_metrics_endpoint` is on:
