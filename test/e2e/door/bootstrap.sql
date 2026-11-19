@@ -36,8 +36,9 @@ ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT 'test/idp/s' TO ROLE analyst;
 -- One role, many tenants: the slice comes from the token's claim, not from the role name. The grant
 -- both confines reads (RLS) and assigns the tenant on write, so a client cannot place a row outside
 -- its own slice even by trying - which is what the run then checks by reading the stored rows.
+-- a quack client's streamed insert is a bulk load: ingest on top of insert (spec 173)
 ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
-    CAPS '{"select": true, "insert": true}'
+    CAPS '{"select": true, "insert": true, "ingest": true}'
     RLS 'tenant = acl_claim(''tenant'')'
     COLUMNS (id, tenant, amount) MASK (tenant AS acl_claim('tenant'));
 

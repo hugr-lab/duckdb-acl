@@ -71,20 +71,22 @@ COMMENT ON COLUMN customers.name IS 'PHYS name';
 ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders IS 'the orders';
 ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN amount IS 'what was paid';
 ACL ADMIN CREATE ROLE analyst;
--- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp) MAIN;
+-- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them; ingest too (spec 173):
+-- a bulk load is a right of its own
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp, ingest) MAIN;
 -- one role, many tenants: the slice comes from the token's claim
 ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
-    CAPS '{"select": true, "insert": true}'
+    CAPS '{"select": true, "insert": true, "merge": true, "delete": true, "ingest": true}'
     RLS 'tenant = acl_claim(''tenant'')';
-ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select) COLUMNS (id, name);
-ACL ADMIN GRANT TABLE c.ledger TO ROLE analyst WITH (select, insert, update, merge) RLS (tenant = acl_claim('tenant'));
+-- insert without ingest: a row is written, a bulk load is refused (spec 173)
+ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select, insert) COLUMNS (id, name);
+ACL ADMIN GRANT TABLE c.ledger TO ROLE analyst WITH (select, insert, update, merge, ingest) RLS (tenant = acl_claim('tenant'));
 ACL ADMIN GRANT TABLE c.nested TO ROLE analyst WITH (select) COLUMNS (id, address);
 -- spec 051: create prices CREATE, drop prices REPLACE and DROP - a live-alias schema as the home
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
-ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);
+ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop, ingest);
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage2 AS memory.staging2;
-ACL ADMIN GRANT SCHEMA c.stage2 TO ROLE analyst WITH (select, insert, create);
+ACL ADMIN GRANT SCHEMA c.stage2 TO ROLE analyst WITH (select, insert, create, ingest);
 -- empty outside the DDL checks (after run.sh's GetDbSchemas, adbc_client.py): GetDbSchemas lists no empty expansion
 ACL ADMIN CREATE VIRTUAL SCHEMA c.made FROM memory.made_home;
 ACL ADMIN GRANT SCHEMA c.made TO ROLE analyst WITH (select, create, drop);

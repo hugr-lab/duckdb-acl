@@ -1030,10 +1030,13 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	if (prefix.kind == AclPrefix::Kind::INGEST) {
 		audit.proto.detail = "ingest";
 		// the ingest prefix carries the door's own composed statement and nothing else (spec 049):
-		// one statement, of exactly two shapes - the append INSERT, or the CREATE TABLE that stages
-		// into the session (spec 050) or creates/replaces in a granted home (spec 051). Anything
-		// wider would hand the arrow_scan exemption to text the door never wrote.
-		bool insert_form = statements.size() == 1 && statements[0]->type == StatementType::INSERT_STATEMENT;
+		// one statement, of exactly four shapes - the append INSERT, the CREATE TABLE that stages
+		// into the session (spec 050) or creates/replaces in a granted home (spec 051), and the MERGE /
+		// DELETE of a load by key (spec 173). Anything wider would hand the arrow_scan exemption to text
+		// the door never wrote.
+		bool insert_form = statements.size() == 1 && (statements[0]->type == StatementType::INSERT_STATEMENT ||
+		                                              statements[0]->type == StatementType::MERGE_INTO_STATEMENT ||
+		                                              statements[0]->type == StatementType::DELETE_STATEMENT);
 		bool create_form = false;
 		if (statements.size() == 1 && statements[0]->type == StatementType::CREATE_STATEMENT) {
 			auto &info = statements[0]->Cast<CreateStatement>().info;
@@ -1042,7 +1045,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		if (!insert_form && !create_form) {
 			NoteDenyReason(Reason::STATEMENT_TYPE);
 			throw BinderException(
-			    "acl_rewrite: the ingest prefix carries exactly one INSERT or CREATE TABLE statement");
+			    "acl_rewrite: the ingest prefix carries exactly one INSERT, MERGE, DELETE or CREATE TABLE statement");
 		}
 		principal.arrow_ingest = true;
 	}

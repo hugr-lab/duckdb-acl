@@ -167,6 +167,20 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   ingest may stream, enforced while reading. A `transaction_id` on ingest is refused, and so is an
   ingest inside a client's open transaction (the refusal says `inside an open transaction`): the
   ingest owns its own transaction so the row-count cross-check decides before commit.
+  Every load needs the explicit **`ingest`** capability on what it writes, on top of the operation's own
+  (spec 173): `insert` for append, `create` (+ `drop`) on the home for create / replace, `temp` for a temporary
+  target; a role that may insert a row may not stream a table unless granted `ingest`.
+- **A load by key** (spec 173): the backend option `acl.mode` in `CommandStatementIngest.options` - `merge`
+  upserts the stream by the target's declared `PRIMARY KEY` (`MERGE … ON <key>`: a row whose key exists is
+  updated, the others inserted; priced at `ingest` + `merge`), `remove` deletes the rows whose key the stream
+  carries (`DELETE … USING`; `ingest` + `delete`). Both write into a table that exists - the protocol's mode must be
+  append - and refuse a target without a declared key or a temporary one. A key that appears twice in one stream
+  takes the stream's last row; a key holding a NULL matches nothing (a merge inserts each such row). A key column the
+  role reads masked or not at all refuses the load: the key is compared as stored. RLS joins the key (a row outside the grant is
+  never matched), the grant's predicate confines what a merge writes, and the object's `ON INSERT` / `ON UPDATE`
+  values (spec 172) are computed on both branches. The answer is the rows the statement affected. Any other
+  `acl.` option is refused by name. ADBC's Flight SQL driver sends no `options`; Java's
+  `FlightSqlClient.executeIngest` does.
 - **Results stream, and a client that stops is heard** (spec 070). `DoGet` executes the statement
   lazily and converts one duckdb chunk into one Arrow batch as the client pulls it - nothing beyond
   the chunk in flight is held, whatever the result's size, and the first batch of a 200M-row scan is
@@ -395,7 +409,10 @@ NULL, which quack turns into its refusal. Both are the defaults of `acl_quack_au
 `acl_quack_scan_data`, ...) are in the function gate's never set (spec 072): refused under a principal
 whatever the policy says. Streamed bulk ingest (`SEND_DATA`) is
 generated unprefixed by the server; the parser override recovers the principal from the stream id
-(spec 042) and enforces the write as that principal's, and refuses where recovery fails.
+(spec 042) and enforces the write as that principal's, and refuses where recovery fails. A drain into a table is a
+bulk load: it needs the `ingest` capability on the target beside `insert` (spec 173). quack streams every insert into
+an attached table, `VALUES (1)` included, so on this door `ingest` goes with any write of rows; the stream drains only
+into the source of an INSERT (what the client composes).
 
 **Staging on quack is a granted schema** (spec 056): a quack client's `CREATE TEMP TABLE` is its own
 local catalog and an attached catalog cannot hold a temporary object, so the Flight door's session
@@ -848,7 +865,8 @@ denied to a principal.
   or reconnects.
 - **Explicit capabilities only where meant.** `temp` (session temp tables), `explain` (a plan names
   physical objects), `create`/`drop` (ingest create/replace, staging), `secrets` (the attached secrets
-  service, spec 082) are never in the unstated default; grant them by name.
+  service, spec 082) and `ingest` (a bulk load through either door, spec 173) are never in the unstated default;
+  grant them by name.
 - **Stop before close.** Drain, watch, kill stragglers, stop the doors, then close duckdb.
 - **A ready node to look at**: `test/live/serve.sh [flight|quack|all] [--tls]` seeds a demo policy
   and prints URIs and tokens; `test/live/RUNBOOK.md` walks DBeaver, ADBC and a quack client through it

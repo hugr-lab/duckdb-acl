@@ -693,6 +693,24 @@ private:
 		return temp_cap_state == 1;
 	}
 
+	//! spec 173: a door's bulk load is the explicit `ingest` capability on top of the operation's - here where it lands
+	//! in the session (the MAIN catalog grant, beside `temp`)
+	void RequireIngestCap(const TablePolicy &policy, const string &key) {
+		if (!policy.caps.count("ingest")) {
+			Deny(Reason::CAPABILITY,
+			     "ingest into " + Shown(key) + " is not allowed: a bulk load needs the ingest capability");
+		}
+		Note(policy.canonical.empty() ? key : policy.canonical, "ingest");
+	}
+
+	void RequireIngestOnMain(const string &key) {
+		if (principal.arrow_ingest && !store.PrincipalMainCap(principal, "ingest")) {
+			Deny(Reason::CAPABILITY,
+			     "ingest into " + Shown(key) + " is not allowed: a bulk load needs the ingest capability");
+		}
+		Note(key, "ingest");
+	}
+
 	//! A name the principal already aimed at the temp catalog: first qualifier `temp`. It binds only
 	//! against the connection's private temp catalog and can never reach a physical object (probed:
 	//! `temp.main.x` does not find a physical `x`, and `ATTACH ... AS temp` is refused by duckdb).
@@ -778,6 +796,9 @@ private:
 		auto &info = *stmt.info;
 		if (!TempAllowed()) {
 			Deny(Reason::CAPABILITY, "temporary objects need the temp capability on the MAIN catalog grant");
+		}
+		if (principal.arrow_ingest) {
+			RequireIngestOnMain(info.GetQualifiedName().Name().GetIdentifierName());
 		}
 		// only the private temp catalog may be named; any other home would be a physical write
 		auto qualifiers = NameParts(info.GetQualifiedName());
@@ -976,6 +997,14 @@ private:
 		}
 		RequireNoCaseSibling(target);
 		Note(key, "create");
+		if (principal.arrow_ingest) {
+			// spec 173: a load that creates its table is the ingest capability on the home, beside create
+			DdlTarget ingest_home;
+			if (!store.ResolveDdlTarget(principal, key, "ingest", ingest_home)) {
+				Deny(Reason::DDL_HOME, "no schema of the catalog allows creating " + Shown(key));
+			}
+			Note(key, "ingest");
+		}
 		if (principal.arrow_ingest && (target.virtual_only || target.needs_record)) {
 			// spec 151: the door prepares a load and checks it by the count it answers - a CREATE with its record
 			// is two statements, which do not prepare, and a VIRTUAL ONLY one makes no table at all
@@ -1845,7 +1874,18 @@ private:
 			column = MapWrittenColumn(policy, column, vname);
 		}
 		if (node.select_statement && node.select_statement->node) {
-			RewriteQueryNode(*node.select_statement->node);
+			auto caps = dml_target_caps;
+			auto temp = dml_target_temp;
+			in_insert_source = true;
+			try {
+				RewriteQueryNode(*node.select_statement->node);
+			} catch (...) {
+				in_insert_source = false;
+				throw;
+			}
+			in_insert_source = false;
+			dml_target_caps = caps;
+			dml_target_temp = temp;
 		}
 		ApplyInsertPolicy(node, policy, vname);
 		ApplyComputedInsert(node, policy, vname); // spec 172
@@ -2114,9 +2154,164 @@ private:
 		RequireReadableReturning(node.returning_list, policy, vname, TargetAliasOf(node.table));
 	}
 
+	//===------------------------------------------------------------------===//
+	// spec 173: a door's load by key
+	//===------------------------------------------------------------------===//
+	static bool IsIngestKeyMarker(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
+			return false;
+		}
+		auto &function = expr.Cast<FunctionExpression>();
+		return function.GetArguments().empty() && NameParts(function.GetQualifiedName()).size() == 1 &&
+		       StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "acl_ingest_key");
+	}
+
+	//! The declared key of the load's target (spec 048), in its virtual names: none refuses the load
+	vector<string> IngestKeyOf(const TablePolicy &policy, const string &vname) {
+		auto key = store.DeclaredRelationKey(policy.canonical.empty() ? vname : policy.canonical);
+		if (key.empty()) {
+			Deny(Reason::POLICY_ERROR, "a load by key into " + Shown(vname) +
+			                               " needs its declared key: ALTER VIRTUAL TABLE " + Shown(vname) +
+			                               " SET PRIMARY KEY (...)");
+		}
+		return key;
+	}
+
+	//! A load by key compares and writes the key as stored: a key column the role reads masked or not at all (or, for a
+	//! merge, writes masked) refuses the load - a mask substituted into the ON would match by the mask's value (a
+	//! constant mask: every row), never by the key
+	void RequirePlainKey(const vector<string> &key, const TablePolicy &policy, const string &vname) {
+		for (auto &column : key) {
+			auto physical = MapWrittenColumn(policy, Identifier(column), vname).GetIdentifierName();
+			const TablePolicy *scopes[] = {&policy, &dml_read_policy};
+			for (auto scope : scopes) {
+				bool masked = false;
+				for (auto &injection : scope->injections) {
+					masked = masked || StringUtil::CIEquals(injection.first, physical);
+				}
+				if (masked || (scope->ColumnsNarrowed() && !scope->Readable(physical))) {
+					Deny(Reason::WRITE_POLICY, "a load by key into " + Shown(vname) +
+					                               " compares its key as stored, and \"" + column +
+					                               "\" is masked or not readable for this role");
+				}
+			}
+		}
+	}
+
+	//! `acl_ingest_key()` as a condition: `__acl_target.k = __acl_ingest.k AND ...`
+	static unique_ptr<ParsedExpression> IngestKeyCondition(const vector<string> &key) {
+		unique_ptr<ParsedExpression> condition;
+		for (auto &column : key) {
+			unique_ptr<ParsedExpression> equal = make_uniq<ComparisonExpression>(
+			    ExpressionType::COMPARE_EQUAL,
+			    make_uniq<ColumnRefExpression>(Identifier(column), Identifier("__acl_target")),
+			    make_uniq<ColumnRefExpression>(Identifier(column), Identifier("__acl_ingest")));
+			if (condition) {
+				condition = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(condition),
+				                                             std::move(equal));
+			} else {
+				condition = std::move(equal);
+			}
+		}
+		return condition;
+	}
+
+	//! A `PARTITION BY acl_ingest_key()` anywhere in `expr`: the key's columns (the source's own names)
+	static void ExpandIngestKeyPartitions(ParsedExpression &expr, const vector<string> &key) {
+		if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
+			auto &partitions = expr.Cast<WindowExpression>().PartitionsMutable();
+			vector<unique_ptr<ParsedExpression>> expanded;
+			for (auto &partition : partitions) {
+				if (IsIngestKeyMarker(*partition)) {
+					for (auto &column : key) {
+						expanded.push_back(make_uniq<ColumnRefExpression>(Identifier(column)));
+					}
+				} else {
+					expanded.push_back(std::move(partition));
+				}
+			}
+			partitions = std::move(expanded);
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](ParsedExpression &child) { ExpandIngestKeyPartitions(child, key); });
+	}
+
+	static bool IsKeyColumn(const vector<string> &key, const string &column) {
+		for (auto &k : key) {
+			if (StringUtil::CIEquals(k, column)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! The door's MERGE (spec 173): ON the key, the source's last row per key, the key's columns never SET
+	void ExpandIngestKey(MergeQueryNode &node, const TablePolicy &policy, const string &vname) {
+		if (!node.join_condition || !IsIngestKeyMarker(*node.join_condition)) {
+			return; // a load that appends composes no MERGE; any other marker is refused at bind
+		}
+		auto key = IngestKeyOf(policy, vname);
+		RequirePlainKey(key, policy, vname);
+		node.join_condition = IngestKeyCondition(key);
+		if (node.source && node.source->type == TableReferenceType::SUBQUERY) {
+			auto &subquery = node.source->Cast<SubqueryRef>();
+			if (subquery.subquery && subquery.subquery->node &&
+			    subquery.subquery->node->type == QueryNodeType::SELECT_NODE) {
+				auto &select = subquery.subquery->node->Cast<SelectNode>();
+				if (select.qualify) {
+					ExpandIngestKeyPartitions(*select.qualify, key);
+					// a NULL is no key value: PARTITION BY puts NULLs together, and such a row matches nothing - each
+					// one is kept, so the merge inserts them all
+					for (auto &column : key) {
+						auto is_null = make_uniq<OperatorExpression>(
+						    ExpressionType::OPERATOR_IS_NULL, make_uniq<ColumnRefExpression>(Identifier(column)));
+						select.qualify = make_uniq<ConjunctionExpression>(
+						    ExpressionType::CONJUNCTION_OR, std::move(select.qualify), std::move(is_null));
+					}
+				}
+			}
+		}
+		for (auto &action_set : node.actions) {
+			for (auto &action : action_set.second) {
+				if (action->action_type != MergeActionType::MERGE_UPDATE || !action->update_info) {
+					continue;
+				}
+				auto &info = *action->update_info;
+				vector<Identifier> columns;
+				vector<unique_ptr<ParsedExpression>> expressions;
+				for (idx_t i = 0; i < info.columns.size(); i++) {
+					if (!IsKeyColumn(key, info.columns[i].GetIdentifierName())) {
+						columns.push_back(info.columns[i]);
+						expressions.push_back(std::move(info.expressions[i]));
+					}
+				}
+				if (columns.empty()) {
+					// every column is the key's: a row that exists is the row the stream carries
+					action->action_type = MergeActionType::MERGE_DO_NOTHING;
+					action->update_info.reset();
+					continue;
+				}
+				info.columns = std::move(columns);
+				info.expressions = std::move(expressions);
+			}
+		}
+	}
+
+	//! The door's DELETE (spec 173): WHERE the key
+	void ExpandIngestKey(DeleteQueryNode &node, const TablePolicy &policy, const string &vname) {
+		if (node.condition && IsIngestKeyMarker(*node.condition)) {
+			auto key = IngestKeyOf(policy, vname);
+			RequirePlainKey(key, policy, vname);
+			node.condition = IngestKeyCondition(key);
+		}
+	}
+
 	void RewriteDeleteNode(DeleteQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.table, "delete");
 		auto vname = dml_target_name;
+		if (principal.arrow_ingest) {
+			ExpandIngestKey(node, policy, vname);
+		}
 		auto reads = dml_read_policy; // spec 145: the conditions read under the read policy
 		for (auto &using_ref : node.using_clauses) {
 			RewriteTableRef(using_ref);
@@ -2145,6 +2340,9 @@ private:
 	void RewriteMergeNode(MergeQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.target, "merge");
 		auto vname = dml_target_name;
+		if (principal.arrow_ingest) {
+			ExpandIngestKey(node, policy, vname);
+		}
 		auto reads = dml_read_policy; // spec 145: the conditions read under the read policy
 		auto alias = TargetAliasOf(node.target);
 		RewriteTableRef(node.source);
@@ -2862,6 +3060,18 @@ private:
 					// so, and the session remembers the stream so the door's completion hook can tell
 					// the load's outcome from any other statement's.
 					function.SetQualifiedName(ParsePhysName("acl_quack_scan_data"));
+					// spec 173: a drain into a table is a bulk load - the ingest capability on top of insert. The
+					// client's drain is `INSERT INTO t SELECT * FROM <drain>`: a stream read anywhere else (an INSERT's
+					// own WITH, a MERGE's source, a CTAS) has no target judged here, so it drains nothing
+					if (!in_insert_source) {
+						Deny(Reason::STATEMENT_TYPE, "a client's stream drains only into the source of an INSERT");
+					}
+					if (dml_target_temp ? !store.PrincipalMainCap(principal, "ingest")
+					                    : !dml_target_caps.count("ingest")) {
+						Deny(Reason::CAPABILITY, "ingest into " + Shown(dml_target_name) +
+						                             " is not allowed: a bulk load needs the ingest capability");
+					}
+					Note(dml_target_name, "ingest");
 					if (trail) {
 						trail->detail = "drain";
 					}
@@ -4774,6 +4984,11 @@ private:
 			// narrows an object only this connection can see (spec 050). Virtual wins - this is
 			// reached only when no grant claims the name.
 			if (TryTempDmlTarget(target_ref, target_name, key)) {
+				dml_target_caps.clear();
+				dml_target_temp = true;
+				if (principal.arrow_ingest) {
+					RequireIngestOnMain(key);
+				}
 				return TablePolicy();
 			}
 			// a name the principal *does* have, of a kind that is called rather than written: say which
@@ -4794,6 +5009,12 @@ private:
 		if (!policy.caps.count(capability)) {
 			Deny(Reason::CAPABILITY, capability + " on " + Shown(key) + " is not allowed");
 		}
+		// spec 173: a door's bulk load (Flight's ingest) is the ingest capability on top of the verb's
+		if (principal.arrow_ingest) {
+			RequireIngestCap(policy, key);
+		}
+		dml_target_caps = policy.caps;
+		dml_target_temp = false;
 		// spec 167: a write reads and writes the current rows - a grant that reads a snapshot or a window writes
 		// nothing
 		RefuseVersionedWrite(key, capability, policy);
@@ -5449,6 +5670,11 @@ private:
 	PolicyStore &store;
 	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
 	string dml_target_name;
+	//! spec 173: the last DML target's caps (empty for a session temp - `dml_target_temp`) and whether the INSERT's
+	//! source is being rewritten - a quack drain there is a bulk load into that target
+	case_insensitive_set_t dml_target_caps;
+	bool dml_target_temp = false;
+	bool in_insert_source = false;
 	//! spec 145: what the DML target's own conditions read it under (ResolveDmlTarget) - copied by each node at once,
 	//! before a nested statement resolves its own
 	TablePolicy dml_read_policy;

@@ -593,7 +593,8 @@ an object grant that states none takes the catalog grant's, and `ALTER GRANT` ke
   `temp` (session temp tables on the Flight door), `explain` (EXPLAIN) and `secrets` (the node's
   secrets service, see below) on the main catalog grant, and `lineage` (the catalog's definition lineage,
   `acl_lineage_definitions` - [lineage](lineage.md#a-catalogs-definitions-on-demand)) on any catalog grant,
-  each held only when named.
+  and `ingest` (a door's bulk load, [serving](serving.md)) on what the load writes - beside `insert` / `merge` /
+  `delete` on the object, `create` on the home schema, `temp` on the main catalog grant - each held only when named.
   An unknown name is stored as written and enforces nothing. A capability's name is a word (ASCII
   letters, digits, `_`): each item of `WITH (…)` is one - bare or double-quoted, lower-cased, the same
   one twice counting once - and `CAPS` JSON naming anything else, or a capability twice (names compare

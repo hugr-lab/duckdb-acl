@@ -46,12 +46,12 @@ statement ok
 ACL ADMIN CREATE ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, ingest) MAIN;
 
 # the grant states its columns (so a write has a publish order to be checked against) and confines the
 # principal to its own tenant
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant';
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true, "ingest": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant';
 
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=false;
@@ -108,7 +108,7 @@ statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS (id, tenant) MASK (tenant AS acl_claim('tenant'));
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true, "ingest": true}' COLUMNS (id, tenant) MASK (tenant AS acl_claim('tenant'));
 
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=false;
@@ -176,6 +176,34 @@ SELECT count(*), count(*) FILTER (WHERE tenant = 'acme'), count(*) FILTER (WHERE
 
 statement ok
 DETACH remote3;
+
+# --- spec 173: a drain is a bulk load - the ingest capability on top of insert ---------------------------------------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN GRANT TABLE c.stamped TO ROLE analyst CAPS '{"select": true, "insert": true}';
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement ok
+ATTACH 'quack:localhost:31579' AS remote4 (TYPE quack,
+    TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
+
+statement error
+INSERT INTO remote4.main.stamped SELECT * FROM stamp_src;
+----
+<REGEX>:.*a bulk load needs the ingest capability.*
+
+query I
+SELECT count(*) FROM stamped;
+----
+3000
+
+statement ok
+DETACH remote4;
 
 statement ok
 SELECT acl_quack_stop('quack:localhost:31579');

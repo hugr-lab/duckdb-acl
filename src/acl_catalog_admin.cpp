@@ -2241,6 +2241,25 @@ bool PolicyStore::CatalogHasWriteValues(const string &vcat, const string &vname)
 	           ->RowCount() > 0;
 }
 
+vector<string> PolicyStore::DeclaredRelationKey(const string &canonical) {
+	vector<string> key;
+	if (!catalog || catalog->FunctionMode() || canonical.empty()) {
+		return key; // a driver's source and the memory store declare no key
+	}
+	string vcat, vname;
+	if (!NamePath::SplitHeadKey(canonical, vcat, vname)) {
+		return key;
+	}
+	auto rows =
+	    catalog->Query("SELECT \"column\" FROM " + catalog->Tbl("keys") + " WHERE " + KeyEqSql("\"vcat\"", Lit(vcat)) +
+	                   " AND " + KeyEqSql("\"vname\"", Lit(vname)) + " AND \"kind\" = 'relation' ORDER BY \"pos\"");
+	ResultRows read(*rows);
+	for (idx_t row = 0; row < read.Count(); row++) {
+		key.push_back(read.GetValue(0, row).ToString());
+	}
+	return key;
+}
+
 bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vname) {
 	if (!catalog) {
 		return false;

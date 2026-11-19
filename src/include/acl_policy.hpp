@@ -779,6 +779,9 @@ struct PolicyStore {
 	bool CatalogRelationDeclared(const string &vcat, const string &vname);
 	//! spec 172: whether a relation computes values on a write (ON INSERT / ON UPDATE)
 	bool CatalogHasWriteValues(const string &vcat, const string &vname);
+	//! spec 173: the declared PRIMARY KEY of a relation (spec 048), its columns in virtual names in key order - empty
+	//! when none is declared (or the source keeps no keys)
+	vector<string> DeclaredRelationKey(const string &canonical);
 	//! The SQL behind a metadata surface for this principal (spec 010 part 3): duckdb's own shape,
 	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.

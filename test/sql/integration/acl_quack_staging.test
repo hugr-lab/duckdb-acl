@@ -48,14 +48,14 @@ statement ok
 ACL ADMIN CREATE ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, ingest) MAIN;
 
 # the target is confined to the principal's tenant; the staging schema is the principal's to build in
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant';
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true, "ingest": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant';
 
 statement ok
-ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);
+ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop, ingest);
 
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=false;

@@ -20,7 +20,7 @@ def varint(n):
 
 def field(number: int, payload: bytes) -> bytes:
     """One length-delimited protobuf field."""
-    return bytes([(number << 3) | 2]) + varint(len(payload)) + payload
+    return varint((number << 3) | 2) + varint(len(payload)) + payload  # a varint tag: options is field 1000
 
 
 def text(number: int, value: str) -> bytes:
@@ -67,14 +67,24 @@ def do_ingest(client, options, spec: str) -> int:
     schema_name = ""
     if "." in table_name:  # `schema.table` travels as the proto's own schema field (3)
         schema_name, table_name = table_name.split(".", 1)
-    tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (1, 1)}[mode]
+    # spec 173: merge / remove are append plus the backend option acl.mode (options = 1000, map<string, string>);
+    # mergecreate asks a merge under mode create, badoption an option of ours the door does not know
+    tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (1, 1), "merge": (2, 2), "remove": (2, 2),
+           "mergecreate": (1, 1), "badoption": (2, 2), "twomodes": (2, 2)}[mode]
     payload = field(1, enum_field(1, tdo[0]) + enum_field(2, tdo[1])) + text(2, table_name)
     if schema_name:
         payload += text(3, schema_name)
     if mode == "temp":
         payload += flag(5, True)
+    backend = {"merge": [("acl.mode", "merge")], "remove": [("acl.mode", "remove")],
+               "mergecreate": [("acl.mode", "merge")], "badoption": [("acl.colour", "blue")],
+               "twomodes": [("acl.mode", "merge"), ("ACL.MODE", "remove")]}.get(mode, [])
+    if mode == "twomodes":
+        tdo = (2, 2)
+    for key, value in backend:
+        payload += field(1000, text(1, key) + text(2, value))
     names = cols.split(",")
-    parsed = [[int(v) if v.lstrip("-").isdigit() else v for v in row.split(",")]
+    parsed = [[int(v) if v.lstrip("-").isdigit() else None if v == "NULL" else v for v in row.split(",")]
               for row in rows.split(";")]
     data = pa.table({name: [row[i] for row in parsed] for i, name in enumerate(names)})
     descriptor = flight.FlightDescriptor.for_command(command("CommandStatementIngest", payload))

@@ -298,6 +298,9 @@ int main(int argc, char *argv[]) {
 		// a writable target: c.orders carries RLS and is a read-only projection, which would refuse
 		// the write before the call is ever looked at
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.raw AS phys.main.orders");
+		// a drain into a table is a bulk load: ingest on top of insert (spec 173)
+		Exec(con, "ACL ADMIN GRANT TABLE c.raw TO ROLE analyst CAPS '{\"select\": true, \"insert\": true, "
+		          "\"merge\": true, \"ingest\": true}'");
 		auto handle = OpenSession(con, TOKEN);
 		if (!Check(!handle.empty(), "a session opens for the drain check")) {
 			return;
@@ -309,6 +312,22 @@ int main(int argc, char *argv[]) {
 		          over_session->GetError().find("internal function driven by the quack server") != std::string::npos,
 		      "over a session the ACL admits the call (retargeted) and the bind refuses it: " +
 		          (over_session->HasError() ? over_session->GetError() : "no error"));
+		// spec 173's review: the stream drains only into an INSERT's own source - a drain read in the INSERT's WITH, a
+		// MERGE's source or a CTAS judges no target's ingest
+		auto in_cte = con.Query("ACL SESSION '" + handle +
+		                        "' WITH s AS (SELECT * FROM scan_data_from_quack_client('handmade', "
+		                        "NULL::STRUCT(id INTEGER, tenant VARCHAR), ordered := true)) "
+		                        "INSERT INTO c.raw (id, tenant) SELECT * FROM s");
+		Check(in_cte->HasError() &&
+		          in_cte->GetError().find("drains only into the source of an INSERT") != std::string::npos,
+		      "a drain in the INSERT's WITH is refused: " + (in_cte->HasError() ? in_cte->GetError() : "no error"));
+		auto in_merge = con.Query("ACL SESSION '" + handle +
+		                          "' MERGE INTO c.raw USING (SELECT * FROM scan_data_from_quack_client('handmade', "
+		                          "NULL::STRUCT(id INTEGER, tenant VARCHAR), ordered := true)) AS s ON c.raw.id = s.id "
+		                          "WHEN NOT MATCHED THEN INSERT (id, tenant) VALUES (s.id, s.tenant)");
+		Check(in_merge->HasError() &&
+		          in_merge->GetError().find("drains only into the source of an INSERT") != std::string::npos,
+		      "a drain as a MERGE's source is refused: " + (in_merge->HasError() ? in_merge->GetError() : "no error"));
 		auto over_role = con.Query(std::string("ACL ROLE \"analyst\" ") + drain);
 		Check(over_role->HasError() &&
 		          over_role->GetError().find("table function \"scan_data_from_quack_client\" is not allowed") !=

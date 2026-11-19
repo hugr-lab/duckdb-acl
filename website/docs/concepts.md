@@ -54,6 +54,8 @@ capabilities.
   - `temp` (session temp tables), `explain`, and `secrets` (the node's secrets service) on the main
     catalog grant;
   - `lineage` (the catalog's definition lineage, `acl_lineage_definitions`) on a catalog grant;
+  - `ingest` (a door's bulk load - Flight `DoPut` ingest, a quack client's streamed insert) on what the load
+    writes, on top of the operation's own capability;
   - `manage` (administer this catalog).
 - **Predicates.** A grant's **RLS** predicate is AND-ed into every read and write. It is also
   checked against the row being written, so an `INSERT` or `UPDATE` cannot leave a row outside the
