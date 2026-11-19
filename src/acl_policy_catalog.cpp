@@ -2873,6 +2873,13 @@ int64_t PolicyStore::FlightStreamIdleSeconds() {
 	return 30;
 }
 
+int64_t PolicyStore::FlightIngestIdleSeconds() {
+	if (catalog) {
+		return catalog->SettingInt64("acl_flight_ingest_idle", 300);
+	}
+	return 300;
+}
+
 int64_t PolicyStore::MaxSessions() {
 	if (catalog) {
 		return catalog->SettingInt64("acl_max_sessions", 1000); // the registered default (spec 044)

@@ -63,6 +63,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_result_stream.hpp"
+#include <condition_variable>
 #include <thread>
 
 #include <arrow/c/bridge.h>
@@ -1553,6 +1554,48 @@ public:
 	//! The client's Flight stream as a C ArrowArrayStream: get_next pulls the reader directly, so a
 	//! load never sits in server RAM whole, and the row cap refuses *while reading*. The state lives
 	//! on the DoPut frame, which outlives the one statement that scans it - release is a no-op.
+	//! spec 174: Arrow's FlightMessageReader::Next blocks until the client sends, half-closes or the call dies, and
+	//! nothing in Flight's API interrupts it. So one thread reads, on request, and the scan waits for its answer
+	//! with a clock: a wait that ends without a batch fails the load, which rolls back and lets the session go,
+	//! while the read itself goes on until the client acts - its thread joined only after the lock is released.
+	struct IngestPump {
+		explicit IngestPump(flight::FlightMessageReader *reader_p) : reader(reader_p) {
+			thread = std::thread([this]() { Run(); });
+		}
+		~IngestPump() {
+			{
+				std::lock_guard<std::mutex> guard(lock);
+				stop = true;
+			}
+			changed.notify_all();
+			thread.join();
+		}
+		void Run() {
+			std::unique_lock<std::mutex> guard(lock);
+			for (;;) {
+				changed.wait(guard, [&]() { return wanted || stop; });
+				if (stop) {
+					return;
+				}
+				wanted = false;
+				guard.unlock();
+				auto next = reader->Next();
+				guard.lock();
+				chunk = std::move(next);
+				ready = true;
+				changed.notify_all();
+			}
+		}
+		flight::FlightMessageReader *reader;
+		std::mutex lock;
+		std::condition_variable changed;
+		bool wanted = false;
+		bool ready = false;
+		bool stop = false;
+		arrow::Result<flight::FlightStreamChunk> chunk = arrow::Status::UnknownError("acl: no batch read");
+		std::thread thread;
+	};
+
 	struct IngestStreamState {
 		flight::FlightMessageReader *reader = nullptr;
 		std::shared_ptr<arrow::Schema> schema;
@@ -1566,6 +1609,16 @@ public:
 		//! so the merge keeps each key's last row; `finished` = the scan read the stream to its end
 		bool number_rows = false;
 		bool finished = false;
+		//! spec 174: the stream read on a thread of its own, so a wait for the next batch can end - at
+		//! acl_flight_ingest_idle, or when the session is killed. Destroyed after the session's lock goes (the
+		//! state is declared before it): a client that stalled keeps its handler, never its session
+		unique_ptr<IngestPump> pump;
+		PolicyStore *store = nullptr;
+		string handle;
+		int64_t idle_seconds = 0;
+		//! why the wait ended without a batch: the stream sat idle, or the session ended under it
+		bool idle = false;
+		bool session_ended = false;
 	};
 	static constexpr const char *INGEST_ROW_COLUMN = "__acl_ingest_row";
 	static int IngestGetSchema(struct ArrowArrayStream *stream, struct ArrowSchema *out) {
@@ -1586,17 +1639,71 @@ public:
 		}
 		return 0;
 	}
+	//! The next batch, from the pump when there is one (spec 174): the wait is asked every 200 ms whether the call
+	//! was cancelled, the session ended (operator kill, expiry) or the stream sat idle past its limit
+	static arrow::Result<flight::FlightStreamChunk> IngestNextChunk(IngestStreamState &ingest) {
+		if (!ingest.pump) {
+			return ingest.reader->Next();
+		}
+		auto &pump = *ingest.pump;
+		std::unique_lock<std::mutex> guard(pump.lock);
+		pump.ready = false;
+		pump.wanted = true;
+		pump.changed.notify_all();
+		auto since = std::chrono::steady_clock::now();
+		while (!pump.ready) {
+			pump.changed.wait_for(guard, std::chrono::milliseconds(200));
+			if (pump.ready) {
+				break;
+			}
+			if (ingest.context && ingest.context->is_cancelled()) {
+				return arrow::Status::Cancelled("acl: the client cancelled the ingest"); // named by the caller
+			}
+			if (ingest.store && !ingest.store->SessionAlive(ingest.handle)) {
+				return IngestSessionEnded(ingest);
+			}
+			// in seconds: a limit meant as "forever" (INT64_MAX) must not overflow a nanosecond duration
+			auto waited = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - since);
+			if (ingest.idle_seconds > 0 && waited.count() >= ingest.idle_seconds) {
+				ingest.idle = true;
+				ingest.error = "acl: the ingest stream sent nothing for " + std::to_string(ingest.idle_seconds) +
+				               " s (acl_flight_ingest_idle)";
+				return arrow::Status::Cancelled(ingest.error);
+			}
+		}
+		auto chunk = std::move(pump.chunk);
+		pump.chunk = arrow::Status::UnknownError("acl: no batch read");
+		// a batch is the session's activity (its idle clock) - and a session killed while the client keeps sending
+		// ends the load here, at the next batch, as it would a silent one
+		if (chunk.ok() && chunk->data && ingest.store && !ingest.store->SessionTouch(ingest.handle)) {
+			return IngestSessionEnded(ingest);
+		}
+		return chunk;
+	}
+	static arrow::Status IngestSessionEnded(IngestStreamState &ingest) {
+		ingest.session_ended = true;
+		ingest.error = "acl: the session ended during the ingest";
+		return arrow::Status::Cancelled(ingest.error);
+	}
 	static int IngestGetNext(struct ArrowArrayStream *stream, struct ArrowArray *out) {
 		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
 		// a client that cancelled the call is heard here, between batches, rather than as whatever
 		// the reader says once gRPC tears the call down (spec 070): the scan fails, the INSERT with
 		// it, the load rolls back - one batch, one outcome (spec 049)
+		if (!ingest.error.empty()) {
+			// spec 174: the load is over - every scan thread asks once more, and none may wait again (nor write over
+			// the first reason: a cap, a reader's error, the limit, the kill, the client's cancel)
+			return EINVAL;
+		}
 		if (ingest.context && ingest.context->is_cancelled()) {
 			ingest.error = "acl: the client cancelled the ingest";
 			ingest.cancelled = true;
 			return EINVAL;
 		}
-		auto chunk = ingest.reader->Next();
+		auto chunk = IngestNextChunk(ingest);
+		if (ingest.idle || ingest.session_ended) {
+			return EINVAL;
+		}
 		if (!chunk.ok()) {
 			// a client that vanished mid-stream may surface as the reader's error before the call
 			// reads as cancelled: the same outcome, named the same way
@@ -1662,6 +1769,14 @@ public:
 	static const char *IngestLastError(struct ArrowArrayStream *stream) {
 		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
 		return ingest.error.empty() ? nullptr : ingest.error.c_str();
+	}
+	//! spec 174: a load the door ended - the door event, and the status the client reads (never CANCELLED: a driver
+	//! takes that for its own cancel): the limit is a timeout, a killed session unavailable
+	arrow::Status IngestEndedStatus(const IngestStreamState &ingest, const string &handle) {
+		state->store->AuditDoor("flight", ingest.idle ? "ingest_idle" : "ingest_session_ended", false, "unavailable",
+		                        ingest.error, handle);
+		return flight::MakeFlightError(
+		    ingest.idle ? flight::FlightStatusCode::TimedOut : flight::FlightStatusCode::Unavailable, ingest.error);
 	}
 	static void IngestRelease(struct ArrowArrayStream *stream) {
 		stream->release = nullptr; // owned by the DoPut frame
@@ -1812,6 +1927,9 @@ public:
 			ingest.cap = state->store->MaxIngestRows();
 			ingest.context = &context; // spec 070: a cancelled call is heard between batches
 			ingest.number_rows = by_key == ByKey::MERGE;
+			ingest.store = state->store.get();
+			ingest.handle = handle;
+			ingest.idle_seconds = state->store->FlightIngestIdleSeconds();
 			ArrowArrayStream stream;
 			stream.get_schema = IngestGetSchema;
 			stream.get_next = IngestGetNext;
@@ -1894,6 +2012,9 @@ public:
 				return arrow::Status::Invalid(
 				    "acl: ingest inside an open transaction is not supported - commit or roll back first");
 			}
+			// spec 174: from here the stream is read on a thread of its own - started before the BEGIN, so a thread
+			// that cannot start leaves no transaction behind
+			ingest.pump = make_uniq<IngestPump>(reader);
 			// the note the Prepare left (spec 074 / 107): the BEGIN below is a parse nobody decided, which
 			// ends what the connection kept - so it is taken first and given back to the execution
 			ProfileNote note;
@@ -1914,6 +2035,11 @@ public:
 				return status;
 			};
 			auto result = stmt->Execute(values);
+			if (ingest.idle || ingest.session_ended) {
+				// spec 174: the load waited for a batch that never came, or the session went under it - rolled back,
+				// the session free once this frame lets go of its lock; the read ends when the client acts
+				return fail(IngestEndedStatus(ingest, handle), ingest.error, "unavailable");
+			}
 			if (ingest.cancelled) {
 				// the client stopped sending (spec 070): the scan refused the next batch and the INSERT
 				// failed with it - the load rolls back, the door says which side stopped, and the ingest
@@ -1942,6 +2068,9 @@ public:
 					}
 					rest.release(&rest);
 				}
+				if (ingest.idle || ingest.session_ended) {
+					return fail(IngestEndedStatus(ingest, handle), ingest.error, "unavailable");
+				}
 				if (ingest.cancelled) {
 					state->store->AuditDoor("flight", "ingest_cancelled", false, "unavailable", ingest.error, handle);
 					return fail(arrow::Status::Cancelled(ingest.error), ingest.error, "unavailable");
@@ -1956,6 +2085,13 @@ public:
 				auto mismatch = "acl: the target took " + std::to_string(total) + " rows of the " +
 				                std::to_string(ingest.rows) + " the stream delivered";
 				return fail(arrow::Status::Invalid(mismatch), mismatch);
+			}
+			// spec 174: a session killed after the stream's last batch (or during the statement's own work after it)
+			// must not have the load committed under it - the last look before the write stands
+			if (!state->store->SessionAlive(handle)) {
+				ingest.session_ended = true;
+				ingest.error = "acl: the session ended during the ingest";
+				return fail(IngestEndedStatus(ingest, handle), ingest.error, "unavailable");
 			}
 			auto committed = con.Query("COMMIT");
 			if (committed->HasError()) {

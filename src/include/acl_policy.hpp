@@ -1444,6 +1444,8 @@ struct PolicyStore {
 	//! spec 085: the row cap of a session's statements - its groups' `max_result_rows`, else the node's
 	int64_t MaxResultRowsFor(const string &handle);
 	int64_t FlightStreamIdleSeconds();
+	//! spec 174: seconds a Flight ingest may wait for its next batch before the load rolls back (0 = no limit)
+	int64_t FlightIngestIdleSeconds();
 	int64_t MaxSessions();
 
 	//! Is an ACL door serving on this instance (spec 043)? Set by `acl_quack_serve`, cleared when the

@@ -940,6 +940,14 @@ rows: `ResolveDmlTarget` (Flight), the CREATE's home (`ResolveDdlTarget(…, "in
 (`RequireIngestOnMain`), the quack drain's INSERT target (`in_insert_source`); in the platform caps STRUCT. Tests
 `test_acl_ingest_prefix.cpp`, `integration/acl_quack_ingest.test`, e2e run.sh.
 
+**Spec 174 — a Flight ingest whose client goes silent lets its session go**: Arrow's `FlightMessageReader::Next()` cannot
+be interrupted, so from the statement's execution on the stream is read on a thread of its own (`IngestPump`) and the scan
+waits for each batch in 200 ms steps (`IngestNextChunk`: cancelled call, `SessionAlive`, the clock; a batch is
+`SessionTouch`): past `acl_flight_ingest_idle` (GLOBAL, 300 s; 0 = none) or once the session is killed the load rolls back
+(`door` events `ingest_idle` / `ingest_session_ended`), every other scan thread answered at once; the pump lives in the
+ingest's state, declared before the session's lock, so the session is free before the read's thread is joined (that waits
+for the client). e2e `stream.sh` (`stream_client.py stall`).
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`

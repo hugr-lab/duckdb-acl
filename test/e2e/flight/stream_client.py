@@ -9,6 +9,8 @@ client that pulls a result the way a driver does, and stops the way a client sto
   stream_client.py <uri> killed <sql>      read one batch, pause (stream.sh kills the session), then
                                            drain to the error that ends the stream
   stream_client.py <uri> ingest <table>    stream batches into <table> forever - stream.sh kills it
+  stream_client.py <uri> stall <table>     spec 174: one batch into <table>, then silence; the session's next
+                                           statement runs beside it (ACL_STALL_PROBE=0: only say "stalled")
 
 Every mode prints one dict on the last line; a refusal prints {"error": "..."}.
 """
@@ -165,7 +167,9 @@ def main():
             writer, reader = client.do_put(descriptor, schema, options)
             base = 5000000
             sent = 0
-            while True:  # until stream.sh kills this process
+            if os.environ.get("ACL_INGEST_BASE"):
+                base = int(os.environ["ACL_INGEST_BASE"])
+            while True:  # until stream.sh kills this process (or the door ends the load: the write raises)
                 batch = pa.table({"id": list(range(base + sent, base + sent + 10000)),
                                   "tenant": ["acme"] * 10000, "amount": [1] * 10000,
                                   "customer_id": [0] * 10000}, schema=schema)
@@ -173,7 +177,36 @@ def main():
                 sent += 10000
                 sys.stdout.write(f"sent {sent}\n")
                 sys.stdout.flush()
-                time.sleep(0.2)
+                time.sleep(float(os.environ.get("ACL_INGEST_PAUSE", "0.2")))
+        elif mode == "stall":
+            # spec 174: a load whose client stops sending - one batch, then nothing, the call left open. The
+            # session (warmed: the cookie comes with the first answer) must still run its next statement
+            import threading
+            open_stream("SELECT 1 AS warm").read_all()
+            payload = field(1, varint((1 << 3) | 0) + varint(2) + varint((2 << 3) | 0) + varint(2)) + text(2, arg)
+            descriptor = flight.FlightDescriptor.for_command(command("CommandStatementIngest", payload))
+            schema = pa.schema([("id", pa.int64()), ("tenant", pa.string()), ("amount", pa.int64()),
+                                ("customer_id", pa.int64())])
+            silent = threading.Event()
+
+            def load():
+                writer, _ = client.do_put(descriptor, schema, options)
+                writer.write_table(pa.table({"id": [6000000, 6000001], "tenant": ["acme"] * 2, "amount": [1] * 2,
+                                             "customer_id": [0] * 2}, schema=schema))
+                silent.set()
+                time.sleep(3600)  # never another batch, never done_writing: the process exits under it
+
+            threading.Thread(target=load, daemon=True).start()
+            silent.wait(10)
+            time.sleep(0.5)  # the batch is the door's before the probe asks
+            if os.environ.get("ACL_STALL_PROBE") == "0":
+                sys.stdout.write("stalled\n")
+                sys.stdout.flush()
+                time.sleep(float(os.environ.get("ACL_STALL_HOLD", "30")))
+                return
+            started = time.monotonic()
+            probe = open_stream(f"SELECT count(*) AS n FROM {arg} WHERE id >= 6000000").read_all().to_pydict()
+            print({"n": probe.get("n"), "waited_ms": int((time.monotonic() - started) * 1000)})
         else:
             raise SystemExit(f"unknown mode {mode}")
     except Exception as ex:  # noqa: BLE001 - the assertion is about the text

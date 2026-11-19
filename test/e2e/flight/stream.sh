@@ -260,4 +260,66 @@ verdict="$(server_says "SELECT verdict, reason_code FROM acl_audit_events() WHER
 [ "$verdict" = "denied,unavailable" ] || fail "the cancelled load's ingest event: $verdict"
 echo "  pass a client that dies mid-load leaves nothing, and the door says which side stopped"
 
+# --- spec 174: a load whose client stops sending lets its session go --------------------------------
+# one batch, then silence with the call open: without a limit the load held the session's lock and its
+# transaction until the client acted - the session's next statement waited behind it
+echo "SET GLOBAL acl_flight_ingest_idle = 2;" >&3
+got="$(client stall orders)"
+echo "$got" | grep -q "'n': \[0\]" || fail "the stalled load's rows were visible, or the probe failed: $got"
+waited="$(echo "$got" | sed -n "s/.*'waited_ms': \([0-9]*\).*/\1/p")"
+[ -n "$waited" ] && [ "$waited" -lt 8000 ] || fail "the session waited for the stalled load (${waited} ms): $got"
+for _ in $(seq 1 40); do
+	idled="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'door' AND detail = 'ingest_idle'")"
+	[ "${idled:-0}" -ge 1 ] && break
+	sleep 0.25
+done
+[ "${idled:-0}" = "1" ] || fail "the stalled load was not named ingest_idle once: $idled"
+stored="$(server_says "SELECT count(*) FROM memory.main.orders WHERE id >= 6000000")"
+[ "$stored" = "0" ] || fail "the stalled load left $stored rows"
+echo "  pass a load whose client goes silent rolls back at acl_flight_ingest_idle (${waited} ms), the session runs on"
+
+# and with no limit, the operator's KILL SESSION ends it (spec 044's kill, heard by the wait)
+echo "SET GLOBAL acl_flight_ingest_idle = 0;" >&3
+ACL_STALL_PROBE=0 ACL_STALL_HOLD=30 python3 "$HERE/stream_client.py" "$URI" stall orders >"$TMP/stall.out" 2>&1 &
+STALL_PID=$!
+for _ in $(seq 1 80); do
+	grep -q "^stalled" "$TMP/stall.out" 2>/dev/null && break
+	sleep 0.1
+done
+grep -q "^stalled" "$TMP/stall.out" || { cat "$TMP/stall.out" >&2; fail "the stalled load never started"; }
+killed="$(server_says "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\s*\"([^\"]+)\"', 1)) AS id)) WHERE k")"
+[ "${killed:-0}" -ge 1 ] || fail "no session was killed: $killed"
+for _ in $(seq 1 40); do
+	ended="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'door' AND detail = 'ingest_session_ended'")"
+	[ "${ended:-0}" -ge 1 ] && break
+	sleep 0.25
+done
+kill "$STALL_PID" 2>/dev/null || true
+wait "$STALL_PID" 2>/dev/null || true
+[ "${ended:-0}" -ge 1 ] || fail "a killed session did not end its stalled load: $ended"
+stored="$(server_says "SELECT count(*) FROM memory.main.orders WHERE id >= 6000000")"
+[ "$stored" = "0" ] || fail "the killed load left $stored rows"
+# a client that keeps sending (batches far closer than the wait's 200 ms step) is ended at its next batch too
+ACL_INGEST_PAUSE=0.02 ACL_INGEST_BASE=7000000 python3 "$HERE/stream_client.py" "$URI" ingest orders >"$TMP/busy.out" 2>&1 &
+BUSY_PID=$!
+for _ in $(seq 1 50); do
+	grep -q "^sent 50000" "$TMP/busy.out" 2>/dev/null && break
+	sleep 0.1
+done
+grep -q "^sent" "$TMP/busy.out" || { cat "$TMP/busy.out" >&2; fail "the busy load never started sending"; }
+killed="$(server_says "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\s*\"([^\"]+)\"', 1)) AS id)) WHERE k")"
+[ "${killed:-0}" -ge 1 ] || fail "no session was killed while the load was sending: $killed"
+for _ in $(seq 1 40); do
+	ended="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'door' AND detail = 'ingest_session_ended'")"
+	[ "${ended:-0}" -ge 2 ] && break
+	sleep 0.25
+done
+kill "$BUSY_PID" 2>/dev/null || true
+wait "$BUSY_PID" 2>/dev/null || true
+[ "${ended:-0}" -ge 2 ] || fail "a killed session did not end the load that kept sending: $ended"
+stored="$(server_says "SELECT count(*) FROM memory.main.orders WHERE id >= 7000000")"
+[ "$stored" = "0" ] || fail "the load killed while sending left $stored rows"
+echo "SET GLOBAL acl_flight_ingest_idle = 300;" >&3
+echo "  pass a killed session ends the load it was waiting on, and one that keeps sending"
+
 echo "PASS: the door streams, and hears a client that stops"
