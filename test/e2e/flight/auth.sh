@@ -137,6 +137,19 @@ echo "$got" | grep -q '"new_session":true' || fail "the load report does not adm
 echo "$got" | grep -q '"by_door":{"flight":' || fail "the load report does not count sessions per door: $got"
 echo "$got" | grep -q '"observe":"token"' || fail "the load report does not say the token mode is in force: $got"
 case "$got" in *alice*|*analyst*|*watcher*) fail "the load report names a principal: $got";; esac
+# spec 175: the Handshake opens no session, so a reader that polls it never moves the node's idle_since - a statement's
+# per-call session does (its end is a session's end): hugr-platform's console reads the report this way (its spec 012)
+idle_since() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sessions"]["idle_since"])'; }
+first="$(idle_since "$got")"
+case "$first" in ''|None|*[!0-9]*) fail "a node with no session reports no idle_since: $got";; esac
+sleep 1.2
+again="$(idle_since "$(ask "$URI" node-load "$ANALYST_JWT" --tls-roots "$TMP/cert.pem")")"
+[ "$again" = "$first" ] || fail "a Handshake read of the load report moved idle_since ($first -> $again)"
+read_by_sql="$(ask "$URI" bearer "$ANALYST_JWT" "SELECT sessions_live AS n FROM platform.node_load" --tls-roots "$TMP/cert.pem")"
+case "$read_by_sql" in *Error*|*error*) fail "the watcher could not read platform.node_load: $read_by_sql";; esac
+after="$(idle_since "$(ask "$URI" node-load "$ANALYST_JWT" --tls-roots "$TMP/cert.pem")")"
+case "$after" in ''|None|*[!0-9]*) fail "idle again after the statement's session: $after";; esac
+[ "$after" -gt "$first" ] || fail "a statement's per-call session did not move idle_since ($first -> $after)"
 echo "SET GLOBAL acl_metrics_endpoint = false;" >&3
 # the sections below keep their principals as they were: the watcher mapping goes again
 {

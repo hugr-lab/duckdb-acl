@@ -43,8 +43,8 @@ pod with every session on it). Nor could it tell an idle node from a busy one to
   moment: a sweep is no activity, the review) and the `last_used` of a record not yet swept (`SessionTally::last_used`),
   in unix seconds. An autoscaler stops a node idle past its group's `idle`. Known: a reader's own cookie-less session is
   left out of `live` but its end is a session's end - an observer that polls by SQL (the console's `platform.node_load`
-  over Flight) keeps moving `idle_since`; the console should read the report through the Flight Handshake / the
-  well-known route, which open no session (a hugr-platform follow-up).
+  over Flight) keeps moving `idle_since`; the console reads the report through the Flight Handshake, which opens no
+  session (hugr-platform spec 012; the SQL view only where the Handshake does not answer it).
 - `platform.node_load` gains `sessions_idle_since` (TIMESTAMP), `memory_used`, `memory_working`, `memory_limit`,
   `temp_used`, `temp_limit`, `memory_critical`.
 
@@ -61,7 +61,8 @@ reads `null`, never critical;
 the memory fields; a persistent table read leaves `used` well above `working`; an in-memory table larger than a
 100 MB limit spills (`temp_used` > 0, `temp_limit` = `max_temp_directory_size`); `acl_node_admit_memory` 0.01 -
 critical, no new session or stream; 0 - admitted; the default 0.95 - critical by RAM (the in-memory table fills it)
-with the spill far below. `platform_views.test`: the view's new columns.
+with the spill far below. `platform_views.test`: the view's new columns. e2e `test/e2e/flight/auth.sh`: a Handshake
+`node-load` read leaves `idle_since` where it was, a statement's per-call session moves it.
 
 ## Alternatives considered
 
