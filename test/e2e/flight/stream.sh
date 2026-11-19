@@ -299,7 +299,27 @@ wait "$STALL_PID" 2>/dev/null || true
 [ "${ended:-0}" -ge 1 ] || fail "a killed session did not end its stalled load: $ended"
 stored="$(server_says "SELECT count(*) FROM memory.main.orders WHERE id >= 6000000")"
 [ "$stored" = "0" ] || fail "the killed load left $stored rows"
+# a client that keeps sending (batches far closer than the wait's 200 ms step) is ended at its next batch too
+ACL_INGEST_PAUSE=0.02 ACL_INGEST_BASE=7000000 python3 "$HERE/stream_client.py" "$URI" ingest orders >"$TMP/busy.out" 2>&1 &
+BUSY_PID=$!
+for _ in $(seq 1 50); do
+	grep -q "^sent 50000" "$TMP/busy.out" 2>/dev/null && break
+	sleep 0.1
+done
+grep -q "^sent" "$TMP/busy.out" || { cat "$TMP/busy.out" >&2; fail "the busy load never started sending"; }
+killed="$(server_says "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\s*\"([^\"]+)\"', 1)) AS id)) WHERE k")"
+[ "${killed:-0}" -ge 1 ] || fail "no session was killed while the load was sending: $killed"
+for _ in $(seq 1 40); do
+	ended="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'door' AND detail = 'ingest_session_ended'")"
+	[ "${ended:-0}" -ge 2 ] && break
+	sleep 0.25
+done
+kill "$BUSY_PID" 2>/dev/null || true
+wait "$BUSY_PID" 2>/dev/null || true
+[ "${ended:-0}" -ge 2 ] || fail "a killed session did not end the load that kept sending: $ended"
+stored="$(server_says "SELECT count(*) FROM memory.main.orders WHERE id >= 7000000")"
+[ "$stored" = "0" ] || fail "the load killed while sending left $stored rows"
 echo "SET GLOBAL acl_flight_ingest_idle = 300;" >&3
-echo "  pass a killed session ends the load it was waiting on"
+echo "  pass a killed session ends the load it was waiting on, and one that keeps sending"
 
 echo "PASS: the door streams, and hears a client that stops"

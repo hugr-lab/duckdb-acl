@@ -167,7 +167,9 @@ def main():
             writer, reader = client.do_put(descriptor, schema, options)
             base = 5000000
             sent = 0
-            while True:  # until stream.sh kills this process
+            if os.environ.get("ACL_INGEST_BASE"):
+                base = int(os.environ["ACL_INGEST_BASE"])
+            while True:  # until stream.sh kills this process (or the door ends the load: the write raises)
                 batch = pa.table({"id": list(range(base + sent, base + sent + 10000)),
                                   "tenant": ["acme"] * 10000, "amount": [1] * 10000,
                                   "customer_id": [0] * 10000}, schema=schema)
@@ -175,7 +177,7 @@ def main():
                 sent += 10000
                 sys.stdout.write(f"sent {sent}\n")
                 sys.stdout.flush()
-                time.sleep(0.2)
+                time.sleep(float(os.environ.get("ACL_INGEST_PAUSE", "0.2")))
         elif mode == "stall":
             # spec 174: a load whose client stops sending - one batch, then nothing, the call left open. The
             # session (warmed: the cookie comes with the first answer) must still run its next statement

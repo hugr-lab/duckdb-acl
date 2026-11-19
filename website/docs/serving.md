@@ -206,8 +206,10 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   its transaction - for as long as it stays silent: past `acl_flight_ingest_idle` seconds with no batch
   (default 300; `0` = no limit) the load rolls back as `acl: the ingest stream sent nothing for N s`
   (a `door` event `ingest_idle`) and the session's next statement runs; an operator's `KILL SESSION`
-  ends such a load at once (`ingest_session_ended`). Each batch is the session's activity, so a long
-  load never idles its session out.
+  ends such a load at once, and one that keeps sending at its next batch (`ingest_session_ended`). The
+  client reads `TIMED_OUT` / `UNAVAILABLE` when it next acts. Each batch is the session's activity, so a long
+  load never idles its session out - and a silent one with no limit still ends with its session
+  (`acl_session_idle_timeout`).
 - **Sessions are cookie-identified connections** (spec 050). The first call of a connection is
   handed a session cookie (Arrow's `arrow_flight_session_id`, minted by our CSPRNG); a client that
   returns it has a durable session backed by a duckdb `Connection` the door holds for the session's

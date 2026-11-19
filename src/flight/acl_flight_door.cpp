@@ -1660,12 +1660,11 @@ public:
 				return arrow::Status::Cancelled("acl: the client cancelled the ingest"); // named by the caller
 			}
 			if (ingest.store && !ingest.store->SessionAlive(ingest.handle)) {
-				ingest.session_ended = true;
-				ingest.error = "acl: the session ended during the ingest";
-				return arrow::Status::Cancelled(ingest.error);
+				return IngestSessionEnded(ingest);
 			}
-			auto waited = std::chrono::steady_clock::now() - since;
-			if (ingest.idle_seconds > 0 && waited >= std::chrono::seconds(ingest.idle_seconds)) {
+			// in seconds: a limit meant as "forever" (INT64_MAX) must not overflow a nanosecond duration
+			auto waited = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - since);
+			if (ingest.idle_seconds > 0 && waited.count() >= ingest.idle_seconds) {
 				ingest.idle = true;
 				ingest.error = "acl: the ingest stream sent nothing for " + std::to_string(ingest.idle_seconds) +
 				               " s (acl_flight_ingest_idle)";
@@ -1674,10 +1673,17 @@ public:
 		}
 		auto chunk = std::move(pump.chunk);
 		pump.chunk = arrow::Status::UnknownError("acl: no batch read");
-		if (chunk.ok() && chunk->data && ingest.store) {
-			ingest.store->SessionTouch(ingest.handle); // a batch is the session's activity (its idle clock)
+		// a batch is the session's activity (its idle clock) - and a session killed while the client keeps sending
+		// ends the load here, at the next batch, as it would a silent one
+		if (chunk.ok() && chunk->data && ingest.store && !ingest.store->SessionTouch(ingest.handle)) {
+			return IngestSessionEnded(ingest);
 		}
 		return chunk;
+	}
+	static arrow::Status IngestSessionEnded(IngestStreamState &ingest) {
+		ingest.session_ended = true;
+		ingest.error = "acl: the session ended during the ingest";
+		return arrow::Status::Cancelled(ingest.error);
 	}
 	static int IngestGetNext(struct ArrowArrayStream *stream, struct ArrowArray *out) {
 		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
@@ -1689,8 +1695,9 @@ public:
 			ingest.cancelled = true;
 			return EINVAL;
 		}
-		if (ingest.idle || ingest.session_ended) {
-			// spec 174: the load is over - every scan thread asks once more, and none may wait again
+		if (!ingest.error.empty()) {
+			// spec 174: the load is over - every scan thread asks once more, and none may wait again (nor write over
+			// the first reason: a cap, a reader's error, the limit, the kill)
 			return EINVAL;
 		}
 		auto chunk = IngestNextChunk(ingest);
@@ -1762,6 +1769,14 @@ public:
 	static const char *IngestLastError(struct ArrowArrayStream *stream) {
 		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
 		return ingest.error.empty() ? nullptr : ingest.error.c_str();
+	}
+	//! spec 174: a load the door ended - the door event, and the status the client reads (never CANCELLED: a driver
+	//! takes that for its own cancel): the limit is a timeout, a killed session unavailable
+	arrow::Status IngestEndedStatus(const IngestStreamState &ingest, const string &handle) {
+		state->store->AuditDoor("flight", ingest.idle ? "ingest_idle" : "ingest_session_ended", false, "unavailable",
+		                        ingest.error, handle);
+		return flight::MakeFlightError(
+		    ingest.idle ? flight::FlightStatusCode::TimedOut : flight::FlightStatusCode::Unavailable, ingest.error);
 	}
 	static void IngestRelease(struct ArrowArrayStream *stream) {
 		stream->release = nullptr; // owned by the DoPut frame
@@ -2023,9 +2038,7 @@ public:
 			if (ingest.idle || ingest.session_ended) {
 				// spec 174: the load waited for a batch that never came, or the session went under it - rolled back,
 				// the session free once this frame lets go of its lock; the read ends when the client acts
-				auto event = ingest.idle ? "ingest_idle" : "ingest_session_ended";
-				state->store->AuditDoor("flight", event, false, "unavailable", ingest.error, handle);
-				return fail(arrow::Status::Cancelled(ingest.error), ingest.error, "unavailable");
+				return fail(IngestEndedStatus(ingest, handle), ingest.error, "unavailable");
 			}
 			if (ingest.cancelled) {
 				// the client stopped sending (spec 070): the scan refused the next batch and the INSERT
@@ -2056,9 +2069,7 @@ public:
 					rest.release(&rest);
 				}
 				if (ingest.idle || ingest.session_ended) {
-					auto event = ingest.idle ? "ingest_idle" : "ingest_session_ended";
-					state->store->AuditDoor("flight", event, false, "unavailable", ingest.error, handle);
-					return fail(arrow::Status::Cancelled(ingest.error), ingest.error, "unavailable");
+					return fail(IngestEndedStatus(ingest, handle), ingest.error, "unavailable");
 				}
 				if (ingest.cancelled) {
 					state->store->AuditDoor("flight", "ingest_cancelled", false, "unavailable", ingest.error, handle);

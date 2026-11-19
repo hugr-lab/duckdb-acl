@@ -39,18 +39,30 @@ ended from the next statement's thread between pulls.
   waited. Each batch received is the session's activity (`SessionTouch`): a load longer than
   `acl_session_idle_timeout` never idles its session out under it.
 - **A wait that ends without a batch fails the load**: past `acl_flight_ingest_idle` seconds
-  (`acl: the ingest stream sent nothing for N s (acl_flight_ingest_idle)`) or when the session ended
-  (`acl: the session ended during the ingest`). The scan fails, the handler rolls back, audits a `door` event
+  (`acl: the ingest stream sent nothing for N s (acl_flight_ingest_idle)`, the clock in whole seconds - a limit of
+  INT64_MAX means forever) or when the session ended (`acl: the session ended during the ingest`). A session killed
+  while the client keeps sending ends the load at its next batch (`SessionTouch` false - the review: the 200 ms check
+  never ran for batches closer than that). The scan fails, the handler rolls back, audits a `door` event
   `ingest_idle` / `ingest_session_ended` and an `ingest` event `denied` / `unavailable` (spec 070's taxonomy for a
-  load its client was not there to finish), and returns `Cancelled`. Every other scan thread that asks once more is
-  answered at once (duckdb reads the stream from many threads: each waited the limit again - 16 threads, 32 s - the
-  e2e's first run).
+  load its client was not there to finish), and returns `TIMED_OUT` / `UNAVAILABLE` - never `CANCELLED`, which a
+  driver reads as its own cancel. Once a load has a reason (any: the cap, a reader's error, the limit, the kill)
+  every other scan thread that asks again is answered at once and the first reason stands (duckdb's scan threads
+  each ask under its `main_mutex`: each waited the limit again - 16 threads, 32 s - the e2e's first run; and a later
+  wait wrote "idle" over a cap - the review).
 - **The session goes before the read does**: the pump lives in the ingest's state, declared before the session's
   lock, so the lock is released (the session free) before the pump's thread is joined; that join waits for `Next()`
   to return - when the client sends, cancels or goes away. A silent client keeps its call and its handler thread,
   never its session.
 - **`acl_flight_ingest_idle`** (GLOBAL, BIGINT, 300): long enough for a producer that computes between batches
-  (a Spark stage); `0` = no limit, the kill still ends the wait.
+  (a Spark stage); `0` = no limit of its own - the kill still ends the wait, and so does the session's own end
+  (`acl_session_idle_timeout`: only a batch is activity; in memory mode a token's `exp` too). Without a policy
+  catalog (memory mode) the node reads 300, as `acl_flight_stream_idle` reads its default there.
+
+Known and left as they were (each predates this spec - the wait was unbounded before): the client hears the outcome
+only when it next acts (the handler joins the read); a cookie-less call's per-call session stays counted until then;
+`acl_flight_stop`'s `Shutdown()` has no deadline, so a silent client delays a door's stop; the ended load's door and
+ingest events carry no principal when the kill removed the session record first; while a scan thread waits, the
+statement's other pipeline tasks wait on the scan's lock - for at most the limit now.
 
 ## Enforcement & security
 
@@ -65,7 +77,9 @@ No new SQL surface, no parameters.
 - e2e `test/e2e/flight/stream.sh` (`stream_client.py stall`): one batch, then silence with the call open -
   - with `acl_flight_ingest_idle = 2` the session's next statement runs within seconds (it waited for the
     client before), the load's rows are not there, one `ingest_idle` event;
-  - with `0` the operator's `acl_session_kill` ends the waiting load (`ingest_session_ended`), nothing stored.
+  - with `0` the operator's `acl_session_kill` ends the waiting load (`ingest_session_ended`), nothing stored;
+  - a load that keeps sending (a batch every 20 ms) is ended by the kill at its next batch, nothing stored (fails
+    without the review's fix: the load ran on).
 - The existing ingest cases (spec 049 / 051 / 070 / 173: run.sh, the client that dies mid-load) pass unchanged.
 
 ## Alternatives considered
