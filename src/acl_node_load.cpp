@@ -224,7 +224,9 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 	// with nothing running; only the rest is pressure (an in-memory table's blocks evict to the spill, counted there)
 	idx_t cache = 0;
 	for (auto &tag : buffers.GetMemoryUsageInfo()) {
-		if (tag.tag == MemoryTag::BASE_TABLE || tag.tag == MemoryTag::EXTERNAL_FILE_CACHE) {
+		if (tag.tag == MemoryTag::BASE_TABLE || tag.tag == MemoryTag::EXTERNAL_FILE_CACHE ||
+		    tag.tag ==
+		        MemoryTag::OBJECT_CACHE) { // the object cache: parquet metadata, a lake's snapshots - evicted first
 			cache += tag.size;
 		}
 	}
@@ -232,12 +234,19 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 	auto memory_limit = buffers.GetMaxMemory();
 	auto temp_used = buffers.GetUsedSwap();
 	auto temp_max = buffers.GetMaxSwap();
-	bool temp_limited = temp_max.IsValid() && temp_max.GetIndex() > 0;
+	// duckdb keeps "no limit" as the largest index less one (memory_limit / max_temp_directory_size = -1, a disk it
+	// could not size): no limit, so no share to take - null in the report, never a number a consumer reads as a size
+	auto bounded = [](idx_t limit) {
+		return limit > 0 && limit < NumericLimits<idx_t>::Maximum() - 1;
+	};
+	bool memory_limited = bounded(memory_limit);
+	bool temp_limited = temp_max.IsValid() && bounded(temp_max.GetIndex());
 	auto admit_memory = DoubleSettingOf(db, "acl_node_admit_memory", 0.95);
 	auto past = [&](idx_t used, idx_t limit) {
 		return admit_memory > 0 && limit > 0 && double(used) >= admit_memory * double(limit);
 	};
-	bool memory_critical = past(memory_working, memory_limit) || (temp_limited && past(temp_used, temp_max.GetIndex()));
+	bool memory_critical = (memory_limited && past(memory_working, memory_limit)) ||
+	                       (temp_limited && past(temp_used, temp_max.GetIndex()));
 	// spec 175: since when the node has had no live session (null while it has one) - what an autoscaler stops by
 	string idle_since = "null";
 	if (live == 0) {
@@ -307,7 +316,8 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 	       ",\"sessions\":{\"live\":" + std::to_string(live) + ",\"max\":" + std::to_string(max_sessions) +
 	       ",\"idle_since\":" + idle_since + ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups + "}}" +
 	       ",\"memory\":{\"used\":" + std::to_string(memory_used) + ",\"working\":" + std::to_string(memory_working) +
-	       ",\"limit\":" + std::to_string(memory_limit) + ",\"temp_used\":" + std::to_string(temp_used) +
+	       ",\"limit\":" + (memory_limited ? std::to_string(memory_limit) : string("null")) +
+	       ",\"temp_used\":" + std::to_string(temp_used) +
 	       ",\"temp_limit\":" + (temp_limited ? std::to_string(temp_max.GetIndex()) : string("null")) +
 	       ",\"critical\":" + (memory_critical ? "true" : "false") + "},\"quack\":" + quack +
 	       ",\"streams\":" + streams + ",\"certificates\":[" + certificates + "]" +

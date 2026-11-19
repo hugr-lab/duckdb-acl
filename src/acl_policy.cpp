@@ -517,9 +517,12 @@ bool PolicyStore::SessionDeclaredViewAs(const string &id) {
 //! Caller holds the lock; the event itself takes nothing of the store's.
 void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
 	session_notices.QueueClose(session.id, how); // spec 078: delivered once the lock is released
-	// spec 175: every removal passes here - the end of a session is the node's last activity until another
-	if (now > sessions_quiet_since.load()) {
-		sessions_quiet_since.store(now);
+	// spec 175: every removal passes here - the end of a session is the node's last activity until another. A record
+	// swept as idle or expired ended when it was last used, not when the sweep found it (a sweep is no activity)
+	bool lapsed = how && (string(how) == "idle" || string(how) == "expired");
+	auto ended = lapsed ? MinValue<int64_t>(now, session.last_used) : now;
+	if (ended > sessions_quiet_since.load()) {
+		sessions_quiet_since.store(ended);
 	}
 	if (!session.view_as.empty()) {
 		// every removal passes here, before its binding goes: the ids it was bound to are never seated again
