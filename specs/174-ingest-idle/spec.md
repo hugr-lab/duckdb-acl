@@ -46,7 +46,9 @@ ended from the next statement's thread between pulls.
   `ingest_idle` / `ingest_session_ended` and an `ingest` event `denied` / `unavailable` (spec 070's taxonomy for a
   load its client was not there to finish), and returns `TIMED_OUT` / `UNAVAILABLE` - never `CANCELLED`, which a
   driver reads as its own cancel. Once a load has a reason (any: the cap, a reader's error, the limit, the kill)
-  every other scan thread that asks again is answered at once and the first reason stands (duckdb's scan threads
+  every other scan thread that asks again is answered at once and the first reason stands (a cancel included - it no
+  longer writes over a cap), and the session is looked at once more right before the COMMIT (a kill between the last
+  batch and the half-close, or during the statement's own work after it, committed - the re-review) (duckdb's scan threads
   each ask under its `main_mutex`: each waited the limit again - 16 threads, 32 s - the e2e's first run; and a later
   wait wrote "idle" over a cap - the review).
 - **The session goes before the read does**: the pump lives in the ingest's state, declared before the session's
@@ -55,7 +57,8 @@ ended from the next statement's thread between pulls.
   never its session.
 - **`acl_flight_ingest_idle`** (GLOBAL, BIGINT, 300): long enough for a producer that computes between batches
   (a Spark stage); `0` = no limit of its own - the kill still ends the wait, and so does the session's own end
-  (`acl_session_idle_timeout`: only a batch is activity; in memory mode a token's `exp` too). Without a policy
+  (`acl_session_idle_timeout`: only a batch is activity; under `acl_session_token_binding = 'every_use'` - and in
+  memory mode - a token's `exp` too, a per-call session's included). Without a policy
   catalog (memory mode) the node reads 300, as `acl_flight_stream_idle` reads its default there.
 
 Known and left as they were (each predates this spec - the wait was unbounded before): the client hears the outcome

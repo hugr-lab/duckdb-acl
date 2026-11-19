@@ -1690,14 +1690,14 @@ public:
 		// a client that cancelled the call is heard here, between batches, rather than as whatever
 		// the reader says once gRPC tears the call down (spec 070): the scan fails, the INSERT with
 		// it, the load rolls back - one batch, one outcome (spec 049)
+		if (!ingest.error.empty()) {
+			// spec 174: the load is over - every scan thread asks once more, and none may wait again (nor write over
+			// the first reason: a cap, a reader's error, the limit, the kill, the client's cancel)
+			return EINVAL;
+		}
 		if (ingest.context && ingest.context->is_cancelled()) {
 			ingest.error = "acl: the client cancelled the ingest";
 			ingest.cancelled = true;
-			return EINVAL;
-		}
-		if (!ingest.error.empty()) {
-			// spec 174: the load is over - every scan thread asks once more, and none may wait again (nor write over
-			// the first reason: a cap, a reader's error, the limit, the kill)
 			return EINVAL;
 		}
 		auto chunk = IngestNextChunk(ingest);
@@ -2085,6 +2085,13 @@ public:
 				auto mismatch = "acl: the target took " + std::to_string(total) + " rows of the " +
 				                std::to_string(ingest.rows) + " the stream delivered";
 				return fail(arrow::Status::Invalid(mismatch), mismatch);
+			}
+			// spec 174: a session killed after the stream's last batch (or during the statement's own work after it)
+			// must not have the load committed under it - the last look before the write stands
+			if (!state->store->SessionAlive(handle)) {
+				ingest.session_ended = true;
+				ingest.error = "acl: the session ended during the ingest";
+				return fail(IngestEndedStatus(ingest, handle), ingest.error, "unavailable");
 			}
 			auto committed = con.Query("COMMIT");
 			if (committed->HasError()) {
