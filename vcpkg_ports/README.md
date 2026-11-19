@@ -35,6 +35,17 @@ depends on it outright, so it entered the `windows_amd64_mingw` graph and failed
 headers do not; everything else is the registry's port (3.3.2). Upstream still has the bare use
 (v3.5.3); retire the port when a mimalloc guards it, or when the image's mingw-w64 is ≥ 10.
 
+## boost-locale
+
+boost-locale 1.91.0 (the same baseline; thrift depends on it) fails to configure under CMake 4.5 (the
+GitHub macOS and Windows images moved from 4.4.5 to 4.5.0 on 2026-11-18): its `CMakeLists.txt` hands
+`include/boost/locale.hpp` to `source_group(TREE …/include/boost/locale …)`, whose tree does not contain it, and 4.5
+refuses that (`… is not a prefix of file`) where 4.4 let it pass. The new image also changed every package's ABI, so
+the binary cache missed and the port built from source for the first time - `osx_arm64` and `windows_amd64_mingw`
+failed at the configure step of the distribution build. `source-group-cmake45.patch` takes the header out of that
+list before the tree call, as upstream did (boostorg/locale 1d070743d9 / f51b58cd34, 2026-10-25); everything else is
+the registry's port. Retire it with a Boost release that carries those commits (1.92).
+
 ## Overlay triplets (`vcpkg_triplets/`)
 
 `x64-mingw-static`: the registry's community triplet plus `-Wa,-mbig-obj` - grpc 1.76 (the same
