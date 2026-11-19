@@ -202,6 +202,12 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   batches and at the end of the stream (a dead client reads as a clean half-close to gRPC): the load
   fails as `acl: the client cancelled the ingest`, rolls back whole (nothing lands), its ingest event
   reads `denied` / `unavailable`, and a `door` event `ingest_cancelled` says which side stopped.
+  A client that stops sending without ending the call (spec 174) would hold its session - its lock and
+  its transaction - for as long as it stays silent: past `acl_flight_ingest_idle` seconds with no batch
+  (default 300; `0` = no limit) the load rolls back as `acl: the ingest stream sent nothing for N s`
+  (a `door` event `ingest_idle`) and the session's next statement runs; an operator's `KILL SESSION`
+  ends such a load at once (`ingest_session_ended`). Each batch is the session's activity, so a long
+  load never idles its session out.
 - **Sessions are cookie-identified connections** (spec 050). The first call of a connection is
   handed a session cookie (Arrow's `arrow_flight_session_id`, minted by our CSPRNG); a client that
   returns it has a durable session backed by a duckdb `Connection` the door holds for the session's
@@ -612,6 +618,7 @@ report success and change nothing):
 | `acl_session_token_binding` | `connect` | `connect` judges `exp` at establishment only; `every_use` re-judges it on every use. GLOBAL-only (`acl_session_token_binding is global - use SET GLOBAL`); other values refused (`acl_session_token_binding accepts 'connect' or 'every_use', not '<v>'`); entering `connect` with idle at 0 is refused (`acl_session_token_binding='connect' needs a live idle reaper: set acl_session_idle_timeout > 0 first (it is currently 0/disabled)`). Memory mode (no policy catalog) stays at `every_use` |
 | `acl_max_sessions` | 1000 | sessions that may live at once; at the cap a new one is refused; `0` = unlimited |
 | `acl_max_ingest_rows` | 0 | rows one Flight ingest may stream; `0` = unlimited |
+| `acl_flight_ingest_idle` | 300 | seconds a Flight ingest may wait for its next batch before the load rolls back and the session is free; `0` = no limit (spec 174) |
 | `acl_metadata_max_rows` | 1000000 | rows a metadata surface (information_schema, duckdb_*, SHOW, the Flight catalog RPCs, quack's catalog load) answers a principal; above it the statement is refused, never cut; `0` = unlimited; a session may lower it for itself, never raise it (spec 119) |
 | `acl_max_result_rows` | 0 | rows one Flight statement may hand out: exactly that many go out, then the stream ends in a refusal; `0` = unlimited (spec 070) |
 | `acl_door_certificate_refresh` | 60 | seconds between a door's re-reads of its certificate and key when they were given as local files; a renewed pair that checks serves the new connections; `0` = read once, at serve. GLOBAL (spec 140) |

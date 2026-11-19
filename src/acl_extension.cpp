@@ -139,6 +139,12 @@ shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	                          "acl: seconds an open Flight result stream may sit unpulled before the session's "
 	                          "next statement ends it and runs (0 = never: the statement waits for the stream)",
 	                          LogicalType::BIGINT, Value::BIGINT(30), nullptr, SetScope::GLOBAL);
+	// spec 174: a Flight ingest whose client stops sending holds its session's lock and its transaction; past this
+	// the load rolls back and the session is free (the client's read ends when it next acts)
+	config.AddExtensionOption("acl_flight_ingest_idle",
+	                          "acl: seconds a Flight bulk ingest may wait for its next batch before the load rolls "
+	                          "back and the session is free (0 = no limit: it waits for the client)",
+	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
 	// spec 140: a door served from local files re-reads its certificate and key - the csi-driver renews
 	// them in place - and the renewed pair serves the new connections
 	config.AddExtensionOption(
