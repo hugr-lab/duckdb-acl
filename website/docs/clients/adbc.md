@@ -17,7 +17,9 @@ conn = dbapi.connect("grpc://<host>:<port>", db_kwargs={
   [hugr-lab/acl-clients](https://github.com/hugr-lab/acl-clients).
 - The cookie middleware is what makes the connection one server-side session: session temp tables,
   transactions (DBAPI manual-commit works, spec 055) and `adbc_ingest` (append / temporary staging,
-  specs 049/050) all ride on it.
+  specs 049/050) all ride on it. A load needs the role's `ingest` capability beside `insert` (spec 173). The
+  driver sends no ingest `options`, so a load by key (`acl.mode = merge | remove`) is the Flight SQL clients'
+  that carry them (Java's `FlightSqlClient.executeIngest`) - from ADBC, stage into a temp table and `MERGE`.
 - In **Azure / Microsoft Fabric** the environment mints the token:
   `notebookutils.credentials.getToken(<audience>)` or `azure-identity`'s `DefaultAzureCredential`,
   passed as the same Bearer header. The node verifies an Entra token like any other issuer.

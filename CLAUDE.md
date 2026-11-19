@@ -146,8 +146,8 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   explicit `'{}'` means none. An *object* grant that states nothing inherits the catalog grant's caps,
   so a refinement never widens by omission. The capabilities *outside* that default are explicit-only
   and never inherited: `create`/`drop` on a schema (spec 016/051), `temp` (spec 050), `explain`
-  (spec 052) and `secrets` (spec 082) on the MAIN catalog grant, `lineage` (spec 129) on any catalog grant — each
-  granted by name or not held.
+  (spec 052) and `secrets` (spec 082) on the MAIN catalog grant, `lineage` (spec 129) on any catalog grant, `ingest`
+  (spec 173) on what a door's bulk load writes — each granted by name or not held.
 - **A grant's predicate confines writes too** (spec 024): it is AND-ed into the read/write `WHERE` and
   also checked against the row being written — an `INSERT`/`UPDATE`/`MERGE` that would leave a row
   outside the principal's slice is refused where the value is written (`error()` inside a `CASE`). An
@@ -923,6 +923,22 @@ appended to SET), MERGE branch; the client's value overwritten; `new.<c>` the cl
 the row's current; an upsert refuses. `column_default`, `platform.write_values`, the check's `write_value_broken`. Flight
 ingest reads its stream through `arrow_scan_dumb` (the door's factory pushes no projection). Test
 `acl_dml_computed_values.test`.
+
+**Spec 173 — a bulk load by key, and `ingest`**: `CommandStatementIngest.options["acl.mode"]` = `merge` | `remove`
+(any other `acl.` option refused; the protocol's mode must be append, not temporary) composes `MERGE INTO t AS
+__acl_target USING (SELECT … FROM arrow_scan() QUALIFY row_number() OVER (PARTITION BY acl_ingest_key() ORDER BY
+"__acl_ingest_row" DESC) = 1) AS __acl_ingest ON acl_ingest_key() …` / `DELETE FROM t AS __acl_target USING (…) AS
+__acl_ingest WHERE acl_ingest_key()`; the `ACL INGEST` prefix admits INSERT / CREATE TABLE / MERGE / DELETE. The
+door numbers the stream's rows (`__acl_ingest_row`, appended to each batch; a stream naming it refused) so the last
+row of a key wins; the rewriter expands the marker (`ExpandIngestKey`, under `arrow_ingest` only) from the target's
+declared PRIMARY KEY (`PolicyStore::DeclaredRelationKey`; none refuses), drops the key's columns from the SET (all
+key = DO NOTHING), refuses a key column the role reads masked or not at all (`RequirePlainKey`: a mask in the ON
+matched by its value) and keeps every NULL-key row (`QUALIFY … OR k IS NULL`); elsewhere `acl_ingest_key` is an `acl_*`
+name, gated. A quack drain is admitted only as an INSERT's direct source. The count check is the stream read to its
+end (the door reads what a join left). `ingest` is explicit-only, judged on top of the verb wherever a door streams
+rows: `ResolveDmlTarget` (Flight), the CREATE's home (`ResolveDdlTarget(…, "ingest")`), the MAIN grant for a temp
+(`RequireIngestOnMain`), the quack drain's INSERT target (`in_insert_source`); in the platform caps STRUCT. Tests
+`test_acl_ingest_prefix.cpp`, `integration/acl_quack_ingest.test`, e2e run.sh.
 
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema

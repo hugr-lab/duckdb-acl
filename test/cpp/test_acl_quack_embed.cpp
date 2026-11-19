@@ -468,8 +468,8 @@ int main(int argc, char *argv[]) {
 
 			// the longest label still fits quack's SEND_DATA header: a streamed write goes through
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
-			Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{\"select\": true, \"insert\": true}' "
-			          "RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant'");
+			Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{\"select\": true, \"insert\": true, "
+			          "\"ingest\": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant'");
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 			Exec(con, "SET GLOBAL acl_node_label = '" + std::string(63, 'a') + "'");
 			Exec(con, "ATTACH 'quack:localhost:31975' AS longest (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");

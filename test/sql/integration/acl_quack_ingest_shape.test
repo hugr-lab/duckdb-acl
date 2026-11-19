@@ -44,10 +44,10 @@ statement ok
 ACL ADMIN CREATE ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, ingest) MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.pairs TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'a,b';
+ACL ADMIN GRANT TABLE c.pairs TO ROLE analyst CAPS '{"select": true, "insert": true, "ingest": true}' COLUMNS 'a,b';
 
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=false;

@@ -367,6 +367,34 @@ case "$got" in *"lives in the session"*) ;; *) fail "a cookie-less temporary ing
 got="$(ask "@ingest:orders:append:id,tenant,nope:1,acme,1")"
 case "$got" in *nope*) ;; *) fail "an unknown ingest column was not named in the refusal: $got";; esac
 
+# --- spec 173: a load by the declared key (orders: PRIMARY KEY (id)) - acl.mode = merge | remove ----------------
+# 700 exists (amount 7) and is updated; 722 arrives twice - the stream's last row wins
+got="$(ask "@ingest:orders:merge:id,tenant,amount,customer_id:700,acme,70,0;722,acme,1,0;722,acme,2,0")"
+echo "$got" | grep -q "{'count': 2}" || fail "a merge did not write one row per key: $got"
+got="$(ask "SELECT id, amount FROM orders WHERE id IN (700, 722) ORDER BY id")"
+echo "$got" | grep -q "'id': \[700, 722\], 'amount': \[70, 2\]" || fail "a merge did not update and keep the last row: $got"
+got="$(ask "@ingest:orders:merge:id,tenant,amount,customer_id:723,globex,1,0")"
+case "$got" in *"does not satisfy the grant"*) ;; *) fail "a cross-tenant merge was not refused: $got";; esac
+# the RLS joins the key: id 1 is globex's, never matched - nothing deleted; 722 is the principal's
+got="$(ask "@ingest:orders:remove:id:1;722")"
+echo "$got" | grep -q "{'count': 1}" || fail "a remove did not delete exactly the principal's row: $got"
+got="$(ask "SELECT count(*) FROM orders WHERE id = 722")"
+echo "$got" | grep -q "\[0\]" || fail "the removed row read back: $got"
+got="$(ask "@ingest:orders:mergecreate:id,tenant:724,acme")"
+case "$got" in *"writes into a table that exists"*) ;; *) fail "acl.mode under mode create was not refused: $got";; esac
+# a NULL is no key value: every such row is its own, none dropped by the last-row rule
+got="$(ask "@ingest:orders:merge:id,tenant,amount,customer_id:NULL,acme,5,0;NULL,acme,6,0")"
+echo "$got" | grep -q "{'count': 2}" || fail "a merge dropped rows whose key is NULL: $got"
+got="$(ask "@ingest:orders:twomodes:id,tenant:724,acme")"
+case "$got" in *"acl.mode is given twice"*) ;; *) fail "two acl.mode options were not refused: $got";; esac
+got="$(ask "@ingest:orders:badoption:id,tenant:724,acme")"
+case "$got" in *"unknown ingest option"*) ;; *) fail "an unknown acl. option was not refused: $got";; esac
+got="$(ask "@ingest:customers:append:id,name:9,x")"
+case "$got" in *"needs the ingest capability"*) ;; *) fail "a load without the ingest capability was not refused: $got";; esac
+# ledger holds merge and ingest and declares no key
+got="$(ask "@ingest:ledger:merge:id,amount:9,1")"
+case "$got" in *"needs its declared key"*) ;; *) fail "a merge into a keyless object was not refused: $got";; esac
+
 # --- and none of them is answered without a token --------------------------------------------------
 for probe in "@catalogs" "@tables" "@imported:orders"; do
 	got="$(ask "$probe" "-")"

@@ -55,11 +55,11 @@ statement ok
 ACL ADMIN CREATE ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, ingest) MAIN;
 
 # the role is confined to its own tenant, so a bypass shows up as rows this predicate forbids
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' RLS 'tenant = acl_claim(''tenant'')';
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true, "ingest": true}' RLS 'tenant = acl_claim(''tenant'')';
 
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=false;

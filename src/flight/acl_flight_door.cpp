@@ -35,6 +35,7 @@
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/server_builder.h>
 #include <arrow/table.h> // arrow::Schema is complete here, not in the flight headers alone
+#include <arrow/array/builder_primitive.h>
 #include <arrow/util/config.h>
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -1561,10 +1562,24 @@ public:
 		//! spec 070: the call, asked before every batch whether its client is still there
 		const flight::ServerCallContext *context = nullptr;
 		bool cancelled = false;
+		//! spec 173: a load by key numbers the stream's rows (the column `__acl_ingest_row`, after the client's)
+		//! so the merge keeps each key's last row; `finished` = the scan read the stream to its end
+		bool number_rows = false;
+		bool finished = false;
 	};
+	static constexpr const char *INGEST_ROW_COLUMN = "__acl_ingest_row";
 	static int IngestGetSchema(struct ArrowArrayStream *stream, struct ArrowSchema *out) {
 		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
-		auto status = arrow::ExportSchema(*ingest.schema, out);
+		auto schema = ingest.schema;
+		if (ingest.number_rows) {
+			auto added = schema->AddField(schema->num_fields(), arrow::field(INGEST_ROW_COLUMN, arrow::int64()));
+			if (!added.ok()) {
+				ingest.error = added.status().ToString();
+				return EINVAL;
+			}
+			schema = *added;
+		}
+		auto status = arrow::ExportSchema(*schema, out);
 		if (!status.ok()) {
 			ingest.error = status.ToString();
 			return EINVAL;
@@ -1604,14 +1619,40 @@ public:
 				return EINVAL;
 			}
 			out->release = nullptr; // end of stream
+			ingest.finished = true;
 			return 0;
 		}
+		auto first_row = ingest.rows;
 		ingest.rows += chunk->data->num_rows();
 		if (ingest.cap > 0 && ingest.rows > ingest.cap) {
 			ingest.error = "acl: the ingest exceeds acl_max_ingest_rows (" + std::to_string(ingest.cap) + ")";
 			return EINVAL;
 		}
-		auto status = arrow::ExportRecordBatch(*chunk->data, out);
+		auto batch = chunk->data;
+		if (ingest.number_rows) {
+			arrow::Int64Builder numbers;
+			auto status = numbers.Reserve(batch->num_rows());
+			for (int64_t i = 0; status.ok() && i < batch->num_rows(); i++) {
+				numbers.UnsafeAppend(first_row + i);
+			}
+			std::shared_ptr<arrow::Array> column;
+			if (status.ok()) {
+				status = numbers.Finish(&column);
+			}
+			if (status.ok()) {
+				auto added =
+				    batch->AddColumn(batch->num_columns(), arrow::field(INGEST_ROW_COLUMN, arrow::int64()), column);
+				status = added.status();
+				if (added.ok()) {
+					batch = *added;
+				}
+			}
+			if (!status.ok()) {
+				ingest.error = status.ToString();
+				return EINVAL;
+			}
+		}
+		auto status = arrow::ExportRecordBatch(*batch, out);
 		if (!status.ok()) {
 			ingest.error = status.ToString();
 			return EINVAL;
@@ -1664,6 +1705,38 @@ public:
 			auto if_exists = command.table_definition_options.if_exists;
 			bool create_form = false;
 			bool replace_form = false;
+			// spec 173: the protocol's modes as it defines them, and one backend option of ours - a load by the
+			// target's declared key; an `acl.` option this door does not know is refused by name
+			enum class ByKey { NONE, MERGE, REMOVE } by_key = ByKey::NONE;
+			for (auto &option : command.options) {
+				if (!StringUtil::StartsWith(StringUtil::Lower(option.first), "acl.")) {
+					continue; // not ours
+				}
+				if (!StringUtil::CIEquals(option.first, "acl.mode")) {
+					return arrow::Status::Invalid("acl: unknown ingest option \"" + option.first +
+					                              "\" - the one option of ours is acl.mode (merge | remove)");
+				}
+				if (by_key != ByKey::NONE) {
+					return arrow::Status::Invalid("acl: acl.mode is given twice");
+				}
+				if (StringUtil::CIEquals(option.second, "merge")) {
+					by_key = ByKey::MERGE;
+				} else if (StringUtil::CIEquals(option.second, "remove")) {
+					by_key = ByKey::REMOVE;
+				} else {
+					return arrow::Status::Invalid("acl: acl.mode is merge or remove, not \"" + option.second + "\"");
+				}
+			}
+			if (by_key != ByKey::NONE) {
+				if (command.temporary) {
+					return arrow::Status::Invalid("acl: acl.mode loads by the target's declared key, and a temporary "
+					                              "target declares none - stage, then MERGE with SQL");
+				}
+				if (not_exist != NotExist::kFail || if_exists != Exists::kAppend) {
+					return arrow::Status::Invalid("acl: acl.mode writes into a table that exists - ingest with mode "
+					                              "append (if_not_exist FAIL, if_exists APPEND)");
+				}
+			}
 			if (command.temporary) {
 				// spec 050, completing spec 049 milestone 2: the staging target is a native temp
 				// table on the session's own connection - which only exists for a connection-long
@@ -1727,6 +1800,10 @@ public:
 			target += quote(command.table);
 			string columns;
 			for (int i = 0; i < schema->num_fields(); i++) {
+				if (by_key != ByKey::NONE && StringUtil::CIEquals(schema->field(i)->name(), INGEST_ROW_COLUMN)) {
+					return arrow::Status::Invalid(string("acl: the ingest stream names \"") + INGEST_ROW_COLUMN +
+					                              "\", the door's own column of a load by key");
+				}
 				columns += (i ? ", " : "") + quote(schema->field(i)->name());
 			}
 			IngestStreamState ingest;
@@ -1734,6 +1811,7 @@ public:
 			ingest.schema = schema;
 			ingest.cap = state->store->MaxIngestRows();
 			ingest.context = &context; // spec 070: a cancelled call is heard between batches
+			ingest.number_rows = by_key == ByKey::MERGE;
 			ArrowArrayStream stream;
 			stream.get_schema = IngestGetSchema;
 			stream.get_next = IngestGetNext;
@@ -1751,6 +1829,24 @@ public:
 				sql = string("CREATE ") + (replace_form ? "OR REPLACE " : "") +
 				      (command.temporary ? "TEMP TABLE " + quote(command.table) : "TABLE " + target) +
 				      " AS SELECT * FROM arrow_scan()";
+			} else if (by_key == ByKey::MERGE) {
+				// spec 173: `acl_ingest_key()` is the rewriter's - the target's declared key, expanded under this
+				// prefix only; per key the stream's last row (the door numbers them), the key's columns never SET
+				string sets;
+				string values;
+				for (int i = 0; i < schema->num_fields(); i++) {
+					auto column = quote(schema->field(i)->name());
+					sets += (i ? ", " : "") + column + " = __acl_ingest." + column;
+					values += (i ? ", " : "") + string("__acl_ingest.") + column;
+				}
+				sql = "MERGE INTO " + target + " AS __acl_target USING (SELECT " + columns +
+				      " FROM arrow_scan() QUALIFY row_number() OVER (PARTITION BY acl_ingest_key() ORDER BY \"" +
+				      INGEST_ROW_COLUMN +
+				      "\" DESC) = 1) AS __acl_ingest ON acl_ingest_key() WHEN MATCHED THEN UPDATE SET " + sets +
+				      " WHEN NOT MATCHED THEN INSERT (" + columns + ") VALUES (" + values + ")";
+			} else if (by_key == ByKey::REMOVE) {
+				sql = "DELETE FROM " + target + " AS __acl_target USING (SELECT " + columns +
+				      " FROM arrow_scan()) AS __acl_ingest WHERE acl_ingest_key()";
 			} else {
 				if (command.temporary) {
 					// append into the session's own staging table, never anywhere else
@@ -1836,12 +1932,27 @@ public:
 					total = count.GetValue<int64_t>();
 				}
 			}
+			if (by_key != ByKey::NONE) {
+				// spec 173: a load by key writes a row per key it finds, so its count is no check of the stream -
+				// that the stream was read to its end is: a join that needed no more of it leaves the rest, read here
+				while (!ingest.finished && ingest.error.empty()) {
+					ArrowArray rest;
+					if (IngestGetNext(&stream, &rest) != 0 || !rest.release) {
+						break;
+					}
+					rest.release(&rest);
+				}
+				if (ingest.cancelled) {
+					state->store->AuditDoor("flight", "ingest_cancelled", false, "unavailable", ingest.error, handle);
+					return fail(arrow::Status::Cancelled(ingest.error), ingest.error, "unavailable");
+				}
+			}
 			if (!ingest.error.empty()) {
 				return fail(arrow::Status::Invalid(ingest.error), ingest.error);
 			}
 			// the GizmoSQL lesson: a partial load must be an error, never a silent success - and now it
 			// is caught before commit, so nothing of a mismatched load is stored
-			if (total != ingest.rows) {
+			if (by_key == ByKey::NONE && total != ingest.rows) {
 				auto mismatch = "acl: the target took " + std::to_string(total) + " rows of the " +
 				                std::to_string(ingest.rows) + " the stream delivered";
 				return fail(arrow::Status::Invalid(mismatch), mismatch);
