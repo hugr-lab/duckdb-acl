@@ -383,6 +383,7 @@ struct StatementAudit {
 			// spec 155: whichever connection runs it, and whenever, its error is a principal's
 			PrincipalText text;
 			text.renamed = stmt.renamed;
+			text.lazy_sources = stmt.lazy_sources;
 			for (auto &object : stmt.objects) {
 				NamePath path;
 				string ignored;

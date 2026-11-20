@@ -64,6 +64,9 @@ struct AuditTrail {
 		//! spec 155: the physical leaf names the rewrite put where the client named a virtual object of another name
 		//! (physical leaf, virtual leaf) - what a principal's error says instead
 		vector<std::pair<string, string>> renamed;
+		//! spec 177: the lazy sources (NodeTraits::lazy_sources) it reads, attached by the rewrite - each execution
+		//! attaches them again if they went idle since
+		vector<string> lazy_sources;
 		//! spec 074: whether an execution follows (a dropped statement has none) and the hash of the
 		//! text the executing statement carries - what the profile matches its execution by, so a
 		//! follow-up, a nested query or a later statement never takes this one's note

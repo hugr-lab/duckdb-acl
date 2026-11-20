@@ -130,8 +130,11 @@ struct PlatformAccess {
 void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights);
 //! spec 176: on a node that attaches only its group's declared sources (hugr-node spec 035) every management call
 //! that writes - the policy, the cluster profile - is refused, naming where to run it; the node's operation (OPERATE)
-//! and console_info (OPEN) run. Whoever the principal is: the write would be judged against sources the node lacks
+//! and console_info (OPEN) run. Whoever the principal is: the write would be judged against sources the node lacks.
+//! On any other node a call that probes the sources (not the profile's) has the lazy ones attached first (spec 177)
 void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store);
+//! spec 177: attach every source the node keeps lazy (best effort) - before a policy write's probes and the check
+void WakeLazySources(PolicyStore &store);
 void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights &rights);
 //! What the static table cannot see (spec 117 review): a role mapping whose target role administers hands
 //! that administration to whoever holds the claim - spec 095 admits it because the mapping is the client's
@@ -209,6 +212,10 @@ void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyS
 //! spec 138: the table / view names a stored body writes, as written - a one-part name that is a CTE of its scope
 //! left out. Throws when the body does not parse (or is no SELECT / expression).
 void BodyReferences(const string &body, bool expression, vector<vector<string>> &references);
+//! spec 177: the databases a rewritten statement may name - the first part of every table name of two parts or more
+//! it reads or writes, and a CREATE / DROP / ALTER target's catalog. A superset (a two-part name's first part may be a
+//! schema): the caller keeps only the names it knows
+void StatementDatabases(SQLStatement &statement, case_insensitive_set_t &databases);
 //! spec 160: a body with each table it names written whole (`<db>.<schema>.<table>`, as the binder resolves it on the
 //! node) - a principal's CTE or temp table can then never stand in for one; the rest of the text as written
 //! A list's item expressions (a grant's masks, an object's computed columns) are qualified one by one when the list

@@ -540,6 +540,20 @@ public:
 			}
 		}
 		query_text = principal_statement ? query : string();
+		if (principal_statement && !query_info.lazy_sources.empty()) {
+			// spec 177: a lazy source the statement reads may have gone idle since it was decided (a prepared
+			// statement, a later statement of its batch): attached again before it binds. A failure is the bind's
+			// to report - the statement names a database that is not there
+			auto store = store_ref.lock();
+			if (store && store->node_traits.attach_on_demand) {
+				for (auto &alias : query_info.lazy_sources) {
+					try {
+						store->node_traits.attach_on_demand(alias);
+					} catch (std::exception &) { // NOLINT: the bind refuses the statement
+					}
+				}
+			}
+		}
 		guard_keys = WriteGuardKeys(query);
 		began_us = NowMicros();
 		preparing = false;

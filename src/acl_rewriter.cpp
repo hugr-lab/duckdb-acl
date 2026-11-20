@@ -5745,6 +5745,32 @@ public:
 		}
 		trail->physical.push_back(phys);
 	}
+	//! spec 177: the sources the node attaches on demand (NodeTraits::lazy_sources), read once per batch, and those
+	//! this statement reads - attached once each
+	case_insensitive_set_t lazy;
+	vector<string> woken;
+	//! spec 177: a database the statement reads - attached now when it is one the node keeps lazy. The policy named it
+	//! (a principal's own names are virtual), so a statement never wakes a source its policy does not reach
+	void NoteDatabase(const string &database) {
+		if (!lazy.count(database)) {
+			return;
+		}
+		for (auto &known : woken) {
+			if (StringUtil::CIEquals(known, database)) {
+				return;
+			}
+		}
+		try {
+			store.node_traits.attach_on_demand(database);
+		} catch (...) {
+			NoteDenyReason(Reason::SOURCE_ERROR);
+			throw;
+		}
+		woken.push_back(database);
+		if (trail) {
+			trail->lazy_sources.push_back(database);
+		}
+	}
 	case_insensitive_set_t cte_scope;
 	//! the recursive CTEs whose right side is being rewritten: `recurring.<name>` reads one
 	case_insensitive_set_t recurring_scope;
@@ -5883,8 +5909,12 @@ string BakeTemplateForProbe(const string &sql, const ParserOptions &options, boo
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
                        const ParserOptions &options, PolicyStore &store, AuditTrail *trail, bool metadata_only) {
 	AclRewriter rewriter(principal, options, store, metadata_only);
+	for (auto &alias : store.LazySources()) {
+		rewriter.lazy.insert(alias);
+	}
 	vector<unique_ptr<SQLStatement>> rewritten;
 	for (auto &stmt : statements) {
+		rewriter.woken.clear();
 		rewriter.follow_ups.clear();
 		rewriter.drop_statement = false;
 		rewriter.replacement = nullptr;
@@ -5916,6 +5946,15 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			throw;
 		}
 		record_cost();
+		if (!rewriter.lazy.empty() && !rewriter.drop_statement) {
+			// spec 177: what the policy's texts read (a view's SQL, an RLS's subquery, a template) is in the rewritten
+			// statement only - its databases are woken before it binds
+			case_insensitive_set_t databases;
+			StatementDatabases(rewriter.replacement ? *rewriter.replacement : *stmt, databases);
+			for (auto &database : databases) {
+				rewriter.NoteDatabase(database);
+			}
+		}
 		if (as_written) {
 			try {
 				trail->statements.back().origins = rewriter.ResultOrigins(as_written->Cast<SelectStatement>());

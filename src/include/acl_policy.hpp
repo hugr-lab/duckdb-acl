@@ -412,6 +412,7 @@ struct UnionWidening {
 //! the virtual objects it names. Bounded, the least recently used forgotten first.
 struct PrincipalText {
 	vector<std::pair<string, string>> renamed;
+	vector<string> lazy_sources;  // spec 177: the lazy sources it reads - attached again before it runs
 	vector<string> object_parts;  // folded: every part of the objects it resolved
 	vector<string> target_leaves; // folded: the name a CREATE / DROP / temp offers - said back as a table's only
 };
@@ -1019,15 +1020,24 @@ struct PolicyStore {
 		//! spec 176 (hugr-node spec 035): the resource group whose declared source set is all this node attaches
 		//! ('' = every source). Such a node writes no policy: a write judged against sources it lacks would be wrong
 		std::function<string()> partial_sources;
+		//! spec 177 (hugr-node spec 035 stage 2): the sources this node attaches on demand (`LAZY`), by alias - a
+		//! statement's databases are collected only while there are any
+		std::function<vector<string>()> lazy_sources;
+		//! spec 177: attach the lazy source `alias` if it is not attached, and note its use; throws (the source's
+		//! error class, never its text) when it cannot
+		std::function<void(const string &alias)> attach_on_demand;
 	};
 	NodeTraits node_traits;
 	//! spec 176: the group whose source set this node attaches only ('' = every source)
 	string PartialSourcesGroup();
+	//! spec 177: the aliases this node attaches on demand (none without the trait)
+	vector<string> LazySources();
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
 	                               const string &repository, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,
 	                            const string &secret, const string &options_json, const vector<string> &depends_on,
-	                            const string &comment, const string &lineage = string());
+	                            const string &comment, const string &lineage = string(), bool lazy = false,
+	                            const string &idle = string());
 	ClusterAnswer ClusterDetach(const string &scope, const string &alias, bool cascade, bool force);
 	ClusterAnswer ClusterSetting(const string &verb, const string &scope, const string &name, const string &value);
 	int64_t ClusterVersion();

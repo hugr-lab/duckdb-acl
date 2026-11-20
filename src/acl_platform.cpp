@@ -2152,6 +2152,7 @@ void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statement
 	// the exempt calls first: the node's operation must not depend on reading the policy catalog (an incident is
 	// when it is unreachable), and a batch of them costs no read
 	bool writes = false;
+	bool probes = false;
 	for (auto &statement : statements) {
 		auto &call = CompiledCall(*statement);
 		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
@@ -2162,6 +2163,8 @@ void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statement
 			continue;
 		}
 		writes = true;
+		// the profile's writes (INFRASTRUCTURE) judge no stored fact against a source
+		probes = probes || !function || function->right != PlatformRight::INFRASTRUCTURE;
 	}
 	if (!writes) {
 		return;
@@ -2169,6 +2172,21 @@ void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statement
 	auto group = store.PartialSourcesGroup();
 	if (!group.empty()) {
 		ThrowPartialNode(group);
+	}
+	if (probes) {
+		WakeLazySources(store);
+	}
+}
+
+void WakeLazySources(PolicyStore &store) {
+	// spec 177: a policy write probes what it stores against the sources, and the check reads them all - the node's
+	// lazy sources are attached first. Best effort: a source that does not attach is the probe's to report, as a
+	// source that is down
+	for (auto &alias : store.LazySources()) {
+		try {
+			store.node_traits.attach_on_demand(alias);
+		} catch (std::exception &) { // NOLINT: the probe names what it could not read
+		}
 	}
 }
 
@@ -2811,6 +2829,7 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		if (!group.empty()) {
 			ThrowPartialNode(group);
 		}
+		WakeLazySources(store); // spec 177
 	}
 	vector<unique_ptr<SQLStatement>> judged;
 	judged.push_back(std::move(statement));
