@@ -1715,6 +1715,7 @@ unique_ptr<FunctionData> CheckBind(ClientContext &, TableFunctionBindInput &inpu
 unique_ptr<GlobalTableFunctionState> CheckInit(ClientContext &, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<CheckBindData>();
 	auto state = make_uniq<CheckState>();
+	WakeLazySources(*bind.store); // spec 177: the check reads every source - the operator's own call too
 	state->rows = bind.store->CatalogCheck(bind.vcat); // the probes run here, once per scan
 	return std::move(state);
 }

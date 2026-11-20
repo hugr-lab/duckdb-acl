@@ -2148,20 +2148,27 @@ namespace {
 
 } // namespace
 
+namespace {
+
+//! spec 176: a call that writes nothing the sources judge - the node's operation (OPERATE), console_info (OPEN) and
+//! view-as, which sets the session's mode, never the policy (spec 120.3; a session in it must be able to leave it)
+bool CallIsExempt(SQLStatement &statement) {
+	auto target = StringUtil::Lower(CompiledCall(statement).FunctionName().GetIdentifierName());
+	auto function = PlatformFunctionByTarget(target);
+	return target == "acl_session_view_as" ||
+	       (function && (function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN));
+}
+
+} // namespace
+
 void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store) {
 	// the exempt calls first: the node's operation must not depend on reading the policy catalog (an incident is
 	// when it is unreachable), and a batch of them costs no read
 	bool writes = false;
 	for (auto &statement : statements) {
-		auto &call = CompiledCall(*statement);
-		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
-		auto function = PlatformFunctionByTarget(target);
-		// view-as sets the session's mode, never the policy (spec 120.3) - a session in it must be able to leave it
-		if (target == "acl_session_view_as" ||
-		    (function && (function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN))) {
-			continue;
+		if (!CallIsExempt(*statement)) {
+			writes = true;
 		}
-		writes = true;
 	}
 	if (!writes) {
 		return;
@@ -2169,6 +2176,33 @@ void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statement
 	auto group = store.PartialSourcesGroup();
 	if (!group.empty()) {
 		ThrowPartialNode(group);
+	}
+}
+
+void WakeLazySourcesForCalls(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store) {
+	for (auto &statement : statements) {
+		if (CallIsExempt(*statement)) {
+			continue;
+		}
+		auto function =
+		    PlatformFunctionByTarget(StringUtil::Lower(CompiledCall(*statement).FunctionName().GetIdentifierName()));
+		// the profile's writes (INFRASTRUCTURE) judge no stored fact against a source
+		if (!function || function->right != PlatformRight::INFRASTRUCTURE) {
+			WakeLazySources(store);
+			return;
+		}
+	}
+}
+
+void WakeLazySources(PolicyStore &store) {
+	// spec 177: a policy write probes what it stores against the sources, and the check reads them all - the node's
+	// lazy sources are attached first. Best effort: a source that does not attach is the probe's to report, as a
+	// source that is down
+	for (auto &alias : store.LazySources()) {
+		try {
+			store.node_traits.attach_on_demand(alias);
+		} catch (std::exception &) { // NOLINT: the probe names what it could not read
+		}
 	}
 }
 
@@ -2811,6 +2845,10 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		if (!group.empty()) {
 			ThrowPartialNode(group);
 		}
+	}
+	if (function->target == string("acl_check_grant")) {
+		// spec 177: its body (an RLS naming a table) is qualified and probed below, at parse - before its own wake
+		WakeLazySources(store);
 	}
 	vector<unique_ptr<SQLStatement>> judged;
 	judged.push_back(std::move(statement));

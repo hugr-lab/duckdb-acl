@@ -1026,6 +1026,7 @@ private:
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
 			drop_statement = true;
+			NotePhysical(phys, target.vname); // spec 177: the record probes it in its home's source
 			follow_ups.push_back(
 			    AclRecord("acl_register_existing", {Value(target.vcat), Value(target.vname), Value(phys),
 			                                        Value(target.origin), Value(AuthorOf(principal))}));
@@ -5719,7 +5720,16 @@ public:
 	//! spec 074: the physical name a relation resolved to, for the profile's attribution of scans; spec 155: with the
 	//! virtual name it stands for, when their leaves differ - a principal's error says the virtual one
 	void NotePhysical(const string &phys, const string &vname) {
-		if (!trail || phys.empty()) {
+		if (phys.empty()) {
+			return;
+		}
+		string database, rest;
+		if (!lazy.empty() && NamePath::SplitHeadKey(phys, database, rest)) {
+			// spec 177: where the resolution put a physical name - a statement dropped for its record (a principal's
+			// CREATE VIEW) reads its source through its record and guards, never the statement the walk sees
+			NoteDatabase(NamePath::FromKey(database).Parts().front());
+		}
+		if (!trail) {
 			return;
 		}
 		string parent, phys_leaf, virtual_leaf;
@@ -5744,6 +5754,32 @@ public:
 			}
 		}
 		trail->physical.push_back(phys);
+	}
+	//! spec 177: the sources the node attaches on demand (NodeTraits::lazy_sources), read once per batch, and those
+	//! this statement reads - attached once each
+	case_insensitive_set_t lazy;
+	vector<string> woken;
+	//! spec 177: a database the statement reads - attached now when it is one the node keeps lazy. The policy named it
+	//! (a principal's own names are virtual), so a statement never wakes a source its policy does not reach
+	void NoteDatabase(const string &database) {
+		if (!lazy.count(database)) {
+			return;
+		}
+		for (auto &known : woken) {
+			if (StringUtil::CIEquals(known, database)) {
+				return;
+			}
+		}
+		try {
+			store.node_traits.attach_on_demand(database);
+		} catch (...) {
+			NoteDenyReason(Reason::SOURCE_ERROR);
+			throw;
+		}
+		woken.push_back(database);
+		if (trail) {
+			trail->lazy_sources.push_back(database);
+		}
 	}
 	case_insensitive_set_t cte_scope;
 	//! the recursive CTEs whose right side is being rewritten: `recurring.<name>` reads one
@@ -5883,8 +5919,12 @@ string BakeTemplateForProbe(const string &sql, const ParserOptions &options, boo
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
                        const ParserOptions &options, PolicyStore &store, AuditTrail *trail, bool metadata_only) {
 	AclRewriter rewriter(principal, options, store, metadata_only);
+	for (auto &alias : store.LazySources()) {
+		rewriter.lazy.insert(alias);
+	}
 	vector<unique_ptr<SQLStatement>> rewritten;
 	for (auto &stmt : statements) {
+		rewriter.woken.clear();
 		rewriter.follow_ups.clear();
 		rewriter.drop_statement = false;
 		rewriter.replacement = nullptr;
@@ -5916,6 +5956,28 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			throw;
 		}
 		record_cost();
+		if (!rewriter.lazy.empty()) {
+			// spec 177: what the policy's texts read (a view's SQL, an RLS's subquery, a template) is in the rewritten
+			// statement only - its databases are woken before it binds
+			case_insensitive_set_t databases;
+			if (!rewriter.drop_statement) {
+				StatementDatabases(rewriter.replacement ? *rewriter.replacement : *stmt, databases);
+			}
+			for (auto &guard : rewriter.guards) {
+				// spec 157 / 159: each read bound alone before the statement is optimized - its own texts' databases
+				try {
+					Parser parser(ParserOptions::Builtin());
+					parser.ParseQuery(guard);
+					for (auto &read : parser.statements) {
+						StatementDatabases(*read, databases);
+					}
+				} catch (std::exception &) { // NOLINT: a guard that does not parse is refused where it is bound
+				}
+			}
+			for (auto &database : databases) {
+				rewriter.NoteDatabase(database);
+			}
+		}
 		if (as_written) {
 			try {
 				trail->statements.back().origins = rewriter.ResultOrigins(as_written->Cast<SelectStatement>());

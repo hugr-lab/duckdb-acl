@@ -958,6 +958,17 @@ but OPERATE / OPEN / view-as (`RefuseWritesOnPartialNode`, beside `AuthorizeMgmt
 that writes) and `platform.check_catalog` / `check_grant` are refused, naming where to run them; a principal's DDL
 record stays. Test `test_acl_partial_sources.cpp`.
 
+**Spec 177 — a source attached on demand** (hugr-node spec 035 stage 2): `NodeTraits::lazy_sources` (the aliases the
+platform part keeps `LAZY`) and `attach_on_demand(alias)` (attach if not attached, note the use; throws the source's
+error class). While there are any, the rewrite attaches the lazy ones a statement reads before it binds (`NoteDatabase`,
+`source_error` on failure): each physical name it resolves (`NotePhysical`), the rewritten statement walked by
+`StatementDatabases` (tables of two parts or more, an INSERT's node name, a CREATE / DROP / ALTER target, EXPLAIN)
+and its guards - a policy text's tables included, a principal's own names being virtual; the principal text and the
+profile note keep them and `QueryBegin` asks again (a prepared statement, a source idle since); an authorized
+management call that probes the sources wakes every lazy source before its bodies are probed
+(`WakeLazySourcesForCalls`), and `acl_check_catalog` / `acl_check_grant` wake them themselves; a listing never wakes
+one. Test `test_acl_lazy_sources.cpp`.
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`

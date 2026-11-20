@@ -27,10 +27,24 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/alter_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/parser/statement/multi_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
@@ -851,6 +865,7 @@ unique_ptr<GlobalTableFunctionState> CheckGrantInit(ClientContext &, TableFuncti
 	if (!store.catalog || store.catalog->FunctionMode()) {
 		throw BinderException("acl: acl_check_grant needs a policy catalog (acl_use_db)");
 	}
+	WakeLazySources(store); // spec 177: the grant's probes read its object's source
 	auto text = [&](idx_t index) {
 		return index < bind.arguments.size() && !bind.arguments[index].IsNull() ? bind.arguments[index].ToString()
 		                                                                        : string();
@@ -895,6 +910,69 @@ void BodyReferences(const string &body, bool expression, vector<vector<string>> 
 		} else {
 			throw BinderException("acl admin: a stored body is a SELECT, not a %s",
 			                      StatementTypeToString(statement->type));
+		}
+	}
+}
+
+void StatementDatabases(SQLStatement &statement, case_insensitive_set_t &databases) {
+	vector<vector<string>> references;
+	ScopedReferences walk {references};
+	auto catalog_of = [&](const QualifiedName &name) {
+		auto catalog = name.Catalog().GetIdentifierName();
+		if (!catalog.empty()) {
+			databases.insert(catalog);
+		}
+	};
+	switch (statement.type) {
+	case StatementType::SELECT_STATEMENT:
+		walk.Node(*statement.Cast<SelectStatement>().node, case_insensitive_set_t());
+		break;
+	case StatementType::INSERT_STATEMENT: {
+		// the target is the node's name - its table_ref is set only for ON CONFLICT / OR REPLACE | IGNORE
+		auto &node = *statement.Cast<InsertStatement>().node;
+		catalog_of(node.qualified_name);
+		walk.Node(node, case_insensitive_set_t());
+		break;
+	}
+	case StatementType::UPDATE_STATEMENT:
+		walk.Node(*statement.Cast<UpdateStatement>().node, case_insensitive_set_t());
+		break;
+	case StatementType::DELETE_STATEMENT:
+		walk.Node(*statement.Cast<DeleteStatement>().node, case_insensitive_set_t());
+		break;
+	case StatementType::MERGE_INTO_STATEMENT:
+		walk.Node(*statement.Cast<MergeIntoStatement>().node, case_insensitive_set_t());
+		break;
+	case StatementType::CREATE_STATEMENT: {
+		auto &info = *statement.Cast<CreateStatement>().info;
+		catalog_of(info.GetQualifiedName());
+		if (info.type == CatalogType::TABLE_ENTRY && info.Cast<CreateTableInfo>().query) {
+			walk.Node(*info.Cast<CreateTableInfo>().query->node, case_insensitive_set_t());
+		} else if (info.type == CatalogType::VIEW_ENTRY && info.Cast<CreateViewInfo>().query) {
+			walk.Node(*info.Cast<CreateViewInfo>().query->node, case_insensitive_set_t());
+		}
+		break;
+	}
+	case StatementType::DROP_STATEMENT:
+		catalog_of(statement.Cast<DropStatement>().info->GetQualifiedName());
+		break;
+	case StatementType::ALTER_STATEMENT:
+		catalog_of(statement.Cast<AlterStatement>().info->GetQualifiedName());
+		break;
+	case StatementType::EXPLAIN_STATEMENT:
+		StatementDatabases(*statement.Cast<ExplainStatement>().stmt, databases);
+		break;
+	case StatementType::MULTI_STATEMENT:
+		for (auto &part : statement.Cast<MultiStatement>().statements) {
+			StatementDatabases(*part, databases);
+		}
+		break;
+	default:
+		break; // nothing else reads a source's tables after the rewrite
+	}
+	for (auto &parts : references) {
+		if (parts.size() >= 2) {
+			databases.insert(parts.front());
 		}
 	}
 }
