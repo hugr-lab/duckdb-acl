@@ -55,7 +55,7 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.s AS steady.main.s");
 		// a live schema alias: its objects resolve to the source's tables at the read
 		Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA c.arch AS lazy.main");
-		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN");
+		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, delete) MAIN");
 		auto store = acl::PolicyStore::Of(*db.instance);
 		if (!Check(store != nullptr, "the instance has a policy store")) {
 			return;
@@ -108,6 +108,30 @@ int main(int argc, char *argv[]) {
 			Check(Attached(con, "lazy"), "the alias's source is attached");
 		});
 
+		Scenario("a write into a lazy source attaches it (an INSERT's target is the node's name)", [&] {
+			detach();
+			auto error = ErrorOf(con, principal + "INSERT INTO t VALUES (5)");
+			Check(error.empty(), "the INSERT: " + error);
+			Check(Attached(con, "lazy"), "the target's source is attached");
+			detach();
+			error = ErrorOf(con, principal + "DELETE FROM t WHERE a = 5");
+			Check(error.empty(), "the DELETE: " + error);
+		});
+
+		Scenario("negative: a principal's own physical name wakes nothing - it is refused first", [&] {
+			detach();
+			auto error = ErrorOf(con, principal + "SELECT * FROM lazy.main.t");
+			Check(!error.empty(), "the physical name is refused: " + error);
+			Check(calls.empty(), "the trait was not asked");
+		});
+
+		Scenario("negative: a management call the principal may not make wakes nothing", [&] {
+			detach();
+			auto error = ErrorOf(con, principal + "CREATE ROLE refused_by_rights");
+			Check(!error.empty(), "the write is refused: " + error);
+			Check(calls.empty(), "the trait was not asked");
+		});
+
 		Scenario("a statement reading no lazy source wakes none", [&] {
 			detach();
 			auto result = con.Query(principal + "SELECT d FROM s");
@@ -155,6 +179,10 @@ int main(int argc, char *argv[]) {
 			auto findings = con.Query("ACL ADMIN CHECK VIRTUAL CATALOG c");
 			Check(!findings->HasError(), "the check runs: " + (findings->HasError() ? findings->GetError() : ""));
 			Check(Attached(con, "lazy"), "the check had the source attached");
+			detach();
+			auto own = con.Query("SELECT count(*) FROM acl_check_catalog('c') WHERE kind = 'source_missing'");
+			CheckColumn(*own, {0}, "the operator's own call of the check finds no source missing");
+			Check(Attached(con, "lazy"), "the operator's own check had the source attached");
 		});
 
 		store->node_traits.lazy_sources = nullptr;

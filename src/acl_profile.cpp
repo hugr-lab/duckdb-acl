@@ -537,6 +537,7 @@ public:
 			} else if (decided_principal) {
 				principal_statement = true;
 				query_info.renamed = note.renamed;
+				query_info.lazy_sources = note.lazy_sources;
 			}
 		}
 		query_text = principal_statement ? query : string();

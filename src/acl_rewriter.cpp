@@ -5719,7 +5719,16 @@ public:
 	//! spec 074: the physical name a relation resolved to, for the profile's attribution of scans; spec 155: with the
 	//! virtual name it stands for, when their leaves differ - a principal's error says the virtual one
 	void NotePhysical(const string &phys, const string &vname) {
-		if (!trail || phys.empty()) {
+		if (phys.empty()) {
+			return;
+		}
+		string database, rest;
+		if (!lazy.empty() && NamePath::SplitHeadKey(phys, database, rest)) {
+			// spec 177: where the resolution put a physical name - a statement dropped for its record (a principal's
+			// CREATE VIEW) reads its source through its record and guards, never the statement the walk sees
+			NoteDatabase(NamePath::FromKey(database).Parts().front());
+		}
+		if (!trail) {
 			return;
 		}
 		string parent, phys_leaf, virtual_leaf;
@@ -5946,11 +5955,24 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			throw;
 		}
 		record_cost();
-		if (!rewriter.lazy.empty() && !rewriter.drop_statement) {
+		if (!rewriter.lazy.empty()) {
 			// spec 177: what the policy's texts read (a view's SQL, an RLS's subquery, a template) is in the rewritten
 			// statement only - its databases are woken before it binds
 			case_insensitive_set_t databases;
-			StatementDatabases(rewriter.replacement ? *rewriter.replacement : *stmt, databases);
+			if (!rewriter.drop_statement) {
+				StatementDatabases(rewriter.replacement ? *rewriter.replacement : *stmt, databases);
+			}
+			for (auto &guard : rewriter.guards) {
+				// spec 157 / 159: each read bound alone before the statement is optimized - its own texts' databases
+				try {
+					Parser parser(ParserOptions::Builtin());
+					parser.ParseQuery(guard);
+					for (auto &read : parser.statements) {
+						StatementDatabases(*read, databases);
+					}
+				} catch (std::exception &) { // NOLINT: a guard that does not parse is refused where it is bound
+				}
+			}
 			for (auto &database : databases) {
 				rewriter.NoteDatabase(database);
 			}

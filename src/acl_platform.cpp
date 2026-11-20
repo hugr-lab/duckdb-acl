@@ -2148,23 +2148,27 @@ namespace {
 
 } // namespace
 
+namespace {
+
+//! spec 176: a call that writes nothing the sources judge - the node's operation (OPERATE), console_info (OPEN) and
+//! view-as, which sets the session's mode, never the policy (spec 120.3; a session in it must be able to leave it)
+bool CallIsExempt(SQLStatement &statement) {
+	auto target = StringUtil::Lower(CompiledCall(statement).FunctionName().GetIdentifierName());
+	auto function = PlatformFunctionByTarget(target);
+	return target == "acl_session_view_as" ||
+	       (function && (function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN));
+}
+
+} // namespace
+
 void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store) {
 	// the exempt calls first: the node's operation must not depend on reading the policy catalog (an incident is
 	// when it is unreachable), and a batch of them costs no read
 	bool writes = false;
-	bool probes = false;
 	for (auto &statement : statements) {
-		auto &call = CompiledCall(*statement);
-		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
-		auto function = PlatformFunctionByTarget(target);
-		// view-as sets the session's mode, never the policy (spec 120.3) - a session in it must be able to leave it
-		if (target == "acl_session_view_as" ||
-		    (function && (function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN))) {
-			continue;
+		if (!CallIsExempt(*statement)) {
+			writes = true;
 		}
-		writes = true;
-		// the profile's writes (INFRASTRUCTURE) judge no stored fact against a source
-		probes = probes || !function || function->right != PlatformRight::INFRASTRUCTURE;
 	}
 	if (!writes) {
 		return;
@@ -2173,8 +2177,20 @@ void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statement
 	if (!group.empty()) {
 		ThrowPartialNode(group);
 	}
-	if (probes) {
-		WakeLazySources(store);
+}
+
+void WakeLazySourcesForCalls(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store) {
+	for (auto &statement : statements) {
+		if (CallIsExempt(*statement)) {
+			continue;
+		}
+		auto function =
+		    PlatformFunctionByTarget(StringUtil::Lower(CompiledCall(*statement).FunctionName().GetIdentifierName()));
+		// the profile's writes (INFRASTRUCTURE) judge no stored fact against a source
+		if (!function || function->right != PlatformRight::INFRASTRUCTURE) {
+			WakeLazySources(store);
+			return;
+		}
 	}
 }
 

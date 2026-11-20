@@ -431,6 +431,7 @@ struct StatementAudit {
 			note.objects = stmt.objects;
 			note.physical = stmt.physical;
 			note.renamed = stmt.renamed;
+			note.lazy_sources = stmt.lazy_sources;
 			note.origins = stmt.origins;
 			if (stmt.lineage) {
 				stmt.lineage->decision_seq = seq; // spec 107: the run names its decision
@@ -869,7 +870,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		AuthorizeMgmt(statements, rights);
 		RefuseWritesOnPartialNode(statements, store); // spec 176
 		AuthorizeRoleTargets(statements, rights, store);
-		QualifyBodies(statements, store); // spec 160
+		WakeLazySourcesForCalls(statements, store); // spec 177
+		QualifyBodies(statements, store);           // spec 160
 		AuthorizeBodies(statements, rights, store, principal);
 		AuthorizeSources(statements, rights, store);
 		return ParserOverrideResult(std::move(statements));
@@ -975,7 +977,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			AuthorizeMgmt(compiled, rights);
 			RefuseWritesOnPartialNode(compiled, store); // spec 176
 			AuthorizeRoleTargets(compiled, rights, store);
-			QualifyBodies(compiled, store); // spec 160
+			WakeLazySourcesForCalls(compiled, store); // spec 177
+			QualifyBodies(compiled, store);           // spec 160
 			AuthorizeBodies(compiled, rights, store, principal);
 			AuthorizeSources(compiled, rights, store);
 			return ParserOverrideResult(std::move(compiled));
