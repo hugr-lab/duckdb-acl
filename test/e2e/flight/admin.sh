@@ -266,7 +266,9 @@ exec(open(__file__).read().split("uri, token, query = sys.argv")[0])
 uri, token = sys.argv[1], sys.argv[2]
 client = flight.FlightClient(uri, middleware=[MemoryJarFactory()])
 options = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
-for query in ("SELECT * FROM platform.effective_rights('analyst', 'c')", "SELECT * FROM platform.check_catalog('c')"):
+# (spec 179 addendum: the grammar form CHECK is a management statement that answers rows, announced the same way)
+for query in ("SELECT * FROM platform.effective_rights('analyst', 'c')", "SELECT * FROM platform.check_catalog('c')",
+              "CHECK VIRTUAL CATALOG c"):
     request = command("ActionCreatePreparedStatementRequest", text(1, query))
     result = list(client.do_action(flight.Action("CreatePreparedStatement", request), options))
     fields = fields_of(fields_of(result[0].body.to_pybytes())[2])
@@ -275,7 +277,7 @@ for query in ("SELECT * FROM platform.effective_rights('analyst', 'c')", "SELECT
     print(schema is not None and len(schema) > 0)
 PY
 )"
-[ "$(echo "$got" | tr -d '\n')" = "TrueTrue" ] || fail "a prepared platform read function announced no columns: $got"
+[ "$(echo "$got" | tr -d '\n')" = "TrueTrueTrue" ] || fail "a prepared platform read function announced no columns: $got"
 
 # --- spec 179 addendum (found by acl-clients 010): a management statement, prepared, announces its (ok, message) --
 # JDBC read the empty schema of a command as an update and lost the answer; it still runs once, at GetFlightInfo

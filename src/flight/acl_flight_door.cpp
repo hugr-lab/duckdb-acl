@@ -2161,8 +2161,8 @@ public:
 			    ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt, nullptr,
 			                                             result.dataset_schema, result.parameter_schema));
 			    ARROW_ASSIGN_OR_RAISE(result.dataset_schema, Described(result.dataset_schema, *reservation));
-			    if (AnswersOnlyCount(*reservation) &&
-			        KindOfClientStatement(request.query) != ClientStatementKind::MANAGEMENT) {
+			    auto kind = KindOfClientStatement(request.query);
+			    if (kind != ClientStatementKind::MANAGEMENT && AnswersOnlyCount(*reservation, kind)) {
 				    // spec 111: a statement that answers only a count is announced as an update - JDBC reads
 				    // an empty dataset schema as one and executes it through DoPut, in one call (the field
 				    // Flight SQL added for this, is_update, is set once the Arrow pin carries it). A management
@@ -2637,9 +2637,6 @@ public:
 		return prefixed;
 	}
 
-	//! spec 111: a statement that returns no rows - DML answers its changed rows (CHANGED_ROWS), DDL
-	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
-	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these.
 	//! What a client's text is to the door: a management statement (the grammar, or a top-level platform.<op>(…)
 	//! call - a change that answers its (ok, message) row, spec 179), a command that answers nothing but a count, or a
 	//! query
@@ -2696,12 +2693,6 @@ public:
 		}
 	}
 
-	//! spec 111: runs at GetFlightInfo - a command, and a management statement (it writes: a client that never fetches
-	//! its answer must not lose the write)
-	static bool ClientStatementIsCommand(const string &query) {
-		return KindOfClientStatement(query) != ClientStatementKind::QUERY;
-	}
-
 	//! spec 128: a statement that expands into several (ExpandsIntoSeveral) runs at GetFlightInfo, as a count does
 	//! (spec 111), and its schema is its result's
 	static bool Expands(PreparedStatement &stmt) {
@@ -2709,11 +2700,20 @@ public:
 	}
 
 	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation) {
+		return AnswersOnlyCount(reservation, KindOfClientStatement(reservation.query));
+	}
+
+	//! spec 111: a statement that returns no rows - DML answers its changed rows (CHANGED_ROWS), DDL
+	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
+	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these. It runs at
+	//! GetFlightInfo, and so does a management statement (it writes: a client that never fetches its answer must not
+	//! lose the write)
+	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation, ClientStatementKind kind) {
 		auto &stmt = *reservation.stmt;
 		// a client's USE / SET / CREATE / DROP / ALTER answers no rows, whatever the rewrite made of it: a
 		// USE or a CREATE VIEW becomes the record's `PRAGMA acl_…(…)` (a query result to duckdb, spec 151), and
 		// left to the DoGet a client that never fetches it - ADBC's execute - would lose it (spec 114)
-		if (ClientStatementIsCommand(reservation.query)) {
+		if (kind != ClientStatementKind::QUERY) {
 			return true;
 		}
 		auto properties = stmt.GetStatementProperties();
