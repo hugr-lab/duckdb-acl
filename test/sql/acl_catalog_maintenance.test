@@ -190,10 +190,10 @@ ACL ADMIN REPAIR VIRTUAL TABLE c.customers REMAP (pk AS ghost);
 statement ok
 ALTER TABLE phys.main.customers ADD COLUMN ssn_v2 VARCHAR DEFAULT 'x';
 
-query I
+query IT
 ACL ADMIN REPAIR VIRTUAL TABLE c.customers REMAP (ssn_v2 AS ssn);
 ----
-1
+true	1 entry changed
 
 # the principal reads again, masked; the mark is gone; the table's findings are gone
 query II
@@ -220,10 +220,10 @@ SELECT object, problem FROM acl_check_catalog('c') WHERE kind = 'table';
 statement ok
 ALTER TABLE phys.main.customers DROP COLUMN ssn_v2;
 
-query I
+query IT
 ACL ADMIN REPAIR VIRTUAL TABLE c.customers DROP MISSING COLUMNS AND MASKS;
 ----
-2
+true	2 entries changed
 
 query II
 SELECT "columns", coalesce(masks, '') FROM store.acl.role_object_caps WHERE role = 'analyst' AND vname = 'customers';
@@ -522,10 +522,10 @@ SELECT acl_grant_catalog('mgr', 'c', '{"manage": true}', false);
 statement ok
 ACL ROLE "mgr" ACL CHECK VIRTUAL CATALOG c;
 
-query I
+query IT
 ACL ROLE "mgr" ACL REPAIR VIRTUAL TABLE c.customers DROP MISSING COLUMNS;
 ----
-0
+true	0 entries changed
 
 statement error
 ACL ROLE "mgr" ACL CHECK VIRTUAL CATALOG d;

@@ -311,10 +311,10 @@ ACL ROLE "analyst" SELECT acl_session_profile('x', 'off');
 statement ok
 SET VARIABLE mgmt = 'ACL ADMIN PROFILE SESSION ''' || getvariable('sid') || ''' SAMPLED';
 
-query I
+query IT
 SELECT * FROM query(getvariable('mgmt'));
 ----
-true
+true	NULL
 
 query I
 SELECT acl_sessions() LIKE '%"profile_level":"sampled","profile_source":"override"%';
@@ -324,10 +324,10 @@ true
 statement ok
 SET VARIABLE mgmt = 'ACL ADMIN PROFILE SESSION ''' || getvariable('sid') || ''' OFF';
 
-query I
+query IT
 SELECT * FROM query(getvariable('mgmt'));
 ----
-true
+true	NULL
 
 query I
 SELECT acl_sessions() LIKE '%"profile_level":"off","profile_source":"instance"%';
@@ -360,20 +360,20 @@ SELECT acl_revoke_admin('analyst');
 statement ok
 SELECT acl_grant_admin('analyst', 'passthrough');
 
-query I
+query IT
 SELECT * FROM query(acl_session_sql(getvariable('h'), 'ACL PROFILE SESSION CURRENT ON'));
 ----
-true
+true	NULL
 
 query I
 SELECT acl_sessions() LIKE '%"profile_level":"all","profile_source":"override"%';
 ----
 true
 
-query I
+query IT
 SELECT * FROM query(acl_session_sql(getvariable('h'), 'ACL PROFILE SESSION CURRENT OFF'));
 ----
-true
+true	NULL
 
 query I
 SELECT acl_sessions() LIKE '%"profile_level":"off","profile_source":"instance"%';

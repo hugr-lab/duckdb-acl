@@ -315,10 +315,10 @@ ACL ADMIN REPAIR VIRTUAL TABLE c.only DROP MISSING COLUMNS;
 ----
 every declared column is missing
 
-query I
+query IT
 ACL ADMIN REPAIR VIRTUAL TABLE c.mk DROP MISSING COLUMNS AND MASKS;
 ----
-1
+true	1 entry changed
 
 query II
 SELECT columns, coalesce(masks, '') FROM store.acl.role_object_caps WHERE role = 'mr' AND vname = 'mk';

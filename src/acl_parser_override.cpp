@@ -1,6 +1,7 @@
 #include "acl_parser_override.hpp"
 
 #include "acl_admin_sql.hpp"
+#include "acl_mgmt_answer.hpp"
 #include "acl_platform.hpp"
 #include "acl_attach_lineage.hpp"
 #include "acl_audit_pipeline.hpp"
@@ -879,6 +880,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		QualifyBodies(statements, store);           // spec 160
 		AuthorizeBodies(statements, rights, store, principal);
 		AuthorizeSources(statements, rights, store);
+		AnswerManagement(statements); // spec 179: (ok, message), once every authorizer has judged the call
 		return ParserOverrideResult(std::move(statements));
 	}
 	if (mode == AclPrefix::Mode::NATIVE) {
@@ -986,6 +988,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			QualifyBodies(compiled, store);           // spec 160
 			AuthorizeBodies(compiled, rights, store, principal);
 			AuthorizeSources(compiled, rights, store);
+			AnswerManagement(compiled); // spec 179
 			return ParserOverrideResult(std::move(compiled));
 		}
 	}

@@ -196,7 +196,7 @@ server_true FORGED_PRINCIPAL "(SELECT count(*) FROM acl_audit_events() WHERE kin
 # a console's DRAIN NODE on the draining node answers what remains to drain, its own call's session not among them:
 # the seated analyst's session alone
 got="$("$PYBIN" "$HERE/client.py" "$URI" "DRAIN NODE" "$OPS_TOKEN" 2>&1)" || fail "an operator's DRAIN NODE call: $got"
-echo "$got" | grep -q "\[1\]" || fail "DRAIN NODE counted its own call's session: $got"
+echo "$got" | grep -q "'1 session still open'" || fail "DRAIN NODE counted its own call's session: $got"
 # an operator holding no session on the node resumes it with a call, as a console does with the person's token -
 # while the analyst connecting beside it is still refused
 refusal="$("$PYBIN" "$HERE/client.py" "$URI" "SELECT 1" "$TOKEN" 2>&1)" \

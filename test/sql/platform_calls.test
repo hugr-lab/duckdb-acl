@@ -53,25 +53,25 @@ ACL ADMIN GRANT ADMIN observe TO ROLE obs;
 
 # --- every function at the top level, under the policy bundle --------------------------------------------
 
-query T
+query IT
 ACL ROLE "pol" SELECT platform.create_catalog('sales', comment := 'the sales mart');
 ----
-true
+true	NULL
 
 query TT
 SELECT vcat, comment FROM store.acl.catalogs;
 ----
 sales	the sales mart
 
-query T
+query IT
 ACL ROLE "pol" SELECT platform.main.alter_catalog(catalog := 'sales', comment := 'renamed');
 ----
-true
+true	NULL
 
-query T
+query IT
 ACL ROLE "pol" CALL platform.add_relation('sales', 'orders', 'phys.main.orders', columns := ['id', 'tenant', 'amount']);
 ----
-true
+true	NULL
 
 query TT
 SELECT vname, phys FROM store.acl.relations WHERE vcat = 'sales';
@@ -93,10 +93,10 @@ ACL ROLE "pol" SELECT platform.drop_schema_alias('sales', 'raw');
 statement ok
 ACL ROLE "pol" SELECT platform.expand_schema('sales', 'lake', 'phys.main');
 
-query I
+query IT
 ACL ROLE "pol" SELECT platform.refresh_schema_objects('sales', 'lake', prune := true);
 ----
-0
+true	0 records added or removed
 
 statement ok
 ACL ROLE "pol" SELECT platform.add_table_function('sales', 'report', 'SELECT id FROM phys.main.orders WHERE amount >= acl_arg(1)', params := 'threshold INTEGER');
@@ -145,10 +145,10 @@ ACL ROLE "pol" SELECT platform.drop_reference('sales', 'self');
 statement ok
 ACL ROLE "pol" SELECT platform.rematerialize_schema_caps('sales');
 
-query I
+query IT
 ACL ROLE "pol" SELECT platform.repair_relation('sales', 'orders', 'drop_missing');
 ----
-0
+true	0 entries changed
 
 statement ok
 ACL ROLE "pol" SELECT platform.create_role('analyst', claims := 'tenant=acme');

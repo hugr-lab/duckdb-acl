@@ -1,4 +1,5 @@
 #include "acl_admin_functions.hpp"
+#include "acl_mgmt_answer.hpp"
 #include "acl_platform.hpp"
 #include "acl_door_common.hpp"
 #include "acl_policy_catalog.hpp"
@@ -2677,6 +2678,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// drain (spec 066): the operator's graceful-stop surface, denied to a principal like the rest
 	register_session_bigint("acl_drain", AclDrainFunc);
 	register_admin("acl_resume", {}, AclResumeFunc);
+	RegisterAclAnswer(loader, store); // spec 179: what a management statement answers
 	register_session_text("acl_drain_status", {}, AclDrainStatusFunc);
 	{
 		ScalarFunction view_as(Identifier("acl_session_view_as"), {v}, LogicalType::BOOLEAN, AclSessionViewAsFunc);

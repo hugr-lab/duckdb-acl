@@ -1026,12 +1026,20 @@ struct PolicyStore {
 		//! spec 177: attach the lazy source `alias` if it is not attached, and note its use; throws (the source's
 		//! error class, never its text) when it cannot
 		std::function<void(const string &alias)> attach_on_demand;
+		//! spec 179: what the platform part adds to a management statement's `message` after its call succeeded
+		//! (`function` the acl_* call, `args` its values; '' = nothing) - the grant's group-source hint. It runs inside
+		//! the statement's execution: it reads through the store's own connection, never `context` (a query on it
+		//! deadlocks), and writes nothing; a throw drops the note, never the answer
+		std::function<string(ClientContext &context, const string &function, const vector<Value> &args)>
+		    management_note;
 	};
 	NodeTraits node_traits;
 	//! spec 176: the group whose source set this node attaches only ('' = every source)
 	string PartialSourcesGroup();
 	//! spec 177: the aliases this node attaches on demand (none without the trait)
 	vector<string> LazySources();
+	//! spec 179: the platform part's note on a management call's answer ('' without the trait)
+	string ManagementNote(ClientContext &context, const string &function, const vector<Value> &args);
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
 	                               const string &repository, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,

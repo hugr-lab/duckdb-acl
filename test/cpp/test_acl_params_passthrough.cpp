@@ -157,15 +157,20 @@ void PlatformCallParameters() {
 	Check(!stored->HasError() && stored->Collection().GetValue(0, 0).ToString() == "the second",
 	      "each execution is its own change");
 
-	// the call keeps the column alias it was written with; the grammar answers under the call's name
+	// spec 179: a call and the grammar answer the same two columns, `ok` and `message` - an alias names nothing
+	auto columns_of = [](QueryResult &result) {
+		string names;
+		for (idx_t c = 0; c < result.ColumnCount(); c++) {
+			names += (c ? "," : "") + result.ColumnName(c).GetIdentifierName();
+		}
+		return names;
+	};
 	auto aliased = con.Query("ACL ROLE \"pol\" SELECT platform.create_role('aliased_role') AS made");
-	Check(!aliased->HasError() && aliased->ColumnName(0).GetIdentifierName() == "made",
-	      "a call keeps its alias: " +
-	          (aliased->HasError() ? aliased->GetError() : aliased->ColumnName(0).GetIdentifierName()));
+	Check(!aliased->HasError() && columns_of(*aliased) == "ok,message",
+	      "a call answers (ok, message): " + (aliased->HasError() ? aliased->GetError() : columns_of(*aliased)));
 	auto named = con.Query("ACL ROLE \"pol\" CREATE ROLE named_role");
-	Check(!named->HasError() && named->ColumnName(0).GetIdentifierName() == "create_role",
-	      "the grammar answers as the call is named: " +
-	          (named->HasError() ? named->GetError() : named->ColumnName(0).GetIdentifierName()));
+	Check(!named->HasError() && columns_of(*named) == "ok,message",
+	      "the grammar answers (ok, message): " + (named->HasError() ? named->GetError() : columns_of(*named)));
 	// the grammar's compiled call prepares the same way (and carries no parameter of its own)
 	auto grammar = con.Prepare("ACL ROLE \"pol\" CREATE ROLE prepared_role");
 	if (CheckOk(*grammar, "a management statement prepares")) {
