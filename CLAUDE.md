@@ -952,6 +952,11 @@ waits for each batch in 200 ms steps (`IngestNextChunk`: cancelled call, `Sessio
 ingest's state, declared before the session's lock, so the session is free before the read's thread is joined (that waits
 for the client). e2e `stream.sh` (`stream_client.py stall`).
 
+**Spec 176 — a node with part of the sources writes no policy** (hugr-node spec 035): `NodeTraits::partial_sources`
+(the platform part's) names the group whose declared source set is all the node attaches; there every management call
+but OPERATE / OPEN (`RefuseWritesOnPartialNode`, beside `AuthorizeMgmt`) and `platform.check_catalog` / `check_grant`
+are refused, naming where to run them. Test `test_acl_partial_sources.cpp`.
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`

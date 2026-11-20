@@ -1016,8 +1016,13 @@ struct PolicyStore {
 		std::function<string()> node_group;     //! acl_node_group, '' = none
 		std::function<bool()> node_group_known; //! the policy has the node's group (throws: a catalog not readable)
 		std::function<int64_t()> config_target; //! the profile's version (throws: no profile)
+		//! spec 176 (hugr-node spec 035): the resource group whose declared source set is all this node attaches
+		//! ('' = every source). Such a node writes no policy: a write judged against sources it lacks would be wrong
+		std::function<string()> partial_sources;
 	};
 	NodeTraits node_traits;
+	//! spec 176: the group whose source set this node attaches only ('' = every source)
+	string PartialSourcesGroup();
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
 	                               const string &repository, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,

@@ -128,6 +128,10 @@ struct PlatformAccess {
 //! the batch is judged against `rights`, a refusal anywhere throws before any statement runs, and a call
 //! it does not know is refused, never waved through.
 void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights);
+//! spec 176: on a node that attaches only its group's declared sources (hugr-node spec 035) every management call
+//! that writes - the policy, the cluster profile - is refused, naming where to run it; the node's operation (OPERATE)
+//! and console_info (OPEN) run. Whoever the principal is: the write would be judged against sources the node lacks
+void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store);
 void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights &rights);
 //! What the static table cannot see (spec 117 review): a role mapping whose target role administers hands
 //! that administration to whoever holds the claim - spec 095 admits it because the mapping is the client's
