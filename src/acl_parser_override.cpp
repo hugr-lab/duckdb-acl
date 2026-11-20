@@ -866,6 +866,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		NoteManagement(statements, audit);
 		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);
+		RefuseWritesOnPartialNode(statements, store); // spec 176
 		AuthorizeRoleTargets(statements, rights, store);
 		QualifyBodies(statements, store); // spec 160
 		AuthorizeBodies(statements, rights, store, principal);
@@ -971,6 +972,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			NoteManagement(compiled, audit);
 			audit.phase = Reason::MGMT_UNAUTHORIZED;
 			AuthorizeMgmt(compiled, rights);
+			RefuseWritesOnPartialNode(compiled, store); // spec 176
 			AuthorizeRoleTargets(compiled, rights, store);
 			QualifyBodies(compiled, store); // spec 160
 			AuthorizeBodies(compiled, rights, store, principal);

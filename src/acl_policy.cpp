@@ -1352,6 +1352,10 @@ string PolicyStore::NodeGroup() {
 	return node_traits.node_group ? node_traits.node_group() : string();
 }
 
+string PolicyStore::PartialSourcesGroup() {
+	return node_traits.partial_sources ? node_traits.partial_sources() : string();
+}
+
 int64_t PolicyStore::MetadataMaxRows() {
 	auto db = instance.lock();
 	Value value;

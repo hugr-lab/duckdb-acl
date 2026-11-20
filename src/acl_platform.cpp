@@ -2137,6 +2137,41 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 	}
 }
 
+namespace {
+
+[[noreturn]] void ThrowPartialNode(const string &group) {
+	NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
+	throw BinderException("acl: this node attaches the sources of group \"%s\" only - run it on a node of a group "
+	                      "that attaches every source",
+	                      group);
+}
+
+} // namespace
+
+void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store) {
+	// the exempt calls first: the node's operation must not depend on reading the policy catalog (an incident is
+	// when it is unreachable), and a batch of them costs no read
+	bool writes = false;
+	for (auto &statement : statements) {
+		auto &call = CompiledCall(*statement);
+		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		auto function = PlatformFunctionByTarget(target);
+		// view-as sets the session's mode, never the policy (spec 120.3) - a session in it must be able to leave it
+		if (target == "acl_session_view_as" ||
+		    (function && (function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN))) {
+			continue;
+		}
+		writes = true;
+	}
+	if (!writes) {
+		return;
+	}
+	auto group = store.PartialSourcesGroup();
+	if (!group.empty()) {
+		ThrowPartialNode(group);
+	}
+}
+
 void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights) {
 	for (auto &statement : statements) {
 		AuthorizeAdminCall(*statement, rights);
@@ -2769,6 +2804,14 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 	auto statement = make_uniq<SelectStatement>();
 	statement->node = std::move(node);
 	AuthorizeAdminCall(*statement, rights);
+	// spec 176: what probes the stored facts against the sources (the catalog's check, a grant's check) does not run
+	// on a node that attaches only part of them - it would answer a source missing that the group never attaches
+	if (function->target == string("acl_check_catalog") || function->target == string("acl_check_grant")) {
+		auto group = store.PartialSourcesGroup();
+		if (!group.empty()) {
+			ThrowPartialNode(group);
+		}
+	}
 	vector<unique_ptr<SQLStatement>> judged;
 	judged.push_back(std::move(statement));
 	// spec 122: a read function carrying a body (check_grant's RLS and columns) is judged by its author's function
