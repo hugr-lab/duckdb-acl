@@ -53,6 +53,9 @@ struct FunctionKey {
 //! `whoami()` - and an attached catalog's function of that name (tresor's) is categorized like any
 //! other (spec 082).
 bool FunctionNeverCallable(const string &lowered_name, const string &database = string());
+//! spec 178: a module linked into the extension (the platform part) puts its own operator-only functions in the never
+//! set by their prefix (hugr-node: `hugr_node_`) - at load, before the first statement; idempotent
+void RegisterNeverCallablePrefix(const string &lowered_prefix);
 //! Whether `lowered_name` is never callable only as the system catalog's (quack's `whoami`)
 bool FunctionNeverOnlyInSystem(const string &lowered_name);
 

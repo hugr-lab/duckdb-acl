@@ -5,6 +5,8 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include "duckdb/common/mutex.hpp"
+
 #include <algorithm>
 #include <cstring>
 
@@ -32,12 +34,48 @@ string FunctionKey::Serialize() const {
 	       "\x1f" + FunctionKindName(kind);
 }
 
+namespace {
+
+//! spec 178: the prefixes a linked module registered - written at load, read on every judged call
+struct NeverCallablePrefixes {
+	mutex lock;
+	vector<string> prefixes;
+};
+
+NeverCallablePrefixes &RegisteredNeverCallable() {
+	static NeverCallablePrefixes registered; // NOLINT: a process-wide registry, as the platform registry is
+	return registered;
+}
+
+} // namespace
+
+void RegisterNeverCallablePrefix(const string &lowered_prefix) {
+	if (lowered_prefix.empty()) {
+		throw InternalException("acl: a never-set prefix is never empty");
+	}
+	auto &registered = RegisteredNeverCallable();
+	lock_guard<mutex> guard(registered.lock);
+	if (std::find(registered.prefixes.begin(), registered.prefixes.end(), lowered_prefix) ==
+	    registered.prefixes.end()) {
+		registered.prefixes.push_back(lowered_prefix);
+	}
+}
+
 bool FunctionNeverCallable(const string &name, const string &database) {
 	// the extension's own surface, the lakehouse's, the door's, unity catalog's - and the optimizer's
 	// own helpers, which no statement spells by name
 	for (auto prefix : {"acl_", "ducklake_", "quack_", "uc_", "__internal_"}) {
 		if (StringUtil::StartsWith(name, prefix)) {
 			return true;
+		}
+	}
+	{
+		auto &registered = RegisteredNeverCallable();
+		lock_guard<mutex> guard(registered.lock);
+		for (auto &prefix : registered.prefixes) {
+			if (StringUtil::StartsWith(name, prefix)) {
+				return true;
+			}
 		}
 	}
 	// SQL past the rewriter, pointers, generated queries
