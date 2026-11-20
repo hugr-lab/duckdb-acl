@@ -118,6 +118,16 @@ int main(int argc, char *argv[]) {
 			Check(error.empty(), "the DELETE: " + error);
 		});
 
+		Scenario("a role registering an existing table of a lazy source (VIRTUAL ONLY) attaches it", [&] {
+			Exec(con, "ACL ADMIN CREATE ROLE curator");
+			Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE curator CAPS '{}' MAIN");
+			Exec(con, "ACL ADMIN GRANT SCHEMA c.arch TO ROLE curator WITH (select, create) VIRTUAL ONLY");
+			detach();
+			auto error = ErrorOf(con, "ACL ROLE 'curator' CREATE TABLE arch.w(c INTEGER)");
+			Check(error.empty(), "the registration: " + error);
+			Check(Attached(con, "lazy"), "the record's source is attached");
+		});
+
 		Scenario("negative: a principal's own physical name wakes nothing - it is refused first", [&] {
 			detach();
 			auto error = ErrorOf(con, principal + "SELECT * FROM lazy.main.t");

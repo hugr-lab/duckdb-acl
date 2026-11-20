@@ -1026,6 +1026,7 @@ private:
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
 			drop_statement = true;
+			NotePhysical(phys, target.vname); // spec 177: the record probes it in its home's source
 			follow_ups.push_back(
 			    AclRecord("acl_register_existing", {Value(target.vcat), Value(target.vname), Value(phys),
 			                                        Value(target.origin), Value(AuthorOf(principal))}));

@@ -2845,7 +2845,10 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		if (!group.empty()) {
 			ThrowPartialNode(group);
 		}
-		WakeLazySources(store); // spec 177
+	}
+	if (function->target == string("acl_check_grant")) {
+		// spec 177: its body (an RLS naming a table) is qualified and probed below, at parse - before its own wake
+		WakeLazySources(store);
 	}
 	vector<unique_ptr<SQLStatement>> judged;
 	judged.push_back(std::move(statement));

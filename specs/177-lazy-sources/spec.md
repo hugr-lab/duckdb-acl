@@ -24,7 +24,8 @@ statement reads. This spec is that seam.
   attached (`NoteDatabase`, once per statement) and noted on the statement's trail wherever the statement may read
   it:
   - each physical name the resolution puts in (`NotePhysical`: a read, a write's target, a statement dropped for its
-    record such as a principal's CREATE VIEW, whose record and guards read through the author's resolution);
+    record - a principal's CREATE VIEW, whose record and guards read through the author's resolution, and a VIRTUAL
+    ONLY CREATE TABLE, whose record probes the existing table);
   - the rewritten statement, walked by `StatementDatabases` (acl_platform_rights.cpp, spec 138's scoped walk). The walk
     covers a SELECT, the DML nodes, an INSERT's target (duckdb 2.0 keeps it in the node's name), a CREATE's query and
     target catalog, a DROP's and an ALTER's target, and an EXPLAIN's statement;
@@ -43,7 +44,9 @@ statement reads. This spec is that seam.
   INFRASTRUCTURE. The wake runs once the calls are authorized (`AuthorizeMgmt`, `AuthorizeRoleTargets`), and before
   the bodies are qualified and probed (`QualifyBodies`, `AuthorizeBodies`, `AuthorizeSources` bind them). A call the
   principal may not make wakes nothing. `acl_check_catalog` and `acl_check_grant` wake every lazy source themselves,
-  so the operator's own call does too. A source that does not attach is the probe's to report, as one that is down.
+  so the operator's own call does too; `platform.check_grant` also wakes them at parse, where its body is qualified
+  and probed. The wake attaches every lazy source, not only the batch's: attaching reads nothing, and the bodies'
+  tables are known only once they are qualified. A source that does not attach is the probe's to report, as one that is down.
 - **Listings never wake a source.** They read the physical facts through `acl_physical_*` with the keys as constants,
   and a database that is not attached is `not attached` (spec 136).
 - **Not covered.** `ACL NATIVE` and the operator's own unprefixed SQL (but the check functions) are not rewritten;
@@ -66,6 +69,8 @@ reference.
   - a read of an operator's view whose SQL names it;
   - a read through a live schema alias over it;
 - an INSERT and a DELETE into the lazy source attach it (the INSERT's target is the node's name);
+- a role registering an existing table of the lazy source (a VIRTUAL ONLY schema grant) attaches it - the statement
+  is dropped for its record, which probes the table;
 - negative: a principal's own physical name, and a management call it may not make, wake nothing;
 - a read of another source asks nothing, and the tables listing and `SHOW TABLES` wake nothing;
 - a prepared statement executed after the source was detached attaches it again (QueryBegin);
