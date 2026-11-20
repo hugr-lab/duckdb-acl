@@ -97,6 +97,14 @@ int main(int argc, char *argv[]) {
 			Check(granted == "true|group etl does not list a source of c", "the grant's note: " + granted);
 			Check(!seen.empty() && seen.back().rfind("acl_grant_catalog|analyst|c|", 0) == 0,
 			      "the note reads the call's arguments: " + (seen.empty() ? std::string() : seen.back()));
+			// named arguments reach the note in the function's order
+			Exec(con, "ACL ADMIN CREATE ROLE pol_n");
+			Exec(con, "SELECT acl_grant_admin('pol_n', 'policy')");
+			auto named = Answer(con, "ACL ROLE \"pol_n\" SELECT platform.grant_catalog(catalog := 'c', "
+			                         "role := 'analyst', caps := ['select'], main := true)");
+			Check(named == "true|group etl does not list a source of c" &&
+			          seen.back().rfind("acl_grant_catalog|analyst|c|", 0) == 0,
+			      "named arguments in the call's order: " + named + " / " + seen.back());
 			auto count = seen.size();
 			auto again = Answer(con, "ACL ADMIN RESUME NODE");
 			Check(again == "false|the node was not draining" && seen.size() == count,
@@ -104,6 +112,15 @@ int main(int argc, char *argv[]) {
 			auto drained = Answer(con, "ACL ADMIN DRAIN NODE");
 			Check(drained == "true|0 sessions still open", "an empty note adds nothing: " + drained);
 			Exec(con, "ACL ADMIN RESUME NODE");
+			// a note that throws is dropped: the grant has committed and answers ok
+			store->node_traits.management_note = [](ClientContext &, const std::string &,
+			                                        const vector<Value> &) -> std::string {
+				throw IOException("the platform part's catalog is down");
+			};
+			auto thrown = Answer(con, "ACL ADMIN GRANT CATALOG c TO ROLE thrower WITH (select)");
+			Check(thrown == "true|NULL", "a throwing note: " + thrown);
+			auto stored = con.Query("SELECT count(*) FROM store.acl.role_catalogs WHERE role = 'thrower'");
+			Check(!stored->HasError() && Cell(*stored, 0) == "1", "the grant stands");
 			store->node_traits.management_note = nullptr;
 		});
 
@@ -114,8 +131,14 @@ int main(int argc, char *argv[]) {
 			if (!Check(!prepared->HasError(), "prepared: " + (prepared->HasError() ? prepared->GetError() : ""))) {
 				return;
 			}
+			auto version = [&]() {
+				auto v = con.Query("SELECT CAST(value AS BIGINT) FROM store.acl.meta WHERE key = 'policy_version'");
+				return v->HasError() ? int64_t(-1) : v->Collection().GetValue(0, 0).GetValue<int64_t>();
+			};
 			for (auto comment : {"first", "second"}) {
+				auto before = version();
 				auto result = prepared->Execute(comment);
+				Check(version() == before + 1, std::string("execution ") + comment + " writes once");
 				Check(!result->HasError() && Columns(*result) == "ok,message" && Cell(*result, 0) == "true",
 				      std::string("execution ") + comment + ": " +
 				          (result->HasError() ? result->GetError() : Columns(*result)));
@@ -139,6 +162,23 @@ int main(int argc, char *argv[]) {
 			Check(fields[0] == Value::BOOLEAN(true) && fields[1].ToString() == "applied here; a note" &&
 			          fields[2] == Value::BIGINT(7),
 			      "its message first, then the note: " + answer.ToString());
+			auto through = [&](const std::string &value) {
+				auto r = con.Query("SELECT a.* FROM (SELECT acl_answer('acl_x', " + value + ") AS a)");
+				if (r->HasError()) {
+					return "error: " + r->GetError();
+				}
+				std::string out = Columns(*r);
+				for (idx_t c = 0; c < r->ColumnCount(); c++) {
+					out += "|" + Cell(*r, c);
+				}
+				return out;
+			};
+			auto null_ok = through("{'ok': NULL::BOOLEAN, 'v': 1}");
+			Check(null_ok == "ok,message,v|false|NULL|1", "a STRUCT's NULL ok is not ok: " + null_ok);
+			auto bad_ok = through("{'ok': 'maybe', 'v': 1}");
+			Check(bad_ok == "ok,message,v|false|NULL|1", "an ok that is no BOOLEAN is not ok, no throw: " + bad_ok);
+			auto huge = through("18446744073709551615::UBIGINT");
+			Check(huge == "ok,message|true|18446744073709551615", "a count past BIGINT is its text: " + huge);
 			auto none = acl::ManagementAnswer("acl_x", Value(type), type, "");
 			Check(StructValue::GetChildren(none)[0] == Value::BOOLEAN(false), "no answer is not ok");
 			auto text = acl::ManagementAnswer("acl_migrate_catalog", Value("migrated to 28"), LogicalType::VARCHAR, "");

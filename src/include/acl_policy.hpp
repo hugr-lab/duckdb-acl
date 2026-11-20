@@ -1027,7 +1027,9 @@ struct PolicyStore {
 		//! error class, never its text) when it cannot
 		std::function<void(const string &alias)> attach_on_demand;
 		//! spec 179: what the platform part adds to a management statement's `message` after its call succeeded
-		//! (`function` the acl_* call, `args` its values; '' = nothing) - the grant's group-source hint
+		//! (`function` the acl_* call, `args` its values; '' = nothing) - the grant's group-source hint. It runs inside
+		//! the statement's execution: it reads through the store's own connection, never `context` (a query on it
+		//! deadlocks), and writes nothing; a throw drops the note, never the answer
 		std::function<string(ClientContext &context, const string &function, const vector<Value> &args)>
 		    management_note;
 	};

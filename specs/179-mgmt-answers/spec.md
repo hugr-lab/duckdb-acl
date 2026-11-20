@@ -42,6 +42,13 @@ answers two fields, `ok` and `message`.
   `acl_*` call in the native context (the operator's scripts and tests), the secrets service's calls (tresor's
   answers). A column alias written on a `platform.<op>` call names nothing now.
 
+- **Found by its review, fixed**: acl_answer runs after the write has committed on the store's own connection, so
+  nothing in it may throw - a note that throws is dropped (the answer stays `ok`), a STRUCT's `ok` that is NULL or no
+  BOOLEAN reads as not ok (`Truth`, a try-cast), a count past BIGINT is its text. The note's contract says it reads
+  through the store's own connection, never the statement's `context` (a query on it deadlocks), and writes nothing.
+  Only a constant or a parameter is copied for the note (all a form writes today); anything else reaches it as NULL,
+  never evaluated twice.
+
 ## Enforcement & security
 
 Nothing is admitted or refused differently: the wrap is applied to statements every authorizer has already judged,
@@ -53,7 +60,10 @@ part's code; it reads what it likes on the context it is given and must not writ
 - `test/cpp/test_acl_mgmt_answer.cpp`: the grammar answers `(ok, message)` and runs the call once (fails with the
   `unnest` form); a false, a count; a direct call and CHECK answer as before; the note after a success with the
   call's arguments, none after a false, an empty note adds nothing; a prepared platform call answers the pair at each
-  execution and writes once; a STRUCT answer keeps its fields, NULL is not ok, a text is the message.
+  execution and writes once (the policy version moves by one); named arguments reach the note in the function's
+  order; a throwing note leaves the grant standing and the answer ok; through SQL, a STRUCT's NULL or non-BOOLEAN `ok`
+  is not ok and a count past BIGINT is its text; a STRUCT answer keeps its fields, NULL is not ok, a text is the
+  message. Each of the review's cases fails on the code before its fix.
 - `test/cpp/test_acl_params_passthrough.cpp`: a call and the grammar answer the same two columns.
 - The suite's management answers (`acl_mgmt_grammar`, `platform_calls`, `node_operate`, `acl_profile`,
   `acl_catalog_maintenance`, `acl_empty_grant_projection`) and the Flight e2e (`admin.sh`, `drain.sh`) read the pair.

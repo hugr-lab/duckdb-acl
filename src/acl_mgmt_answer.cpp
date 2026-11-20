@@ -67,6 +67,15 @@ LogicalType AnswerType(const LogicalType &value) {
 	return LogicalType::STRUCT(std::move(children));
 }
 
+//! A value read as ok: NULL, or one that is no BOOLEAN, is not ok - never a throw (the write has committed)
+bool Truth(const Value &value) {
+	if (value.IsNull()) {
+		return false;
+	}
+	auto as_bool = value.DefaultTryCastAs(LogicalType::BOOLEAN);
+	return as_bool && !as_bool->IsNull() && as_bool->GetValue<bool>();
+}
+
 //! Whether the call did what it said - the platform part notes only after such a call
 bool Succeeded(const Value &value) {
 	if (value.IsNull()) {
@@ -80,7 +89,7 @@ bool Succeeded(const Value &value) {
 		auto &values = StructValue::GetChildren(value);
 		for (idx_t i = 0; i < types.size(); i++) {
 			if (StringUtil::CIEquals(types[i].first.GetIdentifierName(), "ok")) {
-				return !values[i].IsNull() && values[i].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+				return Truth(values[i]);
 			}
 		}
 	}
@@ -110,7 +119,13 @@ void AnswerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 			for (idx_t c = 2; c < args.ColumnCount(); c++) {
 				call_args.push_back(args.data[c].GetValue(row));
 			}
-			note = store.ManagementNote(context, name, call_args);
+			try {
+				note = store.ManagementNote(context, name, call_args);
+			} catch (std::exception &) {
+				// the write has committed on the store's own connection: a note that fails is dropped, never the
+				// answer of a change that stands
+				note.clear();
+			}
 		}
 		result.SetValue(row, ManagementAnswer(name, value, type, note));
 	}
@@ -146,7 +161,7 @@ Value ManagementAnswer(const string &function, const Value &value, const Logical
 		for (idx_t i = 0; i < types.size(); i++) {
 			auto &field = types[i].first.GetIdentifierName();
 			if (StringUtil::CIEquals(field, "ok")) {
-				ok = values[i].DefaultCastAs(LogicalType::BOOLEAN);
+				ok = Value::BOOLEAN(Truth(values[i]));
 			} else if (StringUtil::CIEquals(field, "message")) {
 				if (!values[i].IsNull()) {
 					message = values[i].ToString();
@@ -157,7 +172,8 @@ Value ManagementAnswer(const string &function, const Value &value, const Logical
 			}
 		}
 	} else if (type.IsIntegral()) {
-		message = CountMessage(function, value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>());
+		auto count = value.DefaultTryCastAs(LogicalType::BIGINT);
+		message = count && !count->IsNull() ? CountMessage(function, count->GetValue<int64_t>()) : value.ToString();
 		has_message = true;
 	} else {
 		message = value.ToString();
@@ -197,7 +213,13 @@ void AnswerManagement(vector<unique_ptr<SQLStatement>> &statements) {
 		inner->ClearAlias();
 		children.push_back(std::move(inner));
 		for (auto &argument : call.GetArguments()) {
-			children.push_back(argument.GetExpression().Copy());
+			// the note reads the arguments again: a constant or a parameter is the value the call read; anything
+			// else (no form writes one today) would be evaluated a second time, so the note gets NULL for it
+			auto &expression = argument.GetExpression();
+			auto kind = expression.GetExpressionClass();
+			children.push_back(kind == ExpressionClass::CONSTANT || kind == ExpressionClass::PARAMETER
+			                       ? expression.Copy()
+			                       : ConstantExpression::FromValue(Value()));
 		}
 		// `SELECT __acl_answer.* FROM (SELECT acl_answer(…) AS __acl_answer)`: the struct's star reads the column
 		// once - an `unnest(acl_answer(…))` is one struct_extract per field, each running the call
