@@ -72,8 +72,20 @@ int main(int argc, char *argv[]) {
 			Check(own.find(REFUSAL) != std::string::npos, "a principal's write: " + own);
 			auto grant = ErrorOf(con, principal + "GRANT CATALOG c TO ROLE analyst WITH (select) MAIN");
 			Check(grant.find(REFUSAL) != std::string::npos, "a grant: " + grant);
+			auto call = ErrorOf(con, principal + "SELECT platform.create_role('refused_call')");
+			Check(call.find(REFUSAL) != std::string::npos, "a platform call (the call seam): " + call);
 			auto check = ErrorOf(con, principal + "SELECT * FROM platform.check_catalog()");
 			Check(check.find(REFUSAL) != std::string::npos, "the catalog's check against the sources: " + check);
+			auto inside =
+			    ErrorOf(con, principal + "SELECT count(*) FROM platform.check_catalog() WHERE kind IS NOT NULL");
+			Check(inside.find(REFUSAL) != std::string::npos,
+			      "the check read inside a query (the rewriter's path): " + inside);
+			auto check_grant =
+			    ErrorOf(con, principal + "SELECT * FROM platform.check_grant('analyst', 'c', 't', NULL, NULL)");
+			Check(check_grant.find(REFUSAL) != std::string::npos,
+			      "a grant's check against the sources: " + check_grant);
+			auto mixed = ErrorOf(con, "ACL ADMIN RESUME NODE; CREATE ROLE refused_mixed");
+			Check(mixed.find(REFUSAL) != std::string::npos, "a batch with one write among exempt calls: " + mixed);
 			auto written = con.Query("SELECT count(*) FROM store.acl.roles WHERE \"role\" LIKE 'refused%'");
 			Check(!written->HasError() && written->Collection().GetValue(0, 0).GetValue<int64_t>() == 0,
 			      "nothing written");
@@ -86,6 +98,34 @@ int main(int argc, char *argv[]) {
 			Check(info.empty(), "console_info (OPEN): " + info);
 			auto roles = ErrorOf(con, principal + "SELECT * FROM platform.roles");
 			Check(roles.empty(), "a read of the policy: " + roles);
+			auto kill = ErrorOf(con, "ACL ADMIN KILL SESSION 'nobody'");
+			Check(kill.find(REFUSAL) == std::string::npos, "KILL SESSION is the node's operation: " + kill);
+		});
+
+		Scenario("...and the exempt calls never read the trait (an unreachable catalog keeps the node operable)", [&] {
+			store->node_traits.partial_sources = []() -> std::string {
+				throw std::runtime_error("the policy catalog is unreachable");
+			};
+			auto resume = ErrorOf(con, "ACL ADMIN RESUME NODE");
+			Check(resume.empty(), "RESUME NODE: " + resume);
+			auto write = ErrorOf(con, "ACL ADMIN CREATE ROLE refused_unreachable");
+			Check(write.find("unreachable") != std::string::npos, "a write fails with the trait's error: " + write);
+			store->node_traits.partial_sources = [] {
+				return std::string("etl");
+			};
+		});
+
+		Scenario("...view-as only sets the session's mode: it runs there, and a session in it can leave it", [&] {
+			auto opened = con.Query("SELECT acl_session_open('" + std::string(TOKEN) + "')");
+			auto handle = opened->HasError() ? std::string() : opened->Collection().GetValue(0, 0).ToString();
+			if (!Check(!handle.empty(), "a session opens")) {
+				return;
+			}
+			auto session = "ACL SESSION '" + handle + "' ";
+			auto set = ErrorOf(con, session + "SET SESSION VIEW AS ROLE 'analyst'");
+			Check(set.empty(), "SET SESSION VIEW AS: " + set);
+			auto reset = ErrorOf(con, session + "RESET SESSION VIEW AS");
+			Check(reset.empty(), "RESET SESSION VIEW AS: " + reset);
 		});
 
 		store->node_traits.partial_sources = nullptr;

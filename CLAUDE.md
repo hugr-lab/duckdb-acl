@@ -954,8 +954,9 @@ for the client). e2e `stream.sh` (`stream_client.py stall`).
 
 **Spec 176 — a node with part of the sources writes no policy** (hugr-node spec 035): `NodeTraits::partial_sources`
 (the platform part's) names the group whose declared source set is all the node attaches; there every management call
-but OPERATE / OPEN (`RefuseWritesOnPartialNode`, beside `AuthorizeMgmt`) and `platform.check_catalog` / `check_grant`
-are refused, naming where to run them. Test `test_acl_partial_sources.cpp`.
+but OPERATE / OPEN / view-as (`RefuseWritesOnPartialNode`, beside `AuthorizeMgmt`; the trait read only for a batch
+that writes) and `platform.check_catalog` / `check_grant` are refused, naming where to run them; a principal's DDL
+record stays. Test `test_acl_partial_sources.cpp`.
 
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema

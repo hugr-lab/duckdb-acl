@@ -3643,8 +3643,11 @@ void PolicyStore::CatalogDropResourceGroup(const string &name, bool if_exists) {
 		}
 		// spec 096: its part of the cluster profile is its nodes' bootstrap - removed first, on purpose,
 		// never orphaned (a scope nothing can write to again, revived by a group of the same name)
-		auto items = read("SELECT \"kind\" || ' ' || \"name\" FROM " + catalog->Tbl("cluster_items") +
-		                  " WHERE \"scope\" = " + Lit(name) + " ORDER BY 1");
+		// a group's source set (hugr-node spec 035) reads as what removes it
+		auto items =
+		    read("SELECT CASE \"kind\" WHEN 'sources' THEN 'source set (RESET SOURCES)' ELSE \"kind\" || ' ' || "
+		         "\"name\" END FROM " +
+		         catalog->Tbl("cluster_items") + " WHERE \"scope\" = " + Lit(name) + " ORDER BY 1");
 		ResultRows item_rows(*items);
 		if (item_rows.Count() > 0) {
 			vector<string> named;

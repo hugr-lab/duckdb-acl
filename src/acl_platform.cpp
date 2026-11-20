@@ -2149,16 +2149,25 @@ namespace {
 } // namespace
 
 void RefuseWritesOnPartialNode(const vector<unique_ptr<SQLStatement>> &statements, PolicyStore &store) {
-	auto group = store.PartialSourcesGroup();
-	if (group.empty()) {
-		return;
-	}
+	// the exempt calls first: the node's operation must not depend on reading the policy catalog (an incident is
+	// when it is unreachable), and a batch of them costs no read
+	bool writes = false;
 	for (auto &statement : statements) {
 		auto &call = CompiledCall(*statement);
-		auto function = PlatformFunctionByTarget(StringUtil::Lower(call.FunctionName().GetIdentifierName()));
-		if (function && (function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN)) {
+		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		auto function = PlatformFunctionByTarget(target);
+		// view-as sets the session's mode, never the policy (spec 120.3) - a session in it must be able to leave it
+		if (target == "acl_session_view_as" ||
+		    (function && (function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN))) {
 			continue;
 		}
+		writes = true;
+	}
+	if (!writes) {
+		return;
+	}
+	auto group = store.PartialSourcesGroup();
+	if (!group.empty()) {
 		ThrowPartialNode(group);
 	}
 }
@@ -2797,9 +2806,11 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 	AuthorizeAdminCall(*statement, rights);
 	// spec 176: what probes the stored facts against the sources (the catalog's check, a grant's check) does not run
 	// on a node that attaches only part of them - it would answer a source missing that the group never attaches
-	if ((function->target == string("acl_check_catalog") || function->target == string("acl_check_grant")) &&
-	    !store.PartialSourcesGroup().empty()) {
-		ThrowPartialNode(store.PartialSourcesGroup());
+	if (function->target == string("acl_check_catalog") || function->target == string("acl_check_grant")) {
+		auto group = store.PartialSourcesGroup();
+		if (!group.empty()) {
+			ThrowPartialNode(group);
+		}
 	}
 	vector<unique_ptr<SQLStatement>> judged;
 	judged.push_back(std::move(statement));

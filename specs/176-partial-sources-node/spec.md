@@ -19,12 +19,18 @@ naming where to run them.
   it, and an open node has none.
 - `RefuseWritesOnPartialNode(statements, store)` (acl_platform.cpp) runs beside the one authorizer (`AuthorizeMgmt`)
   at both management seams, the gateway's `ACL ADMIN` and a principal's statements. It refuses every compiled call
-  but those whose right is `OPERATE` (the node's runtime: sessions, drain / resume) or `OPEN` (`console_info`):
-  `acl: this node attaches the sources of group "etl" only - run it on a node of a group that attaches every source`.
-  That covers the policy's writes and the cluster profile's.
+  except those whose right is `OPERATE` (the node's runtime: sessions, drain / resume), `OPEN` (`console_info`), and
+  view-as (`SET / RESET SESSION VIEW AS`, which sets the session's mode and never the policy; a session already in the
+  mode must be able to leave it). The refusal reads `acl: this node attaches the sources of group "etl" only - run it
+  on a node of a group that attaches every source`. That covers the policy's writes and the cluster profile's.
+- The exempt calls are judged first, and the trait is read only for a batch holding a call that writes. The node's
+  operation therefore never depends on reading the policy catalog: during an incident the catalog may be unreachable,
+  and a `DRAIN NODE` must still run.
 - The read functions that probe the stored facts against the sources (`platform.check_catalog`,
   `platform.check_grant`) are refused there the same way. The policy's reads (the `platform.*` views, the listings)
   and the group's queries run.
+- A principal's own DDL keeps its record (spec 113 / 151: `acl_register_*`, `acl_rename_relation`,
+  `acl_drop_relation`). The record names an object in a source the node holds, because the DDL ran there.
 - `ACL NATIVE` (the break-glass) and the operator's own SQL on the node (its bootstrap's direct `acl_*` calls) are
   unchanged: they are not the management grammar's, and NATIVE is never refused. A cluster whose every group declares
   a source set therefore writes its policy only through them; the ordinary place is a node of a group without a set.
@@ -40,7 +46,11 @@ never lands in the catalog. A trait that throws (the profile not readable) fails
 - with every source, a gateway write and a principal's write run;
 - with the trait set, the gateway's write, a principal's write, a grant and `platform.check_catalog` are refused with
   the message, and nothing is written;
-- `RESUME NODE`, `console_info` and a read of `platform.roles` run;
+- a platform call (`SELECT platform.create_role(…)`), `platform.check_grant`, the check read inside a query (the
+  rewriter's path) and a batch with one write among exempt calls are refused;
+- `RESUME NODE`, `KILL SESSION`, `console_info`, a read of `platform.roles`, and `SET` / `RESET SESSION VIEW AS` run;
+- with a trait that throws (an unreachable catalog), `RESUME NODE` still runs, and a write fails with the trait's
+  error;
 - the trait cleared, writes run again.
 
 It fails without the refusal.
