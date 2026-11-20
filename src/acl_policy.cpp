@@ -1356,6 +1356,10 @@ string PolicyStore::PartialSourcesGroup() {
 	return node_traits.partial_sources ? node_traits.partial_sources() : string();
 }
 
+string PolicyStore::ManagementNote(ClientContext &context, const string &function, const vector<Value> &args) {
+	return node_traits.management_note ? node_traits.management_note(context, function, args) : string();
+}
+
 vector<string> PolicyStore::LazySources() {
 	return node_traits.lazy_sources && node_traits.attach_on_demand ? node_traits.lazy_sources() : vector<string>();
 }

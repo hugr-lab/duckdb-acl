@@ -124,9 +124,9 @@ echo "$got" | grep -q "'bundles': \[\['policy'\]\]" || fail "console_info: $got"
 
 # --- and it changes the policy without ACL NATIVE: a call and the bare grammar, ad hoc and prepared ----
 got="$(ask "SELECT platform.create_role('made_adhoc')")"
-echo "$got" | grep -q "'create_role': \[True\]" || fail "an ad-hoc platform call: $got"
+echo "$got" | grep -q "'ok': \[True\], 'message': \[None\]" || fail "an ad-hoc platform call: $got"
 got="$(ask "@prepared:SELECT platform.create_role('made_prepared')")"
-echo "$got" | grep -q "'create_role': \[True\]" || fail "a prepared platform call: $got"
+echo "$got" | grep -q "'ok': \[True\], 'message': \[None\]" || fail "a prepared platform call: $got"
 got="$(ask "CREATE ROLE made_bare")"
 echo "$got" | grep -qi "error" && fail "the bare grammar: $got"
 got="$(ask "@prepared:GRANT CATALOG c TO ROLE made_bare WITH (select)")"
@@ -279,15 +279,16 @@ PY
 
 # --- spec 118: the operate bundle drains and resumes the node, and administers no policy ---------------
 got="$(ask "DRAIN NODE" "$OPS")"
-echo "$got" | grep -q "\[[0-9]*\]" || fail "DRAIN NODE under operate: $got"
+echo "$got" | grep -q "'ok': \[True\], 'message': \['[0-9]* sessions\{0,1\} still open'\]" || fail "DRAIN NODE under operate: $got"
 # draining seats no new session but the drain's own right's one call (spec 066's addendum): the analyst is refused,
 # the operator's call without a cookie is seated - it resumes the node - and a second RESUME finds it serving
 got="$(ask "SELECT 1" "$ANALYST")"
 echo "$got" | grep -q "node is draining" || fail "a new session was seated while draining: $got"
 got="$(ask "RESUME NODE" "$OPS")"
-echo "$got" | grep -q "True" || fail "RESUME NODE under operate on the draining node: $got"
+echo "$got" | grep -q "'ok': \[True\]" || fail "RESUME NODE under operate on the draining node: $got"
 got="$(ask "RESUME NODE" "$OPS")"
-echo "$got" | grep -q "False" || fail "RESUME NODE under operate on a serving node: $got"
+echo "$got" | grep -q "'ok': \[False\], 'message': \['the node was not draining'\]" ||
+	fail "RESUME NODE under operate on a serving node: $got"
 got="$(ask "CREATE ROLE by_ops" "$OPS")"
 echo "$got" | grep -q "unrestricted manage\|requires" || fail "the operate bundle administered the policy: $got"
 got="$(ask "DRAIN NODE")"

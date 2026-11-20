@@ -38,6 +38,20 @@ every management operation also as a function of the system catalog, `SELECT pla
 top level of a statement, judged by the same authorizer, and reads the policy and the node through
 `platform`'s views - see [the platform catalog](platform-catalog.md).
 
+### What a statement answers (spec 179)
+
+Every management statement and every top-level `platform.<op>(…)` call answers one row of two columns:
+
+| column    | type    | what it says                                                                                     |
+| --------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `ok`      | BOOLEAN | the statement did what it says; `false` when there was nothing to do (`RESUME NODE` on a serving node, `KILL SESSION` of no session) |
+| `message` | VARCHAR | NULL for a plain write; otherwise what happened, in words: what remains (`DRAIN NODE`: `3 sessions still open`), what changed (`REPAIR`: `2 entries changed`), what was refreshed, a migration's report, or a note the platform adds after the write |
+
+A refusal is still an error, never a row with `ok = false`. A statement whose call answers more (a
+platform's cluster answer) keeps its own fields after these two. A form that answers rows (`CHECK
+VIRTUAL CATALOG`, a platform read function in FROM) answers its rows as before, and so does a direct
+`acl_*` call in the native context - the pair is the answer of the grammar and of `platform`.
+
 Writing policy needs a catalog policy source enabled with `acl_use_db`. The function driver
 (`acl_use_functions`) is read-only and refuses every write; without any source the store is
 in-memory, where `CREATE ROLE`, `acl_define_token` and the legacy wrappers work and the virtual

@@ -36,45 +36,45 @@ ACL ADMIN CREATE VIRTUAL CATALOG grammar_one; CREATE ROLE grammar_one;
 
 # --- the operations of a node: rules, the same calls ---------------------------------------------------------------
 
-query I
+query IT
 ACL ADMIN DRAIN NODE;
 ----
-0
+true	0 sessions still open
 
 query I
 SELECT acl_drain_status();
 ----
 draining
 
-query I
+query IT
 ACL ADMIN RESUME NODE;
 ----
-true
+true	NULL
 
-query I
+query IT
 ACL ADMIN KILL SESSION 'no-such-session';
 ----
-false
+false	no session has that id
 
-query I
+query IT
 ACL ADMIN KILL SESSION "no-such-session";
 ----
-false
+false	no session has that id
 
-query I
+query IT
 ACL ADMIN SET SESSION 'no-such-session' AUDIT LEVEL decisions;
 ----
-false
+false	no session has that id
 
-query I
+query IT
 ACL ADMIN SET SESSION 'no-such-session' AUDIT LEVEL DEFAULT;
 ----
-false
+false	no session has that id
 
-query I
+query IT
 ACL ADMIN PROFILE SESSION 'no-such-session' SAMPLED;
 ----
-false
+false	no session has that id
 
 # the catalog is at the build's version already: the call answers so
 statement ok
@@ -86,15 +86,15 @@ ACL ADMIN MIGRATE POLICY CATALOG "aclcat"."acl";
 # keywords in any case, a comment before the statement, the batch split by duckdb's grammar (a comment INSIDE the
 # first statement still hides it from the text check that tells management from native SQL - the last PR of stage 3
 # makes that a rule too)
-query I
+query IT
 ACL ADMIN /* the operator's note */ drain node;
 ----
-0
+true	0 sessions still open
 
-query I
+query IT
 ACL ADMIN RESUME NODE ;;
 ----
-true
+true	NULL
 
 # a batch of a rule's statement and a compiler's
 statement ok
@@ -243,10 +243,10 @@ SELECT count(*) FROM aclcat.acl.roles WHERE role = 'made_anyway';
 0
 
 # block comments nest, as duckdb's tokenizer reads them: a comment that holds one before the statement says nothing
-query I
+query IT
 ACL ADMIN /* a /* b */ c */ DRAIN NODE;
 ----
-0
+true	0 sessions still open
 
 statement ok
 ACL ADMIN RESUME NODE;
@@ -2243,10 +2243,10 @@ ACL ROLE "headed" SELECT 1; KILL /* k */ SESSION 'x';
 ----
 a batch mixing management statements and queries
 
-query I
+query IT
 ACL ADMIN SET SESSION /* c */ 'nosuch' AUDIT LEVEL all;
 ----
-false
+false	no session has that id
 
 # a name with a leading digit (`1x`) is quoted after FUNCTION CATEGORY, as duckdb reads a name (spec 150 4a)
 statement error

@@ -260,6 +260,10 @@ back - only an explicit DROP removes them.
   `ROLLBACK` does not undo it, as for the grammar. The grammar compiles into the same calls and is judged
   by the same authorizer: the grammar and a direct call give the same result and the same refusal.
 
+- **The answer** is `(ok BOOLEAN, message VARCHAR)`, as the grammar's (spec 179, see [what a statement
+  answers](management-sql.md#what-a-statement-answers-spec-179)); a column alias written on the call names
+  nothing.
+
 ```sql
 SELECT platform.create_catalog('sales', comment := 'the sales mart');
 CALL platform.add_relation('sales', 'orders', 'pg.public.orders', columns := ['id', 'amount']);

@@ -107,10 +107,10 @@ ACL ROLE "op" SELECT * FROM platform.grants;
 statement ok
 SET VARIABLE mgmt = 'ACL ROLE "op" SET SESSION ''' || getvariable('sid') || ''' AUDIT LEVEL all';
 
-query I
+query IT
 SELECT * FROM query(getvariable('mgmt'));
 ----
-true
+true	NULL
 
 query TT
 ACL ROLE "op" SELECT audit_level, audit_level_source FROM platform.sessions;
@@ -120,18 +120,18 @@ all	override
 statement ok
 SET VARIABLE mgmt = 'ACL ROLE "op" SET SESSION ''' || getvariable('sid') || ''' AUDIT LEVEL DEFAULT';
 
-query I
+query IT
 SELECT * FROM query(getvariable('mgmt'));
 ----
-true
+true	NULL
 
 statement ok
 SET VARIABLE mgmt = 'ACL ROLE "op" PROFILE SESSION ''' || getvariable('sid') || ''' SAMPLED';
 
-query I
+query IT
 SELECT * FROM query(getvariable('mgmt'));
 ----
-true
+true	NULL
 
 statement error
 ACL ROLE "op" SET SESSION 'x' AUDIT LEVEL loud;
@@ -144,44 +144,44 @@ ACL ROLE "op" SET SESSION threads = 2;
 ----
 <REGEX>:.*acl_rewrite: SET.*
 
-query I
+query IT
 ACL ROLE "op" DRAIN NODE;
 ----
-1
+true	1 session still open
 
 query I
 SELECT acl_drain_status();
 ----
 draining
 
-query I
+query IT
 ACL ROLE "op" RESUME NODE;
 ----
-true
+true	NULL
 
 # the same through the calls
-query I
+query IT
 ACL ROLE "op" SELECT platform.drain();
 ----
-1
+true	1 session still open
 
-query I
+query IT
 ACL ROLE "op" CALL platform.resume();
 ----
-true
+true	NULL
 
-query I
+query IT
 ACL ROLE "op" KILL SESSION 'nosuch';
 ----
-false
+false	no session has that id
 
 statement ok
 SET VARIABLE mgmt = 'ACL ROLE "op" KILL SESSION ''' || getvariable('sid') || '''';
 
-query I
+query IT
 SELECT * FROM query(getvariable('mgmt'));
 ----
-true
+true	NULL
 
 query I
 SELECT acl_session_count();
@@ -219,10 +219,10 @@ ACL ROLE "r" DRAIN NODE;
 statement ok
 ACL ADMIN GRANT FUNCTION platform.kill_session TO ROLE pol;
 
-query I
+query IT
 ACL ROLE "pol" KILL SESSION 'nosuch';
 ----
-false
+false	no session has that id
 
 statement error
 ACL ROLE "pol" DRAIN NODE;

@@ -974,6 +974,14 @@ linked module (hugr-node: `hugr_node_`) adds its operator-only functions to the 
 judgment reads it. A compiled `acl_cluster_*` table-function call is audited by its name (`ClusterAuditObject`). Test
 `test_acl_never_set_prefix.cpp`.
 
+**Spec 179 — what a management statement answers**: every compiled management statement and top-level
+`platform.<op>(…)` call answers `(ok BOOLEAN, message VARCHAR)` - wrapped after every authorizer (`AnswerManagement`,
+acl_mgmt_answer.cpp) into `SELECT __acl_answer.* FROM (SELECT acl_answer('<fn>', acl_<fn>(…), <args>…) AS
+__acl_answer)` (never `unnest(…)`: one struct_extract per field ran the call per field). `ManagementAnswer`: a BOOLEAN
+is ok (a false in the form's words), a count / a text the message, a STRUCT keeps its fields after the pair;
+`NodeTraits::management_note(context, fn, args)` adds the platform part's note after a call that succeeded. A table
+call, a direct `acl_*` call and the secrets service's calls answer as before. Test `test_acl_mgmt_answer.cpp`.
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`
