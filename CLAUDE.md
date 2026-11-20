@@ -980,7 +980,9 @@ acl_mgmt_answer.cpp) into `SELECT __acl_answer.* FROM (SELECT acl_answer('<fn>',
 __acl_answer)` (never `unnest(…)`: one struct_extract per field ran the call per field). `ManagementAnswer`: a BOOLEAN
 is ok (a false in the form's words), a count / a text the message, a STRUCT keeps its fields after the pair;
 `NodeTraits::management_note(context, fn, args)` adds the platform part's note after a call that succeeded. A table
-call, a direct `acl_*` call and the secrets service's calls answer as before. Test `test_acl_mgmt_answer.cpp`.
+call, a direct `acl_*` call and the secrets service's calls answer as before. On Flight a management statement runs at
+GetFlightInfo and its prepared form announces the answer's schema (`KindOfClientStatement`; JDBC took an empty one as an
+update and lost the answer - found by acl-clients 010). Tests `test_acl_mgmt_answer.cpp`, e2e `admin.sh`.
 
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema

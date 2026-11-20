@@ -2161,10 +2161,14 @@ public:
 			    ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt, nullptr,
 			                                             result.dataset_schema, result.parameter_schema));
 			    ARROW_ASSIGN_OR_RAISE(result.dataset_schema, Described(result.dataset_schema, *reservation));
-			    if (AnswersOnlyCount(*reservation)) {
+			    auto kind = KindOfClientStatement(request.query);
+			    if (kind != ClientStatementKind::MANAGEMENT && AnswersOnlyCount(*reservation, kind)) {
 				    // spec 111: a statement that answers only a count is announced as an update - JDBC reads
 				    // an empty dataset schema as one and executes it through DoPut, in one call (the field
-				    // Flight SQL added for this, is_update, is set once the Arrow pin carries it)
+				    // Flight SQL added for this, is_update, is set once the Arrow pin carries it). A management
+				    // statement answers its (ok, message) row (spec 179): announced with its schema, it still runs at
+				    // GetFlightInfo and the DoGet reads the kept answer - JDBC took it as an update and lost the
+				    // answer (found by acl-clients 010)
 				    result.dataset_schema = arrow::schema(arrow::FieldVector {});
 			    }
 			    reservation->owner = owner;
@@ -2633,21 +2637,23 @@ public:
 		return prefixed;
 	}
 
-	//! spec 111: a statement that returns no rows - DML answers its changed rows (CHANGED_ROWS), DDL
-	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
-	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these.
-	static bool ClientStatementIsCommand(const string &query) {
+	//! What a client's text is to the door: a management statement (the grammar, or a top-level platform.<op>(…)
+	//! call - a change that answers its (ok, message) row, spec 179), a command that answers nothing but a count, or a
+	//! query
+	enum class ClientStatementKind { QUERY, COMMAND, MANAGEMENT };
+
+	static ClientStatementKind KindOfClientStatement(const string &query) {
 		// spec 117: a management statement - the grammar, bare or after the `ACL` marker - is a change, not
 		// a query, whatever call it compiles to: run where Flight SQL says a statement runs
 		string rest; // the client's statement past the markers it wrote itself (TRACE '…', LINEAGE …, ACL NATIVE)
 		if (acl::ClientTextIsMgmt(query, rest)) {
-			return true; // (GRANT / REVOKE SECRET open with a management phrase too)
+			return ClientStatementKind::MANAGEMENT; // (GRANT / REVOKE SECRET open with a management phrase too)
 		}
 		try {
 			Parser parser(ParserOptions::Builtin());
 			parser.ParseQuery(UseSchemaAsSet(rest)); // `USE SCHEMA s` is the SET it compiles to
 			if (parser.statements.size() != 1) {
-				return false;
+				return ClientStatementKind::QUERY;
 			}
 			// spec 117: a top-level platform.<op>(…) call is one change too - but a read function in FROM
 			// (`SELECT * FROM platform.check_catalog(…)`, effective_rights, exposures) answers rows: a query, whose
@@ -2661,28 +2667,29 @@ public:
 						auto &node = *statement.Cast<SelectStatement>().node;
 						if (node.type == QueryNodeType::SELECT_NODE && node.Cast<SelectNode>().from_table &&
 						    node.Cast<SelectNode>().from_table->type == TableReferenceType::TABLE_FUNCTION) {
-							return false;
+							return ClientStatementKind::QUERY;
 						}
 					}
-					return true;
+					return ClientStatementKind::MANAGEMENT;
 				}
 			} catch (std::exception &) {
-				return false; // a call written wrongly: refused where it is decided, not here
+				return ClientStatementKind::QUERY; // a call written wrongly: refused where it is decided, not here
 			}
 			switch (parser.statements[0]->type) {
 			case StatementType::SET_STATEMENT:
 			case StatementType::DROP_STATEMENT:
 			case StatementType::ALTER_STATEMENT:
-				return true;
+				return ClientStatementKind::COMMAND;
 			case StatementType::CREATE_STATEMENT: {
 				auto &info = parser.statements[0]->Cast<CreateStatement>().info;
-				return info && info->type != CatalogType::SECRET_ENTRY;
+				return info && info->type != CatalogType::SECRET_ENTRY ? ClientStatementKind::COMMAND
+				                                                       : ClientStatementKind::QUERY;
 			}
 			default:
-				return false;
+				return ClientStatementKind::QUERY;
 			}
 		} catch (std::exception &) {
-			return false;
+			return ClientStatementKind::QUERY;
 		}
 	}
 
@@ -2693,11 +2700,20 @@ public:
 	}
 
 	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation) {
+		return AnswersOnlyCount(reservation, KindOfClientStatement(reservation.query));
+	}
+
+	//! spec 111: a statement that returns no rows - DML answers its changed rows (CHANGED_ROWS), DDL
+	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
+	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these. It runs at
+	//! GetFlightInfo, and so does a management statement (it writes: a client that never fetches its answer must not
+	//! lose the write)
+	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation, ClientStatementKind kind) {
 		auto &stmt = *reservation.stmt;
 		// a client's USE / SET / CREATE / DROP / ALTER answers no rows, whatever the rewrite made of it: a
 		// USE or a CREATE VIEW becomes the record's `PRAGMA acl_…(…)` (a query result to duckdb, spec 151), and
 		// left to the DoGet a client that never fetches it - ADBC's execute - would lose it (spec 114)
-		if (ClientStatementIsCommand(reservation.query)) {
+		if (kind != ClientStatementKind::QUERY) {
 			return true;
 		}
 		auto properties = stmt.GetStatementProperties();

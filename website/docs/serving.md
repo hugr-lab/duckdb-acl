@@ -137,6 +137,9 @@ What the door serves, every RPC authenticated per call from the `authorization: 
         not mean nothing was written.
     - Flight SQL's `is_update` flag (Arrow ≥ the release carrying apache/arrow#49498) will be set too,
       once the Arrow pin carries it.
+    - A **management statement** (the grammar, or a top-level `platform.<op>(…)` call) also runs at
+      `GetFlightInfo`, but its prepared form is announced with its answer's schema, `ok` and `message`:
+      JDBC executes it as a query and reads the answer at the `DoGet` (spec 179).
   - **DDL runs as text** (spec 153). A `CREATE` (not of a secret, which answers a row), `DROP` or `ALTER`
     with no placeholder is not prepared: the door runs it through `Query` on the session's connection, as
     quack and a gateway do. A principal's table DDL in a schema that records its objects is the DDL and its
