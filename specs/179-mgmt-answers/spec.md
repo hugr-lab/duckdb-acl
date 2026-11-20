@@ -49,6 +49,13 @@ answers two fields, `ok` and `message`.
   Only a constant or a parameter is copied for the note (all a form writes today); anything else reaches it as NULL,
   never evaluated twice.
 
+- **Found by acl-clients 010, fixed**: the Flight door ran a management statement as a command (spec 117) and announced
+  its prepared form, like a count's, with an empty dataset schema - Arrow's JDBC driver (which prepares every
+  statement) took it as an update and the answer never reached the DBeaver plugin. A management statement is now its
+  own kind (`KindOfClientStatement` in the door): it still runs at GetFlightInfo (a client that never fetches keeps the
+  write), and its prepared form announces the answer's schema, so the DoGet reads the kept row. Test: the Flight e2e
+  `admin.sh` prepares a grammar form and a platform call, reads `['ok', 'message']` and the answer (it read `[]`).
+
 ## Enforcement & security
 
 Nothing is admitted or refused differently: the wrap is applied to statements every authorizer has already judged,
