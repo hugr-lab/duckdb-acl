@@ -969,6 +969,11 @@ management call that probes the sources wakes every lazy source before its bodie
 (`WakeLazySourcesForCalls`), and `acl_check_catalog` / `acl_check_grant` wake them themselves; a listing never wakes
 one. Test `test_acl_lazy_sources.cpp`.
 
+**Spec 178 — the platform part's never set**: `RegisterNeverCallablePrefix(prefix)` (acl_function_categories.hpp) - a
+linked module (hugr-node: `hugr_node_`) adds its operator-only functions to the never set at load; every never-set
+judgment reads it. A compiled `acl_cluster_*` table-function call is audited by its name (`ClusterAuditObject`). Test
+`test_acl_never_set_prefix.cpp`.
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`

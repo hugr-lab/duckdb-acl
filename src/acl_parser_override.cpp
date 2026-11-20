@@ -499,6 +499,11 @@ string MgmtCallName(SQLStatement &stmt) {
 //! (a source's path is a physical name, and the audit carries none): `<kind>:<name>`
 AuditObject ClusterAuditObject(SQLStatement &stmt, const string &call) {
 	auto &select = stmt.Cast<SelectStatement>().node->Cast<SelectNode>();
+	if (select.from_table) {
+		// spec 178: a read the platform part compiled to a table function (`SELECT * FROM acl_cluster_…(…)`) writes
+		// no item - its name is the object
+		return AuditObject {call, "cluster"};
+	}
 	auto &args = select.select_list[0]->Cast<FunctionExpression>().GetArguments();
 	auto arg = [&](idx_t i) {
 		return i < args.size() ? args[i].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().ToString()
