@@ -984,6 +984,11 @@ call, a direct `acl_*` call and the secrets service's calls answer as before. On
 GetFlightInfo and its prepared form announces the answer's schema (`KindOfClientStatement`; JDBC took an empty one as an
 update and lost the answer - found by acl-clients 010). Tests `test_acl_mgmt_answer.cpp`, e2e `admin.sh`.
 
+**Spec 180 — a grant's MASK and VERSIONS as one literal**: `AclMaskClause <- 'MASK' AclList` and `AclVersionsSpec`
+also `AclQuotedValue` - `MASK '<items>'` / `VERSIONS '<clause>'`, as `RLS '<predicate>'`, read by the same writers
+(`ReadMasks`, `NormalizeVersions`) with duckdb's parser, so a client composing a grant (the console's editor) passes the
+person's text as a value - its own scanner of SQL text gone. Test `acl_grant_literal_clauses.test`.
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`

@@ -1599,7 +1599,13 @@ string VersionsText(PEGTransformer &transformer, ParseResult &result) {
 		return "BETWEEN " + transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(1))->ToString() +
 		       " AND " + transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(3))->ToString();
 	}
-	return StringUtil::Upper(KeywordOf(node));
+	auto word = StringUtil::Lower(KeywordOf(node));
+	if (word == "current" || word == "any") {
+		return StringUtil::Upper(word);
+	}
+	// spec 180: `VERSIONS '<clause>'` - the clause as one literal, normalized by the writer as any other (ReadVersions)
+	optional_idx offset;
+	return ValueOf(transformer, node, offset);
 }
 
 //! Whether a list clause's value (`AclList`) is empty as written - `()` or `''`
@@ -1773,9 +1779,10 @@ void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t 
 			continue;
 		}
 		if (keyword == "mask") {
-			// spec 158: `MASK (<column> AS <expression>, …)` - read by the writer (`ReadMasks`)
+			// spec 158: `MASK (<column> AS <expression>, …)` - read by the writer (`ReadMasks`); spec 180: or the
+			// same items as one literal, `MASK '<items>'`, read by the same writer
 			clauses.masks_written = !ListIsEmpty(transformer, parts.GetChild(1));
-			ParensInto(parts.GetChild(1), clauses.masks, MgmtParsed::TextKind::TEXT, true, data);
+			ListInto(transformer, parts.GetChild(1), clauses.masks, MgmtParsed::TextKind::TEXT, true, "masks", data);
 			continue;
 		}
 		if (keyword == "with") {
@@ -3018,9 +3025,10 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclVersionsWord <- 'CURRENT' / 'ANY'"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclVersionsBetween <- 'BETWEEN' OtherOperatorExpression 'AND' OtherOperatorExpression"));
-		changes.push_back(GrammarChange::AddRule("AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclVersionsClause <- 'VERSIONS' AclVersionsSpec"));
-		changes.push_back(GrammarChange::AddRule("AclMaskClause <- 'MASK' AclParenList"));
+		changes.push_back(GrammarChange::AddRule("AclMaskClause <- 'MASK' AclList"));
 		changes.push_back(GrammarChange::AddRule("AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / "
 		                                         "AclGrantColumnsClause / AclVersionsClause / AclMaskClause"));
 		changes.push_back(GrammarChange::AddRule("AclGrantClause <- AclObjectClause / AclMainClause"));
