@@ -31,7 +31,10 @@ owner, 2026-11-06: duckdb's grammar and tokenizer, not our own).
   literal goes to `rls`) - the argument the parenthesised items always reached, read by `ReadMasks` (duckdb's
   `Expression` per item, the column a name) and stored cast to the column's type. A versions literal goes to the
   `versions` argument as its text, normalized by the writer as a function call's versions are (constants evaluated
-  where written). An empty `MASK ''` is no mask, as `MASK ()`.
+  where written). An empty `MASK ''` is no mask, as `MASK ()`; an empty `VERSIONS ''` is refused (on an object grant
+  no clause inherits the catalog grant's, which `''` would not say).
+- **One plain literal**, as every quoted value of the grammar (`WrittenPlainly`): no string joined across a line
+  break, no `E'…'`, no `$$…$$` - what is stored is what is visibly written.
 - **Nothing else changes**: the writers, the stored forms and the views are those of specs 158 and 167; the
   parenthesised forms stay.
 
@@ -40,6 +43,8 @@ owner, 2026-11-06: duckdb's grammar and tokenizer, not our own).
 - The literal is a value: whatever it holds - a `;`, a closing parenthesis, another clause's words - is text the
   writer reads as the items or the clause it must be, and refuses otherwise (`MASK 'ssn AS 1); DROP ROLE r; --'` is
   one malformed mask, never a batch).
+- A comment inside a mask literal is refused by the mask's reader (the parenthesised form reads a comment as a space,
+  as every list does).
 - The same judgments as the inline forms: a mask's author's function gate (spec 117), its tables stored whole (spec
   160), one expression per item (spec 148); a versions clause's constants evaluated where written (spec 167).
 
@@ -48,7 +53,12 @@ owner, 2026-11-06: duckdb's grammar and tokenizer, not our own).
 - `test/sql/acl_grant_literal_clauses.test`: a mask literal stores what the parenthesised items store and the role
   reads it masked; two items with COLUMNS beside them; an empty literal; a literal holding a second statement and one
   that is no mask list refused, the batch not run; a versions literal (`'AT (VERSION => 2)'`, `'any'`) normalized as the
-  clause; a literal with another clause's words and one that is no clause refused; a catalog grant's versions literal.
+  clause; a literal with another clause's words and one that is no clause refused; a catalog grant's versions literal;
+  `E'…'`, `$$…$$` and a string joined across a line break refused for both clauses; `VERSIONS ''` refused; a comment
+  in a mask literal refused; a catalog's and a schema's grant refuse a mask literal; a principal author's function gate
+  (spec 117) and the tables written whole (spec 160) through a literal.
+- **Found by its review, fixed**: a versions literal skipped the plain-literal check (a string joined across a line
+  break was stored as one word); `VERSIONS ''` silently meant "unstated"; the form's usage did not name the literals.
 
 ## Alternatives
 

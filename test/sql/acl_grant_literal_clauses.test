@@ -119,3 +119,78 @@ query I
 SELECT versions FROM aclcat.acl.role_catalogs WHERE "role" = 'none';
 ----
 ANY
+
+# --- a literal is one plain literal, as every quoted value of the grammar --------------------------------------------
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS E'ANY';
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS $$ANY$$;
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS 'CUR'
+'RENT';
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK E'ssn AS ''x''';
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK $$ssn AS 'x'$$;
+----
+plain literal
+
+# an empty versions literal says nothing: refused, never "inherit" by accident
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS '';
+----
+leave VERSIONS out
+
+# a comment inside a mask literal is refused by the mask's reader (the parenthesised form reads a comment as a space)
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn AS ''x'' -- hidden';
+----
+
+# a mask is an object grant's: a catalog or a schema grant refuses one written as a literal too
+statement error
+ACL ADMIN GRANT CATALOG c TO ROLE none MAIN MASK 'ssn AS ''x''';
+----
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.raw AS phys.main;
+
+statement error
+ACL ADMIN GRANT SCHEMA c.raw TO ROLE none MASK 'ssn AS ''x''';
+----
+
+# --- the literal is judged as the items are: its author's function gate (spec 117), its tables whole (spec 160) ------
+
+statement ok
+CREATE TABLE phys.main.lookup(v VARCHAR);
+
+statement ok
+INSERT INTO phys.main.lookup VALUES ('masked');
+
+statement ok
+ACL ADMIN CREATE ROLE author; GRANT ADMIN policy TO ROLE author;
+
+statement error
+ACL ROLE "author" GRANT TABLE c.people TO ROLE none MASK 'ssn AS acl_create_catalog(''zz'')';
+----
+may not call
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn AS (SELECT max(v) FROM phys.main.lookup)';
+
+query I
+SELECT masks LIKE '%phys.main.lookup%' FROM aclcat.acl.role_object_caps WHERE "role" = 'none';
+----
+true
