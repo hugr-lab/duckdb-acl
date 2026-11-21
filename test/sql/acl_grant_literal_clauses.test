@@ -1,0 +1,197 @@
+# name: test/sql/acl_grant_literal_clauses.test
+# description: spec 180 - a grant's MASK and VERSIONS take one literal too, as RLS does: the same items and clause,
+#   read by the same writers with duckdb's parser (ReadMasks, ReadVersions), so a client that composes a grant passes
+#   the person's text as a value, never as SQL of its statement. A literal that is no mask list or no versions clause
+#   is refused where it is written; one holding a second statement is text, never a batch.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.people(id INT, name VARCHAR, ssn VARCHAR, salary INT);
+
+statement ok
+INSERT INTO phys.main.people VALUES (1, 'ann', '123-45-6789', 1234);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c; CREATE VIRTUAL TABLE c.people AS phys.main.people;
+
+statement ok
+ACL ADMIN CREATE ROLE paren; CREATE ROLE lit; CREATE ROLE two; CREATE ROLE none;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE paren MAIN; GRANT CATALOG c TO ROLE lit MAIN; GRANT CATALOG c TO ROLE two MAIN; GRANT CATALOG c TO ROLE none MAIN;
+
+# --- MASK: the parenthesised items and one literal of the same items store the same -------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE paren MASK (ssn AS '***-**-' || right(ssn, 4));
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE lit MASK 'ssn AS ''***-**-'' || right(ssn, 4)';
+
+query II
+SELECT "role", masks FROM aclcat.acl.role_object_caps WHERE "role" IN ('paren', 'lit') ORDER BY "role";
+----
+lit	ssn AS CAST((('***-**-' || "right"(ssn, 4))) AS VARCHAR)
+paren	ssn AS CAST((('***-**-' || "right"(ssn, 4))) AS VARCHAR)
+
+query II
+ACL ROLE "lit" SELECT id, ssn FROM people;
+----
+1	***-**-6789
+
+# two items in one literal, with COLUMNS beside it
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE two COLUMNS (id, ssn, salary) MASK 'ssn AS ''x'', salary AS round(salary, -3)';
+
+query III
+ACL ROLE "two" SELECT * FROM people;
+----
+1	x	1000
+
+# an empty literal is no mask
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK '';
+
+query I
+SELECT coalesce(masks, '') = '' FROM aclcat.acl.role_object_caps WHERE "role" = 'none';
+----
+true
+
+# a literal that is no mask list, or that holds a second statement, is refused as the items it is - never a batch
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn AS 1); DROP ROLE paren; --';
+----
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn';
+----
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE "role" = 'paren';
+----
+1
+
+# --- VERSIONS: the clause as one literal is normalized as the clause is ---------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE paren VERSIONS AT (VERSION => 2);
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE lit VERSIONS 'AT (VERSION => 2)';
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE two VERSIONS 'any';
+
+query II
+SELECT "role", versions FROM aclcat.acl.role_object_caps WHERE "role" IN ('paren', 'lit', 'two') ORDER BY "role";
+----
+lit	AT (VERSION => 2)
+paren	AT (VERSION => 2)
+two	ANY
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS 'ANY MASK (ssn AS 1)';
+----
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS 'sometime';
+----
+
+# a catalog grant's VERSIONS too
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE none MAIN VERSIONS 'ANY';
+
+query I
+SELECT versions FROM aclcat.acl.role_catalogs WHERE "role" = 'none';
+----
+ANY
+
+# --- a literal is one plain literal, as every quoted value of the grammar --------------------------------------------
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS E'ANY';
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS $$ANY$$;
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS 'CUR'
+'RENT';
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK E'ssn AS ''x''';
+----
+plain literal
+
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK $$ssn AS 'x'$$;
+----
+plain literal
+
+# an empty versions literal says nothing: refused, never "inherit" by accident
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none VERSIONS '';
+----
+leave VERSIONS out
+
+# a comment inside a mask literal is refused by the mask's reader (the parenthesised form reads a comment as a space)
+statement error
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn AS ''x'' -- hidden';
+----
+
+# a mask is an object grant's: a catalog or a schema grant refuses one written as a literal too
+statement error
+ACL ADMIN GRANT CATALOG c TO ROLE none MAIN MASK 'ssn AS ''x''';
+----
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.raw AS phys.main;
+
+statement error
+ACL ADMIN GRANT SCHEMA c.raw TO ROLE none MASK 'ssn AS ''x''';
+----
+
+# --- the literal is judged as the items are: its author's function gate (spec 117), its tables whole (spec 160) ------
+
+statement ok
+CREATE TABLE memory.main.lookup(v VARCHAR);
+
+statement ok
+INSERT INTO memory.main.lookup VALUES ('masked');
+
+statement ok
+ACL ADMIN CREATE ROLE author; GRANT ADMIN policy TO ROLE author;
+
+statement error
+ACL ROLE "author" GRANT TABLE c.people TO ROLE none MASK 'ssn AS acl_create_catalog(''zz'')';
+----
+may not call
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn AS (SELECT max(v) FROM lookup)';
+
+# the bare name is stored whole - the default database's table, as the binder reads it
+query I
+SELECT masks LIKE '%memory.main.lookup%' FROM aclcat.acl.role_object_caps WHERE "role" = 'none';
+----
+true

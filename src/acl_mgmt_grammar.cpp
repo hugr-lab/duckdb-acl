@@ -1571,7 +1571,8 @@ arena_ptr<TransformResultValue> FinalizeDropObject(PEGTransformer &transformer, 
 // --- grants (specs 011, 012, 015, 120) ------------------------------------------------------------------------------
 
 //! A grant's policy clauses, in any order, each once: `WITH (select, insert)` (the list form of
-//! CAPS), `CAPS '<json>'`, `RLS <list>`, `COLUMNS <list>`, and - a catalog grant's - `MAIN`
+//! CAPS), `CAPS '<json>'`, `RLS <list>`, `COLUMNS <list>`, `MASK <list>` (spec 180: the items or one literal),
+//! `VERSIONS <clause>` (or one literal), and - a catalog grant's - `MAIN`
 struct GrantClauses {
 	optional_idx caps;
 	optional_idx rls;
@@ -1586,10 +1587,11 @@ struct GrantClauses {
 	bool masks_written = false;
 };
 
-//! spec 167: `AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord` as the clause the grant functions
-//! read - `CURRENT` / `ANY`, duckdb's AT clause as duckdb prints it, `BETWEEN <a> AND <b>` with duckdb's BETWEEN
-//! operands (`OtherOperatorExpression`, so the AND is the window's)
-string VersionsText(PEGTransformer &transformer, ParseResult &result) {
+//! spec 167: `AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord / AclQuotedValue` as the clause the
+//! grant functions read - `CURRENT` / `ANY`, duckdb's AT clause as duckdb prints it, `BETWEEN <a> AND <b>` with
+//! duckdb's BETWEEN operands (`OtherOperatorExpression`, so the AND is the window's); spec 180: or the clause as one
+//! plain literal, normalized by the writer
+string VersionsText(PEGTransformer &transformer, ParseResult &result, MgmtParseData &data) {
 	auto &node = Strip(result);
 	if (node.Name() == "AtClause") {
 		return transformer.Transform<unique_ptr<AtClause>>(node)->ToString();
@@ -1599,7 +1601,20 @@ string VersionsText(PEGTransformer &transformer, ParseResult &result) {
 		return "BETWEEN " + transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(1))->ToString() +
 		       " AND " + transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(3))->ToString();
 	}
-	return StringUtil::Upper(KeywordOf(node));
+	auto word = StringUtil::Lower(KeywordOf(node));
+	if (word == "current" || word == "any") {
+		return StringUtil::Upper(word);
+	}
+	// spec 180: `VERSIONS '<clause>'` - the clause as one plain literal (as every quoted value: no string joined
+	// across a line break, no E'…' or $$…$$), normalized by the writer as any other (ReadVersions); an empty one is
+	// refused - on an object grant no clause inherits the catalog grant's, which `''` would not say
+	auto text = QuotedOf(transformer, node, "a VERSIONS clause", data);
+	auto trimmed = text;
+	StringUtil::Trim(trimmed);
+	if (trimmed.empty()) {
+		throw BinderException("acl admin: VERSIONS '' says nothing - write CURRENT or ANY, or leave VERSIONS out");
+	}
+	return text;
 }
 
 //! Whether a list clause's value (`AclList`) is empty as written - `()` or `''`
@@ -1768,14 +1783,16 @@ void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t 
 		if (keyword == "versions") {
 			clauses.versions_written = true;
 			if (clauses.versions.IsValid()) {
-				data.args[clauses.versions.GetIndex()] = Value(VersionsText(transformer, parts.GetChild(1)));
+				data.args[clauses.versions.GetIndex()] = Value(VersionsText(transformer, parts.GetChild(1), data));
 			}
 			continue;
 		}
 		if (keyword == "mask") {
-			// spec 158: `MASK (<column> AS <expression>, …)` - read by the writer (`ReadMasks`)
+			// spec 158: `MASK (<column> AS <expression>, …)` - read by the writer (`ReadMasks`); spec 180: or the
+			// same items as one literal, `MASK '<items>'`, read by the same writer
 			clauses.masks_written = !ListIsEmpty(transformer, parts.GetChild(1));
-			ParensInto(parts.GetChild(1), clauses.masks, MgmtParsed::TextKind::TEXT, true, data);
+			ListInto(transformer, parts.GetChild(1), clauses.masks, MgmtParsed::TextKind::TEXT, true, "a MASK list",
+			         data);
 			continue;
 		}
 		if (keyword == "with") {
@@ -3018,9 +3035,10 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclVersionsWord <- 'CURRENT' / 'ANY'"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclVersionsBetween <- 'BETWEEN' OtherOperatorExpression 'AND' OtherOperatorExpression"));
-		changes.push_back(GrammarChange::AddRule("AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclVersionsSpec <- AclVersionsBetween / AtClause / AclVersionsWord / AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclVersionsClause <- 'VERSIONS' AclVersionsSpec"));
-		changes.push_back(GrammarChange::AddRule("AclMaskClause <- 'MASK' AclParenList"));
+		changes.push_back(GrammarChange::AddRule("AclMaskClause <- 'MASK' AclList"));
 		changes.push_back(GrammarChange::AddRule("AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / "
 		                                         "AclGrantColumnsClause / AclVersionsClause / AclMaskClause"));
 		changes.push_back(GrammarChange::AddRule("AclGrantClause <- AclObjectClause / AclMainClause"));

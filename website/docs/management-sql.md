@@ -586,7 +586,8 @@ Functions: `acl_map_role(scope_kind, scope, source, external_value, role)` and
 
 ```
 GRANT CATALOG <catalog> TO ROLE <role>
-    [WITH (<capability>, …) | CAPS '<json>'] [MAIN] [RLS (<predicate>)] [VERSIONS <versions>]
+    [WITH (<capability>, …) | CAPS '<json>'] [MAIN] [RLS (<predicate>) | RLS '<predicate>']
+    [VERSIONS <versions> | VERSIONS '<versions>']
 ALTER GRANT CATALOG <catalog> TO ROLE <role>
     SET CAPS '<json>' | SET RLS '<predicate>' | SET MAIN true | false
 REVOKE CATALOG <catalog> FROM ROLE <role>
@@ -740,7 +741,8 @@ nearest ancestor that states capabilities (function only).
 ```
 GRANT TABLE | VIEW | OBJECT <catalog>.<name> TO ROLE <role>
     [WITH (<capability>, …) | CAPS '<json>'] [RLS (<predicate>)]
-    [COLUMNS (<name>, … | * | * EXCLUDE (<name>, …))] [MASK (<column> AS <expression>, …)] [VERSIONS <versions>]
+    [COLUMNS (<name>, … | * | * EXCLUDE (<name>, …))] [MASK (<column> AS <expression>, …) | MASK '<items>']
+    [VERSIONS <versions> | VERSIONS '<versions>']
 ```
 
 The three keywords are the same statement: the name may be a table, a view, a table function or a
@@ -765,6 +767,11 @@ sees and what it reads in place of some:
   expression as duckdb reads it, judged by its author's function gate (spec 117) with its tables stored whole (spec
   160). It is stored cast to the column's type (`CAST((<expression>) AS <type>)`) - a mask never changes what a column
   is, so a listing's type is the same for every role.
+- **One literal** (spec 180): `MASK '<column> AS <expression>, …'` is the same items as one string literal (quotes
+  doubled), and `VERSIONS '<versions>'` the same clause, as `RLS '<predicate>'` is the predicate - read by the same
+  writers with duckdb's parser, so a tool that composes a grant passes the text as a value. A literal that is no mask
+  list or no versions clause is refused where it is written; `MASK ''` is no mask, and `VERSIONS ''` is refused (leave
+  the clause out instead: on an object grant that inherits the catalog grant's).
 - **`acl_has_role('<role>')`** in a mask (or an RLS, or an object's computed column) is `true` when the principal holds
   that role, `false` otherwise - the constant is baked in where the statement is rewritten.
 - **Several roles** of a principal unite per object: a column is visible when some role's `COLUMNS` admits it; it
