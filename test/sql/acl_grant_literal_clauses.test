@@ -174,10 +174,10 @@ ACL ADMIN GRANT SCHEMA c.raw TO ROLE none MASK 'ssn AS ''x''';
 # --- the literal is judged as the items are: its author's function gate (spec 117), its tables whole (spec 160) ------
 
 statement ok
-CREATE TABLE phys.main.lookup(v VARCHAR);
+CREATE TABLE memory.main.lookup(v VARCHAR);
 
 statement ok
-INSERT INTO phys.main.lookup VALUES ('masked');
+INSERT INTO memory.main.lookup VALUES ('masked');
 
 statement ok
 ACL ADMIN CREATE ROLE author; GRANT ADMIN policy TO ROLE author;
@@ -188,9 +188,10 @@ ACL ROLE "author" GRANT TABLE c.people TO ROLE none MASK 'ssn AS acl_create_cata
 may not call
 
 statement ok
-ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn AS (SELECT max(v) FROM phys.main.lookup)';
+ACL ADMIN GRANT TABLE c.people TO ROLE none MASK 'ssn AS (SELECT max(v) FROM lookup)';
 
+# the bare name is stored whole - the default database's table, as the binder reads it
 query I
-SELECT masks LIKE '%phys.main.lookup%' FROM aclcat.acl.role_object_caps WHERE "role" = 'none';
+SELECT masks LIKE '%memory.main.lookup%' FROM aclcat.acl.role_object_caps WHERE "role" = 'none';
 ----
 true

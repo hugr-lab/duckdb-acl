@@ -770,7 +770,8 @@ sees and what it reads in place of some:
 - **One literal** (spec 180): `MASK '<column> AS <expression>, …'` is the same items as one string literal (quotes
   doubled), and `VERSIONS '<versions>'` the same clause, as `RLS '<predicate>'` is the predicate - read by the same
   writers with duckdb's parser, so a tool that composes a grant passes the text as a value. A literal that is no mask
-  list or no versions clause is refused where it is written; `MASK ''` is no mask.
+  list or no versions clause is refused where it is written; `MASK ''` is no mask, and `VERSIONS ''` is refused (leave
+  the clause out instead: on an object grant that inherits the catalog grant's).
 - **`acl_has_role('<role>')`** in a mask (or an RLS, or an object's computed column) is `true` when the principal holds
   that role, `false` otherwise - the constant is baked in where the statement is rewritten.
 - **Several roles** of a principal unite per object: a column is visible when some role's `COLUMNS` admits it; it
