@@ -1508,6 +1508,34 @@ void AclRevokeResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector 
 	BindResourceGroup(args, state, result, "acl_revoke_resource_group", true);
 }
 
+//! spec 181: acl_set_session_script(group, role, sql[, on_error]) / acl_drop_session_script(group, role) - a resource
+//! group's (role ''), a role's (group '') or a role's grant of the group (both): the SQL a session runs as the node
+//! when it opens, stored as written; on_error 'fail' (the default) or 'continue'
+void SessionScriptFunc(DataChunk &args, ExpressionState &state, Vector &result, bool remove) {
+	auto fn = remove ? "acl_drop_session_script" : "acl_set_session_script";
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto group = OptionalArg(args, 0, row, "");
+		auto role = OptionalArg(args, 1, row, "");
+		string sql;
+		string on_error = "fail";
+		if (!remove) {
+			sql = RequiredArg(args, 2, row, fn, "script");
+			on_error = StringUtil::Lower(OptionalArg(args, 3, row, "fail"));
+			if (on_error != "fail" && on_error != "continue") {
+				throw InvalidInputException("%s: on_error is fail or continue, got \"%s\"", fn, on_error);
+			}
+		}
+		StoreOf(state).CatalogSessionScript(group, role, sql, on_error, remove);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+void AclSetSessionScriptFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	SessionScriptFunc(args, state, result, false);
+}
+void AclDropSessionScriptFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	SessionScriptFunc(args, state, result, true);
+}
+
 //! acl_deny_function(fname) / acl_allow_function(fname) - the legacy pair, kept as wrappers: a grant
 //! by name to every role, denied or allowed, for both kinds (the old gate never knew the kind)
 void SetFunctionGate(DataChunk &args, ExpressionState &state, Vector &result, const char *what, bool allowed) {
@@ -2635,6 +2663,8 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_drop_resource_group", {{v}, {v, v}}, AclDropResourceGroupFunc);
 	register_admin("acl_grant_resource_group", {v, v}, AclGrantResourceGroupFunc);
 	register_admin("acl_revoke_resource_group", {v, v}, AclRevokeResourceGroupFunc);
+	register_admin_set("acl_set_session_script", {{v, v, v}, {v, v, v, v}}, AclSetSessionScriptFunc); // spec 181
+	register_admin("acl_drop_session_script", {v, v}, AclDropSessionScriptFunc);
 	// the session contract both doors stand on (spec 040): open once, prefix every statement, close
 	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, const scalar_function_t &fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);

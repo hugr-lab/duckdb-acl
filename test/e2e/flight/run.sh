@@ -89,6 +89,10 @@ echo "$got" | grep -q "'n': \[5\]" || fail "expected 5 rows for this tenant, got
 got="$(ask "SELECT count(*) AS n FROM orders WHERE tenant = 'globex'")"
 echo "$got" | grep -q "'n': \[0\]" || fail "another tenant's rows were visible: $got"
 
+# --- spec 181: the role's session script ran on the session's connection before the statement ------------------
+got="$(ask "SELECT getvariable('e2e_region') AS region")"
+echo "$got" | grep -q "'region': \['north'\]" || fail "the role's session script did not run before the statement: $got"
+
 # --- the physical object is refused by the same path that refuses it anywhere ----------------------
 got="$(ask "SELECT * FROM memory.main.orders")"
 echo "$got" | grep -q "no access to object" || fail "the physical name was not refused: $got"

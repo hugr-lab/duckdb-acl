@@ -74,6 +74,10 @@ ACL ADMIN CREATE ROLE analyst;
 -- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them; ingest too (spec 173):
 -- a bulk load is a right of its own
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp, ingest) MAIN;
+-- spec 181: what every session of the role runs as the node when it opens - a variable the principal reads back
+-- (getvariable granted by name: the environment category would hand out getenv too)
+ACL ADMIN GRANT FUNCTION getvariable TO ROLE analyst;
+ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'SET VARIABLE e2e_region = ''north''';
 -- one role, many tenants: the slice comes from the token's claim
 ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     CAPS '{"select": true, "insert": true, "merge": true, "delete": true, "ingest": true}'

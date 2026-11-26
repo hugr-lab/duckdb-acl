@@ -52,6 +52,11 @@ void AclQuackStatementCompleted(Connection &connection, const string &connection
 //! from the level and the session's trace whether the execution is profiled, and sets the
 //! connection's profiler so. A connection nobody bound is left alone. Never throws.
 void AclQuackStatementStarting(Connection &connection, const string &connection_id);
+//! spec 181: the CONNECT handler (a sync.py patch), right after it made the client's connection and before it answers:
+//! the session bound to `connection_id` runs its scripts there, as the node. False = the session is refused (a script
+//! ON ERROR FAIL SESSION failed, or the scripts could not be read) - the audit has why; the handler disconnects.
+//! A connection nobody bound is left alone (true). Never throws.
+bool AclQuackSessionOpened(Connection &connection, const string &connection_id);
 //! True when `data` is the record a principal's DDL / USE writes (spec 151, `PRAGMA acl_…`). The server's result
 //! collector (a sync.py patch) streams a batch's first statement that returns a result, and skips this one, so
 //! `CREATE TABLE …; SELECT …` answers the SELECT as a native quack server does. Never throws.

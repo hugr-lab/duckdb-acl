@@ -252,6 +252,29 @@ PATCHES = {
             "\t\t\treturn auth.Failure(\"Authentication\");\n"
             "\t\t}\n",
         ),
+        # spec 181: a session's scripts run on the connection the session is bound to, before its first statement:
+        # the client's connection exists only here, after authentication opened and bound the session. The handler
+        # holds its execution lock while they run (no statement of it can be in flight yet); a script that refuses
+        # the session disconnects the connection, ends the session and answers the door's one sentence
+        (
+            "\t\treturn make_uniq<ConnectionResponseMessage>(\n"
+            "\t\t    CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds), heartbeat_timeout_seconds);\n",
+            "\t\tauto acl_connection_id = CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds);\n"
+            "\t\t// acl (spec 181): the session's scripts, on its own connection before its first statement\n"
+            "\t\tif (auto acl_connection = GetConnection(acl_connection_id)) {\n"
+            "\t\t\tbool acl_prepared;\n"
+            "\t\t\t{\n"
+            "\t\t\t\tstd::lock_guard<std::mutex> acl_execution(acl_connection->execution_lock);\n"
+            "\t\t\t\tacl_prepared = acl::AclQuackSessionOpened(*acl_connection->duckdb_connection, acl_connection_id);\n"
+            "\t\t\t}\n"
+            "\t\t\tif (!acl_prepared) {\n"
+            "\t\t\t\tDisconnectConnection(acl_connection_id);\n"
+            "\t\t\t\tacl::AclQuackConnectionGone(db, acl_connection_id, \"client\");\n"
+            "\t\t\t\treturn make_uniq<ErrorResponse>(\"acl: the session could not be prepared\");\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t\treturn make_uniq<ConnectionResponseMessage>(acl_connection_id, heartbeat_timeout_seconds);\n",
+        ),
         # spec 134: the node's label in front of every connection id it mints - the id stays opaque to
         # quack and to the client, the random part after the label is unchanged (the connection's secret)
         (

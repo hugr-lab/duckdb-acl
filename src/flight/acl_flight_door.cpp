@@ -49,6 +49,7 @@
 #include "acl_door_common.hpp"
 #include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
+#include "acl_session_scripts.hpp"
 #include "acl_placement.hpp"
 #include "acl_session_state.hpp"
 #include "duckdb/main/config.hpp"
@@ -3522,6 +3523,31 @@ private:
 			// connection until the takeover is done
 			moving.conn = state->ConnFor(handle);
 			moving.hold = std::unique_lock<std::mutex>(moving.conn->exec);
+		}
+		// spec 181: the session's scripts, as the node, on its own connection before its first statement - and before
+		// a takeover restores what the client carried (UnderSession), so the client's own SETs override the
+		// administrator's. A per-call session is a session too: it runs them each call. A session with none makes no
+		// connection here (a session that ran nothing holds nothing on one - spec 135).
+		vector<SessionScript> scripts;
+		auto prepared = SessionScriptsOf(*state->store, handle, "flight", scripts);
+		if (prepared && !scripts.empty()) {
+			auto conn = moving.conn ? moving.conn : state->ConnFor(handle);
+			std::unique_lock<std::mutex> running;
+			if (!moving.hold.owns_lock()) {
+				running = std::unique_lock<std::mutex>(conn->exec);
+			}
+			prepared = RunSessionScripts(*state->store, *conn->con, handle, scripts, "flight");
+		}
+		if (!prepared) {
+			// the session is not served: it ends here, before anyone holds it - the one it replaces stays, as on any
+			// refusal of a new session (the audit has why: a `session` event, reason session_script)
+			if (moving.hold.owns_lock()) {
+				moving.hold.unlock();
+			}
+			moving.conn.reset();
+			state->store->SessionClose(handle);
+			state->DropConn(handle);
+			return arrow::Status::UnknownError("acl: the session could not be prepared");
 		}
 		if (!transient) {
 			state->store->SessionBind(cookie, handle); // ends the session it replaces, if any

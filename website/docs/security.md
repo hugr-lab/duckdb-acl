@@ -511,7 +511,7 @@ private address. They publish counts and states, never a principal, a handle or 
 | `create`, `drop` | schema (or catalog) grant | **no** | `CREATE TABLE|VIEW` into the granted physical home; `DROP`; `CREATE OR REPLACE` = both (specs 016/051) |
 | `temp` | MAIN catalog grant | **no** | `CREATE TEMP TABLE` and temp-name resolution on a session connection (spec 050) |
 | `explain` | MAIN catalog grant | **no** | `EXPLAIN [ANALYZE]` - "a plan names the physical objects a query resolves to" (spec 052) |
-| bundle `policy` (global; spec 009's `manage` = `policy` + `observe`) | `acl.admins` via `acl_grant_admin` | - | the management grammar and the platform functions over every catalog plus catalog-less statements; the policy views (spec 117) |
+| bundle `policy` (global; spec 009's `manage` = `policy` + `observe`) | `acl.admins` via `acl_grant_admin` | - | the management grammar and the platform functions over every catalog plus catalog-less statements; the policy views (spec 117); session scripts (spec 181), which run as the node - so this bundle is given as `passthrough` is |
 | bundle `passthrough` | `acl.admins` via `acl_grant_admin` | - | everything, including `ACL NATIVE`; the only scope that grants bundles and grants on `platform` |
 | bundle `observe` | `acl.admins` via `acl_grant_admin` | - | the node views, the load report and `/metrics` (spec 097); administers nothing - implied by `passthrough` and a global `manage` |
 | bundle `operate` (spec 118) | `acl.admins` via `acl_grant_admin` | - | the node's runtime: kill a session, set a session's audit level (`OFF` included - its own too) and profile, drain / resume; reads what `observe` reads; administers no policy - implied by `passthrough` |
@@ -876,6 +876,8 @@ Before a node serves anyone:
       (spec 097) - `acl_observe_unauthenticated` stays off unless the listener's address is private.
 - [ ] Admin scopes are minimal: catalog-scoped `manage` for operators of one catalog, `passthrough`
       for the platform only - it is "the actual god mode" and the only scope that runs `ACL NATIVE`.
+- [ ] The `policy` bundle is given as `passthrough` is: it writes session scripts (spec 181), SQL the node runs
+      with its own rights on a principal's connection - read them in `platform.session_scripts`.
 - [ ] Sensitive objects declare `COLUMNS (…)`; no whole-table grant sits on a live alias whose
       source may grow (section 7). Schema aliases are used only where "everything, forever" is
       intended; otherwise expand with `FROM` and `REFRESH` deliberately.

@@ -18,7 +18,7 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <relation_columns>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"expr\" VARCHAR, \"nullable\" BOOLEAN, PRIMARY KEY (\"vcat\", \"vname\", \"pos\"))",
     "CREATE TABLE IF NOT EXISTS <relation_types>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"column\" ACL_KEY_TEXT, \"as_base\" VARCHAR, \"as_varchar\" VARCHAR, \"as_both\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"column\"))",
     "CREATE TABLE IF NOT EXISTS <functions>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"form\" VARCHAR, \"target\" VARCHAR, \"template\" VARCHAR, \"comment\" VARCHAR, \"params\" VARCHAR, \"created_by\" VARCHAR, \"created_roles\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\"))",
-    "CREATE TABLE IF NOT EXISTS <roles>(\"role\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR)",
+    "CREATE TABLE IF NOT EXISTS <roles>(\"role\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR, \"session_script\" VARCHAR, \"session_on_error\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <role_claims>(\"role\" ACL_KEY_TEXT, \"claim\" ACL_KEY_TEXT, \"value\" VARCHAR, PRIMARY KEY (\"role\", \"claim\"))",
     "CREATE TABLE IF NOT EXISTS <role_catalogs>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"is_main\" BOOLEAN, \"caps\" VARCHAR, \"rls\" VARCHAR, \"columns\" VARCHAR, \"rls_checked\" BOOLEAN, \"versions\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\"))",
     "CREATE TABLE IF NOT EXISTS <role_object_caps>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"caps\" VARCHAR, \"rls\" VARCHAR, \"columns\" VARCHAR, \"rls_checked\" BOOLEAN, \"versions\" VARCHAR, \"masks\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\"))",
@@ -39,8 +39,8 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <references>(\"vcat\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"from_vname\" VARCHAR, \"to_vname\" VARCHAR, \"to_kind\" VARCHAR, \"expr\" VARCHAR, \"cardinality\" VARCHAR, \"optional\" BOOLEAN, \"join_method\" VARCHAR, \"comment\" VARCHAR, \"created_by\" VARCHAR, \"created_roles\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\"))",
     "CREATE TABLE IF NOT EXISTS <reference_columns>(\"vcat\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"pos\" INTEGER, \"side\" ACL_KEY_TEXT, \"column\" VARCHAR, \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
     "CREATE TABLE IF NOT EXISTS <keys>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"pos\" INTEGER, \"column\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
-    "CREATE TABLE IF NOT EXISTS <resource_groups>(\"group\" ACL_KEY_TEXT PRIMARY KEY, \"window_start\" BIGINT, \"window_max\" BIGINT, \"batch_bytes\" BIGINT, \"max_result_rows\" BIGINT, \"queue_priority\" BIGINT, \"max_sessions\" BIGINT, \"comment\" VARCHAR, \"is_default\" BOOLEAN)",
-    "CREATE TABLE IF NOT EXISTS <role_resource_groups>(\"role\" ACL_KEY_TEXT, \"group\" ACL_KEY_TEXT, PRIMARY KEY (\"role\", \"group\"))",
+    "CREATE TABLE IF NOT EXISTS <resource_groups>(\"group\" ACL_KEY_TEXT PRIMARY KEY, \"window_start\" BIGINT, \"window_max\" BIGINT, \"batch_bytes\" BIGINT, \"max_result_rows\" BIGINT, \"queue_priority\" BIGINT, \"max_sessions\" BIGINT, \"comment\" VARCHAR, \"is_default\" BOOLEAN, \"session_script\" VARCHAR, \"session_on_error\" VARCHAR)",
+    "CREATE TABLE IF NOT EXISTS <role_resource_groups>(\"role\" ACL_KEY_TEXT, \"group\" ACL_KEY_TEXT, \"session_script\" VARCHAR, \"session_on_error\" VARCHAR, PRIMARY KEY (\"role\", \"group\"))",
     "CREATE TABLE IF NOT EXISTS <cluster_items>(\"scope\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"spec\" VARCHAR, \"class\" VARCHAR, \"version\" BIGINT, \"pos\" BIGINT, \"comment\" VARCHAR, PRIMARY KEY (\"scope\", \"kind\", \"name\"))",
     "CREATE TABLE IF NOT EXISTS <cluster_deps>(\"scope\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"depends_on\" ACL_KEY_TEXT, PRIMARY KEY (\"scope\", \"name\", \"depends_on\"))",
     "INSERT INTO <function_categories> SELECT * FROM (VALUES ('base', 'core scalars, aggregates, windows, the compute macros, the operators - what ordinary SQL is made of', true), ('generators', 'table functions that make rows from their arguments: range, unnest, repeat, ...', true), ('node_facts', 'read-only facts about the node that name no object: keywords, collations, platform, time zones', true), ('json', 'the json extension''s compute: parse, extract, transform, serialize; not its readers or executor', true), ('icu', 'icu''s collations and sort keys', true), ('spatial', 'spatial''s compute; not its readers or driver listing', true), ('inet', 'inet''s address functions', true), ('h3', 'h3''s cell functions', true), ('hashfuncs', 'hashfuncs'' hash functions', true), ('a5', 'a5''s cell functions', true), ('geosilo', 'geosilo''s encoding functions', true), ('readers', 'functions that read outside the query: files, URLs, object stores, other databases - unconfined by construction', true), ('meta', 'listings and probes of the catalog and the node: duckdb_*, pragma_*, the pg-compatibility readers, stats', true), ('environment', 'the process''s secrets, settings and variables', true), ('node', 'the operator''s knobs: checkpoints, logging, profiling, sequences, external resources, servers', true), ('plan', 'functions that answer a query plan, which names physical objects', true)) AS v(\"category\", \"comment\", \"builtin\") WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'function_seed')",
@@ -56,7 +56,7 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "INSERT INTO <function_category_members> SELECT * FROM (VALUES ('meta', 'system', 'pg_catalog', 'shobj_description', 'scalar'), ('environment', 'system', 'main', 'current_query', 'scalar'), ('environment', 'system', 'main', 'current_setting', 'scalar'), ('environment', 'system', 'main', 'getenv', 'scalar'), ('environment', 'system', 'main', 'getvariable', 'scalar'), ('environment', 'system', 'main', 'in_search_path', 'scalar'), ('environment', 'system', 'main', 'duckdb_secrets', 'table'), ('environment', 'system', 'main', 'duckdb_settings', 'table'), ('environment', 'system', 'main', 'duckdb_variables', 'table'), ('environment', 'system', 'main', 'which_secret', 'table'), ('environment', 'system', 'pg_catalog', 'current_query', 'scalar'), ('node', 'system', 'main', 'currval', 'scalar'), ('node', 'system', 'main', 'nextval', 'scalar'), ('node', 'system', 'main', 'setval', 'scalar'), ('node', 'system', 'main', 'sleep_ms', 'scalar'), ('node', 'system', 'main', 'write_log', 'scalar'), ('node', 'system', 'main', 'checkpoint', 'table'), ('node', 'system', 'main', 'create_external_resource', 'table'), ('node', 'system', 'main', 'dbgen', 'table'), ('node', 'system', 'main', 'delta_set_transaction_version', 'table'), ('node', 'system', 'main', 'deregister_external_resource', 'table'), ('node', 'system', 'main', 'destroy_external_resource', 'table'), ('node', 'system', 'main', 'disable_logging', 'table'), ('node', 'system', 'main', 'disable_profiling', 'table'), ('node', 'system', 'main', 'dsdgen', 'table'), ('node', 'system', 'main', 'enable_logging', 'table'), ('node', 'system', 'main', 'enable_profiling', 'table'), ('node', 'system', 'main', 'force_checkpoint', 'table'), ('node', 'system', 'main', 'iceberg_to_ducklake', 'table'), ('node', 'system', 'main', 'load_aws_credentials', 'table'), ('node', 'system', 'main', 'notify_ui', 'table'), ('node', 'system', 'main', 'register_external_resource', 'table'), ('node', 'system', 'main', 'register_external_resource_type', 'table'), ('node', 'system', 'main', 'start_ui', 'table'), ('node', 'system', 'main', 'start_ui_server', 'table'), ('node', 'system', 'main', 'stop_ui_server', 'table'), ('node', 'system', 'main', 'truncate_duckdb_logs', 'table'), ('node', 'system', 'main', 'unity_catalog_checkpoint_table', 'table'), ('node', 'system', 'pg_catalog', 'pg_sleep', 'scalar'), ('plan', 'system', 'main', 'from_substrait', 'scalar'), ('plan', 'system', 'main', 'get_substrait', 'scalar'), ('plan', 'system', 'main', 'json_serialize_plan', 'scalar')) AS v(\"category\", \"database\", \"schema\", \"name\", \"kind\") WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'function_seed')",
     "INSERT INTO <function_grants> SELECT * FROM (VALUES ('', 'base', '', '', '', '', true), ('', 'generators', '', '', '', '', true), ('', 'node_facts', '', '', '', '', true), ('', 'json', '', '', '', '', true), ('', 'icu', '', '', '', '', true), ('', 'spatial', '', '', '', '', true), ('', 'inet', '', '', '', '', true), ('', 'h3', '', '', '', '', true), ('', 'hashfuncs', '', '', '', '', true), ('', 'a5', '', '', '', '', true), ('', 'geosilo', '', '', '', '', true)) AS v(\"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\") WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'function_seed')",
     "INSERT INTO <meta> SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'function_seed')",
-    "INSERT INTO <meta> SELECT 'schema_version', '28' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
+    "INSERT INTO <meta> SELECT 'schema_version', '29' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
     "INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'policy_version')",
     "INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'config_version')",
     "INSERT INTO <meta> SELECT 'min_reader_version', '28' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'min_reader_version')",
@@ -65,7 +65,7 @@ static const char *const ACL_SCHEMA_SQL[] = {
 
 //! The version this schema is. A catalog carries its own in `meta`, and a build refuses one
 //! that does not match: the migration contract rests on the two being comparable (spec 034).
-static constexpr int ACL_SCHEMA_VERSION = 28;
+static constexpr int ACL_SCHEMA_VERSION = 29;
 //! spec 094: the oldest build that may read a catalog of this version - it serves from it and
 //! refuses every write. What the latest step in schema/migrations/ declares.
 static constexpr int ACL_SCHEMA_MIN_READER = 28;
@@ -223,6 +223,15 @@ static const char *const ACL_SCHEMA_STEP_28[] = {
     "INSERT INTO <meta> VALUES ('min_reader_version', '28')",
     "UPDATE <meta> SET \"value\" = '28' WHERE \"key\" = 'schema_version'",
 };
+static const char *const ACL_SCHEMA_STEP_29[] = {
+    "ALTER TABLE <roles> ADD COLUMN IF NOT EXISTS \"session_script\" VARCHAR",
+    "ALTER TABLE <roles> ADD COLUMN IF NOT EXISTS \"session_on_error\" VARCHAR",
+    "ALTER TABLE <resource_groups> ADD COLUMN IF NOT EXISTS \"session_script\" VARCHAR",
+    "ALTER TABLE <resource_groups> ADD COLUMN IF NOT EXISTS \"session_on_error\" VARCHAR",
+    "ALTER TABLE <role_resource_groups> ADD COLUMN IF NOT EXISTS \"session_script\" VARCHAR",
+    "ALTER TABLE <role_resource_groups> ADD COLUMN IF NOT EXISTS \"session_on_error\" VARCHAR",
+    "UPDATE <meta> SET \"value\" = '29' WHERE \"key\" = 'schema_version'",
+};
 static const AclSchemaStep ACL_SCHEMA_STEPS[] = {
     {11, 11, ACL_SCHEMA_STEP_11, 4},
     {12, 12, ACL_SCHEMA_STEP_12, 3},
@@ -242,6 +251,7 @@ static const AclSchemaStep ACL_SCHEMA_STEPS[] = {
     {26, 26, ACL_SCHEMA_STEP_26, 4},
     {27, 27, ACL_SCHEMA_STEP_27, 4},
     {28, 28, ACL_SCHEMA_STEP_28, 4},
+    {29, 28, ACL_SCHEMA_STEP_29, 7},
 };
 // clang-format on
 

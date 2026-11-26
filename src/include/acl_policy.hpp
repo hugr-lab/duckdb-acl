@@ -390,6 +390,16 @@ struct ResourceLimits {
 	string refusal;
 };
 
+//! spec 181: one script a session runs when it opens - its layer (group | role | grant), whose it is, the SQL as the
+//! administrator wrote it, and what a failure does (ON ERROR FAIL SESSION, the default, or CONTINUE)
+struct SessionScript {
+	string level;
+	string group; // level group or grant
+	string role;  // level role or grant
+	string sql;
+	bool fail_session = true;
+};
+
 //! The limits a resource group states, as written (spec 085): the names a group may carry
 static constexpr const char *RESOURCE_LIMIT_NAMES[] = {"window_start",    "window_max",     "batch_bytes",
                                                        "max_result_rows", "queue_priority", "max_sessions"};
@@ -1057,6 +1067,18 @@ struct PolicyStore {
 	vector<ClusterItem> ClusterItems(const string &scope);
 	//! The limits of the principal's groups, merged (catalog mode; memory mode has no groups)
 	ResourceLimits ResolveResourceLimits(const Principal &principal);
+	//! spec 181: the scripts a session of these roles runs on a node of `group` ('' = no group layer), in their run
+	//! order - the group's, each role's by name, each grant of the group by role name; none in memory mode and in the
+	//! driver contract. Cached per role set and group for the policy version; throws when the source does not answer.
+	vector<SessionScript> SessionScriptsFor(const vector<string> &roles, const string &group);
+	//! spec 181: the group a session's first layer is: the node's (spec 096), else the session's charged group, else
+	//! its one group ('' when none decides)
+	string SessionScriptGroup(const ResourceLimits &limits);
+	//! spec 181: a session script failed on the session `handle`'s connection - `refused` (ON ERROR FAIL SESSION, or
+	//! the scripts could not be resolved: `script` null) or served on (CONTINUE). The event names the script's level
+	//! and owner and the error's class, never its text nor the error's message.
+	void AuditSessionScript(const string &door, const string &handle, const SessionScript *script,
+	                        const string &error_class, bool refused);
 	void CatalogDropFunctionCategory(const string &name, bool if_exists);
 	//! add=true inserts the keys as members (the category must exist), add=false removes them
 	void CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add);
@@ -1082,6 +1104,10 @@ struct PolicyStore {
 	void CatalogAlterReference(const string &vcat, const string &name, const string &field, const string &value);
 	void CatalogAlterResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits);
 	void CatalogCommentResourceGroup(const string &name, const string &comment);
+	//! spec 181: set (or with `remove` drop) a session script - a group's (role ''), a role's (group '') or a role's
+	//! grant of a group (both); `on_error` 'fail' | 'continue'
+	void CatalogSessionScript(const string &group, const string &role, const string &sql, const string &on_error,
+	                          bool remove);
 	void CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value);
 	void CatalogGrantAdmin(const string &role, const string &scope);
 	void CatalogRevokeAdmin(const string &role, const string &scope);

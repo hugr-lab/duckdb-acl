@@ -484,6 +484,44 @@ void PolicyStore::AuditSessionRefused(const string &door, const string &handle, 
 	             reason_code, reason, -1);
 }
 
+void PolicyStore::AuditSessionScript(const string &door, const string &handle, const SessionScript *script,
+                                     const string &error_class, bool refused) {
+	if (!audit) {
+		return;
+	}
+	Principal principal;
+	string why;
+	PolicyStore::SessionRef ref;
+	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
+	// names only: the level, whose script it is and the error's class - the SQL and the message may carry names a
+	// source's error puts there, or a connection string
+	string reason;
+	if (!script) {
+		reason = "the session's scripts could not be resolved (" + error_class + ")";
+	} else {
+		string owner = script->level == "group"  ? "resource group \"" + script->group + "\""
+		               : script->level == "role" ? "role \"" + script->role + "\""
+		                                         : "role \"" + script->role + "\" in resource group \"" + script->group +
+		                                               "\"";
+		reason = "the session script of " + owner + " failed (" + error_class + ")" +
+		         (refused ? string() : " - ON ERROR CONTINUE, the session is served");
+	}
+	AuditEvent event;
+	// a denial's level either way: a script that fails is the operator's to know, served on or not
+	event.level = AuditLevel::DENIED;
+	event.recorded = audit->Records(event.level, known ? ref.audit_level : static_cast<int8_t>(-1));
+	event.kind = "session";
+	event.door = door;
+	event.session = known ? ref.id : string();
+	event.principal = known ? principal : Principal();
+	event.detail = refused ? "refused" : "script_failed";
+	event.allowed = !refused;
+	event.reason_code = "session_script";
+	event.reason = AuditReasonText(event.reason_code, reason);
+	event.duration_us = -1;
+	audit->Emit(std::move(event));
+}
+
 void PolicyStore::AuditSessionMove(const string &door, const string &handle, bool refused, const char *reason_code,
                                    const string &what) {
 	Principal principal;

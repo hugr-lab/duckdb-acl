@@ -144,7 +144,7 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | `references` *c* | catalog, name, from_object, to_object, to_kind, expression, cardinality, optional BOOLEAN, join_method, comment, created_by |
 | `reference_columns` *c* | catalog, reference, pos BIGINT, side, column, param |
 | `keys` *c* | catalog, object, kind, pos BIGINT, column |
-| `roles` *c* | role, comment |
+| `roles` *c* | role, comment, session_script, session_on_error (spec 181; NULL to a catalog admin) |
 | `role_claims` | role, claim, value |
 | `grants` *c* | role, catalog, is_main BOOLEAN, caps, rls, rls_checked BOOLEAN, columns VARCHAR[] |
 | `schema_grants` *c* | role, catalog, schema_path, caps, inherited BOOLEAN, into, virtual_only BOOLEAN, comment |
@@ -159,8 +159,8 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | `function_category_members` | category, database, schema, name, kind |
 | `function_grants` | role, category, database, schema, name, kind, allowed BOOLEAN |
 | `function_status` | database, schema, name, kind, function_type, categories VARCHAR[], status, present BOOLEAN |
-| `resource_groups` | group, window_start, window_max, batch_bytes, max_result_rows, queue_priority, max_sessions (BIGINT), comment, is_default BOOLEAN |
-| `role_resource_groups` | role, group |
+| `resource_groups` | group, window_start, window_max, batch_bytes, max_result_rows, queue_priority, max_sessions (BIGINT), comment, is_default BOOLEAN, session_script, session_on_error (spec 181) |
+| `role_resource_groups` | role, group, session_script, session_on_error (a grant's session script, spec 181) |
 | `cluster_items` † | scope, kind, name, spec `MAP(VARCHAR, VARCHAR)`, class, version BIGINT, depends_on VARCHAR[], comment |
 | `cluster_effective` † | the same, what applies to this node (spec 096) |
 | `catalog_schema` | build, build_min_reader, catalog, min_reader (BIGINT), mode |
@@ -343,6 +343,8 @@ ESCALATES and INFRASTRUCTURE.
 | `alter_resource_group` | group_name\*, property\* (default / limits / comment), value | POLICY |
 | `drop_resource_group` | group_name\*, mode | POLICY |
 | `grant_resource_group` / `revoke_resource_group` | role\*, group_name\* | POLICY |
+| `set_session_script` | group_name\*, role\* (`''` for a group's / a role's own), sql, on_error (fail / continue) | POLICY |
+| `drop_session_script` | group_name\*, role\* | POLICY |
 | `grant_admin` | role\*, scope\* | ESCALATES |
 | `revoke_admin` | role\*, scope\* (omitted: everything) | ESCALATES |
 | `grant_platform` | role\*, kind\*, object\*, allowed | ESCALATES |
@@ -407,6 +409,10 @@ The parameters mean what the matching `acl_*` function's do - see the
   `t` is the node's default database's, `x.t` the default schema of database `x`. Direct names only -
   what a physical view or macro reads in turn is not followed, and `ACL NATIVE` (passthrough) reaches
   every source outside the policy. An empty `schema` is any schema. `policy` only (it spans catalogs).
+- `platform.session_scripts(role[, group_name])` (spec 181) - the session scripts a session of the role runs on a
+  node of the group (without one: the role's own group, as a session takes it), in run order: `pos`, `level`
+  (`group` / `role` / `grant`), `group`, `role`, `on_error`, `sql`. `policy` only. See
+  [Session scripts](management-sql.md#session-scripts-spec-181).
 
 ```sql
 SELECT bundles, admin_catalogs, my_views FROM platform.console_info();

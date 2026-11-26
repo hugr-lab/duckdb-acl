@@ -451,6 +451,8 @@ with `to_kind` `relation` (default) or `function`, `args` the substitution text 
 CREATE [OR REPLACE] ROLE [IF NOT EXISTS] <role> [CLAIMS (<name> = '<value>', …) | CLAIMS '<name>=<value>,…']
 ALTER ROLE <role> SET CLAIMS (<name> = '<value>', …) | '<name>=<value>,…'
 ALTER ROLE <role> SET COMMENT '<text>'
+ALTER ROLE <role> SET SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | CONTINUE]   -- spec 181: Session scripts
+ALTER ROLE <role> DROP SESSION SCRIPT
 DROP ROLE [IF EXISTS] <role>
 ```
 
@@ -972,6 +974,8 @@ CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] [(<limit> <value>, …)] [DEFA
 ALTER RESOURCE GROUP <group> SET DEFAULT | DROP DEFAULT
 ALTER RESOURCE GROUP <group> SET (<limit> <value>, …)   -- only the limits named change (spec 120)
 ALTER RESOURCE GROUP <group> SET COMMENT '<text>'
+ALTER RESOURCE GROUP <group> [FOR ROLE <role>] SET SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | CONTINUE]
+ALTER RESOURCE GROUP <group> [FOR ROLE <role>] DROP SESSION SCRIPT     -- spec 181: Session scripts
 DROP RESOURCE GROUP [IF EXISTS] <group>
 GRANT  RESOURCE GROUP <group> TO   ROLE <role>
 REVOKE RESOURCE GROUP <group> FROM ROLE <role>
@@ -1022,6 +1026,96 @@ profile** (`ACL CLUSTER …`, spec 093), **drift** and the **`cluster` bundle** 
 they live in [hugr-node](https://github.com/hugr-lab/hugr-node) (its `docs/cluster.md`), which builds this acl into
 the platform node's extension, `hugr_node` (spec 127). An open node is configured by its bootstrap SQL and its
 admin's `ACL NATIVE`.
+
+## Session scripts (spec 181)
+
+```sql
+ALTER RESOURCE GROUP <group> SET SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | CONTINUE]
+ALTER RESOURCE GROUP <group> DROP SESSION SCRIPT
+ALTER ROLE <role> SET SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | CONTINUE]
+ALTER ROLE <role> DROP SESSION SCRIPT
+ALTER RESOURCE GROUP <group> FOR ROLE <role> SET SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | CONTINUE]
+ALTER RESOURCE GROUP <group> FOR ROLE <role> DROP SESSION SCRIPT
+```
+
+A session script is SQL the node runs on a client session's own connection when the session opens, before the
+session's first statement. It runs **as the node**: unprefixed, outside the ACL, with the node's full rights. It may
+put the session's variables in place, a local setting (`SET TimeZone`), or anything else the node itself may do on a
+connection.
+
+- **The SQL is one literal**, stored and run exactly as written. acl does not read or check it. It may hold several
+  statements (`'SET VARIABLE a = 1; SET VARIABLE b = 2'`); a quote inside is doubled.
+- **Three levels**, all stored in the policy:
+  1. a resource group's, for every session of a principal of that group;
+  2. a role's, for every session of a principal holding the role;
+  3. a role's grant of a resource group (`FOR ROLE r`): the role must be in the group (`GRANT RESOURCE GROUP g TO
+     ROLE r` first). Revoking the grant drops its script, and dropping the role or the group drops what hangs on it.
+
+  A re-created group, a re-defined role (`SET CLAIMS`) and a grant made again keep their scripts: they are set and
+  dropped by `ALTER` alone.
+- **Every script that applies runs, layered** from the general to the specific, each on the same connection, so a
+  later one sees, and may override, what an earlier one set:
+  1. the group's - the node's group (spec 096) where it has one; otherwise the session's charged group, or the
+     principal's one group (its own, or the default group for a principal in none);
+  2. each of the session's roles that has a script, in role name order;
+  3. each grant of that group to one of the session's roles that has a script, in role name order.
+- **What a script knows.** Before the scripts run, the node sets four variables on the connection:
+
+  | variable | value |
+  | --- | --- |
+  | `acl_session_roles` | `VARCHAR[]`: the principal's roles |
+  | `acl_session_groups` | `VARCHAR[]`: the resource groups those roles are in |
+  | `acl_session_group` | the group of the first layer, NULL when none |
+  | `acl_session_subject` | the token's subject |
+
+  DuckDB has no `IF`, so a script branches in its expressions:
+  `SET VARIABLE region = (SELECT 'north' WHERE list_contains(getvariable('acl_session_roles'), 'analyst_a'))`. The
+  variables are set only on a session that runs a script, and they name only the principal's own roles and groups.
+  A principal reads a variable back with `getvariable` where its roles are granted that function (it is in the
+  `environment` category, or grant it by name).
+- **`ON ERROR`.** `FAIL SESSION`, the default, refuses the session: the client gets "the session could not be
+  prepared" and nothing more. `CONTINUE` records the failure and serves the session; the scripts after it still run.
+  A failed script that left a transaction open has it rolled back. Either way the audit records a `session` event -
+  `refused` or `script_failed` - with reason code `session_script`, the script's level and owner and the error's
+  class, never the script's text nor the error's message. `acl.sessions.script_failed{door}` counts the `CONTINUE`
+  ones.
+- **When it runs.** Once per session, on the doors' sessions:
+  - Flight SQL: on the session's connection when the door opens the session, and again when another node takes a
+    moved session over (spec 135) - before the client's carried settings are put back, so the client's own SETs
+    win. A cookie-less call is a session of one call, so it runs the scripts on every call. A value a script sets
+    in a setting a session carries (spec 135's portable settings) travels in the state cookie like the client's own.
+  - quack: on the connection quack makes for the client, right after it authenticated.
+  - A gateway's per-statement prefix (`ACL ROLE …`, `ACL TOKEN …`) and a session the gateway opens itself with
+    `acl_session_open` run none: the gateway owns its connections, and the node never gets one of its own to run
+    them on.
+  - A script runs before the session's first statement and holds the session's open until it ends: keep it short.
+- **The cache.** The list a session runs is resolved once per role set and group, and kept until the policy
+  changes: a write empties it, so a session opened after the write runs the new scripts. A session already open keeps
+  what it ran.
+- **Who writes.** The `policy` bundle (an unrestricted `manage`), as for roles and resource groups. A catalog
+  admin's `manage` does not reach them, and no principal can see them: the views below are the policy bundle's.
+- **Reading.** `platform.resource_groups`, `platform.roles` and `platform.role_resource_groups` carry
+  `session_script` and `session_on_error` (`fail` or `continue`, NULL where none is set).
+  `platform.session_scripts(role[, group_name])` lists what a session of that role, on a node of that group (without
+  one: the role's own group, as a session would take it), runs - `pos`, `level` (`group` | `role` | `grant`),
+  `group`, `role`, `on_error`, `sql` - in run order.
+- **Memory mode** keeps no session scripts: the writers need a policy catalog, as resource groups do.
+- **Functions.** `acl_set_session_script(group, role, sql[, on_error])` and `acl_drop_session_script(group,
+  role)` - `role` `''` for a group's script, `group` `''` for a role's, both for a grant's; `on_error` is `fail`
+  or `continue`. `platform.set_session_script` / `drop_session_script` call them. `acl_session_scripts(role[,
+  group])` is the listing.
+
+:::warning A session script is the node's power on a principal's connection
+A script runs with the node's rights - it can read any source and write the policy. Whoever holds the `policy`
+bundle can therefore act as the node through one, so give that bundle as you give `passthrough`.
+:::
+
+```sql
+ACL ADMIN ALTER RESOURCE GROUP north SET SESSION SCRIPT 'SET VARIABLE region = ''north''';
+ACL ADMIN ALTER ROLE etl SET SESSION SCRIPT 'SET TimeZone = ''UTC''' ON ERROR CONTINUE;
+ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE analyst SET SESSION SCRIPT 'SET VARIABLE desk = ''north analysts''';
+ACL ADMIN ALTER ROLE etl DROP SESSION SCRIPT;
+```
 
 ## Sources (spec 118.3)
 

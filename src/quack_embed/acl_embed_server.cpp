@@ -693,8 +693,21 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		if (!connection_request_message.ClientId().empty()) {
 			client_id_hash = ComputeClientHash(server_hmac_key, connection_request_message.ClientId());
 		}
-		return make_uniq<ConnectionResponseMessage>(
-		    CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds), heartbeat_timeout_seconds);
+		auto acl_connection_id = CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds);
+		// acl (spec 181): the session's scripts, on its own connection before its first statement
+		if (auto acl_connection = GetConnection(acl_connection_id)) {
+			bool acl_prepared;
+			{
+				std::lock_guard<std::mutex> acl_execution(acl_connection->execution_lock);
+				acl_prepared = acl::AclQuackSessionOpened(*acl_connection->duckdb_connection, acl_connection_id);
+			}
+			if (!acl_prepared) {
+				DisconnectConnection(acl_connection_id);
+				acl::AclQuackConnectionGone(db, acl_connection_id, "client");
+				return make_uniq<ErrorResponse>("acl: the session could not be prepared");
+			}
+		}
+		return make_uniq<ConnectionResponseMessage>(acl_connection_id, heartbeat_timeout_seconds);
 	}
 	case MessageType::DISCONNECT_MESSAGE: {
 		auto &connection = *connection_p;

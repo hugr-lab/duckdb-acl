@@ -257,6 +257,7 @@ void CatalogBackend::EnsureFresh() {
 		identity_model.reset();
 		rights_cache.clear();
 		known_roles_cache.clear();
+		session_scripts_cache.clear();
 		callable_cache.clear();
 		fn_grants.clear();
 		fn_grants_loaded.clear();
@@ -2756,6 +2757,94 @@ ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal, cons
 		out.charged_max = 0;
 	}
 	return out;
+}
+
+vector<SessionScript> CatalogBackend::SessionScripts(const vector<string> &roles, const string &group) {
+	if (function_mode) {
+		return {};
+	}
+	EnsureFresh();
+	auto sorted = roles;
+	std::sort(sorted.begin(), sorted.end()); // roles compare exactly: name order is byte order
+	sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+	string key;
+	for (auto &role : sorted) {
+		key += std::to_string(role.size()) + ":" + role + ";";
+	}
+	key += "\x1f" + group;
+	int64_t read_at;
+	{
+		lock_guard<mutex> guard(lock);
+		read_at = version;
+		auto entry = session_scripts_cache.find(key);
+		if (entry != session_scripts_cache.end()) {
+			return entry->second;
+		}
+	}
+	// ONE read: the group's, the roles', the roles' grants of the group - ordered here, by layer then role name
+	string role_list = sorted.empty() ? string() : LitList(sorted);
+	string sql = "SELECT 0, \"group\", NULL, \"session_script\", \"session_on_error\" FROM " +
+	             Tbl("resource_groups") + " WHERE \"session_script\" IS NOT NULL AND \"group\" = " + Lit(group);
+	if (!sorted.empty()) {
+		sql += " UNION ALL SELECT 1, NULL, \"role\", \"session_script\", \"session_on_error\" FROM " + Tbl("roles") +
+		       " WHERE \"session_script\" IS NOT NULL AND \"role\" IN (" + role_list + ")";
+		sql += " UNION ALL SELECT 2, \"group\", \"role\", \"session_script\", \"session_on_error\" FROM " +
+		       Tbl("role_resource_groups") + " WHERE \"session_script\" IS NOT NULL AND \"group\" = " + Lit(group) +
+		       " AND \"role\" IN (" + role_list + ")";
+	}
+	vector<SessionScript> out;
+	vector<std::pair<int64_t, string>> order;
+	if (!group.empty() || !sorted.empty()) {
+		auto result = Query(sql);
+		ResultRows rows(*result);
+		for (idx_t row = 0; row < rows.Count(); row++) {
+			static const char *LEVELS[] = {"group", "role", "grant"};
+			SessionScript script;
+			auto layer = rows.GetValue(0, row).GetValue<int32_t>();
+			script.level = LEVELS[layer];
+			script.group = rows.GetValue(1, row).IsNull() ? string() : rows.GetValue(1, row).ToString();
+			script.role = rows.GetValue(2, row).IsNull() ? string() : rows.GetValue(2, row).ToString();
+			script.sql = rows.GetValue(3, row).ToString();
+			auto on_error = rows.GetValue(4, row);
+			script.fail_session = on_error.IsNull() || on_error.ToString() != "continue";
+			out.push_back(std::move(script));
+		}
+		std::stable_sort(out.begin(), out.end(), [](const SessionScript &a, const SessionScript &b) {
+			auto rank = [](const SessionScript &s) {
+				return s.level == "group" ? 0 : s.level == "role" ? 1 : 2;
+			};
+			if (rank(a) != rank(b)) {
+				return rank(a) < rank(b);
+			}
+			return a.role < b.role;
+		});
+	}
+	lock_guard<mutex> guard(lock);
+	if (version == read_at) {
+		ClearIfOversized(session_scripts_cache);
+		session_scripts_cache[key] = out;
+	}
+	return out;
+}
+
+vector<SessionScript> PolicyStore::SessionScriptsFor(const vector<string> &roles, const string &group) {
+	if (!catalog) {
+		return {}; // memory mode keeps no session scripts (their writers refuse there, as the groups' do)
+	}
+	return catalog->SessionScripts(roles, group);
+}
+
+string PolicyStore::SessionScriptGroup(const ResourceLimits &limits) {
+	auto node_group = NodeGroup();
+	if (!node_group.empty()) {
+		return node_group;
+	}
+	if (!limits.charged.empty()) {
+		return limits.charged;
+	}
+	// a group that limits no sessions charges none: a principal in exactly one group (its own, or the default one for
+	// a principal in none) still has that group's script
+	return limits.groups.size() == 1 ? limits.groups[0] : string();
 }
 
 uint64_t PolicyStore::CatalogLocalWrites() {

@@ -600,6 +600,15 @@ A session is opened when a token is verified - by a door or by `acl_session_open
   [authentication.md](authentication.md));
 - an operator kills it (`acl_session_kill`).
 
+**Session scripts** (spec 181): when a door opens a session it first runs, on the session's own connection and as
+the node, the SQL the policy keeps for it - its resource group's, each of its roles', each grant of the group to its
+roles - with the variables `acl_session_roles`, `acl_session_groups`, `acl_session_group` and `acl_session_subject`
+set before them. A script that fails `ON ERROR FAIL SESSION` (the default) refuses the session ("the session could not
+be prepared"); one that fails `CONTINUE` is recorded and the session served. On Flight a cookie-less call runs them
+for its one-call session, and a moved session runs them before its carried settings are restored; on quack they run
+right after authentication. A gateway's own sessions (`acl_session_open`) and per-statement prefixes run none. See
+[Session scripts](management-sql.md#session-scripts-spec-181).
+
 Dead records are swept in one pass: explicitly by `acl_session_sweep()`, automatically inside
 `SessionOpen` at most once every 60 seconds or whenever the map is at `acl_max_sessions`. At the cap
 a new session is **refused**, never an old one evicted - an arriving stranger must not be able to end
@@ -797,7 +806,8 @@ principal's roles uniting into cells none of them reads (`role_union_widens`, sp
 id - never the handle), what (the statement class - never the text), the verdict, and on a refusal
 one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only`, `function_denied`,
 `statement_type`, `unchecked_predicate`, `setting_denied`, `parse`, `principal`,
-`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `wrong_resource_group`, `source_error`,
+`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `wrong_resource_group`, `session_script` (a session
+script refused the session, or failed under `CONTINUE` - spec 181), `source_error`,
 `unavailable`, `write_policy`, `policy_error`) plus the refusal text.
 
 - **Levels** - `SET GLOBAL acl_audit_level = 'off' | 'denied' | 'decisions' | 'all'` (default

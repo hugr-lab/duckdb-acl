@@ -472,10 +472,12 @@ struct HeadWords {
 		if (noun == "resource") {
 			RefuseMovedForm(
 			    "write ALTER RESOURCE GROUP <group> SET (<limit> <value>, ...) | SET COMMENT '<text>' | SET "
-			    "DEFAULT | DROP DEFAULT");
+			    "DEFAULT | DROP DEFAULT | [FOR ROLE <role>] SET SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | "
+			    "CONTINUE] | [FOR ROLE <role>] DROP SESSION SCRIPT");
 		}
 		if (noun == "role") {
-			RefuseMovedForm("write ALTER ROLE <role> SET COMMENT '<text>' | SET CLAIMS (name = 'value', ...)");
+			RefuseMovedForm("write ALTER ROLE <role> SET COMMENT '<text>' | SET CLAIMS (name = 'value', ...) | SET "
+			                "SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | CONTINUE] | DROP SESSION SCRIPT");
 		}
 		if (noun == "issuer") {
 			RefuseMovedForm(
