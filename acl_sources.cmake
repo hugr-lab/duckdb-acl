@@ -63,6 +63,12 @@ set(EXTENSION_SOURCES
     ${ACL_ROOT}/src/acl_identity.cpp
     ${ACL_ROOT}/src/acl_identity_store.cpp
     ${ACL_ROOT}/third_party/p256-m/p256-m.c)
+# spec 182: GCC 14.2.1 (el8's gcc-toolset-14, the Linux build images) on aarch64 miscompiles p256-m at -O2 and up -
+# every valid ES256 signature is refused; -fexpensive-optimizations is the pass, and without it the file is right.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(${ACL_ROOT}/third_party/p256-m/p256-m.c PROPERTIES COMPILE_OPTIONS
+                                -fno-expensive-optimizations)
+endif()
 
 # The Arrow Flight SQL door (specs/045): built by default, because it is what a client with an ADBC or
 # JDBC driver connects to - a feature of the extension rather than an option for people who build it
