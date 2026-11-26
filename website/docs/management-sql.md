@@ -1064,27 +1064,34 @@ connection.
   | variable | value |
   | --- | --- |
   | `acl_session_roles` | `VARCHAR[]`: the principal's roles |
-  | `acl_session_groups` | `VARCHAR[]`: the resource groups those roles are in |
+  | `acl_session_groups` | `VARCHAR[]`: the resource groups the session is in - on a node of a group, exactly that one group (the node serves the principal as a member of its group alone, spec 096); on a node without one, every group the principal's roles are in (or the default group for a principal in none) |
   | `acl_session_group` | the group of the first layer, NULL when none |
   | `acl_session_subject` | the token's subject |
 
   DuckDB has no `IF`, so a script branches in its expressions:
   `SET VARIABLE region = (SELECT 'north' WHERE list_contains(getvariable('acl_session_roles'), 'analyst_a'))`. The
   variables are set only on a session that runs a script, and they name only the principal's own roles and groups.
-  A principal reads a variable back with `getvariable` where its roles are granted that function (it is in the
-  `environment` category, or grant it by name).
+  A principal reads a variable back with `getvariable` where its roles are granted that function - grant it by name
+  (`GRANT FUNCTION getvariable TO ROLE r`): its category, `environment`, also hands out `getenv`, `current_setting`
+  and the like.
 - **`ON ERROR`.** `FAIL SESSION`, the default, refuses the session: the client gets "the session could not be
   prepared" and nothing more. `CONTINUE` records the failure and serves the session; the scripts after it still run.
   A failed script that left a transaction open has it rolled back. Either way the audit records a `session` event -
   `refused` or `script_failed` - with reason code `session_script`, the script's level and owner and the error's
   class, never the script's text nor the error's message. `acl.sessions.script_failed{door}` counts the `CONTINUE`
-  ones.
+  ones. Each script that ran is a `session` event `script_ran` (level `decisions`, `acl.sessions.scripts_ran{door}`)
+  naming its level and owner: SQL run unprefixed leaves no statement or profile event of its own. A session a script
+  refused is then closed with the observers' reason `client`, the event saying it was refused by a session script.
 - **When it runs.** Once per session, on the doors' sessions:
   - Flight SQL: on the session's connection when the door opens the session, and again when another node takes a
     moved session over (spec 135) - before the client's carried settings are put back, so the client's own SETs
     win. A cookie-less call is a session of one call, so it runs the scripts on every call. A value a script sets
     in a setting a session carries (spec 135's portable settings) travels in the state cookie like the client's own.
-  - quack: on the connection quack makes for the client, right after it authenticated.
+    What the scripts leave on the connection - a temp table, a transaction they opened - pins no move: the next node
+    runs its scripts first, which make them again.
+  - quack: on the connection quack makes for the client, right after it authenticated and before quack publishes
+    the connection - no request reaches it and its heartbeat lease starts once the scripts are done. While they run
+    the client holds one of the node's seats as authenticating.
   - A gateway's per-statement prefix (`ACL ROLE …`, `ACL TOKEN …`) and a session the gateway opens itself with
     `acl_session_open` run none: the gateway owns its connections, and the node never gets one of its own to run
     them on.
@@ -1092,8 +1099,10 @@ connection.
 - **The cache.** The list a session runs is resolved once per role set and group, and kept until the policy
   changes: a write empties it, so a session opened after the write runs the new scripts. A session already open keeps
   what it ran.
-- **Who writes.** The `policy` bundle (an unrestricted `manage`), as for roles and resource groups. A catalog
-  admin's `manage` does not reach them, and no principal can see them: the views below are the policy bundle's.
+- **Who writes.** The `policy` bundle (an unrestricted `manage`), as for roles and resource groups - and only it:
+  `platform.set_session_script`, `drop_session_script` and `session_scripts` are never granted by name (a `DENY`
+  still is), and a reader of the views below by a point grant sees no script. A catalog admin's `manage` does not
+  reach them, and no principal can see them.
 - **Reading.** `platform.resource_groups`, `platform.roles` and `platform.role_resource_groups` carry
   `session_script` and `session_on_error` (`fail` or `continue`, NULL where none is set).
   `platform.session_scripts(role[, group_name])` lists what a session of that role, on a node of that group (without
@@ -1106,8 +1115,9 @@ connection.
   group])` is the listing.
 
 :::warning A session script is the node's power on a principal's connection
-A script runs with the node's rights - it can read any source and write the policy. Whoever holds the `policy`
-bundle can therefore act as the node through one, so give that bundle as you give `passthrough`.
+A script runs with the node's rights - it can read any source, run `ACL NATIVE`'s SQL and write the policy. Whoever
+holds the `policy` bundle can therefore act as the node through one, past every guard the bundle's own writes pass
+(see [security](security.md)), so give that bundle as you give `passthrough`.
 :::
 
 ```sql

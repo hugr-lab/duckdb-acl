@@ -105,8 +105,9 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders");
 		Exec(con, "ACL ADMIN CREATE ROLE analyst");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN");
-		// getvariable is the environment category's: what lets the principal's statement read what a script set
-		Exec(con, "ACL ADMIN GRANT FUNCTION CATEGORY environment TO ROLE analyst");
+		// getvariable by name - what lets the principal's statement read what a script set (its category, environment,
+		// would hand out getenv and the settings too)
+		Exec(con, "ACL ADMIN GRANT FUNCTION getvariable TO ROLE analyst");
 		Exec(con, "ACL ADMIN CREATE RESOURCE GROUP north");
 		Exec(con, "ACL ADMIN GRANT RESOURCE GROUP north TO ROLE analyst");
 		// the layers: each sees what the one before it set, and the last word is the most specific's
@@ -114,11 +115,12 @@ int main(int argc, char *argv[]) {
 		          "'SET VARIABLE region = ''north''; SET VARIABLE layer = ''group'''");
 		Exec(con, "ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT "
 		          "'SET VARIABLE role_saw = getvariable(''layer''); SET VARIABLE layer = ''role'''");
-		Exec(con, "ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE analyst SET SESSION SCRIPT "
-		          "'SET VARIABLE grant_saw = getvariable(''layer''); SET VARIABLE layer = ''grant''; "
-		          "SET VARIABLE seen = getvariable(''acl_session_group'') || ''|'' || getvariable(''acl_session_subject'') "
-		          "|| ''|'' || array_to_string(getvariable(''acl_session_roles''), '','') || ''|'' || "
-		          "array_to_string(getvariable(''acl_session_groups''), '','')'");
+		Exec(con,
+		     "ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE analyst SET SESSION SCRIPT "
+		     "'SET VARIABLE grant_saw = getvariable(''layer''); SET VARIABLE layer = ''grant''; "
+		     "SET VARIABLE seen = getvariable(''acl_session_group'') || ''|'' || getvariable(''acl_session_subject'') "
+		     "|| ''|'' || array_to_string(getvariable(''acl_session_roles''), '','') || ''|'' || "
+		     "array_to_string(getvariable(''acl_session_groups''), '','')'");
 		Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 		Exec(con, std::string("SELECT acl_quack_serve('") + DOOR + "', 'server-token')");
 
@@ -127,13 +129,23 @@ int main(int argc, char *argv[]) {
 			if (!Check(error.empty(), "the session opens: " + error)) {
 				return;
 			}
-			Check(Read(con, "first", "getvariable(''layer'')") == "grant", "the grant's script ran last: " +
-			                                                                  Read(con, "first", "getvariable(''layer'')"));
+			Check(Read(con, "first", "getvariable(''layer'')") == "grant",
+			      "the grant's script ran last: " + Read(con, "first", "getvariable(''layer'')"));
 			Check(Read(con, "first", "getvariable(''region'')") == "north", "the group's variable is there");
-			Check(Read(con, "first", "getvariable(''role_saw'')") == "group", "the role's script ran after the group's");
-			Check(Read(con, "first", "getvariable(''grant_saw'')") == "role", "the grant's script ran after the role's");
+			Check(Read(con, "first", "getvariable(''role_saw'')") == "group",
+			      "the role's script ran after the group's");
+			Check(Read(con, "first", "getvariable(''grant_saw'')") == "role",
+			      "the grant's script ran after the role's");
 			auto seen = Read(con, "first", "getvariable(''seen'')");
 			Check(seen == "north|u|analyst|north", "the variables were set before the scripts: " + seen);
+			// SQL that ran unprefixed leaves no statement event: each script that ran is a `script_ran` of its own
+			Exec(con, "SELECT acl_audit_flush()");
+			auto ran = One(con, "SELECT string_agg(reason, ' / ' ORDER BY seq) FROM acl_audit_events() WHERE kind = "
+			                    "'session' AND detail = 'script_ran'");
+			Check(Contains(ran, "resource group \"north\" ran") && Contains(ran, "role \"analyst\" ran") &&
+			          Contains(ran, "role \"analyst\" in resource group \"north\" ran"),
+			      "a script_ran event per script, naming its level and owner: " + ran);
+			Check(!Contains(ran, "SET VARIABLE"), "...never its text");
 			// the principal's own statements stay judged: the scripts' rights are the node's, not the session's
 			Check(Contains(Read(con, "first", "acl_session_count()"), "ERROR"),
 			      "the principal still may not call the node's functions");
@@ -185,12 +197,16 @@ int main(int argc, char *argv[]) {
 			Check(Contains(error, "the session could not be prepared") && !Contains(error, "nosuch_function_181"),
 			      "...saying only that the session could not be prepared: " + error);
 			Exec(con, "SELECT acl_audit_flush()");
-			auto event = One(con, "SELECT reason_code || ' ' || reason FROM acl_audit_events() WHERE kind = 'session' "
-			                      "AND detail = 'refused' AND reason_code = 'session_script' ORDER BY seq DESC LIMIT 1");
+			auto event =
+			    One(con, "SELECT reason_code || ' ' || reason FROM acl_audit_events() WHERE kind = 'session' "
+			             "AND detail = 'refused' AND reason_code = 'session_script' ORDER BY seq DESC LIMIT 1");
 			Check(Contains(event, "role \"analyst\"") && !Contains(event, "nosuch_function_181"),
 			      "a refused event, reason session_script, names the owner and not the text: " + event);
-			Check(One(con, "SELECT acl_session_count()") == "1",
-			      "the refused session is gone; the first stays");
+			Check(One(con, "SELECT acl_session_count()") == "1", "the refused session is gone; the first stays");
+			auto closed = One(con, "SELECT reason FROM acl_audit_events() WHERE kind = 'session' AND detail = 'client' "
+			                       "ORDER BY seq DESC LIMIT 1");
+			Check(Contains(closed, "refused by a session script"),
+			      "its close keeps the observers' reason (client) and says why: " + closed);
 		});
 
 		Exec(con, "DETACH first");

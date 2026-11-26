@@ -647,6 +647,20 @@ bool AclQuackSessionOpened(Connection &connection, const string &connection_id) 
 	}
 }
 
+void AclQuackSessionRefused(DatabaseInstance &db, const string &connection_id) {
+	try {
+		if (auto store = PolicyStore::Of(db)) {
+			{
+				lock_guard<mutex> guard(store->quack_lineage_lock);
+				store->quack_lineage.erase(connection_id);
+				store->quack_lineage_reported.erase(connection_id);
+			}
+			store->SessionEndBound(connection_id, "client", "refused by a session script (spec 181)");
+		}
+	} catch (...) { // NOLINT: the idle timeout still ends it
+	}
+}
+
 bool AclQuackRecordStatement(StatementType type, const PhysicalOperator &root) {
 	return type == StatementType::PRAGMA_STATEMENT && root.type == PhysicalOperatorType::PRAGMA &&
 	       IsAclRecordPragma(root.Cast<PhysicalPragma>().info->function.name.GetIdentifierName());

@@ -877,7 +877,12 @@ Before a node serves anyone:
 - [ ] Admin scopes are minimal: catalog-scoped `manage` for operators of one catalog, `passthrough`
       for the platform only - it is "the actual god mode" and the only scope that runs `ACL NATIVE`.
 - [ ] The `policy` bundle is given as `passthrough` is: it writes session scripts (spec 181), SQL the node runs
-      with its own rights on a principal's connection - read them in `platform.session_scripts`.
+      with its own rights on a principal's connection - read them in `platform.session_scripts`. Through one, a
+      `policy` holder acts as the node and so steps past the guards its own management writes pass: the role-target
+      check (no mapping a claim to a privileged role, no repointing an issuer behind one), the policy store's tables
+      no definition may name, the source gate, the bodies judged by their author's function gate - and the rule
+      that a scope never escalates itself. That is the owner's decision: roles and groups are the policy's, and so
+      are the scripts.
 - [ ] Sensitive objects declare `COLUMNS (…)`; no whole-table grant sits on a live alias whose
       source may grow (section 7). Schema aliases are used only where "everything, forever" is
       intended; otherwise expand with `FROM` and `REFRESH` deliberately.

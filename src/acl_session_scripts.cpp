@@ -39,10 +39,11 @@ string VarcharOrNull(const string &text) {
 
 //! A failed script may leave the connection in a transaction it opened (`BEGIN; …` that broke before its COMMIT): an
 //! aborted transaction refuses every statement after it, so the session would be served a connection that answers
-//! nothing. Rolled back; a script that succeeded keeps whatever it left open.
-void EndFailedTransaction(Connection &con) {
+//! nothing. Rolled back - only one the failing script opened itself (`was_autocommit` before it ran); a transaction an
+//! earlier script left open is that script's, and a script that succeeded keeps whatever it left open.
+void EndFailedTransaction(Connection &con, bool was_autocommit) {
 	try {
-		if (!con.IsAutoCommit()) {
+		if (was_autocommit && !con.IsAutoCommit()) {
 			con.Query("ROLLBACK");
 		}
 	} catch (...) { // NOLINT: the connection is the session's; what it refuses next is the client's to see
@@ -62,7 +63,7 @@ bool SessionScriptsOf(PolicyStore &store, const string &handle, const string &do
 		return true;
 	} catch (std::exception &ex) {
 		// the policy source did not answer: a session whose scripts are unknown is not served as if it had none
-		store.AuditSessionScript(door, handle, nullptr, ErrorClass(ErrorData(ex)), true);
+		store.AuditSessionScript(door, handle, nullptr, ErrorClass(ErrorData(ex)), "refused");
 		return false;
 	}
 }
@@ -84,25 +85,29 @@ bool RunSessionScripts(PolicyStore &store, Connection &con, const string &handle
 		                 "; SET VARIABLE acl_session_subject = " + VarcharOrNull(ref.principal.subject);
 		auto set = con.Query(variables);
 		if (set->HasError()) {
-			store.AuditSessionScript(door, handle, nullptr, ErrorClass(set->GetErrorObject()), true);
+			store.AuditSessionScript(door, handle, nullptr, ErrorClass(set->GetErrorObject()), "refused");
 			return false;
 		}
 		for (auto &script : scripts) {
 			// as the node: unprefixed, as written - the override leaves a text that is no ACL statement alone
+			auto was_autocommit = con.IsAutoCommit();
 			auto result = con.Query(script.sql);
 			if (!result->HasError()) {
+				// SQL that ran unprefixed leaves no statement nor profile event: this is its trace
+				store.AuditSessionScript(door, handle, &script, string(), "script_ran");
 				continue;
 			}
 			auto error_class = ErrorClass(result->GetErrorObject());
-			EndFailedTransaction(con);
-			store.AuditSessionScript(door, handle, &script, error_class, script.fail_session);
+			EndFailedTransaction(con, was_autocommit);
+			store.AuditSessionScript(door, handle, &script, error_class,
+			                         script.fail_session ? "refused" : "script_failed");
 			if (script.fail_session) {
 				return false;
 			}
 		}
 		return true;
 	} catch (std::exception &ex) {
-		store.AuditSessionScript(door, handle, nullptr, ErrorClass(ErrorData(ex)), true);
+		store.AuditSessionScript(door, handle, nullptr, ErrorClass(ErrorData(ex)), "refused");
 		return false;
 	}
 }

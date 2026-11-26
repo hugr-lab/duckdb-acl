@@ -454,7 +454,7 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	return handle;
 }
 
-void PolicyStore::SessionEndBound(const string &external_id, const char *how) {
+void PolicyStore::SessionEndBound(const string &external_id, const char *how, const string &note) {
 	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
@@ -464,7 +464,7 @@ void PolicyStore::SessionEndBound(const string &external_id, const char *how) {
 	}
 	auto entry = sessions.find(binding->second);
 	if (entry != sessions.end()) {
-		SessionClosed(entry->second, how, now);
+		SessionClosed(entry->second, how, now, note);
 		sessions.erase(entry);
 	}
 	session_bindings.erase(binding);
@@ -485,7 +485,7 @@ void PolicyStore::AuditSessionRefused(const string &door, const string &handle, 
 }
 
 void PolicyStore::AuditSessionScript(const string &door, const string &handle, const SessionScript *script,
-                                     const string &error_class, bool refused) {
+                                     const string &error_class, const char *detail) {
 	if (!audit) {
 		return;
 	}
@@ -493,30 +493,36 @@ void PolicyStore::AuditSessionScript(const string &door, const string &handle, c
 	string why;
 	PolicyStore::SessionRef ref;
 	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
+	auto outcome = string(detail);
+	auto ran = outcome == "script_ran";
+	auto refused = outcome == "refused";
 	// names only: the level, whose script it is and the error's class - the SQL and the message may carry names a
 	// source's error puts there, or a connection string
 	string reason;
 	if (!script) {
 		reason = "the session's scripts could not be resolved (" + error_class + ")";
 	} else {
-		string owner = script->level == "group"  ? "resource group \"" + script->group + "\""
-		               : script->level == "role" ? "role \"" + script->role + "\""
-		                                         : "role \"" + script->role + "\" in resource group \"" + script->group +
-		                                               "\"";
-		reason = "the session script of " + owner + " failed (" + error_class + ")" +
-		         (refused ? string() : " - ON ERROR CONTINUE, the session is served");
+		string owner = script->level == "group" ? "resource group \"" + script->group + "\""
+		               : script->level == "role"
+		                   ? "role \"" + script->role + "\""
+		                   : "role \"" + script->role + "\" in resource group \"" + script->group + "\"";
+		reason = "the session script of " + owner +
+		         (ran ? string(" ran")
+		              : " failed (" + error_class + ")" +
+		                    (refused ? string() : " - ON ERROR CONTINUE, the session is served"));
 	}
 	AuditEvent event;
-	// a denial's level either way: a script that fails is the operator's to know, served on or not
-	event.level = AuditLevel::DENIED;
+	// a script that ran is a decision of the node's (what ran on the principal's connection, as the node); one that
+	// failed is the operator's to know, served on or not - a denial's level
+	event.level = ran ? AuditLevel::DECISIONS : AuditLevel::DENIED;
 	event.recorded = audit->Records(event.level, known ? ref.audit_level : static_cast<int8_t>(-1));
 	event.kind = "session";
 	event.door = door;
 	event.session = known ? ref.id : string();
 	event.principal = known ? principal : Principal();
-	event.detail = refused ? "refused" : "script_failed";
+	event.detail = outcome;
 	event.allowed = !refused;
-	event.reason_code = "session_script";
+	event.reason_code = ran ? "" : "session_script";
 	event.reason = AuditReasonText(event.reason_code, reason);
 	event.duration_us = -1;
 	audit->Emit(std::move(event));
@@ -553,7 +559,7 @@ bool PolicyStore::SessionDeclaredViewAs(const string &id) {
 
 //! The close event of a session being removed (spec 069): how it ended, and for how long it lived.
 //! Caller holds the lock; the event itself takes nothing of the store's.
-void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
+void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now, const string &note) {
 	session_notices.QueueClose(session.id, how); // spec 078: delivered once the lock is released
 	// spec 175: every removal passes here - the end of a session is the node's last activity until another. A record
 	// swept as idle or expired ended when it was last used, not when the sweep found it (a sweep is no activity)
@@ -577,7 +583,7 @@ void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t
 		}
 	}
 	auto lived = session.opened_at > 0 ? (now - session.opened_at) * 1000000 : -1;
-	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", "", lived);
+	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", note, lived);
 }
 
 bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string &reason) {
@@ -1434,13 +1440,13 @@ vector<DoorCertificateStatus> PolicyStore::DoorCertificates() const {
 	return out;
 }
 
-void PolicyStore::SessionClose(const string &handle) {
+void PolicyStore::SessionClose(const string &handle, const string &note) {
 	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
 	if (entry != sessions.end()) {
-		SessionClosed(entry->second, "client", now);
+		SessionClosed(entry->second, "client", now, note);
 		sessions.erase(entry);
 	}
 	for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {

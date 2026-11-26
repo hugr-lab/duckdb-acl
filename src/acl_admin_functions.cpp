@@ -1849,11 +1849,13 @@ void AclGrantPlatformFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		if (allowed != "true" && allowed != "false") {
 			throw BinderException("acl_grant_platform: allowed is true or false, got \"%s\"", allowed);
 		}
-		if (allowed == "true" && kind == "function" && object == "view_as") {
-			// spec 120.3: the policy bundle's - a grant by name would grant nothing (a DENY still works, a REVOKE
-			// still removes a row written before)
-			throw BinderException("acl_grant_platform: platform.view_as is the policy bundle's - it is never granted "
-			                      "by name (a DENY still is)");
+		auto function = kind == "function" ? FindPlatformFunction(object) : nullptr;
+		if (allowed == "true" && function && PolicyBundleOnly(function->target)) {
+			// spec 120.3 / 181: the policy bundle's - view-as, and the session scripts, which run as the node (a grant
+			// by name would hand out the node's power). A DENY still works, a REVOKE still removes a row written before
+			throw BinderException("acl_grant_platform: platform.%s is the policy bundle's - it is never granted by "
+			                      "name (a DENY still is)",
+			                      object);
 		}
 		StoreOf(state).GrantPlatform(role, kind, object, allowed == "true");
 	}

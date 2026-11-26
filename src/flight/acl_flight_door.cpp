@@ -50,6 +50,7 @@
 #include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
 #include "acl_session_scripts.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "acl_placement.hpp"
 #include "acl_session_state.hpp"
 #include "duckdb/main/config.hpp"
@@ -232,6 +233,29 @@ struct FlightDoorState {
 		//! has no id of this node's: EndTransaction ends it whatever id it names (a COMMIT commits nothing), and
 		//! BeginTransaction waits for that. Guarded by `exec`.
 		bool moved_txn = false;
+		//! spec 181: what the session's scripts left on the connection - its temp tables (lowered) and the transaction
+		//! they left open (`script_txn_open`, its global id) - none of which pins a move (spec 135): the next node's
+		//! scripts make them again. Written once, before the session is bound; read under `exec`.
+		std::set<string> script_temps;
+		bool script_txn_open = false;
+		transaction_t script_txn = 0;
+		//! Notes what the scripts left, right after they ran (caller holds `exec`)
+		void NoteScriptState() {
+			auto &client = *con->context;
+			for (auto &name : TempCatalogNames(client)) {
+				script_temps.insert(StringUtil::Lower(name));
+			}
+			if (!client.transaction.IsAutoCommit() && client.transaction.HasActiveTransaction()) {
+				script_txn_open = true;
+				script_txn = client.transaction.ActiveTransaction().global_transaction_id;
+			}
+		}
+		//! Whether the connection's open transaction is the one the scripts left (caller holds `exec`)
+		bool InScriptTransaction() {
+			auto &client = *con->context;
+			return script_txn_open && client.transaction.HasActiveTransaction() &&
+			       client.transaction.ActiveTransaction().global_transaction_id == script_txn;
+		}
 		//! spec 070: the result stream open on this connection, REACHABLE FROM HERE rather than owned by
 		//! its reader alone - a reader lives as long as its gRPC call, which a client that forgot its
 		//! cursor never ends, so the session's next statement must be able to end the stream from its
@@ -3049,6 +3073,30 @@ private:
 		return std::make_unique<flight::RecordBatchStream>(std::move(reader));
 	}
 
+	//! spec 181: a session SessionFor opened and has not bound yet - closed with its connection on the way out unless
+	//! released (a throw from ConnFor or a script, a refusal: no session left for the idle sweep alone to find)
+	struct OpeningSession {
+		OpeningSession(FlightDoorState &state_p, string handle_p) : state(state_p), handle(std::move(handle_p)) {
+		}
+		~OpeningSession() {
+			if (!armed) {
+				return;
+			}
+			try {
+				state.store->SessionClose(handle, note);
+				state.DropConn(handle);
+			} catch (...) { // NOLINT: a destructor; the idle sweep still ends it
+			}
+		}
+		void Release() {
+			armed = false;
+		}
+		FlightDoorState &state;
+		string handle;
+		string note;
+		bool armed = true;
+	};
+
 	//! A session that closes itself, whichever way the call leaves. Sessions here are opened and closed
 	//! inside one RPC (see SessionFor); the one way to leak one was a C++ exception between the two,
 	//! and this is what makes that impossible rather than merely unlikely.
@@ -3183,11 +3231,16 @@ private:
 		}
 		// duckdb's own word, whoever began it (BeginTransaction, SQL BEGIN, a moved one): ended by COMMIT/ROLLBACK
 		// on any path, it is autocommit again
-		if (!client.transaction.IsAutoCommit()) {
+		// spec 181: what the session's scripts left (a temp table, the transaction they opened) pins nothing - the next
+		// node runs its scripts before it restores the state
+		if (!client.transaction.IsAutoCommit() && !conn->InScriptTransaction()) {
 			out.pinned.emplace_back("transaction");
 		}
-		if (!TempCatalogNames(client).empty()) {
-			out.pinned.emplace_back("temp");
+		for (auto &name : TempCatalogNames(client)) {
+			if (!conn->script_temps.count(StringUtil::Lower(name))) {
+				out.pinned.emplace_back("temp");
+				break;
+			}
 		}
 		if (view_as) {
 			out.pinned.emplace_back("view_as");
@@ -3518,6 +3571,9 @@ private:
 			// what refuses a token in the prefix refuses it here, and says no more (spec 040)
 			return arrow::Status::UnknownError("acl: authentication failed");
 		}
+		// until the session is bound, a throw (ConnFor, the scripts, the bind) or a refusal leaves no session behind -
+		// nobody else holds the handle, and the idle sweep would be its only end
+		OpeningSession opening(*state, handle);
 		if (!transient && moving.read != SessionStateRead::ABSENT) {
 			// spec 135: held before it is bound - a concurrent call on the cookie finds the session and waits for its
 			// connection until the takeover is done
@@ -3537,21 +3593,24 @@ private:
 				running = std::unique_lock<std::mutex>(conn->exec);
 			}
 			prepared = RunSessionScripts(*state->store, *conn->con, handle, scripts, "flight");
+			if (prepared) {
+				conn->NoteScriptState(); // what they left pins no move (spec 135)
+			}
 		}
 		if (!prepared) {
-			// the session is not served: it ends here, before anyone holds it - the one it replaces stays, as on any
-			// refusal of a new session (the audit has why: a `session` event, reason session_script)
+			// the session is not served: it ends here (the guard), before anyone holds it - the one it replaces
+			// stays, as on any refusal of a new session (the audit has why: a `session` event, reason session_script)
 			if (moving.hold.owns_lock()) {
 				moving.hold.unlock();
 			}
 			moving.conn.reset();
-			state->store->SessionClose(handle);
-			state->DropConn(handle);
+			opening.note = "refused by a session script (spec 181)";
 			return arrow::Status::UnknownError("acl: the session could not be prepared");
 		}
 		if (!transient) {
 			state->store->SessionBind(cookie, handle); // ends the session it replaces, if any
 		}
+		opening.Release(); // bound (or the call's own, for a per-call one): UnderSession owns its end from here
 		if (!replacing.empty()) {
 			state->DropConn(replacing); // and the old principal's connection with it
 		}

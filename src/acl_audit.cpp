@@ -318,6 +318,8 @@ void AuditPipeline::Count(const AuditEvent &event) {
 			counters.Add("acl.sessions.refused", {{"door", event.door}, {"reason_code", event.reason_code}});
 		} else if (event.detail == "script_failed") {
 			counters.Add("acl.sessions.script_failed", {{"door", event.door}}); // spec 181: ON ERROR CONTINUE
+		} else if (event.detail == "script_ran") {
+			counters.Add("acl.sessions.scripts_ran", {{"door", event.door}}); // spec 181
 		} else if (event.detail == "moved") {
 			counters.Add("acl.sessions.moved", {{"door", event.door}}); // spec 135
 		} else if (event.detail == "move_refused") {

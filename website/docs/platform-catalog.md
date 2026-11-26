@@ -343,8 +343,8 @@ ESCALATES and INFRASTRUCTURE.
 | `alter_resource_group` | group_name\*, property\* (default / limits / comment), value | POLICY |
 | `drop_resource_group` | group_name\*, mode | POLICY |
 | `grant_resource_group` / `revoke_resource_group` | role\*, group_name\* | POLICY |
-| `set_session_script` | group_name\*, role\* (`''` for a group's / a role's own), sql, on_error (fail / continue) | POLICY |
-| `drop_session_script` | group_name\*, role\* | POLICY |
+| `set_session_script` | group_name\*, role\* (`''` for a group's / a role's own), sql, on_error (fail / continue) | POLICY (never granted by name) |
+| `drop_session_script` | group_name\*, role\* | POLICY (never granted by name) |
 | `grant_admin` | role\*, scope\* | ESCALATES |
 | `revoke_admin` | role\*, scope\* (omitted: everything) | ESCALATES |
 | `grant_platform` | role\*, kind\*, object\*, allowed | ESCALATES |

@@ -108,6 +108,9 @@ optional_ptr<const PlatformView> FindPlatformView(const string &name);
 optional_ptr<const PlatformFunction> FindPlatformFunction(const string &name);
 //! The platform function an acl_* call is, or nullptr
 optional_ptr<const PlatformFunction> PlatformFunctionByTarget(const string &target);
+//! The calls only the policy bundle (or passthrough) makes - never a point grant: view-as (spec 120.3) and the
+//! session scripts (spec 181), which run as the node, so a grant by name would hand out the node's power
+bool PolicyBundleOnly(const string &target);
 
 //! The leaf a written name gives `platform`'s objects - `platform.x` / `platform.main.x` (parts as
 //! written, the object's own name last); false when the name is not `platform`'s

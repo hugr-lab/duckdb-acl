@@ -1074,11 +1074,12 @@ struct PolicyStore {
 	//! spec 181: the group a session's first layer is: the node's (spec 096), else the session's charged group, else
 	//! its one group ('' when none decides)
 	string SessionScriptGroup(const ResourceLimits &limits);
-	//! spec 181: a session script failed on the session `handle`'s connection - `refused` (ON ERROR FAIL SESSION, or
-	//! the scripts could not be resolved: `script` null) or served on (CONTINUE). The event names the script's level
-	//! and owner and the error's class, never its text nor the error's message.
+	//! spec 181: a session script on the session `handle`'s connection - `detail` is `script_ran` (it ran: a decision,
+	//! the only trace of SQL that runs unprefixed), `script_failed` (it failed ON ERROR CONTINUE: served on) or
+	//! `refused` (ON ERROR FAIL SESSION, or the scripts could not be resolved: `script` null). The event names the
+	//! script's level and owner and the error's class, never its text nor the error's message.
 	void AuditSessionScript(const string &door, const string &handle, const SessionScript *script,
-	                        const string &error_class, bool refused);
+	                        const string &error_class, const char *detail);
 	void CatalogDropFunctionCategory(const string &name, bool if_exists);
 	//! add=true inserts the keys as members (the category must exist), add=false removes them
 	void CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add);
@@ -1218,7 +1219,9 @@ struct PolicyStore {
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
 	int8_t SessionAuditLevel(const string &handle);
 	//! The close event of a session being removed (spec 069); caller holds the lock.
-	void SessionClosed(const Session &session, const char *how, int64_t now);
+	//! `note`: what the `closed` event's reason says (spec 181: a session a script refused) - `how` stays the
+	//! observers' bounded reason
+	void SessionClosed(const Session &session, const char *how, int64_t now, const string &note = string());
 	//! The gauges the audit reads (spec 069): the policy version the caches are keyed by (-1 without a
 	//! catalog), seconds since the last successful version check (-1 = never), and per issuer the
 	//! seconds since its keys were last read successfully.
@@ -1331,7 +1334,7 @@ struct PolicyStore {
 	//! quack server's drain thread): registered in the object cache at load. Null before load.
 	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);
 	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
-	void SessionClose(const string &handle);
+	void SessionClose(const string &handle, const string &note = string());
 	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound
 	//! replaces it: a door that reconnects under the same id gets the session it just authenticated.
 	void SessionBind(const string &external_id, const string &handle);
@@ -1428,7 +1431,7 @@ struct PolicyStore {
 	bool SessionDeclaredViewAs(const string &id);
 	//! A door's connection is gone (spec 079: quack's DISCONNECT, or its heartbeat lease ran out): the
 	//! session bound to it (SessionBind) ends now with `how`, instead of waiting out the idle timeout.
-	void SessionEndBound(const string &external_id, const char *how);
+	void SessionEndBound(const string &external_id, const char *how, const string &note = string());
 	//! One live session, for the admin ops surface (spec 050) - never the handle.
 	struct SessionInfo {
 		string id;

@@ -400,24 +400,27 @@ shared_ptr<QuackConnection> QuackServer::GetConnection(const string &connection_
 
 string QuackServer::CreateNewConnection(const string &connection_id, const string &client_id_hash,
                                         idx_t heartbeat_timeout_seconds) {
-	std::lock_guard<std::mutex> lock(active_connections_mutex);
-
-	D_ASSERT(active_connections.find(connection_id) == active_connections.end());
-
 	auto db = db_ptr.lock();
 	if (!db) {
 		throw InternalException("Database was closed");
 	}
-	auto new_connection = make_shared_ptr<QuackConnection>(connection_id, heartbeat_timeout_seconds);
-	new_connection->client_id_hash = client_id_hash;
-	new_connection->live_caches = live_caches;
-	new_connection->duckdb_connection = make_uniq<Connection>(*db);
-	auto &connection_context = *new_connection->duckdb_connection->context;
+	// acl (spec 181): made, scripted, then published - see acl::AclQuackSessionOpened
+	auto acl_duckdb_connection = make_uniq<Connection>(*db);
+	auto &connection_context = *acl_duckdb_connection->context;
 	// acl_quack_scan_data registers its streams here, and SEND_DATA finds them by connection.
 	connection_context.registered_state->Insert(QuackSessionState::KEY,
 	                                            make_shared_ptr<QuackSessionState>(connection_id));
 	connection_context.config.enable_progress_bar = false;
 	// new_connection->duckdb_connection->context->config.streaming_buffer_size = 10 * 1000000; // 10 MB
+	if (!acl::AclQuackSessionOpened(*acl_duckdb_connection, connection_id)) {
+		return string();
+	}
+	auto new_connection = make_shared_ptr<QuackConnection>(connection_id, heartbeat_timeout_seconds);
+	new_connection->client_id_hash = client_id_hash;
+	new_connection->live_caches = live_caches;
+	new_connection->duckdb_connection = std::move(acl_duckdb_connection);
+	std::lock_guard<std::mutex> lock(active_connections_mutex);
+	D_ASSERT(active_connections.find(connection_id) == active_connections.end());
 	active_connections[connection_id] = std::move(new_connection);
 	return connection_id;
 }
@@ -694,18 +697,10 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			client_id_hash = ComputeClientHash(server_hmac_key, connection_request_message.ClientId());
 		}
 		auto acl_connection_id = CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds);
-		// acl (spec 181): the session's scripts, on its own connection before its first statement
-		if (auto acl_connection = GetConnection(acl_connection_id)) {
-			bool acl_prepared;
-			{
-				std::lock_guard<std::mutex> acl_execution(acl_connection->execution_lock);
-				acl_prepared = acl::AclQuackSessionOpened(*acl_connection->duckdb_connection, acl_connection_id);
-			}
-			if (!acl_prepared) {
-				DisconnectConnection(acl_connection_id);
-				acl::AclQuackConnectionGone(db, acl_connection_id, "client");
-				return make_uniq<ErrorResponse>("acl: the session could not be prepared");
-			}
+		if (acl_connection_id.empty()) {
+			// acl (spec 181): a session script refused the session - it ends here, and nothing was published
+			acl::AclQuackSessionRefused(db, connection_id);
+			return make_uniq<ErrorResponse>("acl: the session could not be prepared");
 		}
 		return make_uniq<ConnectionResponseMessage>(acl_connection_id, heartbeat_timeout_seconds);
 	}

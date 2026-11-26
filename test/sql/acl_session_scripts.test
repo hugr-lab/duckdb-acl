@@ -36,6 +36,15 @@ statement ok
 ACL ADMIN GRANT ADMIN policy TO ROLE pol;
 
 statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE viewer;
+
+statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE cat WITH (select, manage);
 
 statement ok
@@ -207,7 +216,7 @@ SELECT acl_set_session_script('', '', 'SELECT 1');
 statement error
 ACL ROLE "cat" ALTER ROLE analyst SET SESSION SCRIPT 'SELECT 1';
 ----
-<REGEX>:.*needs an unrestricted manage scope.*
+<REGEX>:.*platform.set_session_script needs the policy bundle \(an unrestricted manage scope\).*
 
 statement error
 ACL ROLE "cat" SELECT platform.set_session_script('north', '', 'SELECT 1');
@@ -220,6 +229,60 @@ ACL ROLE "analyst" ALTER RESOURCE GROUP north SET SESSION SCRIPT 'SELECT 1';
 statement error
 ACL ROLE "cat" SELECT * FROM platform.session_scripts('analyst');
 ----
+
+# a session script runs as the node: no grant by name reaches its writers nor its listing - not even passthrough's
+statement error
+ACL ROLE "root" GRANT FUNCTION platform.set_session_script TO ROLE viewer;
+----
+<REGEX>:.*platform.set_session_script is the policy bundle's - it is never granted by name.*
+
+statement error
+ACL ROLE "root" GRANT FUNCTION platform.drop_session_script TO ROLE viewer;
+----
+<REGEX>:.*platform.drop_session_script is the policy bundle's - it is never granted by name.*
+
+statement error
+ACL ROLE "root" GRANT FUNCTION platform.session_scripts TO ROLE viewer;
+----
+<REGEX>:.*platform.session_scripts is the policy bundle's - it is never granted by name.*
+
+# a DENY still is
+statement ok
+ACL ROLE "root" DENY FUNCTION platform.session_scripts TO ROLE viewer;
+
+statement ok
+ACL ROLE "root" REVOKE FUNCTION platform.session_scripts FROM ROLE viewer;
+
+# a point grant written before the rule (by hand here) reaches nothing
+statement ok
+INSERT INTO store.acl.platform_grants VALUES ('viewer', 'set_session_script', 'function', true), ('viewer', 'session_scripts', 'function', true);
+
+statement ok
+SELECT acl_comment_role('viewer', 'bumps the policy version');
+
+statement error
+ACL ROLE "viewer" SELECT platform.set_session_script('north', '', 'SELECT 1');
+----
+<REGEX>:.*platform.set_session_script needs the policy bundle.*
+
+statement error
+ACL ROLE "viewer" SELECT * FROM platform.session_scripts('analyst');
+----
+
+statement ok
+DELETE FROM store.acl.platform_grants WHERE role = 'viewer';
+
+# a reader of the views by a point grant sees no script: they are the policy bundle's to read
+statement ok
+ACL ROLE "root" GRANT VIEW platform.roles TO ROLE viewer;
+
+query TTT
+ACL ROLE "viewer" SELECT role, session_script, session_on_error FROM platform.roles WHERE role = 'analyst';
+----
+analyst	NULL	NULL
+
+statement ok
+ACL ROLE "root" REVOKE VIEW platform.roles FROM ROLE viewer;
 
 # --- the platform's calls, the policy bundle's ----------------------------------------------------------------------
 
