@@ -305,7 +305,7 @@ PATCHES = {
             "\t\tauto acl_connection_id = CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds);\n"
             "\t\tif (acl_connection_id.empty()) {\n"
             "\t\t\t// acl (spec 181): a session script refused the session - it ends here, and nothing was published\n"
-            "\t\t\tacl::AclQuackSessionRefused(db, connection_id);\n"
+            "\t\t\tacl::AclQuackConnectionGone(db, connection_id, \"client\", \"refused by a session script (spec 181)\");\n"
             "\t\t\treturn make_uniq<ErrorResponse>(\"acl: the session could not be prepared\");\n"
             "\t\t}\n"
             "\t\treturn make_uniq<ConnectionResponseMessage>(acl_connection_id, heartbeat_timeout_seconds);\n",

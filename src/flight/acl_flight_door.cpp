@@ -50,7 +50,6 @@
 #include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
 #include "acl_session_scripts.hpp"
-#include "duckdb/transaction/meta_transaction.hpp"
 #include "acl_placement.hpp"
 #include "acl_session_state.hpp"
 #include "duckdb/main/config.hpp"
@@ -233,28 +232,22 @@ struct FlightDoorState {
 		//! has no id of this node's: EndTransaction ends it whatever id it names (a COMMIT commits nothing), and
 		//! BeginTransaction waits for that. Guarded by `exec`.
 		bool moved_txn = false;
-		//! spec 181: what the session's scripts left on the connection - its temp tables (lowered) and the transaction
-		//! they left open (`script_txn_open`, its global id) - none of which pins a move (spec 135): the next node's
-		//! scripts make them again. Written once, before the session is bound; read under `exec`.
-		std::set<string> script_temps;
-		bool script_txn_open = false;
-		transaction_t script_txn = 0;
+		//! spec 181: the temp tables the session's scripts left on the connection - lowered name -> catalog entry oid.
+		//! They pin no move (spec 135): the next node's scripts make them again. A table of that name with another oid
+		//! (the client dropped it and made its own) is the client's and pins. A script leaves no transaction: each is
+		//! committed after it ran (acl_session_scripts.cpp). Written once, before the session is bound; read under
+		//! `exec`.
+		case_insensitive_map_t<idx_t> script_temps;
 		//! Notes what the scripts left, right after they ran (caller holds `exec`)
 		void NoteScriptState() {
-			auto &client = *con->context;
-			for (auto &name : TempCatalogNames(client)) {
-				script_temps.insert(StringUtil::Lower(name));
-			}
-			if (!client.transaction.IsAutoCommit() && client.transaction.HasActiveTransaction()) {
-				script_txn_open = true;
-				script_txn = client.transaction.ActiveTransaction().global_transaction_id;
+			for (auto &entry : TempCatalogEntries(*con->context)) {
+				script_temps[entry.first] = entry.second;
 			}
 		}
-		//! Whether the connection's open transaction is the one the scripts left (caller holds `exec`)
-		bool InScriptTransaction() {
-			auto &client = *con->context;
-			return script_txn_open && client.transaction.HasActiveTransaction() &&
-			       client.transaction.ActiveTransaction().global_transaction_id == script_txn;
+		//! Whether this temp table is one the scripts made, as they made it (caller holds `exec`)
+		bool ScriptTemp(const string &name, idx_t oid) const {
+			auto found = script_temps.find(name);
+			return found != script_temps.end() && found->second == oid;
 		}
 		//! spec 070: the result stream open on this connection, REACHABLE FROM HERE rather than owned by
 		//! its reader alone - a reader lives as long as its gRPC call, which a client that forgot its
@@ -3231,13 +3224,13 @@ private:
 		}
 		// duckdb's own word, whoever began it (BeginTransaction, SQL BEGIN, a moved one): ended by COMMIT/ROLLBACK
 		// on any path, it is autocommit again
-		// spec 181: what the session's scripts left (a temp table, the transaction they opened) pins nothing - the next
-		// node runs its scripts before it restores the state
-		if (!client.transaction.IsAutoCommit() && !conn->InScriptTransaction()) {
+		if (!client.transaction.IsAutoCommit()) {
 			out.pinned.emplace_back("transaction");
 		}
-		for (auto &name : TempCatalogNames(client)) {
-			if (!conn->script_temps.count(StringUtil::Lower(name))) {
+		// spec 181: a temp table the session's scripts made pins nothing - the next node's scripts make it again (the
+		// rows the client wrote into it do not carry); one the client made, or dropped and made again, pins
+		for (auto &entry : TempCatalogEntries(client)) {
+			if (!conn->ScriptTemp(entry.first, entry.second)) {
 				out.pinned.emplace_back("temp");
 				break;
 			}

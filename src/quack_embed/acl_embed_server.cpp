@@ -699,7 +699,7 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		auto acl_connection_id = CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds);
 		if (acl_connection_id.empty()) {
 			// acl (spec 181): a session script refused the session - it ends here, and nothing was published
-			acl::AclQuackSessionRefused(db, connection_id);
+			acl::AclQuackConnectionGone(db, connection_id, "client", "refused by a session script (spec 181)");
 			return make_uniq<ErrorResponse>("acl: the session could not be prepared");
 		}
 		return make_uniq<ConnectionResponseMessage>(acl_connection_id, heartbeat_timeout_seconds);

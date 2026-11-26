@@ -229,6 +229,7 @@ ACL ROLE "analyst" ALTER RESOURCE GROUP north SET SESSION SCRIPT 'SELECT 1';
 statement error
 ACL ROLE "cat" SELECT * FROM platform.session_scripts('analyst');
 ----
+<REGEX>:.*platform.session_scripts needs the policy bundle \(an unrestricted manage scope\).*
 
 # a session script runs as the node: no grant by name reaches its writers nor its listing - not even passthrough's
 statement error
@@ -268,6 +269,7 @@ ACL ROLE "viewer" SELECT platform.set_session_script('north', '', 'SELECT 1');
 statement error
 ACL ROLE "viewer" SELECT * FROM platform.session_scripts('analyst');
 ----
+<REGEX>:.*platform.session_scripts needs the policy bundle \(an unrestricted manage scope\).*
 
 statement ok
 DELETE FROM store.acl.platform_grants WHERE role = 'viewer';

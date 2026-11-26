@@ -162,8 +162,8 @@ ALTER RESOURCE GROUP <g> FOR ROLE <r> DROP SESSION SCRIPT
   source that throws refuses the session), `RunSessionScripts` (one `SET VARIABLE` batch for the four variables, then
   each script by `Connection::Query`, unprefixed - the override leaves a text that is no ACL statement alone), and
   `PrepareSession` for a door holding the connection. The variables are set only on a session that runs a script (a
-  cookie-less Flight call with none costs nothing). A failed script that left an explicit transaction open has it
-  rolled back before the next layer.
+  cookie-less Flight call with none costs nothing). After each script a transaction it left open is committed, an
+  invalidated one (or a failed COMMIT) rolled back and counted its failure (the second review below).
 - **Flight** (`SessionFor`): after `SessionOpen`, before `SessionBind` - so before a takeover's `TakeOverState` and
   `DeclaredViewAs`; the connection is made (`ConnFor`) only when there is a script, under its `exec` lock (or the
   takeover's `moving.hold`). A refusal closes the session and drops its connection (as `AbandonTakeover`), leaves a
@@ -204,11 +204,13 @@ ALTER RESOURCE GROUP <g> FOR ROLE <r> DROP SESSION SCRIPT
 2. **What the scripts left pinned every move** (spec 135): a script's temp table or the transaction it opened made
    each move refuse "lost its temp tables". `SessionConn::NoteScriptState` records, right after the scripts, their
    temp names and the open transaction's global id; `CurrentState` pins neither (the next node's scripts make them
-   again) - a temp of the same name the client made after is read as the scripts' (a known limit).
+   again) - a temp of the same name the client made after is read as the scripts' (a known limit). (Superseded by
+   the second review's 1 and 2: no script transaction survives, and a temp is matched by its oid.)
 3. **Scripts left no trace when they succeeded**: each one that ran is a `session` event `script_ran` (DECISIONS,
    level and owner only), counted `acl.sessions.scripts_ran{door}`.
 4. **A failed script rolled back a transaction an earlier script left open**: only one the failing script opened
-   (autocommit noted before it) is rolled back.
+   (autocommit noted before it) is rolled back. (Superseded by the second review's 1: each script's transaction is
+   committed or rolled back after it.)
 5. **A throw between `SessionOpen` and `SessionBind` leaked the session** to the idle sweep: `OpeningSession`, an RAII
    guard in `SessionFor`, closes the handle and drops its connection unless released at the bind.
 6. **quack: a slow script raced the lease sweep** and ran on a published connection. The patch now makes the
@@ -229,3 +231,27 @@ ALTER RESOURCE GROUP <g> FOR ROLE <r> DROP SESSION SCRIPT
 Smaller: `ScriptColumnsSql` sits before `TableBody`'s doc comment; the close of a refused session keeps the
 observers' reason `client` and its `closed` event's reason says "refused by a session script" (`SessionClose` /
 `SessionEndBound` / `SessionClosed` take a note).
+
+### Found by its second review, fixed
+
+1. **A script could hand the client an open transaction** (the lead's decision, within the owner's "full rights"
+   rule: it may not). The client's writes landed in it and a move lost them; `TakeOverState`'s BEGIN failed inside it
+   and locked the client out; a CONTINUE failure left an invalidated transaction and a connection that answered
+   nothing. `SettleTransaction` (acl_session_scripts.cpp) runs after EACH script: a transaction left open is
+   committed; an invalidated one, or a COMMIT that fails, is rolled back and is that script's failure under its ON
+   ERROR. The first review's "roll back only what the failing script opened" and the Flight door's "script
+   transaction" pin exclusion are gone: the pins are exactly the client's own.
+2. **A temp table the client dropped and made again under a script's name passed as the script's.** `NoteScriptState`
+   keeps each script temp's catalog entry oid (`TempCatalogEntries`; `ScanTempTables` hands the entry's oid);
+   `CurrentState` pins a temp of that name with another oid. Rows the client writes into a script's own temp table do
+   not carry across a move - the next node's scripts make it again (docs).
+3. Docs and this spec state the commit-after-each-script rule, and that a cookie-less Flight call records one
+   `script_ran` per script per call.
+4. `AclQuackConnectionGone` takes the close's note; the duplicate `AclQuackSessionRefused` is gone (the patch calls
+   `AclQuackConnectionGone(db, id, "client", "refused by a session script (spec 181)")`).
+
+Tests: the C++ test - a group script ending inside BEGIN has its work committed, a CONTINUE role script failing in its
+own BEGIN serves a connection that answers (the later layer ran), the same under FAIL SESSION refuses; the Flight e2e -
+the script ends inside BEGIN, the client's write in autocommit carries no transaction pin and survives the move, and a
+temp the client remade under the script's name pins (on a session without USE: under `USE c.stage` a short name is
+read in the session's catalog before the temp catalog - spec 114's order, unchanged here); the SQL test's `session_scripts` refusals name their message.

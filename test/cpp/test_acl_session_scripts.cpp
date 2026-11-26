@@ -209,6 +209,33 @@ int main(int argc, char *argv[]) {
 			      "its close keeps the observers' reason (client) and says why: " + closed);
 		});
 
+		Scenario("a script hands the client no transaction: committed after it, or its failure", [&] {
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			// the group's script ends inside BEGIN: its work is committed after it, before the next layer
+			Exec(con, "ACL ADMIN ALTER RESOURCE GROUP north SET SESSION SCRIPT "
+			          "'BEGIN; CREATE OR REPLACE TABLE memory.main.script_made AS SELECT 7 AS v'");
+			// the role's fails inside a BEGIN of its own: an invalidated transaction, rolled back - CONTINUE serves a
+			// connection that answers, and the grant's script still runs
+			Exec(con, "ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'BEGIN; SELECT nosuch_function_181()' "
+			          "ON ERROR CONTINUE");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			auto error = Attach(con, "settled");
+			if (!Check(error.empty(), "the session opens: " + error)) {
+				return;
+			}
+			Check(One(con, "SELECT v FROM memory.main.script_made") == "7",
+			      "the work a script left in its transaction was committed");
+			Check(Read(con, "settled", "getvariable(''layer'')") == "grant, rewritten",
+			      "the connection answers after the CONTINUE failure, and the later layer ran");
+			Exec(con, "DETACH settled");
+			// FAIL SESSION: a script that leaves its transaction invalidated refuses the session
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			Exec(con, "ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'BEGIN; SELECT nosuch_function_181()'");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			Check(Contains(Attach(con, "unsettled"), "the session could not be prepared"),
+			      "an invalidated transaction under FAIL SESSION refuses the session");
+		});
+
 		Exec(con, "DETACH first");
 		Exec(con, std::string("SELECT acl_quack_stop('") + DOOR + "')");
 	});

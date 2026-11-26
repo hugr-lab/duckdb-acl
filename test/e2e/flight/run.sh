@@ -800,9 +800,10 @@ counts="$(server_says movecount "SELECT coalesce(sum(value) FILTER (WHERE name =
 	fail "the moves were not counted (moved / move_refused): $counts"
 # --- spec 181: a session's scripts on a move and a swap ------------------------------------------------------------
 # the role's script, for this part: refuses the globex principal, sets a zone the client's own SET overrides, and
-# leaves a temp table - which, being the scripts', pins no move (the next node's scripts make it again)
+# ends inside a BEGIN making a temp table - committed after it (a script hands the client no transaction), and the
+# temp table, being the scripts', pins no move (the next node's scripts make it again)
 SCRIPT_SET="$(cat <<'SQL'
-SELECT acl_set_session_script('', 'analyst', 'SELECT CASE WHEN getvariable(''acl_session_subject'') = ''u-globex'' THEN error(''not for globex'') ELSE 1 END; SET VARIABLE e2e_region = ''north''; SET TimeZone = ''Europe/Berlin''; CREATE TEMP TABLE script_tmp AS SELECT 1 AS one', 'fail')::VARCHAR
+SELECT acl_set_session_script('', 'analyst', 'SELECT CASE WHEN getvariable(''acl_session_subject'') = ''u-globex'' THEN error(''not for globex'') ELSE 1 END; SET VARIABLE e2e_region = ''north''; SET TimeZone = ''Europe/Berlin''; BEGIN; CREATE TEMP TABLE script_tmp AS SELECT 1 AS one', 'fail')::VARCHAR
 SQL
 )"
 said="$(server_says scripted0 "$SCRIPT_SET")"
@@ -814,6 +815,11 @@ echo "$got" | grep -qi "error\|denied\|refused" && fail "SET TimeZone on the scr
 got="$(ACL_SHOW_SCHEMA=1 ACL_COOKIE_JAR="$SCJ" ask "SELECT TIMESTAMPTZ '2026-01-01 00:00:00+00' AS t")"
 echo "$got" | grep -q "tz=Asia/Tokyo" || fail "the client's SET did not override the script's zone: $got"
 state_json "$SCJ" | grep -q '"temp"' && fail "the script's temp table pinned the session: $(state_json "$SCJ")"
+# the client starts in autocommit: its write is its own, never inside the script's transaction, and survives a move
+ACL_COOKIE_JAR="$SCJ" ask 'USE c.stage' >/dev/null
+got="$(ACL_COOKIE_JAR="$SCJ" ask "@update:INSERT INTO moved_t VALUES (181)")"
+echo "$got" | grep -q "'count':" || fail "the client's write on the scripted session failed: $got"
+state_json "$SCJ" | grep -q '"transaction"' && fail "the script's transaction reached the client: $(state_json "$SCJ")"
 kill_sessions scripted1
 # the takeover: the scripts run first (their zone, their temp table), then the state the client carried - its SET wins
 got="$(ACL_SHOW_SCHEMA=1 ACL_COOKIE_JAR="$SCJ" ask "SELECT TIMESTAMPTZ '2026-01-01 00:00:00+00' AS t")"
@@ -821,6 +827,20 @@ echo "$got" | grep -q "moved to another node" && fail "a session moved with only
 echo "$got" | grep -q "tz=Asia/Tokyo" || fail "the carried SET did not win over the script's zone after the move: $got"
 got="$(ACL_COOKIE_JAR="$SCJ" ask "SELECT getvariable('e2e_region') AS region")"
 echo "$got" | grep -q "'region': \['north'\]" || fail "the moved session's scripts did not run: $got"
+got="$(ACL_COOKIE_JAR="$SCJ" ask "SELECT count(*) AS n FROM moved_t WHERE x = 181")"
+echo "$got" | grep -q "'n': \[1\]" || fail "the client's write before the move was lost: $got"
+# a temp table of the scripts' name the client dropped and made again is the client's own: it pins (a session of its
+# own, with no USE: a short name under USE c.stage is read in that catalog first)
+STJ="$TMP/scripttempjar"
+ACL_COOKIE_JAR="$STJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$STJ" ask "SELECT one FROM script_tmp")"
+echo "$got" | grep -q "'one': \[1\]" || fail "the script's temp table is not the session's: $got"
+state_json "$STJ" | grep -q '"temp"' && fail "the script's temp table pinned the session: $(state_json "$STJ")"
+got="$(ACL_COOKIE_JAR="$STJ" ask "@update:DROP TABLE script_tmp")"
+echo "$got" | grep -q "'count':" || fail "dropping the script's temp table failed: $got"
+got="$(ACL_COOKIE_JAR="$STJ" ask "@update:CREATE TEMP TABLE script_tmp AS SELECT 2 AS one")"
+echo "$got" | grep -q "'count':" || fail "making the client's own script_tmp failed: $got"
+state_json "$STJ" | grep -q '"temp"' || fail "a temp table the client made under the scripts' name did not pin: $(state_json "$STJ")"
 # a swap whose new session a script refuses: the client is told only that, and the old session stays as it was
 got="$(ACL_COOKIE_JAR="$SCJ" ask "SELECT 1 AS one" "$GLOBEX")"
 echo "$got" | grep -q "the session could not be prepared" || fail "a script's refusal of a swap was not said: $got"

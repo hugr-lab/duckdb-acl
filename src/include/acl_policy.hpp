@@ -98,6 +98,9 @@ bool TempCatalogHas(ClientContext &context, const string &name);
 //! Every temp table name of the connection, for the metadata surfaces (spec 050): a session lists
 //! its own temp objects and nobody else's - per-connection by construction.
 vector<string> TempCatalogNames(ClientContext &context);
+//! spec 181: each temp table of the connection with its catalog entry's oid - a table dropped and made again under
+//! the same name is another entry
+vector<std::pair<string, idx_t>> TempCatalogEntries(ClientContext &context);
 
 //! `bytes` bytes from the platform's CSPRNG, hex-encoded - the ONE minter behind every credential
 //! we hand a client: the session handle (spec 040), the Flight ticket id and the Flight session

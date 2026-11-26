@@ -549,7 +549,7 @@ void AclQuackNoteRequestLineage(DatabaseInstance &db, const string &connection_i
 	}
 }
 
-void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how) {
+void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how, const string &note) {
 	try {
 		if (auto store = PolicyStore::Of(db)) {
 			{
@@ -557,7 +557,7 @@ void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, c
 				store->quack_lineage.erase(connection_id);
 				store->quack_lineage_reported.erase(connection_id);
 			}
-			store->SessionEndBound(connection_id, how);
+			store->SessionEndBound(connection_id, how, note);
 		}
 	} catch (...) {
 		// the idle timeout still ends it
@@ -644,20 +644,6 @@ bool AclQuackSessionOpened(Connection &connection, const string &connection_id) 
 		return PrepareSession(*store, connection, handle, "quack");
 	} catch (...) {
 		return false; // fail closed: a session whose scripts did not run as written is not served
-	}
-}
-
-void AclQuackSessionRefused(DatabaseInstance &db, const string &connection_id) {
-	try {
-		if (auto store = PolicyStore::Of(db)) {
-			{
-				lock_guard<mutex> guard(store->quack_lineage_lock);
-				store->quack_lineage.erase(connection_id);
-				store->quack_lineage_reported.erase(connection_id);
-			}
-			store->SessionEndBound(connection_id, "client", "refused by a session script (spec 181)");
-		}
-	} catch (...) { // NOLINT: the idle timeout still ends it
 	}
 }
 

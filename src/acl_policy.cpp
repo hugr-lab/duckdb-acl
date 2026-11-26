@@ -1973,21 +1973,22 @@ void SetArrowIngestFactory(shared_ptr<TableFunctionInfo> factory) {
 //! committed entries only, which is exactly right - a name only becomes resolvable once the
 //! statement that created it has finished. A live Catalog::GetEntry here would throw "no active
 //! transaction" (probed); this does not, because it never opens one.
-static void ScanTempTables(ClientContext &context, const std::function<void(const string &)> &callback) {
+static void ScanTempTables(ClientContext &context, const std::function<void(const string &, idx_t)> &callback) {
 	auto &temp_db = ClientData::Get(context).temporary_objects;
 	if (!temp_db) {
 		return;
 	}
 	auto &catalog = temp_db->GetCatalog().Cast<DuckCatalog>();
 	catalog.ScanSchemas([&](SchemaCatalogEntry &schema_entry) {
-		schema_entry.Cast<DuckSchemaEntry>().Scan(
-		    CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) { callback(entry.name.GetIdentifierName()); });
+		schema_entry.Cast<DuckSchemaEntry>().Scan(CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+			callback(entry.name.GetIdentifierName(), entry.oid);
+		});
 	});
 }
 
 bool TempCatalogHas(ClientContext &context, const string &name) {
 	bool found = false;
-	ScanTempTables(context, [&](const string &entry) {
+	ScanTempTables(context, [&](const string &entry, idx_t) {
 		if (StringUtil::CIEquals(entry, name)) {
 			found = true;
 		}
@@ -1997,9 +1998,15 @@ bool TempCatalogHas(ClientContext &context, const string &name) {
 
 vector<string> TempCatalogNames(ClientContext &context) {
 	vector<string> names;
-	ScanTempTables(context, [&](const string &entry) { names.push_back(entry); });
+	ScanTempTables(context, [&](const string &entry, idx_t) { names.push_back(entry); });
 	std::sort(names.begin(), names.end());
 	return names;
+}
+
+vector<std::pair<string, idx_t>> TempCatalogEntries(ClientContext &context) {
+	vector<std::pair<string, idx_t>> entries;
+	ScanTempTables(context, [&](const string &entry, idx_t oid) { entries.emplace_back(entry, oid); });
+	return entries;
 }
 
 bool PolicyStore::PrincipalMainCap(const Principal &principal, const string &capability) {

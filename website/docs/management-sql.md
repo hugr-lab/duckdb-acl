@@ -1076,19 +1076,25 @@ connection.
   and the like.
 - **`ON ERROR`.** `FAIL SESSION`, the default, refuses the session: the client gets "the session could not be
   prepared" and nothing more. `CONTINUE` records the failure and serves the session; the scripts after it still run.
-  A failed script that left a transaction open has it rolled back. Either way the audit records a `session` event -
+  Either way the audit records a `session` event -
   `refused` or `script_failed` - with reason code `session_script`, the script's level and owner and the error's
   class, never the script's text nor the error's message. `acl.sessions.script_failed{door}` counts the `CONTINUE`
   ones. Each script that ran is a `session` event `script_ran` (level `decisions`, `acl.sessions.scripts_ran{door}`)
-  naming its level and owner: SQL run unprefixed leaves no statement or profile event of its own. A session a script
+  naming its level and owner: SQL run unprefixed leaves no statement or profile event of its own (a cookie-less
+  Flight call records one per script per call). A session a script
   refused is then closed with the observers' reason `client`, the event saying it was refused by a session script.
+- **A script hands the client no transaction.** After each script, a transaction it left open is committed. One it
+  left invalidated (a statement of it failed), or one whose COMMIT fails, is rolled back and counts as that script's
+  failure under its `ON ERROR`. So the client always starts in autocommit, and a `CONTINUE` serves a connection that
+  answers.
 - **When it runs.** Once per session, on the doors' sessions:
   - Flight SQL: on the session's connection when the door opens the session, and again when another node takes a
     moved session over (spec 135) - before the client's carried settings are put back, so the client's own SETs
     win. A cookie-less call is a session of one call, so it runs the scripts on every call. A value a script sets
     in a setting a session carries (spec 135's portable settings) travels in the state cookie like the client's own.
-    What the scripts leave on the connection - a temp table, a transaction they opened - pins no move: the next node
-    runs its scripts first, which make them again.
+    A temp table the scripts made pins no move: the next node runs its scripts first, which make it again - so rows
+    the client wrote into a script's own temp table do not carry across a move. One the client made, or dropped and
+    made again under the scripts' name, pins as before, and so does the client's own transaction.
   - quack: on the connection quack makes for the client, right after it authenticated and before quack publishes
     the connection - no request reaches it and its heartbeat lease starts once the scripts are done. While they run
     the client holds one of the node's seats as authenticating.

@@ -13,6 +13,8 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/valid_checker.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 namespace duckdb {
@@ -37,17 +39,39 @@ string VarcharOrNull(const string &text) {
 	return text.empty() ? string("NULL::VARCHAR") : Value(text).ToSQLString();
 }
 
-//! A failed script may leave the connection in a transaction it opened (`BEGIN; …` that broke before its COMMIT): an
-//! aborted transaction refuses every statement after it, so the session would be served a connection that answers
-//! nothing. Rolled back - only one the failing script opened itself (`was_autocommit` before it ran); a transaction an
-//! earlier script left open is that script's, and a script that succeeded keeps whatever it left open.
-void EndFailedTransaction(Connection &con, bool was_autocommit) {
-	try {
-		if (was_autocommit && !con.IsAutoCommit()) {
-			con.Query("ROLLBACK");
-		}
-	} catch (...) { // NOLINT: the connection is the session's; what it refuses next is the client's to see
+//! A script hands the client no open transaction: whatever it left open is committed after it ran, and an invalidated
+//! one (a statement of it failed), or a COMMIT that fails, is rolled back and is that script's failure. So a client
+//! never starts inside a transaction it did not begin - its writes never land in one a move would lose, and the
+//! connection a CONTINUE serves always answers. Returns '' when the connection is in autocommit after it, else the
+//! failure's class.
+string SettleTransaction(Connection &con) {
+	if (con.IsAutoCommit()) {
+		return string();
 	}
+	auto rollback = [&]() {
+		try {
+			if (!con.IsAutoCommit()) {
+				con.Query("ROLLBACK");
+			}
+		} catch (...) { // NOLINT: the connection is the session's; what it refuses next is the client's to see
+		}
+	};
+	auto &transaction = con.context->transaction;
+	if (transaction.HasActiveTransaction() && ValidChecker::IsInvalidated(transaction.ActiveTransaction())) {
+		rollback();
+		return Exception::ExceptionTypeToString(ExceptionType::TRANSACTION);
+	}
+	auto commit = con.Query("COMMIT");
+	if (commit->HasError()) {
+		auto error_class = ErrorClass(commit->GetErrorObject());
+		rollback();
+		return error_class;
+	}
+	if (!con.IsAutoCommit()) {
+		rollback();
+		return Exception::ExceptionTypeToString(ExceptionType::TRANSACTION);
+	}
+	return string();
 }
 
 } // namespace
@@ -90,15 +114,18 @@ bool RunSessionScripts(PolicyStore &store, Connection &con, const string &handle
 		}
 		for (auto &script : scripts) {
 			// as the node: unprefixed, as written - the override leaves a text that is no ACL statement alone
-			auto was_autocommit = con.IsAutoCommit();
 			auto result = con.Query(script.sql);
-			if (!result->HasError()) {
+			auto error_class = result->HasError() ? ErrorClass(result->GetErrorObject()) : string();
+			// what it left open is committed - or, invalidated or refused at COMMIT, rolled back and its failure
+			auto settled = SettleTransaction(con);
+			if (error_class.empty()) {
+				error_class = settled;
+			}
+			if (error_class.empty()) {
 				// SQL that ran unprefixed leaves no statement nor profile event: this is its trace
 				store.AuditSessionScript(door, handle, &script, string(), "script_ran");
 				continue;
 			}
-			auto error_class = ErrorClass(result->GetErrorObject());
-			EndFailedTransaction(con, was_autocommit);
 			store.AuditSessionScript(door, handle, &script, error_class,
 			                         script.fail_session ? "refused" : "script_failed");
 			if (script.fail_session) {
