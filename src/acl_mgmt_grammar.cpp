@@ -2601,6 +2601,52 @@ arena_ptr<TransformResultValue> FinalizeAlterResourceGroup(PEGTransformer &trans
 	return MgmtResult(transformer, std::move(data));
 }
 
+// --- a session's scripts (spec 181) ------------------------------------------------------------------------------
+
+//! `AclSessionScriptChange <- AclSetSessionScript / AclDropSessionScript` for the script of `group` / `role` (a grant's
+//! when both): SET SESSION SCRIPT '<sql>' [ON ERROR FAIL SESSION | CONTINUE] - the SQL one literal, stored as written
+arena_ptr<TransformResultValue> SessionScriptCall(PEGTransformer &transformer, ParseResult &change_result,
+                                                  const string &group, const string &role) {
+	auto &change = Strip(change_result).Cast<ListParseResult>();
+	if (change.Name() == "AclDropSessionScript") {
+		auto data = Call("acl_drop_session_script"); // AclDropSessionScript <- 'DROP' 'SESSION' 'SCRIPT'
+		data->args = {Value(group), Value(role)};
+		return MgmtResult(transformer, std::move(data));
+	}
+	// AclSetSessionScript <- 'SET' 'SESSION' 'SCRIPT' AclQuotedValue AclScriptOnError?
+	auto data = Call("acl_set_session_script");
+	auto sql = Quoted(transformer, change, 3, "session script", *data);
+	string on_error = "fail";
+	auto &clause = change.Child<OptionalParseResult>(4);
+	if (clause.HasResult()) {
+		// AclScriptOnError <- 'ON' 'ERROR' AclScriptAction; AclScriptAction <- AclScriptFail / AclScriptContinue
+		// (a rule of one keyword reads as that keyword: CONTINUE, else FAIL SESSION)
+		auto &action = Strip(clause.GetResult()).Cast<ListParseResult>().GetChild(2);
+		on_error = KeywordOf(action) == "continue" ? "continue" : "fail";
+	}
+	data->args = {Value(group), Value(role), Value(sql), Value(on_error)};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterRoleScript <- 'ALTER' 'ROLE' AclName AclSessionScriptChange
+arena_ptr<TransformResultValue> FinalizeAlterRoleScript(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	return SessionScriptCall(transformer, list.GetChild(3), string(), NameOf(list.GetChild(2), "a role name"));
+}
+
+// AclAlterGroupScript <- 'ALTER' 'RESOURCE' 'GROUP' AclName AclGroupForRole? AclSessionScriptChange - FOR ROLE r is
+// the role's grant of the group (AclGroupForRole <- 'FOR' 'ROLE' AclName)
+arena_ptr<TransformResultValue> FinalizeAlterGroupScript(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto group = NameOf(list.GetChild(3), "a group name");
+	string role;
+	auto &for_role = list.Child<OptionalParseResult>(4);
+	if (for_role.HasResult()) {
+		role = NameOf(Strip(for_role.GetResult()).Cast<ListParseResult>().GetChild(2), "a role name");
+	}
+	return SessionScriptCall(transformer, list.GetChild(5), group, role);
+}
+
 // AclDropResourceGroup <- 'DROP' 'RESOURCE' 'GROUP' AclIfExists? AclName - its role bindings go too
 arena_ptr<TransformResultValue> FinalizeDropResourceGroup(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
@@ -3231,6 +3277,22 @@ public:
 		changes.push_back(
 		    GrammarChange::AddRule("AclAlterResourceGroup <- 'ALTER' 'RESOURCE' 'GROUP' AclName AclGroupChange",
 		                           Start<FinalizeAlterResourceGroup>));
+		// spec 181: a session's scripts - a group's, a role's, a role's grant of the group
+		changes.push_back(GrammarChange::AddRule("AclScriptFail <- 'FAIL' 'SESSION'"));
+		changes.push_back(GrammarChange::AddRule("AclScriptContinue <- 'CONTINUE'"));
+		changes.push_back(GrammarChange::AddRule("AclScriptAction <- AclScriptFail / AclScriptContinue"));
+		changes.push_back(GrammarChange::AddRule("AclScriptOnError <- 'ON' 'ERROR' AclScriptAction"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclSetSessionScript <- 'SET' 'SESSION' 'SCRIPT' AclQuotedValue AclScriptOnError?"));
+		changes.push_back(GrammarChange::AddRule("AclDropSessionScript <- 'DROP' 'SESSION' 'SCRIPT'"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclSessionScriptChange <- AclSetSessionScript / AclDropSessionScript"));
+		changes.push_back(GrammarChange::AddRule("AclGroupForRole <- 'FOR' 'ROLE' AclName"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclAlterGroupScript <- 'ALTER' 'RESOURCE' 'GROUP' AclName AclGroupForRole? AclSessionScriptChange",
+		    Start<FinalizeAlterGroupScript>));
+		changes.push_back(GrammarChange::AddRule("AclAlterRoleScript <- 'ALTER' 'ROLE' AclName AclSessionScriptChange",
+		                                         Start<FinalizeAlterRoleScript>));
 		changes.push_back(
 		    GrammarChange::AddRule("AclDropResourceGroup <- 'DROP' 'RESOURCE' 'GROUP' AclIfExists? AclName",
 		                           Start<FinalizeDropResourceGroup>));
@@ -3275,7 +3337,8 @@ public:
 		}
 		changes.push_back(GrammarChange::AddRule(
 		    "AclMgmtStatement <- AclKillSession / AclSessionAuditLevel / AclProfileSession / AclNodeOperation / "
-		    "AclMigrateCatalog / AclCreateRole / AclAlterRoleComment / AclAlterRoleClaims / AclDropRole / "
+		    "AclMigrateCatalog / AclCreateRole / AclAlterRoleComment / AclAlterRoleClaims / AclAlterRoleScript / "
+		    "AclDropRole / "
 		    "AclGrantAdmin / AclRevokeAdmin / AclRevokeAdminScope / AclMapRole / AclDropMap / AclViewAs / "
 		    "AclResetViewAs / AclCreateCatalog / AclCreateReference / AclCreateSchema / AclCreateView / "
 		    "AclCreateFunction / AclCreateTable / AclAddView / AclAddSchema / AclAddFunction / AclAddTable / "
@@ -3288,7 +3351,8 @@ public:
 		    "AclAlterClient / AclDropIdentity / AclGrantFunctionCategory / AclGrantFunction / "
 		    "AclRevokeFunctionCategory / AclRevokeFunction / AclDenyView / AclCreateFunctionCategory / "
 		    "AclAlterFunctionCategory / AclDropFunctionCategory / AclGrantSource / AclRevokeSource / "
-		    "AclCreateResourceGroup / AclAlterResourceGroup / AclDropResourceGroup / AclGrantResourceGroup / "
+		    "AclCreateResourceGroup / AclAlterResourceGroup / AclAlterGroupScript / AclDropResourceGroup / "
+		    "AclGrantResourceGroup / "
 		    "AclRevokeResourceGroup / AclGrantSecret / AclRevokeSecret" +
 		    (modules.empty() ? string() : " / " + modules.substr(0, modules.size() - 3))));
 		// the batch holds management statements only: duckdb's own are not ours to read here

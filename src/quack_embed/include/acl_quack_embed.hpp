@@ -52,6 +52,12 @@ void AclQuackStatementCompleted(Connection &connection, const string &connection
 //! from the level and the session's trace whether the execution is profiled, and sets the
 //! connection's profiler so. A connection nobody bound is left alone. Never throws.
 void AclQuackStatementStarting(Connection &connection, const string &connection_id);
+//! spec 181: quack's CreateNewConnection (a sync.py patch), after it made the client's connection and before it
+//! publishes it: the session bound to `connection_id` runs its scripts there, as the node. False = the session is
+//! refused (a script ON ERROR FAIL SESSION failed, or the scripts could not be read) - the audit has why; nothing is
+//! published and the handler ends the bound session once (AclQuackConnectionGone with the refusal's note).
+//! A connection nobody bound is left alone (true). Never throws.
+bool AclQuackSessionOpened(Connection &connection, const string &connection_id);
 //! True when `data` is the record a principal's DDL / USE writes (spec 151, `PRAGMA acl_…`). The server's result
 //! collector (a sync.py patch) streams a batch's first statement that returns a result, and skips this one, so
 //! `CREATE TABLE …; SELECT …` answers the SELECT as a native quack server does. Never throws.
@@ -132,7 +138,9 @@ private:
 };
 //! The server dropped a client connection (spec 079): its DISCONNECT (`how` = client) or a heartbeat
 //! lease that ran out (`idle`). The acl session bound to it ends now. Never throws.
-void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how);
+//! `note`: what the session's `closed` event says beside `how` (spec 181: a session a script refused)
+void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how,
+                            const string &note = string());
 //! spec 096 addendum: the extra info of a CONNECT refused by placement that names the groups serving the
 //! principal (x-acl-resource-groups' value), for the HTTP layer to answer as that header
 constexpr const char *QUACK_PLACEMENT_INFO = "acl_resource_groups";

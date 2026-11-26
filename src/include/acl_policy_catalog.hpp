@@ -531,6 +531,8 @@ struct CatalogBackend {
 	//! spec 147: role (exact, as roles compare) -> whether the policy knows it; a gateway statement asks per claimed
 	//! role
 	std::unordered_map<string, bool> known_roles_cache;
+	//! spec 181: `<role set sig>\x1f<group>` -> the scripts a session of them runs, per policy version
+	std::unordered_map<string, vector<SessionScript>> session_scripts_cache;
 	case_insensitive_map_t<vector<GrantRow>> fn_grants; // function mode: role -> rows
 	case_insensitive_set_t fn_grants_loaded;
 
@@ -782,6 +784,9 @@ struct CatalogBackend {
 	ResourceLimits ResourceLimitsOf(const Principal &principal, const string &node_group);
 	//! spec 096 addendum: whether `group` is the policy's default group (false in the driver contract)
 	bool GroupIsDefault(const string &group);
+	//! spec 181: the session scripts of these roles on a node of `group`, in run order (none in the driver contract),
+	//! cached per role set and group for the policy version
+	vector<SessionScript> SessionScripts(const vector<string> &roles, const string &group);
 	void LoadRoleClaims(Principal &principal);
 
 	bool SettingBool(const char *name, bool fallback);

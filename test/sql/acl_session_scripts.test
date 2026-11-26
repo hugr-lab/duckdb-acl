@@ -1,0 +1,388 @@
+# name: test/sql/acl_session_scripts.test
+# description: spec 181 - a session's scripts: the SQL the node runs on a session's own connection when it opens, set
+#   on a resource group, a role and a role's grant of a group. The forms and their refusals, who writes them (the
+#   policy bundle), the platform views' columns, platform.session_scripts' run order, what goes with a revoked grant
+#   or a dropped role / group, and the resolved list read again after a write. Running them is the doors' and lives in
+#   test/cpp/test_acl_session_scripts.cpp (a handle cannot be spliced into a prefix here).
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cat;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE viewer;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cat WITH (select, manage);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP north WITH (window_max 8);
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP south;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP north TO ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP north TO ROLE auditor;
+
+# --- the forms -----------------------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP north SET SESSION SCRIPT 'SET VARIABLE region = ''north''; SET VARIABLE layer = ''group''';
+
+statement ok
+ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'SET VARIABLE layer = ''role analyst''' ON ERROR CONTINUE;
+
+statement ok
+ACL ADMIN ALTER ROLE auditor SET SESSION SCRIPT 'SET VARIABLE layer = ''role auditor''' ON ERROR FAIL SESSION;
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE analyst SET SESSION SCRIPT 'SET VARIABLE layer = ''grant''';
+
+query TTT
+SELECT "group", session_script, session_on_error FROM store.acl.resource_groups ORDER BY 1;
+----
+north	SET VARIABLE region = 'north'; SET VARIABLE layer = 'group'	NULL
+south	NULL	NULL
+
+# the views show ON ERROR as written: fail is the default (stored NULL), none where no script is set
+query TTT
+ACL ROLE "pol" SELECT "group", session_script, session_on_error FROM platform.resource_groups ORDER BY 1;
+----
+north	SET VARIABLE region = 'north'; SET VARIABLE layer = 'group'	fail
+south	NULL	NULL
+
+query TTT
+ACL ROLE "pol" SELECT role, session_script, session_on_error FROM platform.roles WHERE role IN ('analyst', 'auditor', 'pol') ORDER BY 1;
+----
+analyst	SET VARIABLE layer = 'role analyst'	continue
+auditor	SET VARIABLE layer = 'role auditor'	fail
+pol	NULL	NULL
+
+query TTTT
+ACL ROLE "pol" SELECT role, "group", session_script, session_on_error FROM platform.role_resource_groups ORDER BY 1;
+----
+analyst	north	SET VARIABLE layer = 'grant'	fail
+auditor	north	NULL	NULL
+
+# a catalog admin sees the names of the roles holding its catalog, nothing about them - a script included
+query TTT
+ACL ROLE "cat" SELECT role, session_script, session_on_error FROM platform.roles ORDER BY 1;
+----
+analyst	NULL	NULL
+cat	NULL	NULL
+
+# --- the run order: the group's, each role's by name, each grant of the group by role name -------------------------
+
+query ITTTTT
+ACL ROLE "pol" SELECT * FROM platform.session_scripts('analyst', 'north');
+----
+1	group	north	NULL	fail	SET VARIABLE region = 'north'; SET VARIABLE layer = 'group'
+2	role	NULL	analyst	continue	SET VARIABLE layer = 'role analyst'
+3	grant	north	analyst	fail	SET VARIABLE layer = 'grant'
+
+# without a group, the role's own one (this node has none): analyst is in north alone
+query ITTT
+ACL ROLE "pol" SELECT pos, level, "group", role FROM platform.session_scripts('analyst');
+----
+1	group	north	NULL
+2	role	NULL	analyst
+3	grant	north	analyst
+
+# on a node of another group only the role's own script applies
+query ITTT
+ACL ROLE "pol" SELECT pos, level, "group", role FROM platform.session_scripts('analyst', 'south');
+----
+1	role	NULL	analyst
+
+query ITTT
+SELECT pos, level, "group", role FROM acl_session_scripts('auditor', 'north');
+----
+1	group	north	NULL
+2	role	NULL	auditor
+
+statement error
+SELECT * FROM acl_session_scripts('nosuch', 'north');
+----
+<REGEX>:.*role "nosuch" does not exist.*
+
+# --- what the resolved list reads after a write: the policy's version, never the list it kept -----------------------
+
+statement ok
+ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'SET VARIABLE layer = ''role analyst, again''';
+
+query TT
+SELECT level, on_error FROM acl_session_scripts('analyst', 'north') WHERE level = 'role';
+----
+role	fail
+
+query T
+SELECT sql FROM acl_session_scripts('analyst', 'north') WHERE level = 'role';
+----
+SET VARIABLE layer = 'role analyst, again'
+
+# --- refusals ------------------------------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP nosuch SET SESSION SCRIPT 'SELECT 1';
+----
+<REGEX>:.*resource group "nosuch" does not exist.*
+
+statement error
+ACL ADMIN ALTER ROLE nosuch SET SESSION SCRIPT 'SELECT 1';
+----
+<REGEX>:.*role "nosuch" does not exist.*
+
+# a grant's script hangs on the grant
+statement error
+ACL ADMIN ALTER RESOURCE GROUP south FOR ROLE analyst SET SESSION SCRIPT 'SELECT 1';
+----
+<REGEX>:.*role "analyst" is not in resource group "south" - GRANT RESOURCE GROUP south TO ROLE analyst first.*
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE nosuch SET SESSION SCRIPT 'SELECT 1';
+----
+<REGEX>:.*role "nosuch" does not exist.*
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP south DROP SESSION SCRIPT;
+----
+<REGEX>:.*the resource group "south" has no session script.*
+
+# ON ERROR is one of two: FAIL SESSION or CONTINUE
+statement error
+ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'SELECT 1' ON ERROR IGNORE;
+----
+<REGEX>:.*SET SESSION SCRIPT '<sql>' \[ON ERROR FAIL SESSION \| CONTINUE\].*
+
+statement error
+ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'SELECT 1' ON ERROR FAIL;
+----
+<REGEX>:.*SET SESSION SCRIPT '<sql>' \[ON ERROR FAIL SESSION \| CONTINUE\].*
+
+statement error
+SELECT acl_set_session_script('', 'analyst', 'SELECT 1', 'later');
+----
+<REGEX>:.*on_error is fail or continue, got "later".*
+
+statement error
+ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT '';
+----
+<REGEX>:.*the script is empty - DROP SESSION SCRIPT removes one.*
+
+statement error
+SELECT acl_set_session_script('', '', 'SELECT 1');
+----
+<REGEX>:.*name a resource group, a role, or both.*
+
+# the policy bundle writes a script - a catalog's manage does not, nor a principal without administration
+statement error
+ACL ROLE "cat" ALTER ROLE analyst SET SESSION SCRIPT 'SELECT 1';
+----
+<REGEX>:.*platform.set_session_script needs the policy bundle \(an unrestricted manage scope\).*
+
+statement error
+ACL ROLE "cat" SELECT platform.set_session_script('north', '', 'SELECT 1');
+----
+
+statement error
+ACL ROLE "analyst" ALTER RESOURCE GROUP north SET SESSION SCRIPT 'SELECT 1';
+----
+
+statement error
+ACL ROLE "cat" SELECT * FROM platform.session_scripts('analyst');
+----
+<REGEX>:.*platform.session_scripts needs the policy bundle \(an unrestricted manage scope\).*
+
+# a session script runs as the node: no grant by name reaches its writers nor its listing - not even passthrough's
+statement error
+ACL ROLE "root" GRANT FUNCTION platform.set_session_script TO ROLE viewer;
+----
+<REGEX>:.*platform.set_session_script is the policy bundle's - it is never granted by name.*
+
+statement error
+ACL ROLE "root" GRANT FUNCTION platform.drop_session_script TO ROLE viewer;
+----
+<REGEX>:.*platform.drop_session_script is the policy bundle's - it is never granted by name.*
+
+statement error
+ACL ROLE "root" GRANT FUNCTION platform.session_scripts TO ROLE viewer;
+----
+<REGEX>:.*platform.session_scripts is the policy bundle's - it is never granted by name.*
+
+# a DENY still is
+statement ok
+ACL ROLE "root" DENY FUNCTION platform.session_scripts TO ROLE viewer;
+
+statement ok
+ACL ROLE "root" REVOKE FUNCTION platform.session_scripts FROM ROLE viewer;
+
+# a point grant written before the rule (by hand here) reaches nothing
+statement ok
+INSERT INTO store.acl.platform_grants VALUES ('viewer', 'set_session_script', 'function', true), ('viewer', 'session_scripts', 'function', true);
+
+statement ok
+SELECT acl_comment_role('viewer', 'bumps the policy version');
+
+statement error
+ACL ROLE "viewer" SELECT platform.set_session_script('north', '', 'SELECT 1');
+----
+<REGEX>:.*platform.set_session_script needs the policy bundle.*
+
+statement error
+ACL ROLE "viewer" SELECT * FROM platform.session_scripts('analyst');
+----
+<REGEX>:.*platform.session_scripts needs the policy bundle \(an unrestricted manage scope\).*
+
+statement ok
+DELETE FROM store.acl.platform_grants WHERE role = 'viewer';
+
+# a reader of the views by a point grant sees no script: they are the policy bundle's to read
+statement ok
+ACL ROLE "root" GRANT VIEW platform.roles TO ROLE viewer;
+
+query TTT
+ACL ROLE "viewer" SELECT role, session_script, session_on_error FROM platform.roles WHERE role = 'analyst';
+----
+analyst	NULL	NULL
+
+statement ok
+ACL ROLE "root" REVOKE VIEW platform.roles FROM ROLE viewer;
+
+# --- the platform's calls, the policy bundle's ----------------------------------------------------------------------
+
+statement ok
+ACL ROLE "pol" SELECT platform.set_session_script('south', '', 'SET VARIABLE region = ''south''', on_error := 'continue');
+
+statement ok
+ACL ROLE "pol" ALTER RESOURCE GROUP south SET COMMENT 'the southern nodes';
+
+query TTT
+ACL ROLE "pol" SELECT session_script, session_on_error, comment FROM platform.resource_groups WHERE "group" = 'south';
+----
+SET VARIABLE region = 'south'	continue	the southern nodes
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_session_script('south', '');
+
+query T
+ACL ROLE "pol" SELECT session_script FROM platform.resource_groups WHERE "group" = 'south';
+----
+NULL
+
+# --- what a re-write keeps, and what goes with its owner -----------------------------------------------------------
+
+# a re-created group, a re-defined role and a grant made again keep their scripts (set and dropped by ALTER alone)
+statement ok
+ACL ADMIN CREATE OR REPLACE RESOURCE GROUP north WITH (window_max 16);
+
+statement ok
+ACL ADMIN ALTER ROLE analyst SET CLAIMS (tid = 'acme');
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP north TO ROLE analyst;
+
+query ITT
+SELECT pos, level, sql FROM acl_session_scripts('analyst', 'north');
+----
+1	group	SET VARIABLE region = 'north'; SET VARIABLE layer = 'group'
+2	role	SET VARIABLE layer = 'role analyst, again'
+3	grant	SET VARIABLE layer = 'grant'
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE analyst DROP SESSION SCRIPT;
+
+query T
+SELECT level FROM acl_session_scripts('analyst', 'north') ORDER BY pos;
+----
+group
+role
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE analyst SET SESSION SCRIPT 'SET VARIABLE layer = ''grant''';
+
+# revoking the grant drops its script: a grant made again starts with none
+statement ok
+ACL ADMIN REVOKE RESOURCE GROUP north FROM ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP north TO ROLE analyst;
+
+query T
+SELECT session_script FROM store.acl.role_resource_groups WHERE role = 'analyst';
+----
+NULL
+
+# a dropped role takes its own script and its grants' along
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE auditor SET SESSION SCRIPT 'SELECT 1';
+
+statement ok
+ACL ADMIN DROP ROLE auditor;
+
+query I
+SELECT count(*) FROM store.acl.role_resource_groups WHERE role = 'auditor';
+----
+0
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+query T
+SELECT session_script FROM store.acl.roles WHERE role = 'auditor';
+----
+NULL
+
+# a dropped group takes its own and its grants'
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP north FOR ROLE analyst SET SESSION SCRIPT 'SELECT 2';
+
+statement ok
+ACL ADMIN DROP RESOURCE GROUP north;
+
+query I
+SELECT count(*) FROM store.acl.role_resource_groups WHERE "group" = 'north';
+----
+0
+
+query ITT
+SELECT pos, level, sql FROM acl_session_scripts('analyst', 'north');
+----
+1	role	SET VARIABLE layer = 'role analyst, again'

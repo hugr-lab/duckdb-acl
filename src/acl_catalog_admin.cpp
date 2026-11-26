@@ -3484,14 +3484,28 @@ void PolicyStore::CatalogDefineRole(const string &role, const case_insensitive_m
 	RequireCatalog(catalog, "acl_define_role");
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		// spec 120: a re-define (ALTER ROLE … SET CLAIMS) keeps the role's comment
-		auto was = read("SELECT \"comment\" FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
+		// spec 181: and its session script
+		auto was = read("SELECT \"comment\", \"session_script\", \"session_on_error\" FROM " + catalog->Tbl("roles") +
+		                " WHERE \"role\" = " + Lit(role));
+		ResultRows was_rows(*was);
 		string comment;
-		if (was->RowCount() > 0 && !was->Collection().GetValue(0, 0).IsNull()) {
-			comment = was->Collection().GetValue(0, 0).ToString();
+		string script = "NULL";
+		string on_error = "NULL";
+		if (was_rows.Count() > 0) {
+			if (!was_rows.GetValue(0, 0).IsNull()) {
+				comment = was_rows.GetValue(0, 0).ToString();
+			}
+			if (!was_rows.GetValue(1, 0).IsNull()) {
+				script = Lit(was_rows.GetValue(1, 0).ToString());
+			}
+			if (!was_rows.GetValue(2, 0).IsNull()) {
+				on_error = Lit(was_rows.GetValue(2, 0).ToString());
+			}
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
-		statements.push_back("INSERT INTO " + catalog->Tbl("roles") + " VALUES (" + Lit(role) + ", " + Lit(comment) +
-		                     ")");
+		statements.push_back("INSERT INTO " + catalog->Tbl("roles") +
+		                     " (\"role\", \"comment\", \"session_script\", \"session_on_error\") VALUES (" + Lit(role) +
+		                     ", " + Lit(comment) + ", " + script + ", " + on_error + ")");
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_claims") + " WHERE \"role\" = " + Lit(role));
 		for (auto &claim : claims) {
 			statements.push_back("INSERT INTO " + catalog->Tbl("role_claims") + " VALUES (" + Lit(role) + ", " +
@@ -3608,10 +3622,19 @@ void PolicyStore::CatalogCreateResourceGroup(const string &name, const case_inse
 			RequireNoOtherDefault(*catalog, read, name);
 		}
 		values.push_back(marked == "true" ? "true" : "NULL");
+		// spec 181: a re-create keeps the group's session script - it is set and dropped by ALTER alone
+		auto kept = read("SELECT \"session_script\", \"session_on_error\" FROM " + catalog->Tbl("resource_groups") +
+		                 " WHERE \"group\" = " + Lit(name));
+		ResultRows kept_rows(*kept);
+		for (idx_t column = 0; column < 2; column++) {
+			auto value = kept_rows.Count() > 0 ? kept_rows.GetValue(column, 0) : Value();
+			values.push_back(value.IsNull() ? string("NULL") : Lit(value.ToString()));
+		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(name));
 		statements.push_back("INSERT INTO " + catalog->Tbl("resource_groups") +
 		                     " (\"group\", \"window_start\", \"window_max\", \"batch_bytes\", \"max_result_rows\", "
-		                     "\"queue_priority\", \"max_sessions\", \"comment\", \"is_default\") VALUES (" +
+		                     "\"queue_priority\", \"max_sessions\", \"comment\", \"is_default\", \"session_script\", "
+		                     "\"session_on_error\") VALUES (" +
 		                     StringUtil::Join(values, ", ") + ")");
 	});
 }
@@ -3679,13 +3702,17 @@ void PolicyStore::CatalogBindResourceGroup(const string &role, const string &gro
 			}
 		}
 		auto where = " WHERE \"role\" = " + Lit(role) + " AND \"group\" = " + Lit(group);
-		if (remove && read("SELECT 1 FROM " + catalog->Tbl("role_resource_groups") + where)->RowCount() == 0) {
+		auto bound = read("SELECT 1 FROM " + catalog->Tbl("role_resource_groups") + where)->RowCount() > 0;
+		if (remove && !bound) {
 			ThrowNothingToRevoke(role, "resource group \"" + group + "\"");
 		}
-		statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + where);
-		if (!remove) {
-			statements.push_back("INSERT INTO " + catalog->Tbl("role_resource_groups") + " VALUES (" + Lit(role) +
-			                     ", " + Lit(group) + ")");
+		if (remove) {
+			// spec 181: the grant's session script goes with the grant
+			statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + where);
+		} else if (!bound) {
+			// a grant made again keeps what hangs on it (its session script, spec 181)
+			statements.push_back("INSERT INTO " + catalog->Tbl("role_resource_groups") +
+			                     " (\"role\", \"group\") VALUES (" + Lit(role) + ", " + Lit(group) + ")");
 		}
 	});
 }
@@ -4001,6 +4028,68 @@ void PolicyStore::CatalogAlterReference(const string &vcat, const string &name, 
 		RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl("references") + where,
 		                "reference \"" + vcat + "." + name + "\"");
 		statements.push_back("UPDATE " + catalog->Tbl("references") + " SET " + assignment + where);
+	});
+}
+
+void PolicyStore::CatalogSessionScript(const string &group, const string &role, const string &sql,
+                                       const string &on_error, bool remove) {
+	auto fn = remove ? "acl_drop_session_script" : "acl_set_session_script";
+	RequireCatalog(catalog, fn);
+	if (group.empty() && role.empty()) {
+		throw InvalidInputException("%s: name a resource group, a role, or both (a role's grant of the group)", fn);
+	}
+	if (!remove && sql.empty()) {
+		throw InvalidInputException("%s: the script is empty - DROP SESSION SCRIPT removes one", fn);
+	}
+	// where the script hangs: the group's row, the role's row, or the role's grant of the group (spec 181)
+	const char *table;
+	string where;
+	string owner;
+	if (!group.empty() && !role.empty()) {
+		table = "role_resource_groups";
+		where = " WHERE \"role\" = " + Lit(role) + " AND \"group\" = " + Lit(group);
+		owner = "grant of resource group \"" + group + "\" to role \"" + role + "\"";
+	} else if (!group.empty()) {
+		table = "resource_groups";
+		where = " WHERE \"group\" = " + Lit(group);
+		owner = "resource group \"" + group + "\"";
+	} else {
+		table = "roles";
+		where = " WHERE \"role\" = " + Lit(role);
+		owner = "role \"" + role + "\"";
+	}
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		if (string(table) == "role_resource_groups") {
+			// a grant's script needs the grant: the group and the role named first, so the refusal says which is
+			// missing
+			if (read("SELECT 1 FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(group))
+			        ->RowCount() == 0) {
+				throw BinderException("acl admin: resource group \"%s\" does not exist", group);
+			}
+			if (read("SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role))->RowCount() == 0) {
+				throw BinderException("acl admin: role \"%s\" does not exist", role);
+			}
+			if (read("SELECT 1 FROM " + catalog->Tbl(table) + where)->RowCount() == 0) {
+				throw BinderException("acl admin: role \"%s\" is not in resource group \"%s\" - GRANT RESOURCE GROUP "
+				                      "%s TO ROLE %s first: a grant's session script hangs on the grant",
+				                      role, group, NamePath(vector<string> {group}).ToGrammar(),
+				                      NamePath(vector<string> {role}).ToGrammar());
+			}
+		} else {
+			RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl(table) + where, owner);
+		}
+		if (remove) {
+			auto set = read("SELECT 1 FROM " + catalog->Tbl(table) + where + " AND \"session_script\" IS NOT NULL");
+			if (set->RowCount() == 0) {
+				throw BinderException("acl admin: the %s has no session script", owner);
+			}
+			statements.push_back("UPDATE " + catalog->Tbl(table) +
+			                     " SET \"session_script\" = NULL, \"session_on_error\" = NULL" + where);
+			return;
+		}
+		statements.push_back("UPDATE " + catalog->Tbl(table) + " SET \"session_script\" = " + Lit(sql) +
+		                     ", \"session_on_error\" = " + (on_error == "continue" ? string("'continue'") : "NULL") +
+		                     where);
 	});
 }
 

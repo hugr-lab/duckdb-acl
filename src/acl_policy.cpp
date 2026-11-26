@@ -454,7 +454,7 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	return handle;
 }
 
-void PolicyStore::SessionEndBound(const string &external_id, const char *how) {
+void PolicyStore::SessionEndBound(const string &external_id, const char *how, const string &note) {
 	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
@@ -464,7 +464,7 @@ void PolicyStore::SessionEndBound(const string &external_id, const char *how) {
 	}
 	auto entry = sessions.find(binding->second);
 	if (entry != sessions.end()) {
-		SessionClosed(entry->second, how, now);
+		SessionClosed(entry->second, how, now, note);
 		sessions.erase(entry);
 	}
 	session_bindings.erase(binding);
@@ -482,6 +482,50 @@ void PolicyStore::AuditSessionRefused(const string &door, const string &handle, 
 	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
 	SessionEvent(audit.get(), known ? principal : Principal(), door, known ? ref.id : string(), -1, "refused",
 	             reason_code, reason, -1);
+}
+
+void PolicyStore::AuditSessionScript(const string &door, const string &handle, const SessionScript *script,
+                                     const string &error_class, const char *detail) {
+	if (!audit) {
+		return;
+	}
+	Principal principal;
+	string why;
+	PolicyStore::SessionRef ref;
+	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
+	auto outcome = string(detail);
+	auto ran = outcome == "script_ran";
+	auto refused = outcome == "refused";
+	// names only: the level, whose script it is and the error's class - the SQL and the message may carry names a
+	// source's error puts there, or a connection string
+	string reason;
+	if (!script) {
+		reason = "the session's scripts could not be resolved (" + error_class + ")";
+	} else {
+		string owner = script->level == "group" ? "resource group \"" + script->group + "\""
+		               : script->level == "role"
+		                   ? "role \"" + script->role + "\""
+		                   : "role \"" + script->role + "\" in resource group \"" + script->group + "\"";
+		reason = "the session script of " + owner +
+		         (ran ? string(" ran")
+		              : " failed (" + error_class + ")" +
+		                    (refused ? string() : " - ON ERROR CONTINUE, the session is served"));
+	}
+	AuditEvent event;
+	// a script that ran is a decision of the node's (what ran on the principal's connection, as the node); one that
+	// failed is the operator's to know, served on or not - a denial's level
+	event.level = ran ? AuditLevel::DECISIONS : AuditLevel::DENIED;
+	event.recorded = audit->Records(event.level, known ? ref.audit_level : static_cast<int8_t>(-1));
+	event.kind = "session";
+	event.door = door;
+	event.session = known ? ref.id : string();
+	event.principal = known ? principal : Principal();
+	event.detail = outcome;
+	event.allowed = !refused;
+	event.reason_code = ran ? "" : "session_script";
+	event.reason = AuditReasonText(event.reason_code, reason);
+	event.duration_us = -1;
+	audit->Emit(std::move(event));
 }
 
 void PolicyStore::AuditSessionMove(const string &door, const string &handle, bool refused, const char *reason_code,
@@ -515,7 +559,7 @@ bool PolicyStore::SessionDeclaredViewAs(const string &id) {
 
 //! The close event of a session being removed (spec 069): how it ended, and for how long it lived.
 //! Caller holds the lock; the event itself takes nothing of the store's.
-void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
+void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now, const string &note) {
 	session_notices.QueueClose(session.id, how); // spec 078: delivered once the lock is released
 	// spec 175: every removal passes here - the end of a session is the node's last activity until another. A record
 	// swept as idle or expired ended when it was last used, not when the sweep found it (a sweep is no activity)
@@ -539,7 +583,7 @@ void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t
 		}
 	}
 	auto lived = session.opened_at > 0 ? (now - session.opened_at) * 1000000 : -1;
-	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", "", lived);
+	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", note, lived);
 }
 
 bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string &reason) {
@@ -1396,13 +1440,13 @@ vector<DoorCertificateStatus> PolicyStore::DoorCertificates() const {
 	return out;
 }
 
-void PolicyStore::SessionClose(const string &handle) {
+void PolicyStore::SessionClose(const string &handle, const string &note) {
 	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
 	if (entry != sessions.end()) {
-		SessionClosed(entry->second, "client", now);
+		SessionClosed(entry->second, "client", now, note);
 		sessions.erase(entry);
 	}
 	for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {
@@ -1929,21 +1973,22 @@ void SetArrowIngestFactory(shared_ptr<TableFunctionInfo> factory) {
 //! committed entries only, which is exactly right - a name only becomes resolvable once the
 //! statement that created it has finished. A live Catalog::GetEntry here would throw "no active
 //! transaction" (probed); this does not, because it never opens one.
-static void ScanTempTables(ClientContext &context, const std::function<void(const string &)> &callback) {
+static void ScanTempTables(ClientContext &context, const std::function<void(const string &, idx_t)> &callback) {
 	auto &temp_db = ClientData::Get(context).temporary_objects;
 	if (!temp_db) {
 		return;
 	}
 	auto &catalog = temp_db->GetCatalog().Cast<DuckCatalog>();
 	catalog.ScanSchemas([&](SchemaCatalogEntry &schema_entry) {
-		schema_entry.Cast<DuckSchemaEntry>().Scan(
-		    CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) { callback(entry.name.GetIdentifierName()); });
+		schema_entry.Cast<DuckSchemaEntry>().Scan(CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+			callback(entry.name.GetIdentifierName(), entry.oid);
+		});
 	});
 }
 
 bool TempCatalogHas(ClientContext &context, const string &name) {
 	bool found = false;
-	ScanTempTables(context, [&](const string &entry) {
+	ScanTempTables(context, [&](const string &entry, idx_t) {
 		if (StringUtil::CIEquals(entry, name)) {
 			found = true;
 		}
@@ -1953,9 +1998,15 @@ bool TempCatalogHas(ClientContext &context, const string &name) {
 
 vector<string> TempCatalogNames(ClientContext &context) {
 	vector<string> names;
-	ScanTempTables(context, [&](const string &entry) { names.push_back(entry); });
+	ScanTempTables(context, [&](const string &entry, idx_t) { names.push_back(entry); });
 	std::sort(names.begin(), names.end());
 	return names;
+}
+
+vector<std::pair<string, idx_t>> TempCatalogEntries(ClientContext &context) {
+	vector<std::pair<string, idx_t>> entries;
+	ScanTempTables(context, [&](const string &entry, idx_t oid) { entries.emplace_back(entry, oid); });
+	return entries;
 }
 
 bool PolicyStore::PrincipalMainCap(const Principal &principal, const string &capability) {

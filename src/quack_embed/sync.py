@@ -252,6 +252,64 @@ PATCHES = {
             "\t\t\treturn auth.Failure(\"Authentication\");\n"
             "\t\t}\n",
         ),
+        # spec 181: a session's scripts run on the connection the session is bound to, before its first statement.
+        # The client's connection is made, scripted, and only then published into active_connections: no request
+        # can reach it and no lease sweep can end it while the scripts run, and its heartbeat lease starts when they
+        # are done (the QuackConnection is made after them). The scripts run outside active_connections_mutex; the
+        # seat claim the CONNECT handler holds counts the client as authenticating meanwhile. An empty id back =
+        # the session is refused: the handler ends it (once) and answers the door's one sentence
+        (
+            "\tstd::lock_guard<std::mutex> lock(active_connections_mutex);\n"
+            "\n"
+            "\tD_ASSERT(active_connections.find(connection_id) == active_connections.end());\n"
+            "\n"
+            "\tauto db = db_ptr.lock();\n"
+            "\tif (!db) {\n"
+            "\t\tthrow InternalException(\"Database was closed\");\n"
+            "\t}\n"
+            "\tauto new_connection = make_shared_ptr<QuackConnection>(connection_id, heartbeat_timeout_seconds);\n"
+            "\tnew_connection->client_id_hash = client_id_hash;\n"
+            "\tnew_connection->live_caches = live_caches;\n"
+            "\tnew_connection->duckdb_connection = make_uniq<Connection>(*db);\n"
+            "\tauto &connection_context = *new_connection->duckdb_connection->context;\n",
+            "\tauto db = db_ptr.lock();\n"
+            "\tif (!db) {\n"
+            "\t\tthrow InternalException(\"Database was closed\");\n"
+            "\t}\n"
+            "\t// acl (spec 181): made, scripted, then published - see acl::AclQuackSessionOpened\n"
+            "\tauto acl_duckdb_connection = make_uniq<Connection>(*db);\n"
+            "\tauto &connection_context = *acl_duckdb_connection->context;\n",
+        ),
+        (
+            "\tconnection_context.config.enable_progress_bar = false;\n"
+            "\t// new_connection->duckdb_connection->context->config.streaming_buffer_size = 10 * 1000000; // 10 MB\n"
+            "\tactive_connections[connection_id] = std::move(new_connection);\n"
+            "\treturn connection_id;\n",
+            "\tconnection_context.config.enable_progress_bar = false;\n"
+            "\t// new_connection->duckdb_connection->context->config.streaming_buffer_size = 10 * 1000000; // 10 MB\n"
+            "\tif (!acl::AclQuackSessionOpened(*acl_duckdb_connection, connection_id)) {\n"
+            "\t\treturn string();\n"
+            "\t}\n"
+            "\tauto new_connection = make_shared_ptr<QuackConnection>(connection_id, heartbeat_timeout_seconds);\n"
+            "\tnew_connection->client_id_hash = client_id_hash;\n"
+            "\tnew_connection->live_caches = live_caches;\n"
+            "\tnew_connection->duckdb_connection = std::move(acl_duckdb_connection);\n"
+            "\tstd::lock_guard<std::mutex> lock(active_connections_mutex);\n"
+            "\tD_ASSERT(active_connections.find(connection_id) == active_connections.end());\n"
+            "\tactive_connections[connection_id] = std::move(new_connection);\n"
+            "\treturn connection_id;\n",
+        ),
+        (
+            "\t\treturn make_uniq<ConnectionResponseMessage>(\n"
+            "\t\t    CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds), heartbeat_timeout_seconds);\n",
+            "\t\tauto acl_connection_id = CreateNewConnection(connection_id, client_id_hash, heartbeat_timeout_seconds);\n"
+            "\t\tif (acl_connection_id.empty()) {\n"
+            "\t\t\t// acl (spec 181): a session script refused the session - it ends here, and nothing was published\n"
+            "\t\t\tacl::AclQuackConnectionGone(db, connection_id, \"client\", \"refused by a session script (spec 181)\");\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(\"acl: the session could not be prepared\");\n"
+            "\t\t}\n"
+            "\t\treturn make_uniq<ConnectionResponseMessage>(acl_connection_id, heartbeat_timeout_seconds);\n",
+        ),
         # spec 134: the node's label in front of every connection id it mints - the id stays opaque to
         # quack and to the client, the random part after the label is unchanged (the connection's secret)
         (

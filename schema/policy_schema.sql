@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS <relation_types>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY
 
 CREATE TABLE IF NOT EXISTS <functions>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
 
-CREATE TABLE IF NOT EXISTS <roles>("role" ACL_KEY_TEXT PRIMARY KEY, "comment" VARCHAR);
+-- spec 181 (schema v29): a session script - SQL the node runs on a session's own connection when it opens, as
+-- written; `session_on_error` is 'fail' (the default, NULL) or 'continue'. Here: a role's; on resource_groups: the
+-- group's; on role_resource_groups: a role's grant of the group.
+CREATE TABLE IF NOT EXISTS <roles>("role" ACL_KEY_TEXT PRIMARY KEY, "comment" VARCHAR, "session_script" VARCHAR, "session_on_error" VARCHAR);
 
 CREATE TABLE IF NOT EXISTS <role_claims>("role" ACL_KEY_TEXT, "claim" ACL_KEY_TEXT, "value" VARCHAR, PRIMARY KEY ("role", "claim"));
 
@@ -119,9 +122,9 @@ CREATE TABLE IF NOT EXISTS <keys>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "ki
 -- spec 085 (schema v15): resource groups - named limits bound to roles, resolved once when a session
 -- opens. A NULL limit is unset: the node's setting applies. Across a principal's groups each limit
 -- takes the most generous value; `max_sessions` is charged to the group that allows the most.
-CREATE TABLE IF NOT EXISTS <resource_groups>("group" ACL_KEY_TEXT PRIMARY KEY, "window_start" BIGINT, "window_max" BIGINT, "batch_bytes" BIGINT, "max_result_rows" BIGINT, "queue_priority" BIGINT, "max_sessions" BIGINT, "comment" VARCHAR, "is_default" BOOLEAN);
+CREATE TABLE IF NOT EXISTS <resource_groups>("group" ACL_KEY_TEXT PRIMARY KEY, "window_start" BIGINT, "window_max" BIGINT, "batch_bytes" BIGINT, "max_result_rows" BIGINT, "queue_priority" BIGINT, "max_sessions" BIGINT, "comment" VARCHAR, "is_default" BOOLEAN, "session_script" VARCHAR, "session_on_error" VARCHAR);
 
-CREATE TABLE IF NOT EXISTS <role_resource_groups>("role" ACL_KEY_TEXT, "group" ACL_KEY_TEXT, PRIMARY KEY ("role", "group"));
+CREATE TABLE IF NOT EXISTS <role_resource_groups>("role" ACL_KEY_TEXT, "group" ACL_KEY_TEXT, "session_script" VARCHAR, "session_on_error" VARCHAR, PRIMARY KEY ("role", "group"));
 
 -- spec 093 (schema v16): the cluster profile - the shared part of every node's bootstrap, as desired
 -- state only (no history: who changed what is the audit's, the previous state the orchestrator's).
@@ -142,7 +145,7 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '28' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '29' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

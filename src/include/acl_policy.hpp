@@ -98,6 +98,9 @@ bool TempCatalogHas(ClientContext &context, const string &name);
 //! Every temp table name of the connection, for the metadata surfaces (spec 050): a session lists
 //! its own temp objects and nobody else's - per-connection by construction.
 vector<string> TempCatalogNames(ClientContext &context);
+//! spec 181: each temp table of the connection with its catalog entry's oid - a table dropped and made again under
+//! the same name is another entry
+vector<std::pair<string, idx_t>> TempCatalogEntries(ClientContext &context);
 
 //! `bytes` bytes from the platform's CSPRNG, hex-encoded - the ONE minter behind every credential
 //! we hand a client: the session handle (spec 040), the Flight ticket id and the Flight session
@@ -388,6 +391,16 @@ struct ResourceLimits {
 	//! sentence safe for the client and the front (group names only)
 	bool admitted = true;
 	string refusal;
+};
+
+//! spec 181: one script a session runs when it opens - its layer (group | role | grant), whose it is, the SQL as the
+//! administrator wrote it, and what a failure does (ON ERROR FAIL SESSION, the default, or CONTINUE)
+struct SessionScript {
+	string level;
+	string group; // level group or grant
+	string role;  // level role or grant
+	string sql;
+	bool fail_session = true;
 };
 
 //! The limits a resource group states, as written (spec 085): the names a group may carry
@@ -1057,6 +1070,19 @@ struct PolicyStore {
 	vector<ClusterItem> ClusterItems(const string &scope);
 	//! The limits of the principal's groups, merged (catalog mode; memory mode has no groups)
 	ResourceLimits ResolveResourceLimits(const Principal &principal);
+	//! spec 181: the scripts a session of these roles runs on a node of `group` ('' = no group layer), in their run
+	//! order - the group's, each role's by name, each grant of the group by role name; none in memory mode and in the
+	//! driver contract. Cached per role set and group for the policy version; throws when the source does not answer.
+	vector<SessionScript> SessionScriptsFor(const vector<string> &roles, const string &group);
+	//! spec 181: the group a session's first layer is: the node's (spec 096), else the session's charged group, else
+	//! its one group ('' when none decides)
+	string SessionScriptGroup(const ResourceLimits &limits);
+	//! spec 181: a session script on the session `handle`'s connection - `detail` is `script_ran` (it ran: a decision,
+	//! the only trace of SQL that runs unprefixed), `script_failed` (it failed ON ERROR CONTINUE: served on) or
+	//! `refused` (ON ERROR FAIL SESSION, or the scripts could not be resolved: `script` null). The event names the
+	//! script's level and owner and the error's class, never its text nor the error's message.
+	void AuditSessionScript(const string &door, const string &handle, const SessionScript *script,
+	                        const string &error_class, const char *detail);
 	void CatalogDropFunctionCategory(const string &name, bool if_exists);
 	//! add=true inserts the keys as members (the category must exist), add=false removes them
 	void CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add);
@@ -1082,6 +1108,10 @@ struct PolicyStore {
 	void CatalogAlterReference(const string &vcat, const string &name, const string &field, const string &value);
 	void CatalogAlterResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits);
 	void CatalogCommentResourceGroup(const string &name, const string &comment);
+	//! spec 181: set (or with `remove` drop) a session script - a group's (role ''), a role's (group '') or a role's
+	//! grant of a group (both); `on_error` 'fail' | 'continue'
+	void CatalogSessionScript(const string &group, const string &role, const string &sql, const string &on_error,
+	                          bool remove);
 	void CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value);
 	void CatalogGrantAdmin(const string &role, const string &scope);
 	void CatalogRevokeAdmin(const string &role, const string &scope);
@@ -1192,7 +1222,9 @@ struct PolicyStore {
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
 	int8_t SessionAuditLevel(const string &handle);
 	//! The close event of a session being removed (spec 069); caller holds the lock.
-	void SessionClosed(const Session &session, const char *how, int64_t now);
+	//! `note`: what the `closed` event's reason says (spec 181: a session a script refused) - `how` stays the
+	//! observers' bounded reason
+	void SessionClosed(const Session &session, const char *how, int64_t now, const string &note = string());
 	//! The gauges the audit reads (spec 069): the policy version the caches are keyed by (-1 without a
 	//! catalog), seconds since the last successful version check (-1 = never), and per issuer the
 	//! seconds since its keys were last read successfully.
@@ -1305,7 +1337,7 @@ struct PolicyStore {
 	//! quack server's drain thread): registered in the object cache at load. Null before load.
 	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);
 	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
-	void SessionClose(const string &handle);
+	void SessionClose(const string &handle, const string &note = string());
 	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound
 	//! replaces it: a door that reconnects under the same id gets the session it just authenticated.
 	void SessionBind(const string &external_id, const string &handle);
@@ -1402,7 +1434,7 @@ struct PolicyStore {
 	bool SessionDeclaredViewAs(const string &id);
 	//! A door's connection is gone (spec 079: quack's DISCONNECT, or its heartbeat lease ran out): the
 	//! session bound to it (SessionBind) ends now with `how`, instead of waiting out the idle timeout.
-	void SessionEndBound(const string &external_id, const char *how);
+	void SessionEndBound(const string &external_id, const char *how, const string &note = string());
 	//! One live session, for the admin ops surface (spec 050) - never the handle.
 	struct SessionInfo {
 		string id;

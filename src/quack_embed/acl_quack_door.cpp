@@ -27,6 +27,7 @@
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 #include "acl_quack_server.hpp"
+#include "acl_session_scripts.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -548,7 +549,7 @@ void AclQuackNoteRequestLineage(DatabaseInstance &db, const string &connection_i
 	}
 }
 
-void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how) {
+void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how, const string &note) {
 	try {
 		if (auto store = PolicyStore::Of(db)) {
 			{
@@ -556,7 +557,7 @@ void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, c
 				store->quack_lineage.erase(connection_id);
 				store->quack_lineage_reported.erase(connection_id);
 			}
-			store->SessionEndBound(connection_id, how);
+			store->SessionEndBound(connection_id, how, note);
 		}
 	} catch (...) {
 		// the idle timeout still ends it
@@ -630,6 +631,19 @@ void AclQuackStatementStarting(Connection &connection, const string &connection_
 		ApplySessionLimits(*connection.context, ref.limits);
 	} catch (...) {
 		// a profile is never worth the statement
+	}
+}
+
+bool AclQuackSessionOpened(Connection &connection, const string &connection_id) {
+	try {
+		auto store = PolicyStore::Of(*connection.context->db);
+		string handle;
+		if (!store || !store->SessionHandleFor(connection_id, handle)) {
+			return true; // no session: every statement of the connection is refused by the authorization
+		}
+		return PrepareSession(*store, connection, handle, "quack");
+	} catch (...) {
+		return false; // fail closed: a session whose scripts did not run as written is not served
 	}
 }
 

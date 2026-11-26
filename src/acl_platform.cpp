@@ -15,6 +15,7 @@
 #include "acl_node_load.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
+#include "acl_session_scripts.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -278,7 +279,10 @@ vector<PlatformView> BuildViews() {
 	     PV::CATALOG,
 	     {{"catalog", V}, {"object", V}, {"kind", V}, {"pos", I}, {"column", V}},
 	     "the declared keys (spec 048)"},
-	    {"roles", PV::ROLES, {{"role", V}, {"comment", V}}, "the roles"},
+	    {"roles",
+	     PV::ROLES,
+	     {{"role", V}, {"comment", V}, {"session_script", V}, {"session_on_error", V}},
+	     "the roles"},
 	    {"role_claims", PV::POLICY, {{"role", V}, {"claim", V}, {"value", V}}, "the default claims of each role"},
 	    {"grants",
 	     PV::CATALOG,
@@ -393,9 +397,14 @@ vector<PlatformView> BuildViews() {
 	      {"queue_priority", I},
 	      {"max_sessions", I},
 	      {"comment", V},
-	      {"is_default", B}},
+	      {"is_default", B},
+	      {"session_script", V},
+	      {"session_on_error", V}},
 	     "the resource groups (spec 085)"},
-	    {"role_resource_groups", PV::POLICY, {{"role", V}, {"group", V}}, "which role is in which resource group"},
+	    {"role_resource_groups",
+	     PV::POLICY,
+	     {{"role", V}, {"group", V}, {"session_script", V}, {"session_on_error", V}},
+	     "which role is in which resource group"},
 	    {"catalog_schema",
 	     PV::POLICY,
 	     {{"build", I}, {"build_min_reader", I}, {"catalog", I}, {"min_reader", I}, {"mode", V}},
@@ -1061,6 +1070,34 @@ vector<PlatformFunction> BuildFunctions() {
 	     false,
 	     B,
 	     "take a role out of a resource group"},
+	    {"set_session_script",
+	     "acl_set_session_script",
+	     {A("group_name"), role, P("sql"), P("on_error", V, "fail")},
+	     {3, 4},
+	     -1,
+	     PR::POLICY,
+	     false,
+	     B,
+	     "set the SQL a session runs as the node when it opens - a resource group's (role ''), a role's (group_name "
+	     "''), or a role's grant of the group (both) (spec 181)"},
+	    {"drop_session_script",
+	     "acl_drop_session_script",
+	     {A("group_name"), role},
+	     {2},
+	     -1,
+	     PR::POLICY,
+	     false,
+	     B,
+	     "drop a session script (spec 181)"},
+	    {"session_scripts",
+	     "acl_session_scripts",
+	     {role, A("group_name")},
+	     {1, 2},
+	     -1,
+	     PR::POLICY,
+	     true,
+	     "TABLE",
+	     "the session scripts a session of the role runs on a node of the group, in their run order (spec 181)"},
 	    // privilege: passthrough alone - the admin scopes and the grants on `platform`
 	    {"grant_admin",
 	     "acl_grant_admin",
@@ -1231,6 +1268,17 @@ optional_ptr<const PlatformFunction> PlatformFunctionByTarget(const string &targ
 	return nullptr;
 }
 
+bool PolicyBundleOnly(const string &target) {
+	static const char *ONLY[] = {"acl_session_view_as", "acl_set_session_script", "acl_drop_session_script",
+	                             "acl_session_scripts"};
+	for (auto name : ONLY) {
+		if (StringUtil::CIEquals(target, name)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool PlatformObjectName(const vector<string> &parts, string &leaf) {
 	if (parts.size() == 2 && IsPlatformCatalog(parts[0])) {
 		leaf = parts[1];
@@ -1349,8 +1397,8 @@ bool PlatformAccess::CallsFunction(const PlatformFunction &function) const {
 	if (point == 0) {
 		return false;
 	}
-	if (string(function.target) == "acl_session_view_as") {
-		return rights->Policy(); // the authorizer's rule (spec 120.3): a point grant does not reach it
+	if (PolicyBundleOnly(function.target)) {
+		return rights->Policy(); // the authorizer's rule (specs 120.3, 181): a point grant does not reach it
 	}
 	switch (function.right) {
 	case PlatformRight::ESCALATES:
@@ -1459,6 +1507,13 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 	auto point = rights.PlatformGrant("function", function->name);
 	if (point == 0) {
 		throw BinderException("acl admin: platform.%s is denied to the principal", function->name);
+	}
+	if (PolicyBundleOnly(name) && name != "acl_session_view_as" && !rights.unrestricted_manage) {
+		// spec 181: a session script runs as the node - the policy bundle's alone, a point grant (one written before
+		// the rule, or by hand) reaches nothing (view-as is judged by its own rule, ViewAsRefusal)
+		throw BinderException("acl admin: platform.%s needs the policy bundle (an unrestricted manage scope) - a "
+		                      "session script runs as the node, and no grant by name reaches it",
+		                      function->name);
 	}
 	switch (function->right) {
 	case PlatformRight::ESCALATES:
@@ -2579,8 +2634,20 @@ string Typed(const PlatformView &view, const string &body) {
 	return "SELECT " + StringUtil::Join(items, ", ") + " FROM (" + body + ") __platform_" + view.name;
 }
 
+//! spec 181: a session script and its ON ERROR as a view shows them - fail (the default, stored NULL) or continue,
+//! NULL where no script is set. Only to the policy bundle: a reader by a point grant on the view sees NULLs (a script
+//! is the node's power, and may name what the node reaches)
+string ScriptColumnsSql(bool shown) {
+	if (!shown) {
+		return "NULL::VARCHAR AS \"session_script\", NULL::VARCHAR AS \"session_on_error\"";
+	}
+	return "\"session_script\", CASE WHEN \"session_script\" IS NULL THEN NULL ELSE coalesce(\"session_on_error\", "
+	       "'fail') END AS \"session_on_error\"";
+}
+
 //! The body of a view read from the policy catalog's tables; empty when the view does not read them
-string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool scoped, const std::set<string> &cats) {
+string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool scoped, const std::set<string> &cats,
+                 bool scripts_shown) {
 	auto table = [&](const char *name) {
 		return catalog.Tbl(name);
 	};
@@ -2639,9 +2706,12 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 	if (view == "roles") {
 		if (scoped) {
 			// a catalog admin sees the NAMES of the roles holding its catalogs, nothing about them
-			return "SELECT DISTINCT \"role\", NULL AS \"comment\" FROM " + table("role_catalogs") + where("\"vcat\"");
+			return "SELECT DISTINCT \"role\", NULL AS \"comment\", NULL AS \"session_script\", NULL AS "
+			       "\"session_on_error\" FROM " +
+			       table("role_catalogs") + where("\"vcat\"");
 		}
-		return "SELECT \"role\", \"comment\" FROM " + table("roles");
+		// spec 181: ON ERROR as written - FAIL SESSION is the default, stored as NULL
+		return "SELECT \"role\", \"comment\", " + ScriptColumnsSql(scripts_shown) + " FROM " + table("roles");
 	}
 	if (view == "role_claims") {
 		return "SELECT \"role\", \"claim\", \"value\" FROM " + table("role_claims");
@@ -2686,11 +2756,12 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 	}
 	if (view == "resource_groups") {
 		return "SELECT \"group\", \"window_start\", \"window_max\", \"batch_bytes\", \"max_result_rows\", "
-		       "\"queue_priority\", \"max_sessions\", \"comment\", \"is_default\" FROM " +
-		       table("resource_groups");
+		       "\"queue_priority\", \"max_sessions\", \"comment\", \"is_default\", " +
+		       ScriptColumnsSql(scripts_shown) + " FROM " + table("resource_groups");
 	}
 	if (view == "role_resource_groups") {
-		return "SELECT \"role\", \"group\" FROM " + table("role_resource_groups");
+		return "SELECT \"role\", \"group\", " + ScriptColumnsSql(scripts_shown) + " FROM " +
+		       table("role_resource_groups");
 	}
 	return string();
 }
@@ -2751,7 +2822,7 @@ bool PlatformViewSql(PolicyStore &store, const PolicyStore::AdminRights &rights,
 			                      "enumerate it (acl_use_db)",
 			                      view->name);
 		}
-		body = TableBody(*store.catalog, view->name, scoped, rights.catalogs);
+		body = TableBody(*store.catalog, view->name, scoped, rights.catalogs, rights.Policy());
 	}
 	sql = Typed(*view, body);
 	return true;
@@ -3424,6 +3495,7 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 	RegisterAclPlatformSources(loader, store);
 	RegisterAclPrincipalFunctionRows(loader, store);
 	RegisterAclPlatformRights(loader, store);
+	RegisterAclSessionScripts(loader, store); // spec 181
 }
 
 } // namespace acl

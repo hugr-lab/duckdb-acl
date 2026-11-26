@@ -171,7 +171,8 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
 - **Administration is a capability** (spec 009): `{"manage": true}` in a catalog grant (per catalog,
   many catalogs per role, independent of `select`), or global bundles in `acl.admins` (spec 117: a set -
   `observe`, `operate`, `cluster`, `policy`, `passthrough`; `manage` = policy + observe), or point grants on the `platform`
-  catalog; never self-escalating, and only `passthrough` leaves the virtual catalog.
+  catalog; never self-escalating, and only `passthrough` leaves the virtual catalog - but a session script (spec 181,
+  the `policy` bundle's) runs as the node, so that bundle is given as passthrough is.
 - **Golden rule**: the rewriter adds no query parameters — a user's `$1`/`?` is the only parameter.
 - **Function gating seam**: `PolicyStore::ResolveFunction` (spec 072) — a call is admitted when its
   key `(database, schema, name, kind)` is in a **category** granted to one of the principal's roles
@@ -988,6 +989,24 @@ update and lost the answer - found by acl-clients 010). Tests `test_acl_mgmt_ans
 also `AclQuotedValue` - `MASK '<items>'` / `VERSIONS '<clause>'`, as `RLS '<predicate>'`, read by the same writers
 (`ReadMasks`, `NormalizeVersions`) with duckdb's parser, so a client composing a grant (the console's editor) passes the
 person's text as a value - its own scanner of SQL text gone. Test `acl_grant_literal_clauses.test`.
+
+**Spec 181 — a session's scripts** (the owner, 2026-11-26): SQL the administrator writes runs when a client session
+opens, on that session's own connection, before its first statement - unprefixed, as the node, full rights, never read
+by us. In the policy at three levels - `ALTER RESOURCE GROUP g [FOR ROLE r] SET | DROP SESSION SCRIPT '<sql>' [ON ERROR
+FAIL SESSION | CONTINUE]`, `ALTER ROLE r SET | DROP SESSION SCRIPT …` (`acl_set_session_script` /
+`acl_drop_session_script`; schema v29, min_reader 28: `session_script`, `session_on_error` on `resource_groups`,
+`roles`, `role_resource_groups`) - the `policy` bundle's ALONE (no point grant on `set_session_script` /
+`drop_session_script` / `session_scripts`, `PolicyBundleOnly`, like view-as: a script is the node's power). Run in layers,
+every one defined (`RunSessionScripts`, src/acl_session_scripts.cpp): the group's (the node's group, else the charged one,
+else the principal's only one), each role's (name order), each grant's (role, that group); the variables
+`acl_session_roles` / `_groups` / `_group` / `_subject` set first; resolved per role set + group and cached per policy
+version (`CatalogBackend::SessionScripts`). After each script an open transaction is committed (an invalidated one
+rolled back, counted as that script's failure): no script transaction reaches the client. Doors: Flight in `SessionFor`
+before the bind and before a takeover's restore (a client's carried SETs win; a script's temp tables - by oid - and
+committed work never pin a move); quack by a `sync.py` CONNECT patch - the connection made, scripted, then published. A
+gateway's `acl_session_open` runs none (a scalar inside the gateway's query). Audit: `session` events `script_ran` /
+`script_failed` / refused `session_script` - level, owner, error class, never the text. `platform.session_scripts(role[,
+group])` lists the run order. Tests `acl_session_scripts.test`, `test_acl_session_scripts.cpp`, Flight e2e `run.sh`.
 
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
