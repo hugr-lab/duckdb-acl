@@ -3711,8 +3711,8 @@ void PolicyStore::CatalogBindResourceGroup(const string &role, const string &gro
 			statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + where);
 		} else if (!bound) {
 			// a grant made again keeps what hangs on it (its session script, spec 181)
-			statements.push_back("INSERT INTO " + catalog->Tbl("role_resource_groups") + " (\"role\", \"group\") VALUES (" +
-			                     Lit(role) + ", " + Lit(group) + ")");
+			statements.push_back("INSERT INTO " + catalog->Tbl("role_resource_groups") +
+			                     " (\"role\", \"group\") VALUES (" + Lit(role) + ", " + Lit(group) + ")");
 		}
 	});
 }

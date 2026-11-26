@@ -2783,8 +2783,8 @@ vector<SessionScript> CatalogBackend::SessionScripts(const vector<string> &roles
 	}
 	// ONE read: the group's, the roles', the roles' grants of the group - ordered here, by layer then role name
 	string role_list = sorted.empty() ? string() : LitList(sorted);
-	string sql = "SELECT 0, \"group\", NULL, \"session_script\", \"session_on_error\" FROM " +
-	             Tbl("resource_groups") + " WHERE \"session_script\" IS NOT NULL AND \"group\" = " + Lit(group);
+	string sql = "SELECT 0, \"group\", NULL, \"session_script\", \"session_on_error\" FROM " + Tbl("resource_groups") +
+	             " WHERE \"session_script\" IS NOT NULL AND \"group\" = " + Lit(group);
 	if (!sorted.empty()) {
 		sql += " UNION ALL SELECT 1, NULL, \"role\", \"session_script\", \"session_on_error\" FROM " + Tbl("roles") +
 		       " WHERE \"session_script\" IS NOT NULL AND \"role\" IN (" + role_list + ")";

@@ -3282,8 +3282,8 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclScriptContinue <- 'CONTINUE'"));
 		changes.push_back(GrammarChange::AddRule("AclScriptAction <- AclScriptFail / AclScriptContinue"));
 		changes.push_back(GrammarChange::AddRule("AclScriptOnError <- 'ON' 'ERROR' AclScriptAction"));
-		changes.push_back(GrammarChange::AddRule(
-		    "AclSetSessionScript <- 'SET' 'SESSION' 'SCRIPT' AclQuotedValue AclScriptOnError?"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclSetSessionScript <- 'SET' 'SESSION' 'SCRIPT' AclQuotedValue AclScriptOnError?"));
 		changes.push_back(GrammarChange::AddRule("AclDropSessionScript <- 'DROP' 'SESSION' 'SCRIPT'"));
 		changes.push_back(
 		    GrammarChange::AddRule("AclSessionScriptChange <- AclSetSessionScript / AclDropSessionScript"));
