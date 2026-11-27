@@ -1106,7 +1106,7 @@ connection.
   changes: a write empties it, so a session opened after the write runs the new scripts. A session already open keeps
   what it ran.
 - **Who writes.** The `policy` bundle (an unrestricted `manage`), as for roles and resource groups - and only it:
-  `platform.set_session_script`, `drop_session_script` and `session_scripts` are never granted by name (a `DENY`
+  `platform.set_session_script`, `drop_session_script`, `session_scripts` and `try_session_script` are never granted by name (a `DENY`
   still is), and a reader of the views below by a point grant sees no script. A catalog admin's `manage` does not
   reach them, and no principal can see them.
 - **Reading.** `platform.resource_groups`, `platform.roles` and `platform.role_resource_groups` carry
@@ -1114,11 +1114,27 @@ connection.
   `platform.session_scripts(role[, group_name])` lists what a session of that role, on a node of that group (without
   one: the role's own group, as a session would take it), runs - `pos`, `level` (`group` | `role` | `grant`),
   `group`, `role`, `on_error`, `sql` - in run order.
+- **Trying one first** (spec 183). `platform.try_session_script(group_name, role, sql[, on_error[, session_role[,
+  session_group]]])` runs what a session would run with the edited script in place of the stored one - the variables,
+  then every layer in its order, each as a session runs it - on a connection of the node made for the trial and
+  dropped after. It answers each script that ran (`ok`, `error_class`, the error's `message`, its `line` and `column`
+  in that script) and a last `session` row: served, or `refused by the <level> script`. The edited script must be one
+  that session runs: a role's needs `session_role` to be that role, a group's or a grant's `session_group` that group.
+  Nothing is stored, no session is opened and no seat is taken - but the trial is a run as the node: what a script
+  does beyond its own connection (a write to a source, `SET GLOBAL`, `ATTACH`, `INSTALL` / `LOAD`, `COPY … TO`, an
+  HTTP call) it does, once, as each session would. It differs from a session in its subject (none) and in having no
+  session for a secrets service to act for. The `policy` bundle's alone, like the writers.
+
+  ```sql
+  SELECT pos, level, ok, error_class, message, line, "column"
+  FROM platform.try_session_script('', 'analyst', 'SET TimeZone = ''Asia/Tokyo''', 'fail', '', 'north');
+  ```
 - **Memory mode** keeps no session scripts: the writers need a policy catalog, as resource groups do.
 - **Functions.** `acl_set_session_script(group, role, sql[, on_error])` and `acl_drop_session_script(group,
   role)` - `role` `''` for a group's script, `group` `''` for a role's, both for a grant's; `on_error` is `fail`
   or `continue`. `platform.set_session_script` / `drop_session_script` call them. `acl_session_scripts(role[,
-  group])` is the listing.
+  group])` is the listing, `acl_try_session_script(group, role, sql[, on_error[, session_role[, session_group]]])` the
+  trial.
 
 :::warning A session script is the node's power on a principal's connection
 A script runs with the node's rights - it can read any source, run `ACL NATIVE`'s SQL and write the policy. Whoever

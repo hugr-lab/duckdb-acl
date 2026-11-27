@@ -1008,6 +1008,14 @@ gateway's `acl_session_open` runs none (a scalar inside the gateway's query). Au
 `script_failed` / refused `session_script` - level, owner, error class, never the text. `platform.session_scripts(role[,
 group])` lists the run order. Tests `acl_session_scripts.test`, `test_acl_session_scripts.cpp`, Flight e2e `run.sh`.
 
+**Spec 183 — a session script tried before it is written**: `platform.try_session_script(group_name, role, sql[,
+on_error[, session_role[, session_group]]])` (`acl_try_session_script`, POLICY, `PolicyBundleOnly`) runs what a session of
+`session_role` on a node of `session_group` would run - the variables, every layer, the edited script in place of the
+stored one (or added in its layer) - as the node, on a connection made for the trial and dropped after (`errors_as_json`
+for the error's position; the caller's interrupt passed on); one row per script (`ok`, class, message, line, column) and
+a `session` row (served / refused by). Nothing stored, no session opened; what a script does beyond its connection it
+does. The owner check is the writer's (`RequireScriptOwner`). Test `acl_session_script_try.test`.
+
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
 <t1> AND <t2>` (duckdb's `AtClause` rule and BETWEEN operands; `role_catalogs` / `role_object_caps.versions`, schema
 v24, min_reader 24), stored normalized - constants evaluated where written (`acl_versions.{hpp,cpp}`: `NormalizeVersions`

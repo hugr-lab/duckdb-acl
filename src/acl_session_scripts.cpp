@@ -12,8 +12,15 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/valid_checker.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -37,6 +44,15 @@ string VarcharList(const vector<string> &items) {
 
 string VarcharOrNull(const string &text) {
 	return text.empty() ? string("NULL::VARCHAR") : Value(text).ToSQLString();
+}
+
+//! What a script branches on (spec 181): only the principal's own roles and groups, and the group its first layer is
+string VariablesSql(const vector<string> &roles, const vector<string> &groups, const string &group,
+                    const string &subject) {
+	return "SET VARIABLE acl_session_roles = " + VarcharList(roles) +
+	       "; SET VARIABLE acl_session_groups = " + VarcharList(groups) +
+	       "; SET VARIABLE acl_session_group = " + VarcharOrNull(group) +
+	       "; SET VARIABLE acl_session_subject = " + VarcharOrNull(subject);
 }
 
 //! A script hands the client no open transaction: whatever it left open is committed after it ran, and an invalidated
@@ -102,12 +118,8 @@ bool RunSessionScripts(PolicyStore &store, Connection &con, const string &handle
 		return false; // ended while it was being prepared
 	}
 	try {
-		// what a script branches on: only the principal's own roles and groups, and the group its first layer is
-		auto variables = "SET VARIABLE acl_session_roles = " + VarcharList(ref.principal.roles) +
-		                 "; SET VARIABLE acl_session_groups = " + VarcharList(ref.limits.groups) +
-		                 "; SET VARIABLE acl_session_group = " + VarcharOrNull(store.SessionScriptGroup(ref.limits)) +
-		                 "; SET VARIABLE acl_session_subject = " + VarcharOrNull(ref.principal.subject);
-		auto set = con.Query(variables);
+		auto set = con.Query(VariablesSql(ref.principal.roles, ref.limits.groups, store.SessionScriptGroup(ref.limits),
+		                                  ref.principal.subject));
 		if (set->HasError()) {
 			store.AuditSessionScript(door, handle, nullptr, ErrorClass(set->GetErrorObject()), "refused");
 			return false;
@@ -237,6 +249,227 @@ void ScriptsScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 
 } // namespace
 
+//===--------------------------------------------------------------------===//
+// spec 183: acl_try_session_script(group, role, sql[, on_error[, session_role[, session_group]]]) - what a session
+// would run with the edited script in its place, run on a connection made for the trial and dropped after
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+constexpr const char *TRY_FN = "acl_try_session_script";
+
+//! a layer's place in the run order (spec 181): the group's, then each role's, then each grant's
+int Layer(const string &level) {
+	return level == "group" ? 0 : level == "role" ? 1 : 2;
+}
+
+//! the byte `offset` of `text` as a line and a column in characters, both from 1
+void LineColumn(const string &text, idx_t offset, int32_t &line, int32_t &column) {
+	line = 1;
+	column = 1;
+	for (idx_t i = 0; i < text.size() && i < offset; i++) {
+		auto c = static_cast<unsigned char>(text[i]);
+		if (c == '\n') {
+			line++;
+			column = 1;
+		} else if ((c & 0xC0) != 0x80) {
+			column++;
+		}
+	}
+}
+
+Value TextOrNull(const string &text) {
+	return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
+}
+
+Value IntOrNull(int32_t n) {
+	return n > 0 ? Value::INTEGER(n) : Value(LogicalType::INTEGER);
+}
+
+struct TryInfo : TableFunctionInfo {
+	explicit TryInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	shared_ptr<PolicyStore> store;
+};
+
+unique_ptr<FunctionData> TryBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                   vector<Identifier> &names) {
+	auto bind = make_uniq<ScriptsBind>();
+	bind->store = input.info->Cast<TryInfo>().store;
+	bind->arguments = input.inputs;
+	auto add = [&](const char *name, const LogicalType &type) {
+		names.push_back(Identifier(name));
+		types.push_back(type);
+	};
+	add("pos", LogicalType::INTEGER);
+	for (auto name : {"level", "group", "role", "on_error"}) {
+		add(name, LogicalType::VARCHAR);
+	}
+	add("edited", LogicalType::BOOLEAN);
+	add("ok", LogicalType::BOOLEAN);
+	add("error_class", LogicalType::VARCHAR);
+	add("message", LogicalType::VARCHAR);
+	add("line", LogicalType::INTEGER);
+	add("column", LogicalType::INTEGER);
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> TryInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<ScriptsBind>();
+	auto &store = *bind.store;
+	if (!store.catalog || store.catalog->FunctionMode()) {
+		throw BinderException("acl: %s needs a policy catalog (acl_use_db)", TRY_FN);
+	}
+	auto text = [&](idx_t index) {
+		return index < bind.arguments.size() && !bind.arguments[index].IsNull() ? bind.arguments[index].ToString()
+		                                                                        : string();
+	};
+	auto group = text(0);
+	auto role = text(1);
+	auto sql = text(2);
+	auto on_error = StringUtil::Lower(text(3).empty() ? string("fail") : text(3));
+	if (on_error != "fail" && on_error != "continue") {
+		throw InvalidInputException("%s: on_error is fail or continue, got \"%s\"", TRY_FN, on_error);
+	}
+	// the owner exists, a grant's binding too - in the writer's words
+	store.CatalogRequireScriptOwner(group, role, TRY_FN);
+	if (sql.empty()) {
+		throw InvalidInputException("%s: the script is empty", TRY_FN);
+	}
+	auto session_role = text(4).empty() ? role : text(4);
+	if (!session_role.empty()) {
+		case_insensitive_set_t known;
+		store.catalog->KnownRoles({session_role}, known);
+		if (known.empty()) {
+			throw BinderException("acl admin: role \"%s\" does not exist", session_role);
+		}
+	}
+	Principal principal;
+	if (!session_role.empty()) {
+		principal.roles = {session_role};
+	}
+	auto limits = store.ResolveResourceLimits(principal);
+	auto session_group = text(5).empty() ? group : text(5);
+	if (!text(5).empty()) {
+		store.CatalogRequireScriptOwner(session_group, string(), TRY_FN);
+	}
+	if (session_group.empty()) {
+		session_group = store.SessionScriptGroup(limits);
+	}
+	// the edited script must be one this session runs
+	SessionScript edited;
+	edited.level = !group.empty() && !role.empty() ? "grant" : !group.empty() ? "group" : "role";
+	edited.group = group;
+	edited.role = role;
+	edited.sql = sql;
+	edited.fail_session = on_error == "fail";
+	if ((!role.empty() && role != session_role) || (!group.empty() && group != session_group)) {
+		throw InvalidInputException("%s: a session of role \"%s\" on a node of group \"%s\" does not run the %s's "
+		                            "script - name a session_role / session_group it runs for",
+		                            TRY_FN, session_role, session_group, edited.level);
+	}
+	// the session's scripts as the policy resolves them, the edited one in its place
+	auto scripts = store.SessionScriptsFor(principal.roles, session_group);
+	auto place = scripts.end();
+	bool replaced = false;
+	for (auto it = scripts.begin(); it != scripts.end(); ++it) {
+		if (it->level == edited.level && it->group == edited.group && it->role == edited.role) {
+			*it = edited;
+			place = it;
+			replaced = true;
+			break;
+		}
+		if (place == scripts.end() &&
+		    (Layer(it->level) > Layer(edited.level) || (it->level == edited.level && it->role > edited.role))) {
+			place = it;
+		}
+	}
+	if (!replaced) {
+		place = scripts.insert(place, edited);
+	}
+	auto edited_index = idx_t(place - scripts.begin());
+
+	auto state = make_uniq<ScriptsState>();
+	// a connection of the node made for the trial, closed when this returns: what the scripts set on it ends with it
+	Connection con(DatabaseInstance::GetDatabase(context));
+	auto json = con.Query("SET SESSION errors_as_json = true"); // an error's offset comes back with it
+	if (json->HasError()) {
+		json->ThrowError();
+	}
+	vector<string> groups = session_group.empty() ? limits.groups : vector<string> {session_group};
+	auto set = con.Query(VariablesSql(principal.roles, groups, session_group, string()));
+	if (set->HasError()) {
+		set->ThrowError();
+	}
+	// the caller's cancel reaches the trial's connection: a script that hangs (a remote source) ends with the call
+	std::atomic<bool> done {false};
+	std::thread watcher([&]() {
+		while (!done.load()) {
+			if (context.IsInterrupted()) {
+				con.Interrupt();
+				return;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+	});
+	struct Join {
+		std::atomic<bool> &done;
+		std::thread &watcher;
+		~Join() {
+			done.store(true);
+			watcher.join();
+		}
+	} join {done, watcher};
+	string refused_by;
+	for (idx_t i = 0; i < scripts.size(); i++) {
+		context.InterruptCheck();
+		auto &script = scripts[i];
+		auto result = con.Query(script.sql);
+		string error_class;
+		string message;
+		int32_t line = 0;
+		int32_t column = 0;
+		if (result->HasError()) {
+			auto &error = result->GetErrorObject();
+			error_class = Exception::ExceptionTypeToString(error.Type());
+			message = error.RawMessage();
+			auto map = StringUtil::ParseJSONMap(message, true);
+			auto text_entry = map.find("exception_message");
+			if (text_entry != map.end()) {
+				message = text_entry->second;
+			}
+			auto position = map.find("position");
+			idx_t offset = 0;
+			if (position != map.end() && TryCast::Operation(string_t(position->second), offset)) {
+				LineColumn(script.sql, offset, line, column);
+			}
+		}
+		// what it left open is committed, or rolled back and its failure - as a session settles it
+		auto settled = SettleTransaction(con);
+		if (error_class.empty() && !settled.empty()) {
+			error_class = settled;
+			message = "the transaction it left open could not be committed";
+		}
+		state->rows.push_back({Value::INTEGER(int32_t(i + 1)), Value(script.level), TextOrNull(script.group),
+		                       TextOrNull(script.role), Value(script.fail_session ? "fail" : "continue"),
+		                       Value::BOOLEAN(i == edited_index), Value::BOOLEAN(error_class.empty()),
+		                       TextOrNull(error_class), TextOrNull(message), IntOrNull(line), IntOrNull(column)});
+		if (!error_class.empty() && script.fail_session) {
+			refused_by = script.level;
+			break;
+		}
+	}
+	auto null_text = Value(LogicalType::VARCHAR);
+	state->rows.push_back({Value(LogicalType::INTEGER), Value("session"), TextOrNull(session_group),
+	                       TextOrNull(session_role), null_text, Value::BOOLEAN(false),
+	                       Value::BOOLEAN(refused_by.empty()), null_text,
+	                       Value(refused_by.empty() ? string("served") : "refused by the " + refused_by + " script"),
+	                       Value(LogicalType::INTEGER), Value(LogicalType::INTEGER)});
+	return std::move(state);
+}
+
+} // namespace
+
 void RegisterAclSessionScripts(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
 	TableFunctionSet set((Identifier("acl_session_scripts")));
 	for (idx_t arity : {1, 2}) {
@@ -246,6 +479,15 @@ void RegisterAclSessionScripts(ExtensionLoader &loader, const shared_ptr<PolicyS
 		set.AddFunction(function);
 	}
 	loader.RegisterFunction(set);
+
+	TableFunctionSet trial((Identifier(TRY_FN)));
+	for (idx_t arity : {3, 4, 5, 6}) {
+		TableFunction function(Identifier(TRY_FN), vector<LogicalType>(arity, LogicalType::VARCHAR), ScriptsScan,
+		                       TryBindFn, TryInit);
+		function.function_info = make_shared_ptr<TryInfo>(store);
+		trial.AddFunction(function);
+	}
+	loader.RegisterFunction(trial);
 }
 
 } // namespace acl
