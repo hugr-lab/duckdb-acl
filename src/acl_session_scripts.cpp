@@ -16,6 +16,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/statement_iterator.hpp"
 #include "duckdb/main/valid_checker.hpp"
 
 #include <atomic>
@@ -278,6 +279,59 @@ void LineColumn(const string &text, idx_t offset, int32_t &line, int32_t &column
 	}
 }
 
+//! A script's run in a trial: its failure's class and message, and where in the text (none when it ran)
+struct ScriptRun {
+	string error_class;
+	string message;
+	optional_idx offset;
+};
+
+//! Run a script as a session runs it - duckdb's own loop, each statement parsed after the one before it ran (a LOAD may
+//! bring the grammar of the next) - one statement at a time, so a failure says where: a parse error at its own
+//! position, any other at the start of the statement that failed. The connection's settings are left as they are: on
+//! a platform node the configuration is locked after the boot.
+ScriptRun RunScript(Connection &con, const string &sql) {
+	ScriptRun run;
+	try {
+		auto statements = con.context->IterateStatements(sql);
+		idx_t cursor = 0;
+		bool more = statements.Peek();
+		while (more) {
+			auto statement = statements.GetStatementForExecution();
+			more = statements.HasMore();
+			if (!statement) {
+				continue;
+			}
+			// the parser hands each statement its own text, located from 0: found in the script after the one before
+			auto found = sql.find(statement->query, cursor);
+			idx_t start = found == string::npos ? cursor : found;
+			cursor = start + statement->query.size();
+			while (start < sql.size() && StringUtil::CharacterIsSpace(sql[start])) {
+				start++;
+			}
+			auto result = con.Query(std::move(statement));
+			if (result->HasError()) {
+				auto &error = result->GetErrorObject();
+				run.error_class = Exception::ExceptionTypeToString(error.Type());
+				run.message = error.RawMessage();
+				run.offset = start;
+				return run;
+			}
+		}
+	} catch (std::exception &ex) {
+		// the parser's: its position is still its own, read before any formatting
+		ErrorData error(ex);
+		run.error_class = Exception::ExceptionTypeToString(error.Type());
+		run.message = error.RawMessage();
+		auto position = error.ExtraInfo().find("position");
+		idx_t offset = 0;
+		if (position != error.ExtraInfo().end() && TryCast::Operation(string_t(position->second), offset)) {
+			run.offset = offset;
+		}
+	}
+	return run;
+}
+
 Value TextOrNull(const string &text) {
 	return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
 }
@@ -392,10 +446,6 @@ unique_ptr<GlobalTableFunctionState> TryInit(ClientContext &context, TableFuncti
 	auto state = make_uniq<ScriptsState>();
 	// a connection of the node made for the trial, closed when this returns: what the scripts set on it ends with it
 	Connection con(DatabaseInstance::GetDatabase(context));
-	auto json = con.Query("SET SESSION errors_as_json = true"); // an error's offset comes back with it
-	if (json->HasError()) {
-		json->ThrowError();
-	}
 	vector<string> groups = session_group.empty() ? limits.groups : vector<string> {session_group};
 	auto set = con.Query(VariablesSql(principal.roles, groups, session_group, string()));
 	if (set->HasError()) {
@@ -424,25 +474,13 @@ unique_ptr<GlobalTableFunctionState> TryInit(ClientContext &context, TableFuncti
 	for (idx_t i = 0; i < scripts.size(); i++) {
 		context.InterruptCheck();
 		auto &script = scripts[i];
-		auto result = con.Query(script.sql);
-		string error_class;
-		string message;
+		auto run = RunScript(con, script.sql);
+		auto &error_class = run.error_class;
+		auto &message = run.message;
 		int32_t line = 0;
 		int32_t column = 0;
-		if (result->HasError()) {
-			auto &error = result->GetErrorObject();
-			error_class = Exception::ExceptionTypeToString(error.Type());
-			message = error.RawMessage();
-			auto map = StringUtil::ParseJSONMap(message, true);
-			auto text_entry = map.find("exception_message");
-			if (text_entry != map.end()) {
-				message = text_entry->second;
-			}
-			auto position = map.find("position");
-			idx_t offset = 0;
-			if (position != map.end() && TryCast::Operation(string_t(position->second), offset)) {
-				LineColumn(script.sql, offset, line, column);
-			}
+		if (run.offset.IsValid()) {
+			LineColumn(script.sql, run.offset.GetIndex(), line, column);
 		}
 		// what it left open is committed, or rolled back and its failure - as a session settles it
 		auto settled = SettleTransaction(con);

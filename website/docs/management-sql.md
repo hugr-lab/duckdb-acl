@@ -1118,8 +1118,8 @@ connection.
   session_group]]])` runs what a session would run with the edited script in place of the stored one - the variables,
   then every layer in its order, each as a session runs it - on a connection of the node made for the trial and
   dropped after. It answers each script that ran (`ok`, `error_class`, the error's `message`, its `line` and `column`
-  in that script) and a last `session` row: served, or `refused by the <level> script`. The edited script must be one
-  that session runs: a role's needs `session_role` to be that role, a group's or a grant's `session_group` that group.
+  in that script - a parse error's own place, any other the failing statement's start) and a last `session` row:
+  served, or `refused by the <level> script`. The edited script must be one that session runs: a role's needs `session_role` to be that role, a group's or a grant's `session_group` that group.
   Nothing is stored, no session is opened and no seat is taken - but the trial is a run as the node: what a script
   does beyond its own connection (a write to a source, `SET GLOBAL`, `ATTACH`, `INSTALL` / `LOAD`, `COPY … TO`, an
   HTTP call) it does, once, as each session would. It differs from a session in its subject (none) and in having no

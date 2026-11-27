@@ -232,3 +232,27 @@ ACL ROLE "viewer" SELECT * FROM platform.try_session_script('', 'analyst', 'SELE
 
 statement ok
 DELETE FROM store.acl.platform_grants WHERE role = 'viewer';
+
+# --- on a locked configuration ---------------------------------------------------------------------------------------
+
+# a platform node locks its configuration after its boot: a trial changes no setting of its connection, and still says
+# where a script failed - a parse error at its own position, any other at the start of the statement that failed
+statement ok
+SET lock_configuration = true;
+
+query ITTTII
+SELECT pos, level, ok, error_class, line, "column" FROM acl_try_session_script('', 'analyst', 'SET VARIABLE a = 1;
+  SET VARIABLE b = ;', 'continue', '', 'north');
+----
+1	group	true	NULL	NULL	NULL
+2	role	false	Parser	2	20
+NULL	session	true	NULL	NULL	NULL
+
+query ITTTII
+SELECT pos, level, ok, error_class, line, "column" FROM acl_try_session_script('', 'analyst', 'SET VARIABLE a = 1;
+-- the table below is none
+  SELECT * FROM no_such_table', 'fail', '', 'north');
+----
+1	group	true	NULL	NULL	NULL
+2	role	false	Catalog	3	3
+NULL	session	false	NULL	NULL	NULL
