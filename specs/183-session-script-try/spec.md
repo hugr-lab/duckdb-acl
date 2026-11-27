@@ -71,10 +71,10 @@ SELECT * FROM platform.try_session_script(group_name, role, sql
   | `ok` | BOOLEAN | it ran; on the session's row, the session would be served |
   | `error_class` | VARCHAR | the exception's type (`Parser`, `Catalog`, `Binder`, …) |
   | `message` | VARCHAR | the error's own message, or for the session row: `served` / `refused by the <level> script` |
-  | `line`, `column` | INTEGER | where in that script, from 1, when duckdb says where |
+  | `line`, `column` | INTEGER | where in that script, from 1: a parse error's own place, else the failing statement's start |
 
-  The position is duckdb's own: the connection reports errors as JSON (`errors_as_json`), and its offset becomes a
-  line and a column in characters.
+  A parse error's position is duckdb's own. Any other error is placed at the start of the statement that failed (see
+  As built). The offset becomes a line and a column in characters.
 
 ### What it is not
 
@@ -146,9 +146,15 @@ SELECT * FROM platform.try_session_script(group_name, role, sql
   `PolicyStore::CatalogRequireScriptOwner`.
 - **The platform function** is `platform.try_session_script`: `PlatformRight::POLICY`, a table function, and in
   `PolicyBundleOnly`. Its arguments in FROM are positional, as for every platform table function: `platform.try_session_script('', 'r', '<sql>', 'fail', '', 'north')`.
-- **An error's place**: the trial's connection runs with `SET SESSION errors_as_json = true`, so duckdb's error keeps
-  its `position` (the plain form folds it into the message's `LINE …` context). The message is the JSON's
-  `exception_message`, and the position becomes a line and a column (UTF-8 characters) in that script's text.
+- **An error's place**: each script runs statement by statement, with duckdb's own loop: `IterateStatements`, each
+  statement parsed after the one before it ran, so a `LOAD` may bring the grammar of the next. A parse error keeps its
+  own position, read from the exception before duckdb formats it. Any other error is placed at the start of the
+  statement that failed, found in the script after the one before (the parser hands each statement its own text,
+  located from 0). The message is duckdb's, with its `LINE …` context. The trial changes no setting of its
+  connection.
+  - Found by hugr-platform's demo (check 21): the first build set `errors_as_json` on the trial's connection, and a
+    platform node locks its configuration after its boot, so every trial was refused there.
+  - The regression test runs under `lock_configuration`.
 - **The caller's cancel**: a watcher thread passes the calling context's interrupt to the trial's connection
   (`Connection::Interrupt`), so a script stuck on a remote source ends with the call. It is checked between scripts
   too.

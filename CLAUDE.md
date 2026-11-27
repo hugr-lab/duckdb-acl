@@ -1011,9 +1011,10 @@ group])` lists the run order. Tests `acl_session_scripts.test`, `test_acl_sessio
 **Spec 183 — a session script tried before it is written**: `platform.try_session_script(group_name, role, sql[,
 on_error[, session_role[, session_group]]])` (`acl_try_session_script`, POLICY, `PolicyBundleOnly`) runs what a session of
 `session_role` on a node of `session_group` would run - the variables, every layer, the edited script in place of the
-stored one (or added in its layer) - as the node, on a connection made for the trial and dropped after (`errors_as_json`
-for the error's position; the caller's interrupt passed on); one row per script (`ok`, class, message, line, column) and
-a `session` row (served / refused by). Nothing stored, no session opened; what a script does beyond its connection it
+stored one (or added in its layer) - as the node, on a connection made for the trial and dropped after (statement by
+statement, duckdb's own loop: a parse error at its place, any other at the failing statement's start; no setting
+changed - a platform node locks its configuration; the caller's interrupt passed on); one row per script (`ok`, class,
+message, line, column) and a `session` row (served / refused by). Nothing stored, no session opened; what a script does beyond its connection it
 does. The owner check is the writer's (`RequireScriptOwner`). Test `acl_session_script_try.test`.
 
 **Spec 167 — the versions of a time-travel table**: a catalog / object grant's `VERSIONS CURRENT | ANY | AT (…) | BETWEEN
