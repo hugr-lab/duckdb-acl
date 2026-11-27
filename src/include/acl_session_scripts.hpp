@@ -33,7 +33,10 @@ bool RunSessionScripts(PolicyStore &store, Connection &con, const string &handle
 //! Both, for a door that already holds the connection: false = refuse the session
 bool PrepareSession(PolicyStore &store, Connection &con, const string &handle, const string &door);
 
-//! acl_session_scripts(role[, group]) - the listing platform.session_scripts answers
+//! acl_session_scripts(role[, group]) - the listing platform.session_scripts answers; and spec 183's
+//! acl_try_session_script(group, role, sql[, on_error[, session_role[, session_group]]]) - platform.try_session_script:
+//! what such a session would run with the edited script in its place, run as the node on a connection made for the
+//! trial and dropped after (nothing stored, no session opened)
 void RegisterAclSessionScripts(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 
 } // namespace acl

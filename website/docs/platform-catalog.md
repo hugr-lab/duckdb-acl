@@ -345,6 +345,7 @@ ESCALATES and INFRASTRUCTURE.
 | `grant_resource_group` / `revoke_resource_group` | role\*, group_name\* | POLICY |
 | `set_session_script` | group_name\*, role\* (`''` for a group's / a role's own), sql, on_error (fail / continue) | POLICY (never granted by name) |
 | `drop_session_script` | group_name\*, role\* | POLICY (never granted by name) |
+| `try_session_script` (in FROM) | group_name\*, role\*, sql, on_error, session_role\*, session_group\* | POLICY (never granted by name) |
 | `grant_admin` | role\*, scope\* | ESCALATES |
 | `revoke_admin` | role\*, scope\* (omitted: everything) | ESCALATES |
 | `grant_platform` | role\*, kind\*, object\*, allowed | ESCALATES |
@@ -413,6 +414,13 @@ The parameters mean what the matching `acl_*` function's do - see the
   node of the group (without one: the role's own group, as a session takes it), in run order: `pos`, `level`
   (`group` / `role` / `grant`), `group`, `role`, `on_error`, `sql`. `policy` only. See
   [Session scripts](management-sql.md#session-scripts-spec-181).
+- `platform.try_session_script(group_name, role, sql[, on_error[, session_role[, session_group]]])` (spec 183) -
+  tries a script before it is written: what a session of `session_role` (default: the script's role) on a node of
+  `session_group` (default: the script's group) would run, with this script in place of the stored one, run as the
+  node on a connection made for the trial and dropped after. One row per script that ran - `pos`, `level`, `group`,
+  `role`, `on_error`, `edited`, `ok`, `error_class`, `message`, `line`, `column` - then the `session` row: `ok` =
+  served. Nothing is stored and no session is opened, but what a script does beyond its connection it does. `policy`
+  only, never granted by name.
 
 ```sql
 SELECT bundles, admin_catalogs, my_views FROM platform.console_info();

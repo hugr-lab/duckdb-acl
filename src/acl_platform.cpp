@@ -1098,6 +1098,17 @@ vector<PlatformFunction> BuildFunctions() {
 	     true,
 	     "TABLE",
 	     "the session scripts a session of the role runs on a node of the group, in their run order (spec 181)"},
+	    {"try_session_script",
+	     "acl_try_session_script",
+	     {A("group_name"), role, P("sql"), P("on_error", V, "fail"), A("session_role"), A("session_group")},
+	     {3, 4, 5, 6},
+	     -1,
+	     PR::POLICY,
+	     true,
+	     "TABLE",
+	     "run what a session of session_role on a node of session_group would run, with this script in place of the "
+	     "stored one - as the node, on a connection made for the trial and dropped after; nothing is stored (spec "
+	     "183)"},
 	    // privilege: passthrough alone - the admin scopes and the grants on `platform`
 	    {"grant_admin",
 	     "acl_grant_admin",
@@ -1270,7 +1281,7 @@ optional_ptr<const PlatformFunction> PlatformFunctionByTarget(const string &targ
 
 bool PolicyBundleOnly(const string &target) {
 	static const char *ONLY[] = {"acl_session_view_as", "acl_set_session_script", "acl_drop_session_script",
-	                             "acl_session_scripts"};
+	                             "acl_session_scripts", "acl_try_session_script"};
 	for (auto name : ONLY) {
 		if (StringUtil::CIEquals(target, name)) {
 			return true;

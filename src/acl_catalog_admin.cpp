@@ -4031,6 +4031,57 @@ void PolicyStore::CatalogAlterReference(const string &vcat, const string &name, 
 	});
 }
 
+namespace {
+
+//! spec 181: where a session script hangs - the group's row, the role's row, or the role's grant of the group - and
+//! that it exists: the writer's check, and the trial's (spec 183), the same words
+struct ScriptOwner {
+	const char *table;
+	string where;
+	string owner;
+};
+
+ScriptOwner RequireScriptOwner(CatalogBackend &catalog, const ReadFn &read, const string &group, const string &role,
+                               const char *fn) {
+	if (group.empty() && role.empty()) {
+		throw InvalidInputException("%s: name a resource group, a role, or both (a role's grant of the group)", fn);
+	}
+	ScriptOwner out;
+	if (!group.empty() && !role.empty()) {
+		out.table = "role_resource_groups";
+		out.where = " WHERE \"role\" = " + Lit(role) + " AND \"group\" = " + Lit(group);
+		out.owner = "grant of resource group \"" + group + "\" to role \"" + role + "\"";
+		// a grant's script needs the grant: the group and the role named first, so the refusal says which is missing
+		if (read("SELECT 1 FROM " + catalog.Tbl("resource_groups") + " WHERE \"group\" = " + Lit(group))->RowCount() ==
+		    0) {
+			throw BinderException("acl admin: resource group \"%s\" does not exist", group);
+		}
+		if (read("SELECT 1 FROM " + catalog.Tbl("roles") + " WHERE \"role\" = " + Lit(role))->RowCount() == 0) {
+			throw BinderException("acl admin: role \"%s\" does not exist", role);
+		}
+		if (read("SELECT 1 FROM " + catalog.Tbl(out.table) + out.where)->RowCount() == 0) {
+			throw BinderException("acl admin: role \"%s\" is not in resource group \"%s\" - GRANT RESOURCE GROUP "
+			                      "%s TO ROLE %s first: a grant's session script hangs on the grant",
+			                      role, group, NamePath(vector<string> {group}).ToGrammar(),
+			                      NamePath(vector<string> {role}).ToGrammar());
+		}
+		return out;
+	}
+	if (!group.empty()) {
+		out.table = "resource_groups";
+		out.where = " WHERE \"group\" = " + Lit(group);
+		out.owner = "resource group \"" + group + "\"";
+	} else {
+		out.table = "roles";
+		out.where = " WHERE \"role\" = " + Lit(role);
+		out.owner = "role \"" + role + "\"";
+	}
+	RequireExisting(read, "SELECT 1 FROM " + catalog.Tbl(out.table) + out.where, out.owner);
+	return out;
+}
+
+} // namespace
+
 void PolicyStore::CatalogSessionScript(const string &group, const string &role, const string &sql,
                                        const string &on_error, bool remove) {
 	auto fn = remove ? "acl_drop_session_script" : "acl_set_session_script";
@@ -4041,56 +4092,30 @@ void PolicyStore::CatalogSessionScript(const string &group, const string &role, 
 	if (!remove && sql.empty()) {
 		throw InvalidInputException("%s: the script is empty - DROP SESSION SCRIPT removes one", fn);
 	}
-	// where the script hangs: the group's row, the role's row, or the role's grant of the group (spec 181)
-	const char *table;
-	string where;
-	string owner;
-	if (!group.empty() && !role.empty()) {
-		table = "role_resource_groups";
-		where = " WHERE \"role\" = " + Lit(role) + " AND \"group\" = " + Lit(group);
-		owner = "grant of resource group \"" + group + "\" to role \"" + role + "\"";
-	} else if (!group.empty()) {
-		table = "resource_groups";
-		where = " WHERE \"group\" = " + Lit(group);
-		owner = "resource group \"" + group + "\"";
-	} else {
-		table = "roles";
-		where = " WHERE \"role\" = " + Lit(role);
-		owner = "role \"" + role + "\"";
-	}
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		if (string(table) == "role_resource_groups") {
-			// a grant's script needs the grant: the group and the role named first, so the refusal says which is
-			// missing
-			if (read("SELECT 1 FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(group))
-			        ->RowCount() == 0) {
-				throw BinderException("acl admin: resource group \"%s\" does not exist", group);
-			}
-			if (read("SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role))->RowCount() == 0) {
-				throw BinderException("acl admin: role \"%s\" does not exist", role);
-			}
-			if (read("SELECT 1 FROM " + catalog->Tbl(table) + where)->RowCount() == 0) {
-				throw BinderException("acl admin: role \"%s\" is not in resource group \"%s\" - GRANT RESOURCE GROUP "
-				                      "%s TO ROLE %s first: a grant's session script hangs on the grant",
-				                      role, group, NamePath(vector<string> {group}).ToGrammar(),
-				                      NamePath(vector<string> {role}).ToGrammar());
-			}
-		} else {
-			RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl(table) + where, owner);
-		}
+		auto at = RequireScriptOwner(*catalog, read, group, role, fn);
 		if (remove) {
-			auto set = read("SELECT 1 FROM " + catalog->Tbl(table) + where + " AND \"session_script\" IS NOT NULL");
+			auto set =
+			    read("SELECT 1 FROM " + catalog->Tbl(at.table) + at.where + " AND \"session_script\" IS NOT NULL");
 			if (set->RowCount() == 0) {
-				throw BinderException("acl admin: the %s has no session script", owner);
+				throw BinderException("acl admin: the %s has no session script", at.owner);
 			}
-			statements.push_back("UPDATE " + catalog->Tbl(table) +
-			                     " SET \"session_script\" = NULL, \"session_on_error\" = NULL" + where);
+			statements.push_back("UPDATE " + catalog->Tbl(at.table) +
+			                     " SET \"session_script\" = NULL, \"session_on_error\" = NULL" + at.where);
 			return;
 		}
-		statements.push_back("UPDATE " + catalog->Tbl(table) + " SET \"session_script\" = " + Lit(sql) +
+		statements.push_back("UPDATE " + catalog->Tbl(at.table) + " SET \"session_script\" = " + Lit(sql) +
 		                     ", \"session_on_error\" = " + (on_error == "continue" ? string("'continue'") : "NULL") +
-		                     where);
+		                     at.where);
 	});
+}
+
+void PolicyStore::CatalogRequireScriptOwner(const string &group, const string &role, const char *fn) {
+	RequireCatalog(catalog, fn);
+	ReadFn read = [&](const string &sql) {
+		return catalog->Query(sql);
+	};
+	RequireScriptOwner(*catalog, read, group, role, fn);
 }
 
 void PolicyStore::CatalogAlterResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits) {

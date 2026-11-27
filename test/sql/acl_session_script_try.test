@@ -1,0 +1,234 @@
+# name: test/sql/acl_session_script_try.test
+# description: spec 183 - a session script tried before it is written: platform.try_session_script runs what a session
+#   would run (spec 181's layers) with the edited script in its place, as the node, on a connection made for the trial
+#   and dropped after. What it answers per script and for the session, the edited script replacing the stored one or
+#   added in its layer, dependencies between statements, an error's line, nothing left behind, the refusals, and who
+#   may call it (the policy bundle alone).
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cat;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cat WITH (select, manage);
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE viewer;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP north;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP south;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP north TO ROLE analyst;
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP north SET SESSION SCRIPT 'SET VARIABLE layer = ''group''; SET VARIABLE region = ''north''';
+
+statement ok
+ACL ADMIN ALTER ROLE analyst SET SESSION SCRIPT 'SET VARIABLE layer = ''role, stored''';
+
+# --- a run, and what it answers -------------------------------------------------------------------------------------
+
+# a role's edited script on a session of that role in north: the group's stored one first, then the edited one in
+# place of the stored role script - which reads the variable the group's set, and a temp table its own first
+# statement made
+query ITTTTTTTTII
+SELECT * FROM acl_try_session_script('', 'analyst', 'CREATE TEMP TABLE seen AS SELECT getvariable(''region'') AS r;
+SET VARIABLE layer = (SELECT ''role, edited '' || r FROM seen)', 'fail', '', 'north');
+----
+1	group	north	NULL	fail	false	true	NULL	NULL	NULL	NULL
+2	role	NULL	analyst	fail	true	true	NULL	NULL	NULL	NULL
+NULL	session	north	analyst	NULL	false	true	NULL	served	NULL	NULL
+
+# the variables a session's scripts see are set first
+query IT
+SELECT pos, ok FROM acl_try_session_script('', 'analyst', 'SELECT CASE WHEN getvariable(''acl_session_roles'') = [''analyst'']
+  AND getvariable(''acl_session_groups'') = [''north''] AND getvariable(''acl_session_group'') = ''north''
+  AND getvariable(''acl_session_subject'') IS NULL THEN 1 ELSE error(''variables'') END', 'fail', '', 'north') WHERE pos = 2;
+----
+2	true
+
+# a grant's script, added in its layer (none is stored): after the group's and the role's
+query ITTTT
+SELECT pos, level, "group", role, edited FROM acl_try_session_script('north', 'analyst', 'SELECT 1');
+----
+1	group	north	NULL	false
+2	role	NULL	analyst	false
+3	grant	north	analyst	true
+NULL	session	north	analyst	false
+
+# a parse error on the third line: its class, line and column; the session refused under fail, the layer after it not run
+query ITTTTII
+SELECT pos, level, ok, error_class, message LIKE 'syntax error at or near%', line, "column"
+FROM acl_try_session_script('north', '', 'SET VARIABLE a = 1;
+SET VARIABLE b = 2;
+SET VARIABLE c = ;', 'fail', 'analyst');
+----
+1	group	false	Parser	true	3	18
+NULL	session	false	NULL	false	NULL	NULL
+
+query T
+SELECT message FROM acl_try_session_script('north', '', 'SELEC 1', 'fail', 'analyst') WHERE level = 'session';
+----
+refused by the group script
+
+# a missing table under continue: its error, the later layers still run, the session served
+query ITTTI
+SELECT pos, level, ok, error_class, line FROM acl_try_session_script('north', 'analyst', '
+SELECT * FROM no_such_table', 'continue');
+----
+1	group	true	NULL	NULL
+2	role	true	NULL	NULL
+3	grant	false	Catalog	2
+NULL	session	true	NULL	NULL
+
+# a script ending inside its own transaction has it committed, as a session settles it
+query IT
+SELECT pos, ok FROM acl_try_session_script('', 'analyst', 'BEGIN; CREATE TEMP TABLE t2 AS SELECT 1 AS x', 'fail', '', 'north') WHERE pos = 2;
+----
+2	true
+
+# --- nothing left behind --------------------------------------------------------------------------------------------
+
+statement error
+SELECT getvariable('layer') IS NOT NULL OR getvariable('region') IS NOT NULL OR error('none');
+----
+none
+
+statement error
+SELECT * FROM seen;
+----
+<REGEX>:.*Table with name seen does not exist.*
+
+query TT
+SELECT "group", session_script FROM store.acl.resource_groups WHERE "group" = 'north';
+----
+north	SET VARIABLE layer = 'group'; SET VARIABLE region = 'north'
+
+query T
+SELECT session_script FROM store.acl.roles WHERE role = 'analyst';
+----
+SET VARIABLE layer = 'role, stored'
+
+query T
+SELECT count(*) FROM store.acl.role_resource_groups WHERE session_script IS NOT NULL;
+----
+0
+
+query I
+SELECT acl_session_count();
+----
+0
+
+# --- refusals -------------------------------------------------------------------------------------------------------
+
+statement error
+SELECT * FROM acl_try_session_script('', '', 'SELECT 1');
+----
+<REGEX>:.*acl_try_session_script: name a resource group, a role, or both.*
+
+statement error
+SELECT * FROM acl_try_session_script('', 'nosuch', 'SELECT 1');
+----
+<REGEX>:.*role "nosuch" does not exist.*
+
+statement error
+SELECT * FROM acl_try_session_script('south', 'analyst', 'SELECT 1');
+----
+<REGEX>:.*role "analyst" is not in resource group "south".*
+
+statement error
+SELECT * FROM acl_try_session_script('', 'analyst', '');
+----
+<REGEX>:.*the script is empty.*
+
+statement error
+SELECT * FROM acl_try_session_script('', 'analyst', 'SELECT 1', 'ignore');
+----
+<REGEX>:.*on_error is fail or continue.*
+
+# a session that does not run the script: another role, another group
+statement error
+SELECT * FROM acl_try_session_script('', 'analyst', 'SELECT 1', 'fail', 'auditor');
+----
+<REGEX>:.*a session of role "auditor" on a node of group "" does not run the role's script.*
+
+statement error
+SELECT * FROM acl_try_session_script('north', '', 'SELECT 1', 'fail', 'analyst', 'south');
+----
+<REGEX>:.*does not run the group's script.*
+
+statement error
+SELECT * FROM acl_try_session_script('', 'analyst', 'SELECT 1', 'fail', '', 'nowhere');
+----
+<REGEX>:.*resource group "nowhere" does not exist.*
+
+# --- who may call it: the policy bundle alone ------------------------------------------------------------------------
+
+query TT
+ACL ROLE "pol" SELECT level, ok FROM platform.try_session_script('', 'analyst', 'SELECT 1', 'fail', '', 'north') WHERE level = 'session';
+----
+session	true
+
+statement error
+ACL ROLE "cat" SELECT * FROM platform.try_session_script('', 'analyst', 'SELECT 1');
+----
+<REGEX>:.*platform.try_session_script needs the policy bundle \(an unrestricted manage scope\).*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM platform.try_session_script('', 'analyst', 'SELECT 1');
+----
+
+statement error
+ACL ROLE "root" GRANT FUNCTION platform.try_session_script TO ROLE viewer;
+----
+<REGEX>:.*platform.try_session_script is the policy bundle's - it is never granted by name.*
+
+statement ok
+INSERT INTO store.acl.platform_grants VALUES ('viewer', 'try_session_script', 'function', true);
+
+statement ok
+SELECT acl_comment_role('viewer', 'bumps the policy version');
+
+statement error
+ACL ROLE "viewer" SELECT * FROM platform.try_session_script('', 'analyst', 'SELECT 1');
+----
+<REGEX>:.*platform.try_session_script needs the policy bundle \(an unrestricted manage scope\).*
+
+statement ok
+DELETE FROM store.acl.platform_grants WHERE role = 'viewer';

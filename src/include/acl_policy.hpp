@@ -1112,6 +1112,8 @@ struct PolicyStore {
 	//! grant of a group (both); `on_error` 'fail' | 'continue'
 	void CatalogSessionScript(const string &group, const string &role, const string &sql, const string &on_error,
 	                          bool remove);
+	//! spec 183: the owner a session script would hang on exists (a grant: its binding), refused in the writer's words
+	void CatalogRequireScriptOwner(const string &group, const string &role, const char *fn);
 	void CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value);
 	void CatalogGrantAdmin(const string &role, const string &scope);
 	void CatalogRevokeAdmin(const string &role, const string &scope);
