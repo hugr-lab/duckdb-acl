@@ -125,7 +125,8 @@ in one write of the store, by a rule per kind that never undoes over somebody el
   - **an operator's PRIMARY KEY** on a created record: the record and the key go;
   - **a same-named table function dropped meanwhile**: the grant it shared is not put back;
   - **any other write** (a `CREATE ROLE`) while a DROP is open: the drop stands, its mark stays, the event says so;
-  - each skip's event and the counter by reason;
+  - each skip's event and the counter by reason, read after `acl_audit_flush()` (the pipeline delivers on its own
+    thread: macOS CI once read the previous skip's event - 2026-11-28);
 - an operator's own `DROP RELATION` and `CREATE VIRTUAL TABLE` inside the operator's transaction stay after its
   ROLLBACK;
 - a failed statement aborts the transaction: its COMMIT rolls back, and the record goes;
