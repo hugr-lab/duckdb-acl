@@ -295,6 +295,10 @@ ACL ROLE "wide" SELECT n FROM vs.pv;
 ----
 2
 
+# the pipeline delivers on its own thread: flush before reading the ring
+statement ok
+SELECT acl_audit_flush();
+
 query TTT
 SELECT verdict, reason, objects::VARCHAR FROM acl_audit_events() WHERE detail = 'record_not_undone';
 ----
@@ -348,6 +352,10 @@ statement error
 ACL ROLE "other" SELECT * FROM vs.cascade;
 ----
 <REGEX>:.*no access to object.*
+
+# the pipeline delivers on its own thread: flush before reading the ring
+statement ok
+SELECT acl_audit_flush();
 
 query TT
 SELECT reason, objects::VARCHAR FROM acl_audit_events() WHERE detail = 'record_not_undone' ORDER BY seq DESC LIMIT 1;
@@ -414,6 +422,10 @@ query TT
 SELECT vname, comment FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname IN ('vs.staging', 'vs.renamed');
 ----
 vs.renamed	checked by ops
+
+# the pipeline delivers on its own thread: flush before reading the ring
+statement ok
+SELECT acl_audit_flush();
 
 query T
 SELECT reason FROM acl_audit_events() WHERE detail = 'record_not_undone' ORDER BY seq DESC LIMIT 1;
@@ -585,6 +597,10 @@ query I
 SELECT count(*) FROM aclcat.acl.schema_dropped WHERE vcat = 'sales' AND path = 'vs' AND name = 'busy';
 ----
 1
+
+# the pipeline delivers on its own thread: flush before reading the ring
+statement ok
+SELECT acl_audit_flush();
 
 query T
 SELECT reason FROM acl_audit_events() WHERE detail = 'record_not_undone' ORDER BY seq DESC LIMIT 1;
